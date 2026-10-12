@@ -791,14 +791,20 @@ mod python_temp_root_tests {
 
     impl TestEnv {
         fn new() -> Self {
+            Self::with_heredoc_limit("")
+        }
+
+        fn with_heredoc_limit(limit: &str) -> Self {
             let root = tempfile::tempdir().expect("create isolated CLI environment");
             std::fs::create_dir_all(root.path().join("home/.config/dcg")).unwrap();
             std::fs::create_dir_all(root.path().join("tmp")).unwrap();
             std::fs::write(
                 root.path().join("config.toml"),
-                "[heredoc]\nenabled = true\ntimeout_ms = 5000\n\
+                format!(
+                    "[heredoc]\nenabled = true\ntimeout_ms = 5000\n{limit}\n\
                  [history]\nenabled = false\n\
-                 [packs]\ndisabled = [\"windows.filesystem\", \"windows.system\"]\n",
+                 [packs]\ndisabled = [\"windows.filesystem\", \"windows.system\"]\n"
+                ),
             )
             .expect("write isolated policy config");
             Self { root }
@@ -863,6 +869,10 @@ mod python_temp_root_tests {
 
         fn assert_python_target(&self, target: &str, expected: &str) {
             let body = format!("import shutil; shutil.rmtree('{target}')");
+            self.assert_python_body(&body, expected);
+        }
+
+        fn assert_python_body(&self, body: &str, expected: &str) {
             self.assert_verdict(&format!("python3 -c \"{body}\""), expected);
             self.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), expected);
         }
@@ -1004,6 +1014,120 @@ mod python_temp_root_tests {
         for root in TEMP_ROOTS {
             env.assert_verdict(&format!("rm -rf {root}"), "deny");
             env.assert_verdict(&format!("rm -rf {root}/build"), "allow");
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_preserves_temp_root_boundary() {
+        let env = TestEnv::new();
+        for (import, function) in [
+            ("from shutil import rmtree", "rmtree"),
+            ("from shutil import rmtree as wipe", "wipe"),
+        ] {
+            for root in TEMP_ROOTS {
+                for (suffix, expected) in [
+                    ("", "deny"),
+                    ("//.//", "deny"),
+                    ("/build/..", "deny"),
+                    ("/build", "allow"),
+                    ("/./build/.", "allow"),
+                ] {
+                    env.assert_python_body(
+                        &format!("{import}; {function}('{root}{suffix}')"),
+                        expected,
+                    );
+                }
+            }
+            for target in [
+                "/etc",
+                "/tmp/../etc",
+                "/private/var/tmp/../../../etc",
+                "/tmp/build/../cache",
+                "/tmp-backup/build",
+            ] {
+                env.assert_python_body(&format!("{import}; {function}('{target}')"), "deny");
+            }
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_handles_grouping_and_complete_targets() {
+        let env = TestEnv::new();
+        for body in [
+            "from shutil import copytree, rmtree as wipe; wipe('/tmp')",
+            "from shutil import (copytree, rmtree as wipe); wipe('/private/tmp/.')",
+            "from shutil import (\n    copytree,\n    rmtree as wipe,\n)\nwipe('/var/tmp')",
+            "from shutil import rmtree as wipe; wipe(path='/private/var/tmp')",
+            "from shutil import rmtree as wipe; wipe(('/tmp/.'))",
+            "from shutil import rmtree as wipe; wipe('/tmp/build' + '/..')",
+            "from shutil import rmtree as wipe; suffix = '/..'; wipe('/tmp/build' + suffix)",
+            "from shutil import rmtree as wipe; wipe('/tmp/build'[:-5])",
+            "from shutil import rmtree as wipe; import tempfile; wipe(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+        ] {
+            env.assert_python_body(body, "deny");
+        }
+        for body in [
+            "from shutil import copytree, rmtree as wipe; wipe('/tmp/build')",
+            "from shutil import (\n    rmtree as wipe,\n)\nwipe('/private//var/./tmp/build')",
+            "from shutil import rmtree as wipe; wipe(path='/var/tmp/build', ignore_errors=True)",
+            "from shutil import rmtree as wipe; wipe('/tmp/' + 'build')",
+            "from shutil import rmtree as wipe; import tempfile; wipe(tempfile.mkdtemp())",
+            "from shutil import rmtree; from tempfile import mkdtemp; rmtree(mkdtemp())",
+        ] {
+            env.assert_python_body(body, "allow");
+        }
+        env.assert_verdict(
+            "python -I -W ignore::DeprecationWarning -c 'from shutil import rmtree as wipe; wipe(\"/tmp\")'",
+            "deny",
+        );
+        env.assert_verdict(
+            "python3 -I <<'PY'\nfrom shutil import rmtree as wipe\nwipe('/tmp/build')\nPY",
+            "allow",
+        );
+    }
+
+    #[test]
+    fn python_imported_rmtree_respects_bindings_and_scope() {
+        let env = TestEnv::new();
+        for body in [
+            "from shutil import rmtree as wipe; print('imported for later cleanup')",
+            "from project_helpers import rmtree; rmtree('/tmp')",
+            "from project_helpers import rmtree as wipe; wipe('/tmp')",
+            "def rmtree(path):\n    print(path)\nrmtree('/tmp')",
+            "from shutil import rmtree as wipe; wipe = print; wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef wipe(path):\n    print(path)\nwipe('/tmp')",
+            "from shutil import rmtree as wipe; from project_helpers import wipe; wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef report(wipe):\n    wipe('/tmp')\nreport(print)",
+            "wipe = print\ndef load_cleanup():\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\n# from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print; example = 'from shutil import rmtree as wipe'; wipe('/tmp')",
+        ] {
+            env.assert_python_body(body, "allow");
+        }
+        for body in [
+            "def cleanup():\n    from shutil import rmtree as wipe\n    wipe('/tmp')\ncleanup()",
+            "from shutil import rmtree as wipe\ndef cleanup():\n    wipe('/tmp')\ncleanup()",
+            "import os\nfrom shutil import rmtree as wipe\nif os.getenv('DRY_RUN'):\n    wipe = print\nwipe('/tmp')",
+            "import os\nwipe = print\nif os.getenv('CLEANUP'):\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+        ] {
+            env.assert_python_body(body, "deny");
+        }
+        env.assert_verdict(
+            "cat <<'PY'\nfrom shutil import rmtree as wipe\nwipe('/tmp')\nPY",
+            "allow",
+        );
+    }
+
+    #[test]
+    fn python_imported_rmtree_keeps_protection_when_extraction_is_incomplete() {
+        // Input-size limits force the fallback deterministically, without
+        // relying on scheduler delays, AST timing, or repeated attempts.
+        let line_limited = TestEnv::with_heredoc_limit("max_body_lines = 1");
+        let byte_limited = TestEnv::with_heredoc_limit("max_body_bytes = 1");
+        for root in TEMP_ROOTS {
+            let body = format!("from shutil import rmtree as wipe\nwipe('{root}')");
+            line_limited.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "deny");
+            byte_limited.assert_python_body(&body, "deny");
         }
     }
 }

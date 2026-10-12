@@ -38,7 +38,7 @@ use ast_grep_language::SupportLang;
 use memchr::memchr_iter;
 use regex::Regex;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
 use std::thread;
@@ -1629,7 +1629,615 @@ fn find_matches_ast(
         }
     }
 
+    // A receiver pattern cannot match `from shutil import rmtree as wipe;
+    // wipe(...)`. Resolve those bindings on the same parsed tree, using the
+    // configured rule's metadata and the same target refinement. A custom
+    // matcher that omitted this rule must not gain a built-in deletion rule.
+    if language == ScriptLanguage::Python
+        && code.contains("shutil")
+        && code.contains("rmtree")
+        && let Some(compiled) = patterns
+            .iter()
+            .find(|pattern| pattern.meta.rule_id == "heredoc.python.shutil_rmtree")
+    {
+        let seen_calls = matches
+            .iter()
+            .filter(|matched| {
+                matched.rule_id == compiled.meta.rule_id
+                    || matched.rule_id.strip_prefix(compiled.meta.rule_id.as_str()) == Some(".temp")
+            })
+            .map(|matched| (matched.start, matched.end))
+            .collect();
+        PythonDeleteScan {
+            meta: &compiled.meta,
+            newline_positions: &newline_positions,
+            matches: &mut matches,
+            seen_calls,
+            start_time,
+            timeout,
+            budget_ms,
+            cancel,
+            remaining_nodes: MAX_PYTHON_DELETE_NODES,
+        }
+        .visit(root, &mut HashMap::new(), None, 0)?;
+    }
+
     Ok(matches)
+}
+
+// This is binding provenance for one destructive API, not evaluation of Python
+// values. An unresolved name grants no new finding; a proven or possible
+// rmtree binding gets exactly the existing rule and #549 target policy.
+// Function bodies inherit bindings visible at their definition. This is
+// source-order provenance, not interprocedural execution: globals introduced
+// only after a definition are not resolved when a later call executes.
+const MAX_PYTHON_DELETE_NODES: usize = 40_000;
+const MAX_PYTHON_DELETE_DEPTH: usize = 128;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PythonDeleteBinding {
+    shutil: bool,
+    rmtree: bool,
+}
+
+type PythonDeleteBindings = HashMap<String, PythonDeleteBinding>;
+
+fn merge_python_delete_bindings(into: &mut PythonDeleteBindings, other: &PythonDeleteBindings) {
+    for (name, binding) in other {
+        let entry = into.entry(name.clone()).or_default();
+        entry.shutil |= binding.shutil;
+        entry.rmtree |= binding.rmtree;
+    }
+}
+
+fn set_python_delete_binding(
+    bindings: &mut PythonDeleteBindings,
+    name: String,
+    binding: PythonDeleteBinding,
+) {
+    if binding == PythonDeleteBinding::default() {
+        bindings.remove(&name);
+    } else {
+        bindings.insert(name, binding);
+    }
+}
+
+struct PythonDeleteScan<'a> {
+    meta: &'a CompiledPattern,
+    newline_positions: &'a [usize],
+    matches: &'a mut Vec<PatternMatch>,
+    seen_calls: HashSet<(usize, usize)>,
+    start_time: Instant,
+    timeout: Duration,
+    budget_ms: u64,
+    cancel: &'a AtomicBool,
+    remaining_nodes: usize,
+}
+
+impl PythonDeleteScan<'_> {
+    fn check(&mut self, depth: usize) -> Result<(), MatchError> {
+        check_ast_timeout(self.start_time, self.timeout, self.budget_ms, self.cancel)?;
+        if depth > MAX_PYTHON_DELETE_DEPTH || self.remaining_nodes == 0 {
+            return Err(MatchError::ParseError {
+                language: ScriptLanguage::Python,
+                detail: "Python deletion binding analysis exceeds its traversal limit".to_string(),
+            });
+        }
+        self.remaining_nodes -= 1;
+        Ok(())
+    }
+
+    fn binding<D: ast_grep_core::Doc>(
+        &mut self,
+        node: &ast_grep_core::Node<'_, D>,
+        bindings: &PythonDeleteBindings,
+        depth: usize,
+    ) -> Result<PythonDeleteBinding, MatchError> {
+        self.check(depth)?;
+        let binding = match node.kind().as_ref() {
+            "identifier" => bindings
+                .get(node.text().as_ref())
+                .copied()
+                .unwrap_or_default(),
+            "attribute" => {
+                let module = match node.field("object") {
+                    Some(object) => self.binding(&object, bindings, depth + 1)?,
+                    None => PythonDeleteBinding::default(),
+                };
+                PythonDeleteBinding {
+                    shutil: false,
+                    rmtree: module.shutil
+                        && node
+                            .field("attribute")
+                            .is_some_and(|name| name.text() == "rmtree"),
+                }
+            }
+            "parenthesized_expression" => {
+                let mut children = node
+                    .children()
+                    .filter(|child| child.is_named() && child.kind() != "comment");
+                match (children.next(), children.next()) {
+                    (Some(inner), None) => self.binding(&inner, bindings, depth + 1)?,
+                    _ => PythonDeleteBinding::default(),
+                }
+            }
+            "assignment" | "named_expression" => {
+                match node.field("right").or_else(|| node.field("value")) {
+                    Some(value) => self.binding(&value, bindings, depth + 1)?,
+                    None => PythonDeleteBinding::default(),
+                }
+            }
+            "conditional_expression" | "boolean_operator" => {
+                let mut value = PythonDeleteBinding::default();
+                let children: Vec<_> = node
+                    .children()
+                    .filter(|child| child.is_named() && child.kind() != "comment")
+                    .collect();
+                for child in children.first().into_iter().chain(children.last()) {
+                    let candidate = self.binding(child, bindings, depth + 1)?;
+                    value.shutil |= candidate.shutil;
+                    value.rmtree |= candidate.rmtree;
+                }
+                value
+            }
+            _ => PythonDeleteBinding::default(),
+        };
+        Ok(binding)
+    }
+
+    fn import_bindings<D: ast_grep_core::Doc>(
+        &mut self,
+        node: &ast_grep_core::Node<'_, D>,
+        depth: usize,
+    ) -> Result<Vec<(String, PythonDeleteBinding)>, MatchError> {
+        let module = node
+            .field("module_name")
+            .map(|name| name.text().into_owned());
+        let mut imported = Vec::new();
+        for name in node.field_children("name") {
+            self.check(depth)?;
+            let source = name
+                .field("name")
+                .unwrap_or_else(|| name.clone())
+                .text()
+                .into_owned();
+            let alias = name.field("alias").map_or_else(
+                || {
+                    if module.is_none() {
+                        source.split('.').next().unwrap_or(&source).to_string()
+                    } else {
+                        source.clone()
+                    }
+                },
+                |alias| alias.text().into_owned(),
+            );
+            imported.push((
+                alias,
+                PythonDeleteBinding {
+                    shutil: module.is_none() && source == "shutil",
+                    rmtree: module.as_deref() == Some("shutil") && source == "rmtree",
+                },
+            ));
+        }
+        if module.as_deref() == Some("shutil")
+            && node
+                .children()
+                .any(|child| child.kind() == "wildcard_import")
+        {
+            imported.push((
+                "rmtree".to_string(),
+                PythonDeleteBinding {
+                    shutil: false,
+                    rmtree: true,
+                },
+            ));
+        }
+        Ok(imported)
+    }
+
+    // Collect only binding positions. Identifiers in an annotation, default
+    // expression, attribute receiver or subscript are reads, not local names.
+    fn target_names<D: ast_grep_core::Doc>(
+        &mut self,
+        node: &ast_grep_core::Node<'_, D>,
+        names: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(depth)?;
+        match node.kind().as_ref() {
+            "identifier" => {
+                names.insert(node.text().into_owned());
+            }
+            "default_parameter" | "typed_default_parameter" => {
+                if let Some(name) = node.field("name") {
+                    self.target_names(&name, names, depth + 1)?;
+                }
+            }
+            "parameters"
+            | "lambda_parameters"
+            | "typed_parameter"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "pattern_list"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern"
+            | "parenthesized_expression"
+            | "as_pattern_target"
+            | "tuple"
+            | "list"
+            | "expression_list" => {
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    if child.kind() != "type" {
+                        self.target_names(&child, names, depth + 1)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn assign<D: ast_grep_core::Doc>(
+        &mut self,
+        target: &ast_grep_core::Node<'_, D>,
+        binding: PythonDeleteBinding,
+        bindings: &mut PythonDeleteBindings,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        let mut target = target.clone();
+        let mut grouping_depth = depth;
+        while matches!(
+            target.kind().as_ref(),
+            "parenthesized_expression" | "tuple_pattern"
+        ) && !target.children().any(|child| child.kind() == ",")
+        {
+            self.check(grouping_depth)?;
+            let inner = {
+                let mut children = target
+                    .children()
+                    .filter(|child| child.is_named() && child.kind() != "comment");
+                match (children.next(), children.next()) {
+                    (Some(inner), None) => inner,
+                    _ => break,
+                }
+            };
+            target = inner;
+            grouping_depth += 1;
+        }
+        let mut names = HashSet::new();
+        self.target_names(&target, &mut names, grouping_depth)?;
+        let scalar = target.kind() == "identifier";
+        for name in names {
+            set_python_delete_binding(
+                bindings,
+                name,
+                if scalar {
+                    binding
+                } else {
+                    PythonDeleteBinding::default()
+                },
+            );
+        }
+        // Function attributes do not replace the callable: `wipe.label = x`
+        // must preserve a captured rmtree. The same holds for unrelated module
+        // members. Only replacing the module's actual rmtree member invalidates
+        // subsequent member-to-function aliases; already captured functions
+        // retain their identity, including when the module had another alias.
+        if target.kind() == "attribute"
+            && target
+                .field("attribute")
+                .is_some_and(|name| name.text() == "rmtree")
+            && let Some(object) = target.field("object")
+            && self.binding(&object, bindings, depth + 1)?.shutil
+            && !binding.rmtree
+        {
+            bindings.retain(|_, value| {
+                value.shutil = false;
+                value.rmtree
+            });
+        }
+        Ok(())
+    }
+
+    fn locals<D: ast_grep_core::Doc>(
+        &mut self,
+        node: &ast_grep_core::Node<'_, D>,
+        names: &mut HashSet<String>,
+        nonlocals: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(depth)?;
+        match node.kind().as_ref() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = node.field("name") {
+                    names.insert(name.text().into_owned());
+                }
+                return Ok(());
+            }
+            "lambda"
+            | "list_comprehension"
+            | "set_comprehension"
+            | "dictionary_comprehension"
+            | "generator_expression" => return Ok(()),
+            "global_statement" | "nonlocal_statement" => {
+                for child in node.children().filter(|child| child.kind() == "identifier") {
+                    nonlocals.insert(child.text().into_owned());
+                }
+                return Ok(());
+            }
+            "import_statement" | "import_from_statement" => {
+                names.extend(
+                    self.import_bindings(node, depth + 1)?
+                        .into_iter()
+                        .map(|(name, _)| name),
+                );
+            }
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                if let Some(target) = node.field("left") {
+                    self.target_names(&target, names, depth + 1)?;
+                }
+            }
+            "named_expression" => {
+                if let Some(target) = node.field("name") {
+                    self.target_names(&target, names, depth + 1)?;
+                }
+            }
+            "as_pattern" | "except_clause" => {
+                if let Some(target) = node.field("alias") {
+                    self.target_names(&target, names, depth + 1)?;
+                }
+            }
+            "delete_statement" => {
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    self.target_names(&child, names, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        for child in node.children().filter(ast_grep_core::Node::is_named) {
+            self.locals(&child, names, nonlocals, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn visit<D: ast_grep_core::Doc>(
+        &mut self,
+        node: ast_grep_core::Node<'_, D>,
+        bindings: &mut PythonDeleteBindings,
+        class_enclosing: Option<&PythonDeleteBindings>,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(depth)?;
+        if node.is_error() || node.is_missing() {
+            return Err(MatchError::ParseError {
+                language: ScriptLanguage::Python,
+                detail: "Python deletion binding analysis encountered invalid syntax".to_string(),
+            });
+        }
+        match node.kind().as_ref() {
+            "import_statement" | "import_from_statement" => {
+                for (name, binding) in self.import_bindings(&node, depth + 1)? {
+                    set_python_delete_binding(bindings, name, binding);
+                }
+                return Ok(());
+            }
+            "function_definition" | "lambda" | "class_definition" => {
+                let body = node.field("body");
+                // Defaults, annotations, and class bases execute in the outer
+                // scope, before the definition replaces its own name.
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    if body
+                        .as_ref()
+                        .is_none_or(|body| child.range() != body.range())
+                    {
+                        self.visit(child, bindings, class_enclosing, depth + 1)?;
+                    }
+                }
+                if let Some(name) = node.field("name") {
+                    bindings.remove(name.text().as_ref());
+                }
+                let enclosing = class_enclosing.unwrap_or(bindings).clone();
+                let mut local = enclosing.clone();
+                if node.kind() != "class_definition" {
+                    let mut names = HashSet::new();
+                    let mut nonlocals = HashSet::new();
+                    if let Some(parameters) = node.field("parameters") {
+                        self.target_names(&parameters, &mut names, depth + 1)?;
+                    }
+                    if let Some(body) = &body {
+                        self.locals(body, &mut names, &mut nonlocals, depth + 1)?;
+                    }
+                    for name in names.difference(&nonlocals) {
+                        local.remove(name);
+                    }
+                }
+                if let Some(body) = body {
+                    self.visit(
+                        body,
+                        &mut local,
+                        (node.kind() == "class_definition").then_some(&enclosing),
+                        depth + 1,
+                    )?;
+                }
+                return Ok(());
+            }
+            "if_statement" => {
+                if let Some(condition) = node.field("condition") {
+                    self.visit(condition, bindings, class_enclosing, depth + 1)?;
+                }
+                let base = bindings.clone();
+                let mut merged = HashMap::new();
+                if let Some(consequence) = node.field("consequence") {
+                    let mut branch = base.clone();
+                    self.visit(consequence, &mut branch, class_enclosing, depth + 1)?;
+                    merge_python_delete_bindings(&mut merged, &branch);
+                }
+                let mut exhaustive = false;
+                for alternative in node.field_children("alternative") {
+                    exhaustive |= alternative.kind() == "else_clause";
+                    let mut branch = base.clone();
+                    self.visit(alternative, &mut branch, class_enclosing, depth + 1)?;
+                    merge_python_delete_bindings(&mut merged, &branch);
+                }
+                if !exhaustive {
+                    merge_python_delete_bindings(&mut merged, &base);
+                }
+                *bindings = merged;
+                return Ok(());
+            }
+            "for_statement" | "while_statement" => {
+                if let Some(iterable) = node.field("right") {
+                    self.visit(iterable, bindings, class_enclosing, depth + 1)?;
+                }
+                let mut entry = bindings.clone();
+                // A later iteration may call an alias established at the end
+                // of an earlier one. Iterate possible bindings to a fixed
+                // point, charging every visit to the same finite node budget.
+                loop {
+                    let mut branch = entry.clone();
+                    if let Some(condition) = node.field("condition") {
+                        self.visit(condition, &mut branch, class_enclosing, depth + 1)?;
+                    }
+                    if let Some(target) = node.field("left") {
+                        self.assign(
+                            &target,
+                            PythonDeleteBinding::default(),
+                            &mut branch,
+                            depth + 1,
+                        )?;
+                    }
+                    if let Some(body) = node.field("body") {
+                        self.visit(body, &mut branch, class_enclosing, depth + 1)?;
+                    }
+                    let previous = entry.clone();
+                    merge_python_delete_bindings(&mut entry, &branch);
+                    if entry == previous {
+                        break;
+                    }
+                }
+                if let Some(alternative) = node.field("alternative") {
+                    let mut branch = entry.clone();
+                    self.visit(alternative, &mut branch, class_enclosing, depth + 1)?;
+                    merge_python_delete_bindings(&mut entry, &branch);
+                }
+                *bindings = entry;
+                return Ok(());
+            }
+            "list_comprehension"
+            | "set_comprehension"
+            | "dictionary_comprehension"
+            | "generator_expression" => {
+                // Comprehension targets have their own scope and bind before
+                // the textually earlier element expression is evaluated.
+                let mut local = bindings.clone();
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    if child.kind() == "for_in_clause" {
+                        for right in child.field_children("right") {
+                            self.visit(right, &mut local, None, depth + 1)?;
+                        }
+                        if let Some(left) = child.field("left") {
+                            self.assign(
+                                &left,
+                                PythonDeleteBinding::default(),
+                                &mut local,
+                                depth + 1,
+                            )?;
+                        }
+                    } else if child.kind() == "if_clause" {
+                        self.visit(child, &mut local, None, depth + 1)?;
+                    }
+                }
+                if let Some(body) = node.field("body") {
+                    self.visit(body, &mut local, None, depth + 1)?;
+                }
+                return Ok(());
+            }
+            "except_clause" => {
+                for value in node.field_children("value") {
+                    self.visit(value, bindings, class_enclosing, depth + 1)?;
+                }
+                if let Some(alias) = node.field("alias") {
+                    self.assign(&alias, PythonDeleteBinding::default(), bindings, depth + 1)?;
+                }
+                for child in node.children().filter(|child| child.kind() == "block") {
+                    self.visit(child, bindings, class_enclosing, depth + 1)?;
+                }
+                return Ok(());
+            }
+            "boolean_operator" | "conditional_expression" | "try_statement" | "match_statement" => {
+                // These forms have optional execution paths. Never let a
+                // harmless arm erase a known destructive binding on another.
+                let mut merged = bindings.clone();
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    let mut branch = merged.clone();
+                    self.visit(child, &mut branch, class_enclosing, depth + 1)?;
+                    merge_python_delete_bindings(&mut merged, &branch);
+                }
+                *bindings = merged;
+                return Ok(());
+            }
+            "call" => {
+                if let Some(function) = node.field("function")
+                    && self.binding(&function, bindings, depth + 1)?.rmtree
+                {
+                    let range = node.range();
+                    if self.seen_calls.insert((range.start, range.end)) {
+                        let text = node.text();
+                        let meta = refine_python_match(self.meta, &text, &node);
+                        self.matches.push(PatternMatch {
+                            rule_id: meta.rule_id,
+                            reason: meta.reason,
+                            matched_text_preview: truncate_preview(&text, 60),
+                            start: range.start,
+                            end: range.end,
+                            line_number: self
+                                .newline_positions
+                                .partition_point(|&pos| pos < range.start)
+                                + 1,
+                            severity: meta.severity,
+                            suggestion: meta.suggestion,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        for child in node.children().filter(ast_grep_core::Node::is_named) {
+            self.visit(child, bindings, class_enclosing, depth + 1)?;
+        }
+        match node.kind().as_ref() {
+            "assignment" | "named_expression" | "augmented_assignment" => {
+                // An annotation without a value makes a name local within a
+                // function, but does not overwrite an existing runtime value.
+                if node
+                    .field("right")
+                    .or_else(|| node.field("value"))
+                    .is_some()
+                    && let Some(target) = node.field("left").or_else(|| node.field("name"))
+                {
+                    let binding = if node.kind() == "augmented_assignment" {
+                        PythonDeleteBinding::default()
+                    } else {
+                        self.binding(&node, bindings, depth + 1)?
+                    };
+                    self.assign(&target, binding, bindings, depth + 1)?;
+                }
+            }
+            "as_pattern" => {
+                if let Some(target) = node.field("alias") {
+                    self.assign(&target, PythonDeleteBinding::default(), bindings, depth + 1)?;
+                }
+            }
+            "delete_statement" => {
+                for target in node.children().filter(ast_grep_core::Node::is_named) {
+                    self.assign(&target, PythonDeleteBinding::default(), bindings, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// Truncate a string to at most `max_chars` characters, UTF-8 safe.
@@ -5566,6 +6174,168 @@ mod tests {
                 "ordinary temporary cleanup must remain allowed: {call:?}"
             );
         }
+    }
+
+    #[test]
+    fn python_imported_rmtree_has_the_same_temporary_path_policy() {
+        let matcher = AstMatcher::new();
+        for (imports, function) in [
+            ("from shutil import rmtree", "rmtree"),
+            ("from shutil import rmtree as wipe", "wipe"),
+            ("from shutil import copy, rmtree as erase, move", "erase"),
+            (
+                "from shutil import (\n    copy,\n    rmtree as clean,\n)",
+                "clean",
+            ),
+            ("from shutil import *", "rmtree"),
+            ("import shutil as sh\nwipe = sh.rmtree", "wipe"),
+            (
+                "from shutil import rmtree\nwipe = rmtree\nerase = wipe",
+                "erase",
+            ),
+        ] {
+            for (target, expected) in [
+                ("'/tmp'", true),
+                ("'/tmp/.'", true),
+                ("'/private/tmp/'", true),
+                ("'/var/tmp'", true),
+                ("'/./private//var/./tmp/'", true),
+                ("'/tmp/build/..'", true),
+                ("'/tmp/build/../../etc'", true),
+                ("'/tmp/' + 'build/..'", true),
+                ("'/tmp-other/build'", true),
+                ("target", true),
+                ("'/tmp/build'", false),
+                ("'/tmp/./build'", false),
+                ("'/private/var/tmp/build'", false),
+                ("'/tmp/' + 'build'", false),
+                ("tempfile.mkdtemp()", false),
+                ("tempfile.TemporaryDirectory().name", false),
+            ] {
+                let source = format!("{imports}\n{function}({target})");
+                let matches = matcher
+                    .find_matches(&source, ScriptLanguage::Python)
+                    .unwrap();
+                assert_eq!(
+                    matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                    expected,
+                    "{source}"
+                );
+            }
+        }
+        for (call, expected) in [
+            ("(wipe)('/tmp')", true),
+            ("((wipe))(path='/tmp/.')", true),
+            ("wipe(ignore_errors=True, path='/tmp/build')", false),
+            ("wipe('/tmp/build'); wipe('/tmp')", true),
+            ("wipe(Path(tempfile.mkdtemp()).parent)", true),
+            ("wipe(tempfile.mkdtemp() + '/..')", true),
+            (
+                "wipe(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+                true,
+            ),
+        ] {
+            let source = format!("from shutil import rmtree as wipe\n{call}");
+            let matches = matcher
+                .find_matches(&source, ScriptLanguage::Python)
+                .unwrap();
+            assert_eq!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_requires_a_visible_unshadowed_binding() {
+        let matcher = AstMatcher::new();
+        for source in [
+            "from shutil import rmtree as wipe",
+            "from project_helpers import rmtree\nrmtree('/tmp')",
+            "from .shutil import rmtree\nrmtree('/tmp')",
+            "from shutil import rmtree\nfrom project_helpers import rmtree\nrmtree('/tmp')",
+            "from shutil import rmtree as wipe\nwipe = print\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef wipe(path):\n    print(path)\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef render(wipe):\n    wipe('/tmp')\nrender(print)",
+            "from shutil import rmtree as wipe\nrender = lambda wipe: wipe('/tmp')\nrender(print)",
+            "from shutil import rmtree as wipe\ndef render():\n    wipe('/tmp')\n    wipe = print",
+            "wipe = print\ndef unrelated():\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\nclass Unrelated:\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\nclass Unrelated:\n    def render(self, wipe):\n        wipe('/tmp')",
+            "from shutil import rmtree as wipe\n[wipe('/tmp') for wipe in callbacks]",
+            "from shutil import rmtree as wipe\nwith context as wipe:\n    wipe('/tmp')",
+            "from shutil import rmtree as wipe\ntry:\n    pass\nexcept Exception as wipe:\n    wipe('/tmp')",
+            "from shutil import rmtree as wipe\nif flag:\n    wipe = print\nelse:\n    wipe = print\nwipe('/tmp')",
+            "import shutil as sh\nsh.rmtree = print\nwipe = sh.rmtree\nwipe('/tmp')",
+            "wipe = print\n# from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\ntext = 'from shutil import rmtree as wipe'\nwipe('/tmp')",
+        ] {
+            let matches = matcher
+                .find_matches(source, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                !matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                "unrelated or inert source: {source}"
+            );
+        }
+        for source in [
+            "from shutil import rmtree as wipe\ndef cleanup():\n    wipe('/tmp')\ncleanup()",
+            "def cleanup():\n    from shutil import rmtree as wipe\n    wipe('/tmp')\ncleanup()",
+            "from shutil import rmtree as wipe\ndef cleanup():\n    global wipe\n    wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef render(path: wipe):\n    wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef render(wipe=wipe('/tmp')):\n    pass",
+            "from shutil import rmtree as wipe\nclass Example:\n    wipe = print\n    def cleanup(self):\n        wipe('/tmp')",
+            "from shutil import rmtree as wipe\nif flag:\n    wipe = print\nwipe('/tmp')",
+            "wipe = print\nif flag:\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\nif flag:\n    from shutil import rmtree as wipe\nelse:\n    wipe = print\nwipe('/tmp')",
+            "from shutil import rmtree\nwipe = rmtree if flag else print\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\nflag and (wipe := print)\nwipe('/tmp')",
+            "from shutil import rmtree\nwipe = print\nfor item in items:\n    wipe('/tmp')\n    wipe = rmtree",
+            "from shutil import rmtree as wipe\nfor item in items:\n    wipe = print\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\n[wipe('/tmp/build') for wipe in callbacks]\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\nwipe.label = 'cleanup'\nwipe('/tmp')",
+            "import shutil as sh\nsh.label = 'cleanup'\nwipe = sh.rmtree\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\nwipe: object\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\n(wipe) = wipe\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\n((wipe)) = wipe\nwipe('/tmp')",
+            "import shutil as sh\nwipe = sh.rmtree\nsh.rmtree = print\nwipe('/tmp')",
+        ] {
+            let matches = matcher
+                .find_matches(source, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                "possible destructive binding: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_respects_the_active_rule_configuration() {
+        let source = "from shutil import rmtree as wipe\nwipe('/tmp')";
+        let mut patterns = default_patterns();
+        patterns
+            .get_mut(&ScriptLanguage::Python)
+            .unwrap()
+            .retain(|pattern| pattern.rule_id != "heredoc.python.shutil_rmtree");
+        let matches = AstMatcher::with_patterns(patterns)
+            .find_matches(source, ScriptLanguage::Python)
+            .unwrap();
+        assert!(!matches.iter().any(|hit| hit.severity.blocks_by_default()));
+
+        let mut patterns = default_patterns();
+        let rule = patterns
+            .get_mut(&ScriptLanguage::Python)
+            .unwrap()
+            .iter_mut()
+            .find(|pattern| pattern.rule_id == "heredoc.python.shutil_rmtree")
+            .unwrap();
+        rule.severity = Severity::Medium;
+        let matches = AstMatcher::with_patterns(patterns)
+            .find_matches(source, ScriptLanguage::Python)
+            .unwrap();
+        assert!(!matches.iter().any(|hit| hit.severity.blocks_by_default()));
     }
 
     #[test]

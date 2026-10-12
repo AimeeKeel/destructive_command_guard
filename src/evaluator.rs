@@ -32130,6 +32130,27 @@ fn fallback_pattern_hit(command: &str) -> bool {
     static FALLBACK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
         RegexSet::new([
             r"shutil\.rmtree",
+            // An imported recursive delete can have any local name. If the
+            // bounded AST pass could not finish, `wipe(...)` alone gives this
+            // backstop no sink name to recognize. Keep the real import as an
+            // incomplete-analysis signal, including grouped imports and line
+            // continuations. This is deliberately not proof of a call: a
+            // completed AST pass checks bindings and the actual target, while
+            // this path cannot establish that the imported capability is unused.
+            // Match source names, so `copy as rmtree` does not create a signal.
+            r"(?x)
+                \bfrom (?:\s|\\\r?\n)+ shutil (?:\s|\\\r?\n)+ import
+                (?:\s|\\\r?\n)+ \(?
+                (?:\s|\\\r?\n|\#[^\r\n]*)*
+                (?:
+                    \w+ (?:
+                        (?:\s|\\\r?\n|\#[^\r\n]*)+ as
+                        (?:\s|\\\r?\n|\#[^\r\n]*)+ \w+
+                    )?
+                    (?:\s|\\\r?\n|\#[^\r\n]*)* ,
+                    (?:\s|\\\r?\n|\#[^\r\n]*)*
+                )*
+                (?: rmtree\b | \* )",
             r"os\.remove",
             r"os\.rmdir",
             r"os\.unlink",
@@ -48357,6 +48378,57 @@ mod tests {
                 result.is_allowed(),
                 "exceeded line limit should fail-open with default settings"
             );
+        }
+
+        #[test]
+        fn imported_python_rmtree_survives_incomplete_extraction() {
+            for (max_body_bytes, max_body_lines) in [(1024 * 1024, 1), (1, 10_000)] {
+                let settings = heredoc_config_with_limits(crate::heredoc::ExtractionLimits {
+                    max_body_bytes,
+                    max_body_lines,
+                    max_heredocs: 10,
+                    timeout_ms: 5_000,
+                });
+                for body in [
+                    "from shutil import rmtree as wipe\nwipe('/tmp')",
+                    "from shutil import copy, rmtree as wipe\nwipe('/private/tmp/.')",
+                    "from shutil import (\n    copy,\n    rmtree as wipe,\n)\nwipe('/var/tmp')",
+                    "from shutil import (\n    copy, # another imported name\n    rmtree as wipe,\n)\nwipe('/private/var/tmp')",
+                    "from shutil import (\n    copy # another imported name\n    as cp,\n    rmtree as wipe,\n)\nwipe('/tmp')",
+                    "from shutil import (\n    copy as # another imported name\n    cp,\n    rmtree as wipe,\n)\nwipe('/tmp')",
+                    "from shutil \\\nimport rmtree as wipe\nwipe('/tmp/build/..')",
+                    "from shutil import *\nwipe = rmtree\nwipe('/tmp')",
+                ] {
+                    let command = format!("python3 - <<'PY'\n{body}\nPY");
+                    assert!(
+                        eval_with_heredoc(&command, &settings).is_denied(),
+                        "an imported recursive delete must retain protection after extraction is bounded: {command:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn imported_python_rmtree_fallback_preserves_unrelated_imports_and_data() {
+            let settings = heredoc_config_with_limits(crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 1,
+                max_heredocs: 10,
+                timeout_ms: 5_000,
+            });
+            for command in [
+                "cat <<'PY'\nfrom shutil import rmtree as wipe\nwipe('/tmp')\nPY",
+                "python3 - <<'PY'\nfrom project_helpers import cleanup as wipe\nwipe('/tmp')\nPY",
+                "python3 - <<'PY'\nfrom shutil import copy as rmtree\nprint('ok')\nPY",
+                "python3 - <<'PY'\nfrom shutil import (copy as rmtree, move)\nprint('ok')\nPY",
+                "python3 - <<'PY'\nfrom shutil import (\n    copy, # rmtree is not imported\n    move,\n)\nprint('ok')\nPY",
+                "python3 - <<'PY'\n# from shutil import rmtree as wipe\nprint('ok')\nPY",
+            ] {
+                assert!(
+                    eval_with_heredoc(command, &settings).is_allowed(),
+                    "the imported-delete signal must not classify unrelated imports or inert data as a delete: {command:?}"
+                );
+            }
         }
 
         /// #452: `check_fallback_patterns` is the only backstop that covers an
