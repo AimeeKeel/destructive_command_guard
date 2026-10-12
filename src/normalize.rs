@@ -4085,6 +4085,7 @@ fn normalize_decoded_command(command: &str, dialect: ShellDialect) -> Cow<'_, st
 #[inline]
 #[must_use]
 pub fn normalize_command_in_dialect(cmd: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    let _phase = crate::perf::PhaseTimer::start("normalization");
     match dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
             let stripped = strip_wrapper_prefixes(cmd);

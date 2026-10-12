@@ -527,6 +527,7 @@ pub enum TriggerResult {
 #[must_use]
 #[instrument(skip(command), fields(cmd_len = command.len()))]
 pub fn check_triggers(command: &str) -> TriggerResult {
+    let _phase = crate::perf::PhaseTimer::start("heredoc_detection");
     if contains_active_heredoc_operator(command)
         || HEREDOC_TRIGGERS.is_match(command)
         || names_a_runner_through_quoting(command)
@@ -1652,6 +1653,7 @@ fn record_timeout_if_needed(
 #[must_use]
 #[instrument(skip(command, limits), fields(cmd_len = command.len(), timeout_ms = limits.timeout_ms))]
 pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionResult {
+    let _phase = crate::perf::PhaseTimer::start("heredoc_extraction");
     // Inline-script extraction scans a view whose *data* heredoc bodies are
     // blanked, while heredoc extraction keeps the raw text (#420).
     //
@@ -10661,6 +10663,7 @@ enum HeredocOutput {
 }
 
 fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
+    let _phase = crate::perf::PhaseTimer::start("heredoc_structure");
     const MAX_HEREDOC_MASK_SOURCE_BYTES: usize = 256 * 1024;
     if command.len() > MAX_HEREDOC_MASK_SOURCE_BYTES {
         return None;

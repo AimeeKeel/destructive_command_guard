@@ -1108,6 +1108,7 @@ const HOOK_INPUT_ALIAS_GROUPS: &[(&str, &[&str])] = &[
 /// carries no reconcilable alias conflict, or still does not fit [`HookInput`]
 /// after canonicalization. Behaviour for those inputs is unchanged.
 pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
+    let _phase = crate::perf::PhaseTimer::start("request_parse");
     let neutralized = neutralize_lone_surrogate_escapes(json);
     let json = neutralized.as_ref();
     let first_error = match serde_json::from_str::<HookInput>(json) {

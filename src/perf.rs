@@ -33,6 +33,37 @@
 
 use std::time::{Duration, Instant};
 
+/// Opt-in, command-free phase measurements for `DCG_LOG=dcg_perf=debug`.
+///
+/// Durations are inclusive wall time, so nested phases must not be summed.
+/// Disabled measurements do not read the clock. Storage runs on a separate
+/// thread; its timings can overlap evaluation and the shutdown wait.
+pub struct PhaseTimer {
+    phase: &'static str,
+    started: Option<Instant>,
+}
+
+impl PhaseTimer {
+    /// Start a measurement only when the dedicated tracing target is enabled.
+    #[must_use]
+    pub fn start(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: tracing::enabled!(target: "dcg_perf", tracing::Level::DEBUG)
+                .then(Instant::now),
+        }
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            tracing::debug!(target: "dcg_perf", phase = self.phase,
+                elapsed_us = started.elapsed().as_micros(), "hook phase");
+        }
+    }
+}
+
 /// Performance budget for a single operation tier.
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {

@@ -852,6 +852,28 @@ def build_cases() -> List[Dict[str, Any]]:
             "env": {},
             "expected_decision": "allow",
         },
+        *[
+            {
+                "id": f"issue_555_{shape}_{lines}",
+                "description": "Fresh-process heredoc scaling (#555)",
+                "command": prefix + "print('ordinary data')\n" * lines + suffix,
+                "env": {},
+                "expected_decision": decision,
+            }
+            for lines in (1, 40, 300)
+            for shape, prefix, suffix, decision in (
+                ("python", "python3 - <<'EOF'\n", "EOF", "allow"),
+                ("data", "cat <<'EOF'\n", "rm -rf /\nEOF", "allow"),
+                ("deny", "python3 - <<'EOF'\n", "import shutil\nshutil.rmtree('/tmp')\nEOF", "deny"),
+            )
+        ],
+        {
+            "id": "issue_555_compound",
+            "description": "Compound shell shape from #555",
+            "command": "cd project && git status --short | head && grep -rn foo src | wc -l",
+            "env": {},
+            "expected_decision": "allow",
+        },
         {
             "id": "destructive_keyword",
             "description": "Keyword present, destructive match",
@@ -1497,6 +1519,119 @@ def build_latency_gate(
     }
 
 
+def compare_issue_555(args: argparse.Namespace) -> int:
+    """Interleave two live binaries; validate every verdict and retain samples.
+
+    This is experimental evidence, not the source-bound absolute gate. Child
+    CPU includes startup, evaluation and history; wall minus CPU is not a
+    storage-only measurement. Instrumented phase probes run separately.
+    """
+    import sqlite3
+    try:
+        import resource
+    except ImportError:
+        resource = None
+
+    binaries = {"incumbent": os.path.abspath(args.compare_bin),
+                "candidate": os.path.abspath(args.bin)}
+    for binary in binaries.values():
+        if not os.path.isfile(binary):
+            raise RuntimeError(f"missing comparison binary: {binary}")
+    env, isolation = create_isolated_environment()
+    cwd = isolation["working_directory"]
+    cases = [case for case in build_cases()
+             if case["id"].startswith("issue_555") or case["id"] == "quick_reject"]
+    report = {"kind": "issue_555_interleaved", "host": capture_host_context(),
+              "binaries": {key: {"path": path, "sha256": sha256_file(path)}
+                           for key, path in binaries.items()},
+              "isolation": isolation, "cases": [], "probe_complete": False}
+
+    def checkpoint():
+        # A failed verdict or interrupted probe must retain completed samples
+        # without looking like a successful comparison.
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(report, indent=2) + "\n")
+
+    checkpoint()
+
+    def measure(binary: str, command: str, child_env: Dict[str, str], expected: str):
+        before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
+        wall = run_one(binary, command, child_env, cwd, expected)
+        after = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
+        cpu = ((after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime)
+               * 1000 if before and after else None)
+        return {"wall_ms": wall, "cpu_ms": cpu}
+
+    for mode in ("disabled", "enabled", "contended"):
+        environments = {}
+        locks = []
+        try:
+            for key, binary in binaries.items():
+                child_env = env.copy()
+                child_env["DCG_HISTORY_ENABLED"] = "0" if mode == "disabled" else "1"
+                if mode != "disabled":
+                    child_env.pop("DCG_HISTORY_DISABLED", None)
+                    db_path = os.path.join(isolation["root"], f"{mode}-{key}.db")
+                    child_env["DCG_HISTORY_DB"] = db_path
+                    run_one(binary, "ls -la", child_env, cwd, "allow")
+                    if not os.path.isfile(db_path):
+                        raise RuntimeError("history-enabled probe did not create its database")
+                    if mode == "contended":
+                        lock = sqlite3.connect(db_path)
+                        lock.execute("BEGIN IMMEDIATE")
+                        locks.append(lock)
+                environments[key] = child_env
+            for case in cases:
+                samples = {key: [] for key in binaries}
+                for index in range(args.warmup + args.runs):
+                    order = list(binaries) if index % 2 == 0 else list(reversed(binaries))
+                    for key in order:
+                        full = measure(binaries[key], case["command"], environments[key],
+                                       case["expected_decision"])
+                        bypass_env = {**environments[key], "DCG_BYPASS": "1"}
+                        bypass = measure(binaries[key], case["command"], bypass_env, "allow")
+                        if index >= args.warmup:
+                            samples[key].append({"full": full, "bypass": bypass,
+                                "delta_ms": full["wall_ms"] - bypass["wall_ms"]})
+                metrics = {key: summarize_timings([s["full"]["wall_ms"] for s in rows])
+                           for key, rows in samples.items()}
+                phases = {}
+                if mode != "contended":
+                    for key in binaries:
+                        probe = subprocess.run(
+                            [binaries[key], "--agent", PERF_HOOK_AGENT],
+                            input=json.dumps({"tool_name": "Bash", "tool_input": {
+                                "command": case["command"]}}).encode(),
+                            capture_output=True, env={**environments[key],
+                                "DCG_LOG": "dcg_perf=debug"}, cwd=cwd,
+                            timeout=PROCESS_BACKSTOP_SECONDS, check=False)
+                        diagnostic = probe.stderr.decode(errors="replace")
+                        # Only our command-free DEBUG events are exempt from
+                        # the ordinary wire checks in this separate probe.
+                        clean_stderr = "\n".join(line for line in diagnostic.splitlines()
+                            if "DEBUG dcg_perf: hook phase " not in line).encode()
+                        clean_probe = subprocess.CompletedProcess(
+                            probe.args, probe.returncode, probe.stdout, clean_stderr)
+                        inspect_hook_result(clean_probe, case["expected_decision"], "phase probe")
+                        phases[key] = diagnostic
+                report["cases"].append({"id": case["id"], "history": mode,
+                    "expected_decision": case["expected_decision"], "samples": samples,
+                    "metrics": metrics, "phase_probes": phases})
+                checkpoint()
+                print(f"{mode}/{case['id']}: incumbent {metrics['incumbent']['p50_ms']:.2f} ms, "
+                      f"candidate {metrics['candidate']['p50_ms']:.2f} ms", file=sys.stderr)
+        finally:
+            for lock in locks:
+                lock.rollback()
+                lock.close()
+    report["probe_complete"] = True
+    checkpoint()
+    if not args.output:
+        print(json.dumps(report, indent=2))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate dcg perf baseline JSON")
     parser.add_argument(
@@ -1505,6 +1640,7 @@ def main() -> int:
         help="Run mutation-sensitive certificate invariant checks and exit",
     )
     parser.add_argument("--bin", default="./target/release/dcg", help="Path to dcg binary")
+    parser.add_argument("--compare-bin", help="Interleave a live incumbent with --bin for #555; includes CPU, bypass and history contention probes")
     parser.add_argument("--output", help="Write JSON output to this file")
     parser.add_argument("--warmup", type=int, default=30, help="Warmup iterations per case")
     parser.add_argument("--runs", type=int, default=300, help="Measured iterations per case")
@@ -1535,6 +1671,10 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.compare_bin:
+        if args.assert_budget_ms is not None or args.runs < 1 or args.warmup < 0:
+            parser.error("comparison needs positive runs, nonnegative warmup and no absolute gate")
+        return compare_issue_555(args)
     if args.self_test:
         try:
             run_internal_self_tests()

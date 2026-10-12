@@ -2516,6 +2516,40 @@ r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f"     // Complex but no lookahead
 
 dcg operates under strict latency constraints - every shell command passes through the hook, so even small delays compound into noticeable sluggishness. `src/perf.rs` is the source of truth for performance budgets, CI benchmark expectations, and hook-mode deadlines.
 
+For a phase breakdown of a real hook invocation, set
+`DCG_LOG=dcg_perf=debug`. Stderr reports `phase` and `elapsed_us` for request
+parsing, normalization, heredoc detection/structure/extraction, pattern
+evaluation, and history setup, redaction/enqueue, database open/insert and
+shutdown wait. These events contain no command text. Durations are inclusive
+wall time: nested events must not be added together, and storage work can
+overlap evaluation. The parse timer excludes waiting for stdin; `hook_total`
+includes configuration, input reading, evaluation and shutdown, but excludes
+process startup and CLI parsing. With diagnostics disabled, timers do not read
+the clock.
+
+To reproduce issue #555 against a live incumbent in the same run:
+
+```bash
+python3 scripts/perf_baseline.py --bin target/release/dcg \
+  --compare-bin /path/to/incumbent/dcg --warmup 5 --runs 25 \
+  --output /tmp/dcg-hook-comparison.json
+cargo bench --bench hook_latency -- issue_555
+```
+
+The comparison alternates incumbent/candidate order, validates every timed
+verdict, retains raw samples, and pairs each full hook with a bypass process.
+It tests ordinary commands, compound shell syntax, and 1/40/300-line executable
+Python and quoted data heredocs (including destructive Python controls), with
+history disabled, enabled, and deliberately write-locked. On Unix it records
+child user+system CPU separately from wall time; instrumented probes run
+outside the timed samples. This diagnostic comparison is separate from the
+source-bound absolute latency gate and does not certify a loaded production
+database. CPU includes process startup; wall minus CPU is not solely storage
+contention. History has a background worker, but normal hook shutdown waits
+for it within the existing bounded budget. A quoted delimiter suppresses shell
+expansion; it does **not** stop `python3 -` or another interpreter executing its
+heredoc body.
+
 **Latency Tiers**:
 
 | Tier | Path | Target | Warning Above | Panic Above |

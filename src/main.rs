@@ -1956,6 +1956,7 @@ fn main() {
     }
 
     init_hook_tracing();
+    let _hook_phase = destructive_command_guard::perf::PhaseTimer::start("hook_total");
 
     // Load configuration
     let config = Config::load();
