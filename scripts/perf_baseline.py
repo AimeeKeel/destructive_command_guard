@@ -1542,6 +1542,9 @@ def compare_issue_555(args: argparse.Namespace) -> int:
     cases = [case for case in build_cases()
              if case["id"].startswith("issue_555") or case["id"] == "quick_reject"]
     report = {"kind": "issue_555_interleaved", "host": capture_host_context(),
+              "parameters": {"warmup": args.warmup, "runs": args.runs,
+                             "hook_argv": ["--agent", PERF_HOOK_AGENT],
+                             "diagnostics_in_timed_samples": False},
               "binaries": {key: {"path": path, "sha256": sha256_file(path)}
                            for key, path in binaries.items()},
               "isolation": isolation, "cases": [], "probe_complete": False}
@@ -1616,6 +1619,10 @@ def compare_issue_555(args: argparse.Namespace) -> int:
                         inspect_hook_result(clean_probe, case["expected_decision"], "phase probe")
                         phases[key] = diagnostic
                 report["cases"].append({"id": case["id"], "history": mode,
+                    "command": case["command"],
+                    "history_environment": {key: {name: child_env.get(name)
+                        for name in ("DCG_HISTORY_ENABLED", "DCG_HISTORY_DISABLED", "DCG_HISTORY_DB")}
+                        for key, child_env in environments.items()},
                     "expected_decision": case["expected_decision"], "samples": samples,
                     "metrics": metrics, "phase_probes": phases})
                 checkpoint()
