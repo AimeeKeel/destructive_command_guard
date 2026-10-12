@@ -140,6 +140,9 @@ EOF";
             )
             .env("DCG_SELF_HEAL_HOOK", "0")
             .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            // These assert semantics and rule ownership. The process-per-hook
+            // performance harness exercises the shipped budgets separately.
+            .env("DCG_AST_TIMEOUT_MS", "5000")
             .current_dir(temporary.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1251,6 +1254,153 @@ EOF";
                     "complete argument arrays do not acquire shell expansion: {command:?}: {rule}"
                 );
             }
+        }
+    }
+
+    fn issue_555_python_body(lines: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut body = String::new();
+        for index in 0..lines.saturating_sub(1) {
+            writeln!(body, "value_{index} = {index}").expect("build Python fixture");
+        }
+        body.push_str("print('ready')\n");
+        body
+    }
+
+    #[test]
+    fn issue_555_large_executable_heredocs_check_both_ends() {
+        for lines in [40, 300] {
+            let body = issue_555_python_body(lines);
+            let danger = "import shutil\nshutil.rmtree('/home/user/project')\n";
+            for delimiter in ["'PY'", "\"PY\"", "PY"] {
+                let safe = format!("python3 - <<{delimiter}\n{body}PY");
+                assert_eq!(hook_decision(&safe).0, "allow", "{safe:?}");
+                for content in [format!("{danger}{body}"), format!("{body}{danger}")] {
+                    let command = format!("python3 - <<{delimiter}\n{content}PY");
+                    let (decision, rule) = hook_decision(&command);
+                    assert_eq!(decision, "deny", "{command:?}: {rule}");
+                    assert_eq!(rule, "heredoc.python:shutil_rmtree", "{command:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_555_large_quoted_data_is_literal_inside_commit_substitution() {
+        for lines in [40, 300] {
+            let data =
+                "Document `git reset --hard` and $(rm -rf /); an odd \" quote\n".repeat(lines);
+            for command in [
+                format!("cat <<'TEXT'\n{data}TEXT"),
+                format!("git commit -m \"$(cat <<'TEXT'\n{data}TEXT\n)\""),
+            ] {
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(decision, "allow", "{command:?}: {rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_555_large_bodies_preserve_nested_and_shell_execution() {
+        let python = issue_555_python_body(300);
+        let shell = "printf '%s\\n' ready\n".repeat(300);
+        let data = "Document commands as literal text.\n".repeat(300);
+        for command in [
+            format!("cat <<'TEXT'\n{data}TEXT\ngit reset --hard"),
+            format!("cat <<TEXT\n{data}$(git reset --hard)\nTEXT"),
+            format!("cat <<'TEXT' | bash\n{shell}rm -rf /home/user/project\nTEXT"),
+            format!(
+                "bash <<'SH'\npython3 - <<'PY'\n{python}import shutil\nshutil.rmtree('/home/user/project')\nPY\nSH"
+            ),
+            format!(
+                "python3 - <<'PY'\n{python}import os\nos.system(\"bash -c 'git reset --hard'\")\nPY"
+            ),
+            format!(
+                "cat <<'TEXT'\n{data}TEXT\npython3 - <<'PY'\n{python}import shutil\nshutil.rmtree('/home/user/project')\nPY"
+            ),
+        ] {
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "deny", "{command:?}: {rule}");
+        }
+    }
+
+    #[test]
+    fn issue_555_interpreter_stdin_retains_body_language_when_nested() {
+        let mut bodies = vec![(
+            "print(\"safe\")".to_string(),
+            "import shutil; shutil.rmtree(\"/home/user/project\")".to_string(),
+        )];
+        for lines in [40, 300] {
+            let safe = issue_555_python_body(lines);
+            let dangerous = format!("{safe}import shutil\nshutil.rmtree(\"/home/user/project\")\n");
+            bodies.push((safe, dangerous));
+        }
+        for (safe, dangerous) in bodies {
+            for (body, denied) in [(safe, false), (dangerous, true)] {
+                // Quote the shell's here-string operand independently of the
+                // Python source. Shell syntax does not make the body Bash.
+                let quoted = format!("'{}'", body.replace('\'', "'\\''"));
+                for inner in [
+                    format!("python3 - <<'PY'\n{body}\nPY"),
+                    format!("python3 - <<< {quoted}"),
+                    format!("cat <<'PY' | python3 -\n{body}\nPY"),
+                ] {
+                    for command in [inner.clone(), format!("bash <<'OUTER'\n{inner}\nOUTER")] {
+                        let (decision, rule) = hook_decision(&command);
+                        assert_eq!(
+                            decision,
+                            if denied { "deny" } else { "allow" },
+                            "{command:?}: {rule}"
+                        );
+                        if denied {
+                            assert_eq!(
+                                rule, "heredoc.python:shutil_rmtree",
+                                "complete nested analysis must reach its precise AST rule: {command:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_555_quoted_and_versioned_herestring_receivers_keep_python_rules() {
+        for receiver in ["\"python3\"", "python3.12", "/opt/venv/bin/python3.12"] {
+            for (body, denied) in [
+                ("print(\"safe\")", false),
+                ("import shutil; shutil.rmtree(\"/home/user/project\")", true),
+            ] {
+                let inner = format!("{receiver} - <<< '{body}'");
+                for command in [inner.clone(), format!("bash <<'OUTER'\n{inner}\nOUTER")] {
+                    let (decision, rule) = hook_decision(&command);
+                    assert_eq!(
+                        decision,
+                        if denied { "deny" } else { "allow" },
+                        "{command:?}: {rule}"
+                    );
+                    if denied {
+                        assert_eq!(rule, "heredoc.python:shutil_rmtree", "{command:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_555_incomplete_and_rebound_shells_never_gain_a_data_exemption() {
+        let python = issue_555_python_body(300);
+        let shell = "echo ready\n".repeat(300);
+        for command in [
+            format!(
+                "python3 - <<'PY'\n{python}import shutil\nshutil.rmtree('/home/user/project')\n"
+            ),
+            format!("cat() {{ bash; }}; cat <<'TEXT'\n{shell}rm -rf /home/user/project\nTEXT"),
+            format!("unknown-interpreter <<'TEXT'\n{shell}rm -rf /home/user/project\nTEXT"),
+        ] {
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "deny", "{command:?}: {rule}");
         }
     }
 }

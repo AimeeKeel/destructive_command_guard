@@ -55,7 +55,12 @@ pub(crate) fn inert_documentation_literal_ranges(
         ScriptLanguage::JavaScript => SupportLang::JavaScript,
         _ => return Vec::new(),
     };
-    let Ok(ast) = AstGrep::try_new(code, grammar) else {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
+    let ast = {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+        AstGrep::try_new(code, grammar)
+    };
+    let Ok(ast) = ast else {
         return Vec::new();
     };
     let root = ast.root();
@@ -779,7 +784,12 @@ fn evaluated_shell_dependency(
         ScriptLanguage::JavaScript => SupportLang::JavaScript,
         _ => return Ok(None),
     };
-    let Ok(ast) = AstGrep::try_new(code, grammar) else {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
+    let ast = {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+        AstGrep::try_new(code, grammar)
+    };
+    let Ok(ast) = ast else {
         return Ok(None);
     };
     let root = ast.root();
@@ -953,8 +963,10 @@ pub(crate) fn interpreter_literal_shell_commands(
         }
     }
     let permit = Permit(&ACTIVE);
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let source = code.to_string();
     let (sender, receiver) = mpsc::sync_channel(1);
+    let profile = crate::perf::capture_profile();
     let _worker = thread::Builder::new()
         .name("dcg-interpreter-literals".into())
         .spawn(move || {
@@ -962,13 +974,17 @@ pub(crate) fn interpreter_literal_shell_commands(
             // worker's deadline and permit along with the interpreter parse.
             // An unsupported inline extraction is not a complete program;
             // leave it to the existing analysis instead of parsing a fragment.
-            let result = match allow_documentation_literals() {
-                Some(allow_documentation_literals) => interpreter_literal_shell_commands_inner(
-                    &source,
-                    language,
-                    allow_documentation_literals,
-                ),
-                None => Ok(Vec::new()),
+            let result = {
+                let _profile = profile.enter();
+                let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
+                match allow_documentation_literals() {
+                    Some(allow_documentation_literals) => interpreter_literal_shell_commands_inner(
+                        &source,
+                        language,
+                        allow_documentation_literals,
+                    ),
+                    None => Ok(Vec::new()),
+                }
             };
             drop(source);
             drop(permit);
@@ -1026,8 +1042,11 @@ fn interpreter_literal_shell_commands_inner(
             "source byte limit",
         ));
     }
-    let ast = AstGrep::try_new(code, grammar)
-        .map_err(|_| interpreter_literal_parse_error(language, "source grammar"))?;
+    let ast = {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+        AstGrep::try_new(code, grammar)
+            .map_err(|_| interpreter_literal_parse_error(language, "source grammar"))?
+    };
     let root = ast.root();
     for (index, node) in root.dfs().enumerate() {
         if index >= MAX_INTERPRETER_LITERAL_NODES {
@@ -1513,11 +1532,18 @@ fn protected_matches(
     // worker owns its input, has byte/node/depth caps, and never executes code.
     // A timed-out receiver cannot leave the worker blocked on a send.
     let source = code.to_string();
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let (sender, receiver) = mpsc::sync_channel(1);
+    let profile = crate::perf::capture_profile();
     let _worker = thread::Builder::new()
         .name("dcg-protected-source".into())
         .spawn(move || {
-            let _ = sender.send(credential_files::scan_extracted(&source, language));
+            let result = {
+                let _profile = profile.enter();
+                let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
+                credential_files::scan_extracted(&source, language)
+            };
+            let _ = sender.send(result);
         })
         .map_err(|error| MatchError::Unavailable {
             language,

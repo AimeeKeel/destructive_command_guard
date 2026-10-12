@@ -59,9 +59,8 @@ use crate::packs::{
     pack_aware_quick_reject_with_normalized,
 };
 use crate::pending_exceptions::AllowOnceStore;
-use crate::perf::Deadline;
-use ast_grep_core::{AstGrep, Doc};
-use ast_grep_language::SupportLang;
+use crate::perf::{Deadline, ProfilePhase, phase};
+use ast_grep_core::Doc;
 use chrono::Utc;
 use regex::RegexSet;
 use std::borrow::Cow;
@@ -8837,7 +8836,7 @@ fn cmd_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
 /// to the caller's shell, and quoted redirect-looking arguments remain words.
 /// A compound or dynamic command has no single verified argv boundary.
 fn static_posix_command_without_redirects(command: &str) -> Option<String> {
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast.root().get_inner_node().has_error() {
         return None;
     }
@@ -9975,7 +9974,7 @@ fn process_substitution_writer_source(
         marker,
         &command[substitution_end..]
     );
-    let ast = AstGrep::new(&reconstructed, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(&reconstructed);
     if ast_contains_error(ast.root()) {
         return Some(IndirectInputSource::Unverified(
             "process-substitution writer cannot be parsed for bounded analysis".to_string(),
@@ -10068,7 +10067,7 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
     if !command.contains("<(") && !command.contains(">(") {
         return;
     }
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast_contains_error(ast.root()) {
         sinks.push(ExecutableTextSink::Unverified {
             rule: PROCESS_SUBSTITUTION_RULE,
@@ -10216,7 +10215,7 @@ fn collect_posix_pipeline_executable_sinks(
         });
         return;
     }
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast.root().get_inner_node().has_error() {
         return;
     }
@@ -14048,7 +14047,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     nested_command_depth: usize,
     inherited_automated_stdin: bool,
 ) -> EvaluationResult {
-    let _phase = crate::perf::PhaseTimer::start("evaluation_total");
+    let _phase = phase(ProfilePhase::Evaluation);
+    let _trace_phase = crate::perf::PhaseTimer::start("evaluation_total");
     let primary = evaluate_command_in_single_dialect_view(
         command,
         enabled_keywords,
@@ -14222,10 +14222,13 @@ fn evaluate_command_in_single_dialect_view(
     // bodies, launcher payloads, and substitutions passes a deeper depth and
     // does not get this exemption; a dcg diagnostic that really is the whole
     // body still hits the Step 2 whole-command exemption on its own.
-    let dcg_masked = if nested_command_depth == 0 {
-        mask_dcg_self_inspection_segments(command)
-    } else {
-        Cow::Borrowed(command)
+    let dcg_masked = {
+        let _phase = phase(ProfilePhase::Normalization);
+        if nested_command_depth == 0 {
+            mask_dcg_self_inspection_segments(command)
+        } else {
+            Cow::Borrowed(command)
+        }
     };
     let command: &str = dcg_masked.as_ref();
 
@@ -14616,7 +14619,10 @@ fn evaluate_command_in_single_dialect_view(
         }
 
         if check_triggers(command) == TriggerResult::Triggered {
-            let sanitized = sanitize_for_pattern_matching(command);
+            let sanitized = {
+                let _phase = phase(ProfilePhase::Normalization);
+                sanitize_for_pattern_matching(command)
+            };
             let sanitized_str = sanitized.as_ref();
             let should_scan = if matches!(sanitized, std::borrow::Cow::Owned(_)) {
                 check_triggers(sanitized_str) == TriggerResult::Triggered
@@ -14741,10 +14747,13 @@ fn evaluate_command_in_single_dialect_view(
         && force_literal_database_packs.is_empty()
         && !force_windows_filesystem
         && !force_scp_semantics
-        && pack_aware_quick_reject(
-            crate::normalize::normalize_command_in_dialect(command, shell_dialect).as_ref(),
-            enabled_keywords,
-        )
+        && {
+            let _phase = phase(ProfilePhase::Normalization);
+            pack_aware_quick_reject(
+                crate::normalize::normalize_command_in_dialect(command, shell_dialect).as_ref(),
+                enabled_keywords,
+            )
+        }
     {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -14768,6 +14777,7 @@ fn evaluate_command_in_single_dialect_view(
     // or an unmatched apostrophe, both of which are ordinary bytes in Cmd.
     // Start from the original command for a proven Cmd hook and let the native
     // token overlay below perform the safe-data masking.
+    let normalization_phase = phase(ProfilePhase::Normalization);
     let sanitized = if shell_dialect == ShellDialect::Cmd {
         Cow::Borrowed(command)
     } else {
@@ -14829,6 +14839,7 @@ fn evaluate_command_in_single_dialect_view(
     } else {
         pack_aware_quick_reject_with_normalized(dialect_normalized.as_ref(), enabled_keywords)
     };
+    drop(normalization_phase);
     if sed_shell_sources.is_empty()
         && tar_helper_sources.is_empty()
         && quick_reject
@@ -15077,6 +15088,7 @@ fn run_documentation_mask_worker(
     analyze: impl FnOnce() -> Option<String> + Send + 'static,
 ) -> Option<String> {
     use std::sync::atomic::Ordering;
+    let _phase = phase(ProfilePhase::AstMatch);
     let started = std::time::Instant::now();
     if budget.is_zero()
         || active
@@ -15093,10 +15105,15 @@ fn run_documentation_mask_worker(
     }
     let permit = Permit(active);
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let profile = crate::perf::capture_profile();
     let _worker = std::thread::Builder::new()
         .name("dcg-documentation-proof".into())
         .spawn(move || {
-            let result = analyze();
+            let result = {
+                let _profile = profile.enter();
+                let _phase = phase(ProfilePhase::AstMatch);
+                analyze()
+            };
             // The closure and all parser/source state are gone before the
             // permit is released. The buffered send cannot block a worker.
             drop(permit);
@@ -15578,7 +15595,7 @@ fn collect_indirect_input_flows_at_depth(
         return Vec::new();
     }
 
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast_contains_error(ast.root()) {
         return vec![unverified_indirect_wildcard(
             "shell syntax could not be parsed for indirect-input analysis".to_string(),
@@ -16896,7 +16913,7 @@ fn protected_consumer_pack_at_depth(command: &str, shell_depth: usize) -> Option
         }
     }
 
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast_contains_error(ast.root()) {
         return None;
     }
@@ -18428,7 +18445,7 @@ fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource>
     // The entire producer must be this one statement. Selecting the first
     // heredoc from `(cat <<EOF ... EOF; printf more_code)` would discard
     // executable bytes emitted by the rest of the subshell.
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     let statements: Vec<_> = ast
         .root()
         .children()
@@ -19197,7 +19214,7 @@ fn tar_callsite_may_write_files(command: &str) -> bool {
     if command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
         return true;
     }
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast_contains_error(ast.root()) {
         return true;
     }
@@ -19252,7 +19269,7 @@ fn tar_invocation_ranges(
         // invocation owns the source, retain the existing bounded fallback.
         return ranges;
     }
-    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+    let Ok(ast) = crate::heredoc::try_parse_shell_ast(command) else {
         return ranges;
     };
     if ast.root().get_inner_node().has_error() {
@@ -23426,7 +23443,8 @@ fn evaluate_packs_with_allowlists_at_depth(
     nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
     inherited_automated_stdin: bool,
 ) -> EvaluationResult {
-    let _phase = crate::perf::PhaseTimer::start("pattern_evaluation");
+    let _phase = phase(ProfilePhase::PatternEvaluation);
+    let _trace_phase = crate::perf::PhaseTimer::start("pattern_evaluation");
     if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
         return EvaluationResult::indeterminate_due_to_budget();
     }
@@ -23440,6 +23458,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     // within the database family changes, so every pack still runs and no
     // denial can be lost; first match wins, so the carrier's own dialect is
     // the one named.
+    let selection_phase = phase(ProfilePhase::PatternSelection);
     let carrier_ordered_packs = database_carrier_first(ordered_packs, original_command);
     let ordered_packs = carrier_ordered_packs.as_deref().unwrap_or(ordered_packs);
 
@@ -23584,6 +23603,8 @@ fn evaluate_packs_with_allowlists_at_depth(
         },
     );
 
+    drop(selection_phase);
+    let preparation_phase = phase(ProfilePhase::PatternPreparation);
     let normalized_offset = compute_normalized_offset(command_for_match, normalized);
     let original_len = original_command.len();
     let segment_ranges = command_segment_ranges_in_dialect(command_for_packs, shell_dialect);
@@ -23717,7 +23738,9 @@ fn evaluate_packs_with_allowlists_at_depth(
     // The rm_parse optimization for core.filesystem is handled inline.
     let mut first_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
 
+    drop(preparation_phase);
     for &pack_id in &candidate_pack_ids {
+        let _rule_phase = phase(ProfilePhase::PatternRules);
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return EvaluationResult::indeterminate_due_to_budget();
         }
@@ -25742,7 +25765,7 @@ fn literal_loop_redirect_values(
     {
         return None;
     }
-    let ast = AstGrep::try_new(source, SupportLang::Bash).ok()?;
+    let ast = crate::heredoc::try_parse_shell_ast(source).ok()?;
     if ast.root().get_inner_node().has_error() {
         return None;
     }
@@ -25947,7 +25970,7 @@ fn literal_bash_source_range(
     if !bash || nonlocal {
         return None;
     }
-    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    let ast = crate::heredoc::try_parse_shell_ast(command).ok()?;
     if ast.root().get_inner_node().has_error() {
         return None;
     }
@@ -28659,6 +28682,7 @@ fn evaluate_core_filesystem_pack(
         Cow::Borrowed(command_for_packs)
     };
     let dialect_source = dialect_source.as_ref();
+    let rm_stdin_context = crate::packs::core::filesystem::RmStdinContext::new(command_for_packs);
 
     for &(segment_start, segment_end) in segment_ranges {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
@@ -28945,11 +28969,7 @@ fn evaluate_core_filesystem_pack(
         }
 
         let rm_automated_stdin = inherited_automated_stdin
-            || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
-                command_for_packs,
-                segment_start,
-                shell_dialect,
-            );
+            || rm_stdin_context.segment_receives_automated_stdin(segment_start, shell_dialect);
         let mut rm_decision = crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
             dialect_segment,
             rm_automated_stdin,
@@ -31078,8 +31098,25 @@ fn evaluate_heredoc(
         }
     };
 
+    // Here-strings historically received the complete Bash analysis, including
+    // its independent AST rules and language/content exemptions. Recognizing
+    // their receiving interpreter adds a second reading; replacing the Bash
+    // reading would let a core-rule allowlist also bypass a distinct
+    // `heredoc.bash` rule, including when the receiver is rebound to a shell.
+    // Each source has at most two bounded views, and both retain the existing
+    // deadline, retry, fallback and allowlist handling below.
+    let content_views = contents.into_iter().flat_map(|content| {
+        let shell_view = (content.heredoc_type == Some(crate::heredoc::HeredocType::HereString)
+            && content.language != crate::heredoc::ScriptLanguage::Bash)
+            .then(|| {
+                let mut shell_view = content.clone();
+                shell_view.language = crate::heredoc::ScriptLanguage::Bash;
+                shell_view
+            });
+        shell_view.into_iter().chain(std::iter::once(content))
+    });
     let mut ast_left_body_unanalysed = false;
-    for mut content in contents {
+    for mut content in content_views {
         if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
         }
@@ -31171,6 +31208,7 @@ fn evaluate_heredoc(
         // Tier 2.5: Recursive Shell Analysis
         // If content is Bash, extract inner commands and feed them back to the full evaluator.
         // This ensures that `kubectl`, `docker`, etc. inside heredocs are checked against their packs.
+        // Here-strings retain this pass in their separate Bash view above.
         if content.language == crate::heredoc::ScriptLanguage::Bash {
             // An awk program printing a computed value into a shell that runs
             // its stdin (`print "rm " $1 | "sh"`) is the shell-level
@@ -31220,9 +31258,11 @@ fn evaluate_heredoc(
                         content.byte_range.start,
                         context.shell_dialect,
                     ));
-            // Fast pre-filter: skip the expensive tree-sitter AST parse if the
-            // heredoc body contains none of the enabled pack keywords. The AC
-            // automaton does a single O(n) scan; the AST parse is much heavier.
+            // Pack keywords alone cannot gate recursion: a shell body may
+            // launch an embedded Python/JavaScript script whose destructive
+            // operations have no enabled shell-pack keyword. Preserve nested
+            // interpreter and heredoc triggers as independent reasons to
+            // evaluate the complete executable source.
             let body_has_keywords = context.keyword_index.map_or_else(
                 || {
                     context.enabled_keywords.iter().any(|kw| {
@@ -31232,7 +31272,7 @@ fn evaluate_heredoc(
                 |index| index.has_any_keyword(&content.content),
             );
 
-            if body_has_keywords {
+            if body_has_keywords || check_triggers(&content.content) == TriggerResult::Triggered {
                 // A payload arriving on `psql`'s stdin is PostgreSQL, and the
                 // denial should say so (#428). The two SQL packs carry a
                 // byte-identical `truncate-table`, so with both enabled
@@ -31386,7 +31426,7 @@ fn evaluate_heredoc(
                         return Some(result);
                     }
                 }
-            } // body_has_keywords
+            }
         }
 
         let matches = match DEFAULT_MATCHER
@@ -38230,6 +38270,228 @@ mod tests {
     }
 
     #[test]
+    fn nested_interpreter_heredocs_are_scanned_without_shell_pack_keywords() {
+        for shell in ["bash", "sh"] {
+            let command = format!(
+                "{shell} <<'OUTER'\npython3 <<'PY'\nimport shutil\nshutil.rmtree('/home/example/project')\nPY\nOUTER"
+            );
+            let result =
+                evaluate_with_pack_ids_in_dialect(&command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "nested Python must be analyzed independently of git keywords: {command:?}: {result:?}"
+            );
+
+            let safe = format!(
+                "{shell} <<'OUTER'\npython3 <<'PY'\nprint('hello from nested Python')\nPY\nOUTER"
+            );
+            let result =
+                evaluate_with_pack_ids_in_dialect(&safe, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "safe nested Python: {safe:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn here_string_receiver_analysis_preserves_bash_rule_allowlists_issue_555() {
+        let enabled_packs = ["core.git".to_string(), "core.filesystem".to_string()]
+            .into_iter()
+            .collect();
+        let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let compiled = default_compiled_overrides();
+        let mut config = default_config();
+        config.heredoc.timeout_ms = Some(5_000);
+
+        for (body, core_rule, bash_rule) in [
+            ("rm -rf ./build", "core.filesystem:rm-rf-general", "rm_rf"),
+            (
+                "rm -r ./build",
+                "core.filesystem:rm-recursive-general",
+                "rm_r",
+            ),
+            ("git reset --hard", "core.git:reset-hard", "git_reset_hard"),
+            ("git clean -fd", "core.git:clean-force", "git_clean_fd"),
+        ] {
+            let core_allowed = project_allowlists_for_rule(core_rule, "reviewed core rule only");
+            let mut both_allowed = core_allowed.clone();
+            both_allowed.layers.extend(
+                project_allowlists_for_rule(
+                    &format!("heredoc.bash:{bash_rule}"),
+                    "separately reviewed Bash AST rule",
+                )
+                .layers,
+            );
+            for receiver in ["python3", "ruby", "node"] {
+                let direct = format!("{receiver} <<< '{body}'");
+                let rebound = format!("{receiver}() {{ bash; }}; {direct}");
+                for command in [direct, rebound] {
+                    for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                        // Excluding the receiving language must not exclude
+                        // the previously enabled Bash view as a side effect.
+                        for allowed_languages in
+                            [None, Some(vec![crate::heredoc::ScriptLanguage::Bash])]
+                        {
+                            let mut settings = config.heredoc_settings();
+                            settings.allowed_languages = allowed_languages;
+                            let evaluate = |allowlists: &LayeredAllowlist| {
+                                evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                                    &command,
+                                    &enabled_keywords,
+                                    &ordered_packs,
+                                    keyword_index.as_ref(),
+                                    &compiled,
+                                    allowlists,
+                                    &settings,
+                                    None,
+                                    None,
+                                    None,
+                                    dialect,
+                                )
+                            };
+                            let result = evaluate(&core_allowed);
+                            assert!(
+                                result.is_denied(),
+                                "a core allowlist cannot waive Bash AST analysis: {command:?}, \
+                                 {dialect:?}, {:?}: {result:?}",
+                                settings.allowed_languages
+                            );
+                            let info = result.pattern_info.expect("Bash AST denial has a rule");
+                            assert_eq!(info.pack_id.as_deref(), Some("heredoc.bash"));
+                            assert_eq!(info.pattern_name.as_deref(), Some(bash_rule));
+
+                            let result = evaluate(&both_allowed);
+                            assert!(
+                                result.is_allowed(),
+                                "both independent rules were explicitly reviewed: {command:?}, \
+                                 {dialect:?}, {:?}: {result:?}",
+                                settings.allowed_languages
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn here_string_bash_and_receiver_views_keep_independent_coverage_issue_555() {
+        // These deliberately narrow evaluator pack sets demonstrate that the
+        // Bash AST rules do not depend on the equivalent core pack running.
+        for receiver in ["python3", "ruby", "node", "\"python3\"", "python3.12"] {
+            for (body, pack_ids, expected_rule) in [
+                ("rm -rf ./build", &["core.git"][..], "rm_rf"),
+                ("rm -r ./build", &["core.git"][..], "rm_r"),
+                (
+                    "git reset --hard",
+                    &["core.filesystem"][..],
+                    "git_reset_hard",
+                ),
+                ("git clean -fd", &["core.filesystem"][..], "git_clean_fd"),
+            ] {
+                let command = format!("{receiver} <<< '{body}'");
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, pack_ids, ShellDialect::Posix);
+                assert!(result.is_denied(), "{command:?}: {result:?}");
+                let info = result.pattern_info.expect("Bash AST denial has a rule");
+                assert_eq!(info.pack_id.as_deref(), Some("heredoc.bash"));
+                assert_eq!(info.pattern_name.as_deref(), Some(expected_rule));
+            }
+        }
+
+        for command in [
+            "python3 <<< 'print(\"ready\")'",
+            "ruby <<< 'puts \"ready\"'",
+            "node <<< 'console.log(\"ready\")'",
+            "python3() { bash; }; python3 <<< 'git status'",
+            "ruby() { bash; }; ruby <<< 'git status'",
+            "node() { bash; }; node <<< 'git status'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "safe here-string: {command:?}: {result:?}"
+            );
+        }
+
+        for receiver in ["python3", "\"python3\"", "python3.12"] {
+            let command =
+                format!("{receiver} <<< 'import shutil; shutil.rmtree(\"/home/user/project\")'");
+            let result =
+                evaluate_with_pack_ids_in_dialect(&command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "receiver view still runs: {command:?}: {result:?}"
+            );
+            let info = result.pattern_info.expect("Python AST denial has a rule");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.python"));
+            assert_eq!(info.pattern_name.as_deref(), Some("shutil_rmtree"));
+        }
+    }
+
+    #[test]
+    fn here_string_wrapped_and_continued_interpreters_keep_verdicts_and_tails_issue_555() {
+        for receiver in [
+            "python3 -",
+            "\"python3\" -",
+            "python3.12 -",
+            "/opt/venv/bin/python3.12 -",
+            "\"/opt/venv bin/python3.12\" -",
+            "env \"python3\" -",
+            "env -i python3.12 -",
+            "command -- \"python3\" -",
+            "command env /opt/venv/bin/python3.12 -",
+            "python3 \\\n-",
+            "env \\\n\"python3\" -",
+            "command \\\npython3.12 -",
+        ] {
+            for (body, denied) in [
+                ("print(\"safe\")", false),
+                ("import shutil; shutil.rmtree(\"/home/user/project\")", true),
+            ] {
+                let direct = format!("{receiver} <<< '{body}'");
+                for command in [direct.clone(), format!("bash <<'OUTER'\n{direct}\nOUTER")] {
+                    let result = evaluate_with_pack_ids_in_dialect(
+                        &command,
+                        &["core.git"],
+                        ShellDialect::Posix,
+                    );
+                    if denied {
+                        assert!(result.is_denied(), "{command:?}: {result:?}");
+                        let info = result.pattern_info.expect("Python AST denial has a rule");
+                        assert_eq!(info.pack_id.as_deref(), Some("heredoc.python"));
+                        assert_eq!(info.pattern_name.as_deref(), Some("shutil_rmtree"));
+                    } else {
+                        assert!(result.is_allowed(), "{command:?}: {result:?}");
+                        let tail = format!("{command}\ngit reset --hard");
+                        let result = evaluate_with_pack_ids_in_dialect(
+                            &tail,
+                            &["core.git"],
+                            ShellDialect::Posix,
+                        );
+                        assert!(
+                            result.is_denied(),
+                            "later commands remain active: {tail:?}: {result:?}"
+                        );
+                        let info = result
+                            .pattern_info
+                            .expect("the later Git command has a rule");
+                        assert_eq!(info.pack_id.as_deref(), Some("core.git"));
+                        assert_eq!(info.pattern_name.as_deref(), Some("reset-hard"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn heredoc_triggers_inside_safe_string_arguments_do_not_scan_or_block() {
         let config = default_config();
         let compiled = default_compiled_overrides();
@@ -43207,25 +43469,45 @@ mod tests {
         );
     }
 
-    /// #382: `heredoc.shell:launcher-unverified` fired on a QUOTED heredoc
-    /// piped to a non-shell interpreter reading stdin. A Markdown fenced block
-    /// in the body puts a backtick at the start of a segment, and the
-    /// unresolved-substitution scan cannot rule out that the segment assembles
-    /// `powershell`, so it failed closed. With a quoted delimiter the outer
-    /// shell performs no expansion, and a proven non-shell receiver does not
-    /// run the body as shell either, so no shell anywhere sees those bytes as
-    /// syntax and the finding is withdrawn — for that shape only.
+    /// #382: Markdown inside a language string literal must not become an
+    /// outer-shell launcher finding in a quoted interpreter heredoc. The body
+    /// still needs its language-specific checks: raw Markdown is not valid
+    /// Python, and Ruby/Perl backticks can execute even with a quoted delimiter.
     #[test]
     fn quoted_heredoc_into_non_shell_interpreter_is_not_a_shell_launcher() {
         const FENCED_BODY: &str = "```bash\nls\n```";
+        let python_body = format!("print(\"\"\"{FENCED_BODY}\"\"\")");
+        let ruby_body = format!("puts \"{FENCED_BODY}\"");
+        let perl_body = format!("print \"{FENCED_BODY}\";");
+        let php_body = format!("<?php echo \"{FENCED_BODY}\";");
 
+        for (consumer, body) in [
+            ("python3 -", python_body.as_str()),
+            ("python -", python_body.as_str()),
+            ("ruby -", ruby_body.as_str()),
+            ("node -", "console.log(\"```bash\\nls\\n```\");"),
+            ("perl -", perl_body.as_str()),
+            ("php -", php_body.as_str()),
+            ("/usr/bin/python3 -", python_body.as_str()),
+        ] {
+            let command = format!("{consumer} <<'PY'\n{body}\nPY\n");
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_allowed(),
+                    "a Markdown literal in a quoted heredoc to {consumer:?} ({dialect:?}) \
+                     must not read as shell launcher assembly: {result:?}"
+                );
+            }
+        }
+
+        // The former positive fixture was raw Markdown, not Python source.
+        // The bounded interpreter-literal parser reports a grammar error;
+        // exec_sink_pack_verdict preserves that as Indeterminate, not Allow.
         for consumer in [
             "python3 -",
             "python -",
-            "ruby -",
-            "node -",
-            "perl -",
-            "php -",
             "/usr/bin/python3 -",
             "python3 script.py",
         ] {
@@ -43234,10 +43516,41 @@ mod tests {
                 let result =
                     evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
                 assert!(
-                    result.is_allowed(),
-                    "inert Markdown in a quoted heredoc to {consumer:?} ({dialect:?}) \
-                     must not read as shell launcher assembly: {:?}",
-                    result.pattern_info
+                    result.is_indeterminate(),
+                    "invalid Python must remain unverified: {consumer:?} ({dialect:?}): {result:?}"
+                );
+            }
+        }
+
+        // A script file is an opaque consumer of stdin, not a proven program
+        // supplied by this heredoc. It cannot use the documentation proof.
+        let command = format!("python3 script.py <<'PY'\n{python_body}\nPY\n");
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+            assert!(result.is_denied(), "{dialect:?}: {result:?}");
+            let info = result.pattern_info.expect("denial has a rule");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
+            assert_eq!(
+                info.pattern_name.as_deref(),
+                Some("substitution-unverified")
+            );
+        }
+
+        // Quoting the outer delimiter does not disable host-language sinks.
+        for (consumer, pack_id) in [("ruby -", "heredoc.ruby"), ("perl -", "heredoc.perl")] {
+            let command = format!("{consumer} <<'CODE'\n`rm -rf ~/data`;\nCODE\n");
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "host-language backticks execute: {consumer:?} ({dialect:?}): {result:?}"
+                );
+                let info = result.pattern_info.expect("denial has a rule");
+                assert_eq!(info.pack_id.as_deref(), Some(pack_id));
+                assert_eq!(
+                    info.pattern_name.as_deref(),
+                    Some("backticks.rm_rf_catastrophic")
                 );
             }
         }
@@ -43281,16 +43594,23 @@ mod tests {
             }
         }
 
-        // The quoted-delimiter exemption covers only the body. A destructive
-        // command chained after the terminator is still evaluated.
-        let command = format!("python3 - <<'PY'\n{FENCED_BODY}\nPY\nrm -rf ~/data\n");
-        let result =
-            evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], ShellDialect::Posix);
-        assert!(
-            result.is_denied(),
-            "a command chained after the heredoc terminator must still be evaluated: {:?}",
-            result.pattern_info
-        );
+        // The quoted-delimiter exemption covers only the body. Use valid
+        // Python comments so this control reaches the actual chained delete,
+        // rather than stopping on malformed source or an unverified literal.
+        let harmless = "python3 - <<'PY'\n# ```bash\n# ls\n# ```\nprint(\"safe\")\nPY\n";
+        let command = format!("{harmless}rm -rf ~/data\n");
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let safe = evaluate_with_pack_ids_in_dialect(harmless, &["core.filesystem"], dialect);
+            assert!(safe.is_allowed(), "{dialect:?}: {safe:?}");
+            let result = evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_denied(),
+                "a command chained after the terminator must still be evaluated: {result:?}"
+            );
+            let info = result.pattern_info.expect("denial has a rule");
+            assert_eq!(info.pack_id.as_deref(), Some("core.filesystem"));
+            assert_eq!(info.pattern_name.as_deref(), Some("rm-rf-root-home"));
+        }
 
         // …and only a proven non-shell receiver qualifies: an unknown name
         // (a wrapper script, `busybox`, …) may well be a shell.
@@ -51020,36 +51340,89 @@ mod tests {
             }
         }
 
-        /// #363: a `>` inside such a body is bytes handed to the interpreter,
-        /// not an outer-shell redirect, so the truncate rules stand down for
-        /// doc prose with `<x>` placeholders — while a real outer redirect,
-        /// or the same body under an unquoted delimiter, keeps the deny.
+        /// #363: a `>` in a quoted interpreter heredoc is not an outer-shell
+        /// redirect. Raw prose still needs valid interpreter syntax, and an
+        /// unquoted delimiter still executes the reported prose's backticks.
         #[test]
         fn placeholder_gt_in_quoted_interpreter_body_is_not_a_redirect_363() {
-            let reported = concat!(
-                "python3 - <<'PYEOF'\n",
+            let reported_body = concat!(
                 "- `DATA_DIR` resolves *inside each instance*: `~/.app/instances/<i>/store-data/` — sqlite `index.db` (+ `-wal`/`-shm`) plus `logs/`, `records/`, `blocks/`, `.meta/`, `.backup/`.\n",
                 "- Every instance's `gw.json` is identically `{\"search\": {\"bm25\": {\"language\": \"en\"}}}` — the **local** backend. No cloud block on any instance.\n",
                 "- The package DOES ship a Cloud client (`~/.app/plugins/vendor-plugin/src/core/store/client.ts`, wants `url`/`user`/`apiKey`, auth header `Bearer acct=x&api_key=y`) — but it is **dormant**. No url/user/apiKey exists in any instance `.env`, any gw config, or anywhere under `~/.app`.\n",
-                "PYEOF",
             );
-            assert!(
-                !denied(reported),
-                "the reported three-line doc body must be allowed"
-            );
+            let reported = format!("python3 - <<'PYEOF'\n{reported_body}PYEOF");
+            let unquoted_report = reported.replace("<<'PYEOF'", "<<PYEOF");
+            let quoted_literal =
+                format!("python3 - <<'PYEOF'\nprint(\"\"\"{reported_body}\"\"\")\nPYEOF");
+            let unquoted_literal = quoted_literal.replace("<<'PYEOF'", "<<PYEOF");
 
-            // The same placeholder text under an UNQUOTED delimiter is
-            // genuinely expanded/redirect-bearing shell as far as the outer
-            // shell is concerned; nothing here may weaken that.
-            let unquoted = reported.replace("<<'PYEOF'", "<<PYEOF");
-            assert!(
-                denied(&unquoted),
-                "an unquoted delimiter keeps the conservative treatment"
-            );
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                // These exact old fixtures are invalid Python. Neither the
+                // former `!denied` assertion nor a forced Deny describes the
+                // parser's explicit incomplete-analysis decision correctly.
+                for malformed in [reported.as_str(), unquoted_report.as_str()] {
+                    let result = evaluate_with_pack_ids_in_dialect(
+                        malformed,
+                        &["core.git", "core.filesystem"],
+                        dialect,
+                    );
+                    assert!(
+                        result.is_indeterminate(),
+                        "raw doc prose is unverified Python ({dialect:?}): {result:?}"
+                    );
+                }
 
-            // A real outer-shell truncate after the terminator still denies.
-            let outer = "python3 - <<'PY'\nx = 1\nPY\n: > \"$HOME/.bashrc\"";
-            assert!(denied(outer), "a real outer redirect must stay denied");
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &quoted_literal,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "the reported prose in a Python literal must allow ({dialect:?}): {result:?}"
+                );
+
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &unquoted_literal,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "unquoted backticks still require shell verification ({dialect:?}): {result:?}"
+                );
+
+                // An angle-bracket placeholder alone is not shell syntax in
+                // a heredoc, even unquoted. The backticks above are what make
+                // that prose execute at the outer-shell expansion layer.
+                for delimiter in ["'PYEOF'", "PYEOF"] {
+                    let command = format!(
+                        "python3 - <<{delimiter}\nprint(\"~/.app/instances/<i>/store-data/\")\nPYEOF"
+                    );
+                    let result = evaluate_with_pack_ids_in_dialect(
+                        &command,
+                        &["core.git", "core.filesystem"],
+                        dialect,
+                    );
+                    assert!(
+                        result.is_allowed(),
+                        "a placeholder is not a redirect ({dialect:?}): {result:?}"
+                    );
+                }
+
+                // A real outer-shell truncate after the terminator denies
+                // under its concrete filesystem rule.
+                let outer = "python3 - <<'PY'\nx = 1\nPY\n: > \"$HOME/.bashrc\"";
+                let result = evaluate_with_pack_ids_in_dialect(
+                    outer,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(result.is_denied(), "{dialect:?}: {result:?}");
+                let info = result.pattern_info.expect("denial has a rule");
+                assert_eq!(info.pack_id.as_deref(), Some("core.filesystem"));
+                assert_eq!(info.pattern_name.as_deref(), Some("credential-file-write"));
+            }
         }
     }
 

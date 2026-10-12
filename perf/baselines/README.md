@@ -61,3 +61,47 @@ Max RSS reduced from ~15MB to ~5-7MB for common cases.
 ```
 ./scripts/perf_baseline.py --bin ./target/release/dcg --output perf/baselines/2026-01-10.json
 ```
+
+## Integrated hook diagnostics (2026-10-12, #555)
+
+The first integrated stage of AST, stdin-provenance, redaction, and profiling
+changes was measured separately from the earlier isolated stdin-provenance
+comparison.
+The earlier artifacts and notes above are unchanged.
+
+- [`2026-10-12-issue-555-integrated-diagnostic-disabled-enabled.json`](2026-10-12-issue-555-integrated-diagnostic-disabled-enabled.json)
+  retains all 16 shapes across two history profiles, with 30 measured pairs
+  and three warmups per shape/profile.
+- [`2026-10-12-issue-555-integrated-diagnostic-seeded-locked.json`](2026-10-12-issue-555-integrated-diagnostic-seeded-locked.json)
+  retains six shapes across seeded and writer-locked profiles, with 15
+  measured pairs and three warmups. Each seeded database uses 247,625
+  synthetic rows plus its initialization row.
+- [`2026-10-12-issue-555-integrated-diagnostic-summary.json`](2026-10-12-issue-555-integrated-diagnostic-summary.json)
+  contains the complete 44-row results appendix, including wall/CPU tails,
+  paired differences, rule identities, phase data, and verification counts.
+- [`2026-10-12-issue-555-integrated-diagnostic-host-storage.json`](2026-10-12-issue-555-integrated-diagnostic-host-storage.json)
+  records CPU affinity/quota, memory limit, and filesystem type.
+- [`2026-10-12-issue-555-development-phase2-profiles.json`](2026-10-12-issue-555-development-phase2-profiles.json)
+  preserves the earlier development call-count observations. It is an
+  instrumented development probe, not an untouched-incumbent certificate.
+
+The raw integrated comparisons both passed: 4,560 measured invocations, 528
+warmups, 88 separate phase invocations, and eight untimed security controls.
+Candidate nested-heredoc denial is mandatory; the incumbent's known silent
+allow remains recorded as an untimed gap. The 300-line Python wall median
+decreased from 108.326 to 65.393 ms with history disabled and from 97.694 to
+55.745 ms with a small enabled database. Large quoted data and commit-message
+cases also showed substantial CPU reductions. Some tail measurements were
+worse, and the writer lock still added roughly 49 ms of shutdown wait.
+
+The measured candidate SHA-256 is
+`77265aab4c6444a5094ca9408e6e0b038f9702dc3686460fef37cd11296bd89d`.
+It was compiled from a dirty integrated tree containing upstream changes
+through `ecf3fc08ccb04485aef58c584c8c24d81295c712` plus this investigation's
+changes, before a separate robot-output-only correction, test repair, and
+subsequent built-in filesystem regex preparation optimization.
+Its embedded SHA is not an exact source attestation. These diagnostic
+artifacts do not replace the absolute gate or certify the reporter's loaded
+production environment. See the [measurement guide](../../docs/performance-issue-555.md)
+for binary/compiler identities, the representative 24-row table, storage
+results, remaining phase costs, and interpretation limits.

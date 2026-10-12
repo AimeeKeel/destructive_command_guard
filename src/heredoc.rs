@@ -527,7 +527,8 @@ pub enum TriggerResult {
 #[must_use]
 #[instrument(skip(command), fields(cmd_len = command.len()))]
 pub fn check_triggers(command: &str) -> TriggerResult {
-    let _phase = crate::perf::PhaseTimer::start("heredoc_detection");
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::HeredocDetect);
+    let _phase_timer = crate::perf::PhaseTimer::start("heredoc_detection");
     if contains_active_heredoc_operator(command)
         || HEREDOC_TRIGGERS.is_match(command)
         || names_a_runner_through_quoting(command)
@@ -547,6 +548,7 @@ pub fn check_triggers(command: &str) -> TriggerResult {
 /// Useful for debugging and logging which patterns triggered.
 #[must_use]
 pub fn matched_triggers(command: &str) -> Vec<usize> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::HeredocDetect);
     let mut matches: Vec<usize> = HEREDOC_TRIGGERS.matches(command).into_iter().collect();
     if let Some(view) = blank_local_redirects(command) {
         for index in &HEREDOC_TRIGGERS.matches(&view) {
@@ -1252,7 +1254,8 @@ pub struct ExtractedContent {
     pub byte_range: std::ops::Range<usize>,
     /// Byte range of the extracted content inside the original command, if known.
     ///
-    /// For inline scripts and here-strings this is the exact content span.
+    /// For inline scripts and literal here-strings this is the exact content
+    /// span. Decoded quote concatenations or escapes have no contiguous span.
     /// For heredoc bodies, this represents the raw body range (may not map
     /// cleanly if indentation or CRLF normalization occurred).
     pub content_range: Option<std::ops::Range<usize>>,
@@ -1653,7 +1656,8 @@ fn record_timeout_if_needed(
 #[must_use]
 #[instrument(skip(command, limits), fields(cmd_len = command.len(), timeout_ms = limits.timeout_ms))]
 pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionResult {
-    let _phase = crate::perf::PhaseTimer::start("heredoc_extraction");
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::HeredocExtract);
+    let _phase_timer = crate::perf::PhaseTimer::start("heredoc_extraction");
     // Inline-script extraction scans a view whose *data* heredoc bodies are
     // blanked, while heredoc extraction keeps the raw text (#420).
     //
@@ -1685,6 +1689,7 @@ fn extract_content_with_scan_view(
     scan_view: &str,
     limits: &ExtractionLimits,
 ) -> ExtractionResult {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::HeredocExtract);
     let start_time = Instant::now();
     let timeout = Duration::from_millis(limits.timeout_ms);
     let mut skip_reasons: Vec<SkipReason> = Vec::new();
@@ -6567,25 +6572,79 @@ fn extract_herestrings(
                 break;
             }
 
-            // Content is in group 1 for all our here-string patterns
-            let content_match = cap.get(1);
-            let content = content_match.map_or("", |m| m.as_str());
-
+            let full_match = cap.get(0).unwrap();
+            let content_match = cap.get(1).unwrap();
+            let quoted_word =
+                is_quoted.then(|| content_match.start().saturating_sub(1)..content_match.end() + 1);
+            // An isolated single-quoted word already gives the complete
+            // literal. Everything glued to a closing quote, an escaped quote,
+            // or an expansion needs the shell grammar's entire operand. The
+            // regex alone stops at the first apostrophe in `'a'\''b'` and
+            // used to silently discard the rest of an executable program.
+            let simple_literal = quoted_word.as_ref().is_some_and(|range| {
+                let raw = &command[range.clone()];
+                command
+                    .as_bytes()
+                    .get(range.end)
+                    .is_none_or(u8::is_ascii_whitespace)
+                    && (raw.starts_with('\'') || !raw.contains(['\\', '$', '`']))
+            });
+            let operand_range = if simple_literal {
+                quoted_word.expect("a simple literal has a quoted word")
+            } else if let Some(range) =
+                complete_herestring_operand_range(command, full_match.start())
+            {
+                range
+            } else {
+                // Keep the already visible text for the fallback scans, but
+                // never report a recovered/truncated operand as complete.
+                skip_reasons.push(SkipReason::MalformedInput {
+                    reason: "could not extract the complete here-string operand".to_string(),
+                });
+                quoted_word.unwrap_or_else(|| content_match.range())
+            };
+            if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+                return;
+            }
+            let raw = &command[operand_range.clone()];
+            let raw_content_range = unquoted_payload_range(raw, operand_range.start);
+            let content = match crate::normalize::decode_posix_syntax_token(raw) {
+                std::borrow::Cow::Owned(decoded) => decoded,
+                // An unresolved expansion stays visible to shell analysis.
+                // Only surrounding quote syntax is removed, as before.
+                std::borrow::Cow::Borrowed(_) => command[raw_content_range.clone()].to_string(),
+            };
             if content.len() > limits.max_body_bytes {
+                skip_reasons.push(SkipReason::ExceededSizeLimit {
+                    actual: content.len(),
+                    limit: limits.max_body_bytes,
+                });
                 continue;
             }
-
-            let full_match = cap.get(0).unwrap();
+            let content_range = (command.get(raw_content_range.clone()) == Some(content.as_str()))
+                .then_some(raw_content_range);
 
             // Extract the command that receives the here-string
             let target_cmd = extract_heredoc_target_command(command, full_match.start());
+            let language = target_cmd
+                .as_deref()
+                .map_or(ScriptLanguage::Unknown, ScriptLanguage::from_command);
+            // The redirect syntax belongs to Bash, but its value is source
+            // code in the receiving interpreter's language. Keep the
+            // existing shell analysis when the receiver is not recognized.
+            let language = if language == ScriptLanguage::Unknown {
+                literal_herestring_receiver_language(command, full_match.start())
+                    .unwrap_or(ScriptLanguage::Bash)
+            } else {
+                language
+            };
 
             extracted.push(ExtractedContent {
-                content: content.to_string(),
-                language: ScriptLanguage::Bash, // Here-strings are bash-specific
+                content,
+                language,
                 delimiter: None,
-                byte_range: full_match.start()..full_match.end(),
-                content_range: content_match.map(|m| m.start()..m.end()),
+                byte_range: full_match.start()..operand_range.end,
+                content_range,
                 quoted: is_quoted,
                 heredoc_type: Some(HeredocType::HereString),
                 target_command: target_cmd,
@@ -6604,6 +6663,145 @@ fn extract_herestrings(
             limit: limits.max_heredocs,
         });
     }
+}
+
+/// Recover the complete shell word after this operator, including adjacent
+/// quoted fragments and escapes. Parsing from the operator also works inside
+/// a Bash heredoc, where the outer shell tree treats the nested source as a
+/// body node. Errors in a later statement do not invalidate this operand;
+/// recovery inside the operand does.
+fn complete_herestring_operand_range(command: &str, operator_start: usize) -> Option<Range<usize>> {
+    let ast = try_parse_shell_ast(command.get(operator_start..)?).ok()?;
+    let root = ast.root();
+    let redirect = root
+        .dfs()
+        .find(|node| node.kind() == "herestring_redirect" && node.range().start == 0)?;
+    let mut operands = redirect
+        .children()
+        .filter(|node| node.is_named() && node.kind() != "file_descriptor");
+    let operand = operands.next()?;
+    if operands.next().is_some()
+        || operand
+            .dfs()
+            .any(|node| node.is_error() || node.is_missing())
+    {
+        return None;
+    }
+    let range = operand.range();
+    Some(operator_start + range.start..operator_start + range.end)
+}
+
+/// Add host-language analysis for a literal receiver the legacy target-token
+/// heuristic could not classify, such as `"python3"` or `python3.12`. The
+/// existing target metadata and its masking/exemption proofs stay unchanged;
+/// this can only add an interpreter scan alongside the prior shell scan.
+fn literal_herestring_receiver_language(
+    command: &str,
+    operator_start: usize,
+) -> Option<ScriptLanguage> {
+    let mut line_start = command
+        .get(..operator_start)?
+        .rfind(['\n', '\r'])
+        .map_or(0, |at| at + 1);
+    // Include physical continuation lines in the candidate parse. This also
+    // works inside an outer heredoc, whose body the outer Bash tree does not
+    // parse as commands. Backslashes only select the starting context: the
+    // AST below still has to prove which command owns this exact operator,
+    // so a backslash in a comment or literal cannot assert a receiver.
+    while line_start > 0 {
+        let mut line_end = line_start - 1;
+        if command.as_bytes().get(line_end) == Some(&b'\n')
+            && line_end > 0
+            && command.as_bytes().get(line_end - 1) == Some(&b'\r')
+        {
+            line_end -= 1;
+        }
+        let backslashes = command[..line_end]
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\\')
+            .count();
+        if backslashes % 2 == 0 {
+            break;
+        }
+        line_start = command[..line_end]
+            .rfind(['\n', '\r'])
+            .map_or(0, |at| at + 1);
+    }
+    let local_operator = operator_start - line_start;
+    let ast = try_parse_shell_ast(command.get(line_start..)?).ok()?;
+    let root = ast.root();
+    let redirect = root.dfs().find(|node| {
+        node.kind() == "herestring_redirect"
+            && node
+                .children()
+                .any(|child| child.kind() == "<<<" && child.range().start == local_operator)
+    })?;
+    let parent = redirect.parent()?;
+    let owner = match parent.kind().as_ref() {
+        "command" => parent,
+        "redirected_statement" => parent.field("body")?,
+        _ => return None,
+    };
+    if owner.kind() != "command" || owner.dfs().any(|node| node.is_error() || node.is_missing()) {
+        return None;
+    }
+    let name = owner.field("name")?;
+    // Locale translation and unresolved expansions do not prove a literal
+    // program name. Ordinary quotes, concatenation and ANSI-C escapes do.
+    if name.dfs().any(|node| node.kind() == "translated_string") {
+        return None;
+    }
+    let raw = name.text();
+    let decoded = crate::normalize::decode_posix_syntax_token(raw.as_ref());
+    if matches!(decoded, std::borrow::Cow::Borrowed(_))
+        && raw.contains(['\'', '"', '\\', '$', '`', '<', '>'])
+    {
+        return None;
+    }
+    let basename = decoded.rsplit(['/', '\\']).next()?;
+    let language = ScriptLanguage::from_command(basename);
+    if language != ScriptLanguage::Unknown {
+        return Some(language);
+    }
+
+    // The AST supplies complete argv words, without continuation whitespace
+    // or local redirections. Re-quote proven literals before passing them to
+    // the existing wrapper parser, so a quoted argument containing spaces or
+    // shell operators cannot turn into a new executable. Unknown/dynamic
+    // words and unsupported wrapper options supply no additional proof.
+    let mut words = Vec::new();
+    for child in owner.children() {
+        // The grammar may represent `$"python3"` as an anonymous bare `$`
+        // followed by a named string. Dropping that token would turn locale
+        // translation (or a literal `$` argv word) into a proven receiver.
+        if !child.is_named() {
+            if child.kind() == "$" {
+                return None;
+            }
+            continue;
+        }
+        if matches!(
+            child.kind().as_ref(),
+            "variable_assignment" | "file_redirect" | "herestring_redirect" | "heredoc_redirect"
+        ) {
+            continue;
+        }
+        let literal_words = literal_script_words(&child)?;
+        let [word] = literal_words.as_slice() else {
+            return None;
+        };
+        words.push(shell_words::quote(word).into_owned());
+    }
+    let invocation = words.join(" ");
+    let normalized = crate::normalize::strip_wrapper_prefixes(&invocation);
+    if normalized.wrapper_limit_reached || normalized.stripped_wrappers.is_empty() {
+        return None;
+    }
+    let argv = shell_words::split(normalized.normalized.as_ref()).ok()?;
+    let basename = argv.first()?.rsplit(['/', '\\']).next()?;
+    let language = ScriptLanguage::from_command(basename);
+    (language != ScriptLanguage::Unknown).then_some(language)
 }
 
 /// Extract heredocs (<<, <<-, <<~).
@@ -6818,7 +7016,7 @@ fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usi
     if command.len() > 256 * 1024 {
         return Vec::new();
     }
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = parse_shell_ast(command);
     let mut heredocs = Vec::new();
     let mut parse_error = false;
     // Only the bodies are wanted here, not where their command's output goes.
@@ -7222,7 +7420,7 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
     let Some(prefix) = command.get(..redirection_start) else {
         return true;
     };
-    let ast = AstGrep::new(prefix, SupportLang::Bash);
+    let ast = parse_shell_ast(prefix);
     let mut overridden = false;
     let mut parse_error = false;
     find_visible_shell_name_override(ast.root(), target, &mut overridden, &mut parse_error);
@@ -7243,7 +7441,7 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
     // mutator commands are all top-level nodes the walker still visits —
     // including ones after the operator, which only adds conservatism. A
     // whole-command parse error keeps the fail-closed answer.
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = parse_shell_ast(command);
     let mut overridden = false;
     let mut parse_error = false;
     find_shell_name_override_deep(ast.root(), target, &mut overridden, &mut parse_error);
@@ -7264,7 +7462,7 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
     let Some(blanked) = quoted_heredoc_bodies_blanked(command) else {
         return true;
     };
-    let ast = AstGrep::new(blanked.as_str(), SupportLang::Bash);
+    let ast = parse_shell_ast(blanked.as_str());
     let mut overridden = false;
     let mut parse_error = false;
     find_shell_name_override_deep(ast.root(), target, &mut overridden, &mut parse_error);
@@ -7982,7 +8180,7 @@ pub(crate) fn range_is_quoted_interpreter_source(
     // file the interpreter writes, and a preceding environment assignment
     // could preload code that changes its builtins. Neither supplies the
     // isolated program assumed by the language-specific literal analysis.
-    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+    let Ok(ast) = try_parse_shell_ast(command) else {
         return false;
     };
     let root = ast.root();
@@ -8071,7 +8269,7 @@ pub(crate) fn range_is_literal_inline_interpreter_source(
     {
         return false;
     }
-    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+    let Ok(ast) = try_parse_shell_ast(command) else {
         return false;
     };
     let root = ast.root();
@@ -8278,7 +8476,7 @@ pub(crate) fn inline_interpreter_source_proof(
     }
 
     let quoted_range = range.start.checked_sub(1)?..range.end.checked_add(1)?;
-    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    let ast = try_parse_shell_ast(command).ok()?;
     let root = ast.root();
     let root = root.get_inner_node();
     if root.has_error() {
@@ -8374,7 +8572,7 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
     if !command.contains("<<") || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
         return None;
     }
-    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    let ast = try_parse_shell_ast(command).ok()?;
     if ast.root().get_inner_node().has_error() {
         return None;
     }
@@ -8699,7 +8897,7 @@ pub(crate) fn plain_heredoc_command_at(command: &str, operator_start: usize) -> 
     {
         return None;
     }
-    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    let ast = try_parse_shell_ast(command).ok()?;
     if ast.root().get_inner_node().has_error() {
         return None;
     }
@@ -9202,6 +9400,7 @@ fn mask_non_executing_heredocs_with_policy(
     command: &str,
     require_quoted_delimiter: bool,
 ) -> std::borrow::Cow<'_, str> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::HeredocMasking);
     use std::borrow::Cow;
 
     // Quick check: no heredoc operator means nothing to mask
@@ -9906,7 +10105,7 @@ fn literal_file_data_consumers_inner(
     if started.elapsed() >= budget {
         return Vec::new();
     }
-    let Ok(ast) = AstGrep::try_new(outside, SupportLang::Bash) else {
+    let Ok(ast) = try_parse_shell_ast(outside) else {
         return Vec::new();
     };
     if started.elapsed() >= budget || ast.root().get_inner_node().has_error() {
@@ -10262,7 +10461,7 @@ fn literal_ssh_git_message_reader(arguments: &[String]) -> bool {
     // parses it. Judge that line, including quotes retained for the remote
     // shell, rather than a substring of the original quoted local operand.
     let remote = arguments.get(payload..).unwrap_or_default().join(" ");
-    let Ok(ast) = AstGrep::try_new(remote.as_str(), SupportLang::Bash) else {
+    let Ok(ast) = try_parse_shell_ast(remote.as_str()) else {
         return false;
     };
     if ast.root().get_inner_node().has_error() {
@@ -10423,7 +10622,7 @@ fn ordered_file_reader_ranges(command: &str, outside: &str) -> Vec<Range<usize>>
     if !outside.contains("sed") && !outside.contains("awk") && !outside.contains("tac") {
         return Vec::new();
     }
-    let Ok(ast) = AstGrep::try_new(outside, SupportLang::Bash) else {
+    let Ok(ast) = try_parse_shell_ast(outside) else {
         return Vec::new();
     };
     if ast.root().get_inner_node().has_error() {
@@ -10669,7 +10868,7 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
         return None;
     }
 
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = parse_shell_ast(command);
     let mut heredocs = Vec::new();
     let mut parse_error = false;
     let plumbed = output_may_be_replumbed(&ast.root());
@@ -12393,6 +12592,19 @@ fn extract_heredoc_body(
 use ast_grep_core::AstGrep;
 use ast_grep_language::SupportLang;
 
+type ShellAst = AstGrep<ast_grep_core::tree_sitter::StrDoc<SupportLang>>;
+
+/// Keep shell parsing visible separately from the structural walks that use
+/// it. A quoted executable heredoc still reaches its own language's parser.
+pub(crate) fn try_parse_shell_ast(command: &str) -> Result<ShellAst, String> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+    AstGrep::try_new(command, SupportLang::Bash)
+}
+
+pub(crate) fn parse_shell_ast(command: &str) -> ShellAst {
+    try_parse_shell_ast(command).expect("should parse")
+}
+
 /// Extracted shell command with position info for evaluator integration.
 ///
 /// Each command represents a simple command invocation that can be
@@ -12501,7 +12713,7 @@ pub fn extract_posix_command_substitutions(
         return Err(PosixCommandSubstitutionParseError);
     }
 
-    let ast = AstGrep::new(content, SupportLang::Bash);
+    let ast = parse_shell_ast(content);
     let root = ast.root();
     let mut substitutions = Vec::new();
     let mut parse_error = false;
@@ -12878,14 +13090,14 @@ pub fn extract_shell_commands(content: &str) -> Vec<ExtractedShellCommand> {
     }
 
     let start = Instant::now();
-    let ast = AstGrep::new(content, SupportLang::Bash);
+    let ast = parse_shell_ast(content);
     let root = ast.root();
 
     let mut commands = Vec::new();
 
     // Walk the AST to find command nodes
     // tree-sitter-bash uses "command" nodes for simple commands
-    collect_commands_recursive(root, content, &mut commands);
+    collect_commands_recursive(root, &mut commands);
 
     debug!(
         elapsed_us = start.elapsed().as_micros(),
@@ -12905,7 +13117,6 @@ pub fn extract_shell_commands(content: &str) -> Vec<ExtractedShellCommand> {
 #[allow(clippy::needless_pass_by_value)]
 fn collect_commands_recursive<D: ast_grep_core::Doc>(
     node: ast_grep_core::Node<'_, D>,
-    content: &str,
     commands: &mut Vec<ExtractedShellCommand>,
 ) {
     let kind = node.kind();
@@ -12915,17 +13126,22 @@ fn collect_commands_recursive<D: ast_grep_core::Doc>(
     // silently drops `> target` and hides redirect-based destruction from the
     // recursive evaluation (#271: `mise exec -c 'echo hi > ~/.zshrc'` and the
     // `sh -c` sibling allowed on the Posix hook route). Emit the complete
-    // statement whenever an output redirect is present; the bare command is
-    // still collected by the recursion below, which is harmless.
+    // statement whenever an output redirect or embedded stdin source is
+    // present. Dropping a heredoc/here-string leaves only `python3 -` (or
+    // `bash -s`) for recursive evaluation and silently loses its executable
+    // body (#555). The bare command is still collected below.
     if kind == "redirected_statement"
-        && node
-            .children()
-            .any(|child| child.kind() == "file_redirect" && child.text().contains('>'))
+        && node.children().any(|child| {
+            matches!(
+                child.kind().as_ref(),
+                "heredoc_redirect" | "herestring_redirect"
+            ) || (child.kind() == "file_redirect" && child.text().contains('>'))
+        })
     {
         let range = node.range();
         let text = node.text().to_string();
         if !text.trim().is_empty() {
-            let line_number = content[..range.start].matches('\n').count() + 1;
+            let line_number = node.start_pos().line() + 1;
 
             commands.push(ExtractedShellCommand {
                 text,
@@ -12943,7 +13159,7 @@ fn collect_commands_recursive<D: ast_grep_core::Doc>(
 
         // Skip empty commands
         if !text.trim().is_empty() {
-            let line_number = content[..range.start].matches('\n').count() + 1;
+            let line_number = node.start_pos().line() + 1;
 
             commands.push(ExtractedShellCommand {
                 text,
@@ -12961,7 +13177,7 @@ fn collect_commands_recursive<D: ast_grep_core::Doc>(
     // - Command substitution: `$(cmd)` contains command
     // - Subshells: `(cmd)` contains command
     for child in node.children() {
-        collect_commands_recursive(child, content, commands);
+        collect_commands_recursive(child, commands);
     }
 }
 
@@ -12974,6 +13190,66 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use proptest::prelude::*;
+
+    #[test]
+    fn shell_command_positions_preserve_preorder_and_utf8_offsets_issue_555() {
+        let source = "# 雪\necho 'λ'\nprintf '%s' \"$(git status)\" > out.txt\n";
+        let expected = [
+            ("echo 'λ'", 2),
+            ("printf '%s' \"$(git status)\" > out.txt", 3),
+            ("printf '%s' \"$(git status)\"", 3),
+            ("git status", 3),
+        ]
+        .into_iter()
+        .map(|(text, line_number)| {
+            let start = source.find(text).unwrap();
+            ExtractedShellCommand {
+                text: text.into(),
+                start,
+                end: start + text.len(),
+                line_number,
+            }
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(extract_shell_commands(source), expected);
+    }
+
+    #[test]
+    fn shell_command_line_metadata_matches_source_for_multiline_and_crlf_issue_555() {
+        for source in [
+            "printf '%s' 'first\nsecond'\necho done\n",
+            "printf '%s' 'αβ'\r\n# 雪\r\n(\r\n  git status\r\n)\r\n",
+        ] {
+            let commands = extract_shell_commands(source);
+            assert_eq!(commands.len(), 2, "{source:?}");
+            for command in commands {
+                assert_eq!(&source[command.start..command.end], command.text);
+                assert_eq!(
+                    command.line_number,
+                    source[..command.start].matches('\n').count() + 1,
+                    "metadata must preserve the previous source-based line convention"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shell_command_extraction_retains_embedded_stdin_source() {
+        for source in [
+            "python3 - <<'PY'\nimport shutil\nshutil.rmtree('/home/user/project')\nPY",
+            "python3 - <<< 'import shutil; shutil.rmtree(\"/home/user/project\")'",
+            "cat <<'PY' | python3 -\nimport shutil\nshutil.rmtree('/home/user/project')\nPY",
+        ] {
+            let commands = extract_shell_commands(source);
+            assert!(
+                commands.iter().any(|command| command.text == source),
+                "recursive evaluation must receive the complete stdin source: {source:?}; {commands:?}"
+            );
+            for command in commands {
+                assert_eq!(&source[command.start..command.end], command.text);
+            }
+        }
+    }
 
     /// Eighth review: an expanding data body keeps exactly what the shell
     /// runs while reading it — `$(…)`, backquotes, arithmetic that may be a
@@ -15873,6 +16149,246 @@ mod tests {
             } else {
                 panic!("Expected Extracted result, got {result:?}");
             }
+        }
+
+        #[test]
+        fn here_string_language_follows_its_receiver() {
+            let limits = ExtractionLimits::structural_scan();
+            for (receiver, language) in [
+                ("python3 -", ScriptLanguage::Python),
+                ("/usr/bin/python3 -", ScriptLanguage::Python),
+                ("ruby", ScriptLanguage::Ruby),
+                ("perl", ScriptLanguage::Perl),
+                ("node", ScriptLanguage::JavaScript),
+                ("deno", ScriptLanguage::TypeScript),
+                ("cat", ScriptLanguage::Bash),
+                ("echo python3", ScriptLanguage::Bash),
+                ("pythonic", ScriptLanguage::Bash),
+            ] {
+                for source in [
+                    "print(\"safe\")",
+                    "import shutil\nshutil.rmtree(\"/home/user/project\")\n",
+                ] {
+                    let direct = format!("{receiver} <<< '{source}'");
+                    for command in [direct.clone(), format!("bash <<'OUTER'\n{direct}\nOUTER")] {
+                        let ExtractionResult::Extracted(contents) =
+                            extract_content(&command, &limits)
+                        else {
+                            panic!("expected complete here-string extraction for {command:?}");
+                        };
+                        let content = contents
+                            .iter()
+                            .find(|content| content.heredoc_type == Some(HeredocType::HereString))
+                            .expect("the nested here-string is retained");
+                        assert_eq!(content.language, language, "{command:?}");
+                        assert_eq!(content.content, source, "{command:?}");
+                        assert_eq!(
+                            content.target_command.as_deref(),
+                            receiver
+                                .split_whitespace()
+                                .next()
+                                .and_then(|word| word.rsplit('/').next()),
+                            "{command:?}"
+                        );
+                        assert!(content.quoted, "{command:?}");
+                        assert_eq!(
+                            &command[content.byte_range.clone()],
+                            format!("<<< '{source}'")
+                        );
+                        assert_eq!(
+                            &command[content
+                                .content_range
+                                .clone()
+                                .expect("a literal body is contiguous")],
+                            source
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn here_strings_decode_the_entire_literal_operand() {
+            let source = "print('ready')\nimport shutil\nshutil.rmtree(\"/home/user/project\")\n";
+            let single_quoted = format!("'{}'", source.replace('\'', r"'\''"));
+            let double_quoted = format!("\"{}\"", source.replace('"', "\\\""));
+            let ansi_quoted =
+                r#"$'print(\'ready\')\nimport shutil\nshutil.rmtree(\"/home/user/project\")\n'"#;
+            for operand in [single_quoted.as_str(), double_quoted.as_str(), ansi_quoted] {
+                let direct = format!("python3 - <<< {operand}; echo done");
+                for command in [direct.clone(), format!("bash <<'OUTER'\n{direct}\nOUTER")] {
+                    let ExtractionResult::Extracted(contents) =
+                        extract_content(&command, &ExtractionLimits::structural_scan())
+                    else {
+                        panic!("expected complete literal extraction for {command:?}");
+                    };
+                    let content = contents
+                        .iter()
+                        .find(|content| content.heredoc_type == Some(HeredocType::HereString))
+                        .expect("the here-string is retained");
+                    assert_eq!(content.content, source, "{command:?}");
+                    assert_eq!(content.language, ScriptLanguage::Python, "{command:?}");
+                    assert_eq!(content.target_command.as_deref(), Some("python3"));
+                    assert_eq!(
+                        &command[content.byte_range.clone()],
+                        format!("<<< {operand}")
+                    );
+                    assert_eq!(
+                        content.content_range, None,
+                        "decoded fragments have no contiguous source span: {command:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn here_string_quoted_and_versioned_receivers_add_language_without_exemptions() {
+            for receiver in [
+                r#""python3" -"#,
+                "python3.12 -",
+                "/opt/venv/bin/python3.12 -",
+            ] {
+                let direct = format!("{receiver} <<< 'print(\"safe\")'");
+                for command in [direct.clone(), format!("bash <<'OUTER'\n{direct}\nOUTER")] {
+                    let ExtractionResult::Extracted(contents) =
+                        extract_content(&command, &ExtractionLimits::structural_scan())
+                    else {
+                        panic!("expected complete extraction for {command:?}");
+                    };
+                    let content = contents
+                        .iter()
+                        .find(|content| content.heredoc_type == Some(HeredocType::HereString))
+                        .expect("the literal interpreter here-string is retained");
+                    assert_eq!(content.language, ScriptLanguage::Python, "{command:?}");
+                    assert_eq!(
+                        content.target_command, None,
+                        "language augmentation must not add a data exemption: {command:?}"
+                    );
+                    assert_eq!(content.content, "print(\"safe\")");
+                }
+            }
+            for receiver in [
+                "$PYTHON -",
+                r#""${PYTHON}" -"#,
+                r#"$"python3" -"#,
+                "echo python3.12 -",
+                "pythonic -",
+            ] {
+                let command = format!("{receiver} <<< 'print(\"safe\")'");
+                assert_eq!(
+                    literal_herestring_receiver_language(&command, command.find("<<<").unwrap()),
+                    None,
+                    "a nonliteral or unrelated executable does not establish Python: {command:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn here_string_literal_wrappers_and_continuations_preserve_receiver_source_issue_555() {
+            let source = "import shutil; shutil.rmtree(\"/home/user/project\")";
+            for program in [
+                "python",
+                "python3",
+                "\"python3\"",
+                "python3.12",
+                "/opt/venv/bin/python3.12",
+                "\"/opt/venv bin/python3.12\"",
+            ] {
+                for wrapper in [
+                    "",
+                    "env ",
+                    "env -i ",
+                    "command ",
+                    "command -p -- ",
+                    "command env ",
+                ] {
+                    for receiver in [
+                        format!("{wrapper}{program} -"),
+                        format!("{wrapper}{program} \\\n-"),
+                        format!("{wrapper}\\\n{program} -"),
+                    ] {
+                        let direct = format!("{receiver} <<< '{source}'; git status");
+                        for command in [direct.clone(), format!("bash <<'OUTER'\n{direct}\nOUTER")]
+                        {
+                            let operator = command.find("<<<").unwrap();
+                            assert_eq!(
+                                literal_herestring_receiver_language(&command, operator),
+                                Some(ScriptLanguage::Python),
+                                "the exact continued/wrapped owner is Python: {command:?}"
+                            );
+                            let legacy_target = extract_heredoc_target_command(&command, operator);
+                            let ExtractionResult::Extracted(contents) =
+                                extract_content(&command, &ExtractionLimits::structural_scan())
+                            else {
+                                panic!("expected complete extraction for {command:?}");
+                            };
+                            let content = contents
+                                .iter()
+                                .find(|content| {
+                                    content.heredoc_type == Some(HeredocType::HereString)
+                                })
+                                .expect("the complete here-string source is retained");
+                            assert_eq!(content.language, ScriptLanguage::Python, "{command:?}");
+                            assert_eq!(content.content, source, "{command:?}");
+                            assert_eq!(content.target_command, legacy_target, "{command:?}");
+                            assert_eq!(
+                                &command[content.byte_range.clone()],
+                                format!("<<< '{source}'")
+                            );
+                            assert_eq!(
+                                command.get(content.content_range.clone().unwrap()),
+                                Some(source)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn here_string_receiver_augmentation_requires_a_literal_executable_owner_issue_555() {
+            for receiver in [
+                "echo python3",
+                "env echo python3",
+                "env --help python3",
+                "command -v python3",
+                "command -V python3",
+                "env $PYTHON",
+                "env \"${PYTHON}\"",
+                "env $\"python3\"",
+                "command $\"python3\"",
+                "env $ \"python3\"",
+                "command unknown-wrapper python3",
+                "python3\n",
+                "python3 \\\\\n",
+                "python3 # a comment ending in \\\n",
+            ] {
+                let command = format!("{receiver} <<< 'print(\"safe\")'");
+                assert_eq!(
+                    literal_herestring_receiver_language(&command, command.find("<<<").unwrap()),
+                    None,
+                    "arguments, queries, expansions and previous commands are not the receiver: {command:?}"
+                );
+            }
+            let command = "env \"python3 <<< 'print(\"safe\")'";
+            assert_eq!(
+                literal_herestring_receiver_language(command, command.find("<<<").unwrap()),
+                None,
+                "an incomplete owning command cannot establish receiver language"
+            );
+        }
+
+        #[test]
+        fn here_string_operand_parser_stops_before_the_next_shell_command() {
+            let command = r"python3 - <<< 'print('\''safe'\'')'; git status";
+            let start = command.find("<<<").unwrap();
+            let range = complete_herestring_operand_range(command, start)
+                .expect("a quoted concatenation is one shell operand");
+            assert_eq!(&command[range], r"'print('\''safe'\'')'");
+            assert_eq!(
+                complete_herestring_operand_range("<<< 'unfinished", 0),
+                None
+            );
         }
 
         #[test]

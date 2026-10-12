@@ -33,6 +33,7 @@
 //! - Hard timeout: 20ms
 
 use crate::heredoc::ScriptLanguage;
+use ast_grep_core::matcher::{Matcher, MatcherExt};
 use ast_grep_core::{AstGrep, Pattern};
 use ast_grep_language::SupportLang;
 use memchr::memchr_iter;
@@ -40,7 +41,7 @@ use regex::Regex;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, mpsc};
+use std::sync::{Arc, LazyLock, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -138,7 +139,7 @@ impl Severity {
 }
 
 /// Result of a pattern match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternMatch {
     /// Stable rule ID for allowlisting (e.g., `heredoc.python.subprocess_rm`).
     pub rule_id: String,
@@ -306,12 +307,35 @@ struct PrecompiledPattern {
     meta: CompiledPattern,
 }
 
+/// Immutable matching plan shared by calls and their bounded worker threads.
+/// The index uses ast-grep's own necessary node-kind conditions, exactly as
+/// `Node::find_all` does. A pattern without that condition visits every node.
+struct PatternIndex {
+    patterns: Vec<PrecompiledPattern>,
+    by_kind: Vec<Vec<usize>>,
+    any_kind: Vec<usize>,
+}
+
+/// A hook normally reads one interpreter language. Keep the other grammars
+/// cold, while retaining every rule when a nested interpreter needs them.
+struct LanguagePatterns {
+    source: Vec<CompiledPattern>,
+    compiled: OnceLock<Arc<PatternIndex>>,
+}
+
+impl LanguagePatterns {
+    fn compiled(&self, language: SupportLang) -> &Arc<PatternIndex> {
+        self.compiled
+            .get_or_init(|| Arc::new(compile_patterns(&self.source, language)))
+    }
+}
+
 /// AST pattern matcher using ast-grep-core.
 ///
-/// Holds pre-compiled patterns for each supported language.
+/// Compiles each supported language's patterns once, on first use.
 pub struct AstMatcher {
     /// Patterns organized by language.
-    patterns: HashMap<ScriptLanguage, Vec<PrecompiledPattern>>,
+    patterns: HashMap<ScriptLanguage, LanguagePatterns>,
     /// Timeout for matching operations.
     timeout: Duration,
 }
@@ -326,9 +350,8 @@ impl AstMatcher {
     /// Create a new matcher with default destructive patterns.
     #[must_use]
     pub fn new() -> Self {
-        precompile_perl_patterns();
         Self {
-            patterns: precompile_patterns(default_patterns()),
+            patterns: prepare_patterns(default_patterns()),
             timeout: ast_timeout(),
         }
     }
@@ -337,9 +360,8 @@ impl AstMatcher {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // HashMap is not const-constructible
     pub fn with_patterns(patterns: HashMap<ScriptLanguage, Vec<CompiledPattern>>) -> Self {
-        precompile_perl_patterns();
         Self {
-            patterns: precompile_patterns(patterns),
+            patterns: prepare_patterns(patterns),
             timeout: ast_timeout(),
         }
     }
@@ -386,13 +408,15 @@ impl AstMatcher {
         language: ScriptLanguage,
         timeout: Duration,
     ) -> Result<Vec<PatternMatch>, MatchError> {
-        let start_time = Instant::now();
         let budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
 
         // Perl is not supported by ast-grep-language; use a conservative regex fallback.
         if language == ScriptLanguage::Perl {
-            return find_matches_perl(code, start_time, timeout, budget_ms);
+            precompile_perl_patterns();
+            return find_matches_perl(code, Instant::now(), timeout, budget_ms);
         }
+
+        let start_time = Instant::now();
 
         // Check language support FIRST (before patterns, so we report unsupported properly)
         let Some(ast_lang) = script_language_to_ast_lang(language) else {
@@ -401,9 +425,17 @@ impl AstMatcher {
 
         // Get patterns for this language (after language support check)
         let patterns = match self.patterns.get(&language) {
-            Some(p) if !p.is_empty() => p,
+            Some(p) => p,
             _ => return Ok(Vec::new()), // No patterns = no matches
         };
+
+        // Compilation, like the previous eager constructor, is outside the
+        // tier-local matching deadline and inside the caller's hook deadline.
+        // Only the requested language pays this once-per-matcher cost.
+        let patterns = patterns.compiled(ast_lang);
+        if patterns.patterns.is_empty() {
+            return Ok(Vec::new());
+        }
 
         if timeout.is_zero() || code.len() > MAX_AST_INPUT_BYTES {
             return Err(timeout_error(start_time, budget_ms));
@@ -413,7 +445,7 @@ impl AstMatcher {
             code.to_string(),
             language,
             ast_lang,
-            patterns.clone(),
+            Arc::clone(patterns),
             timeout,
             budget_ms,
         )
@@ -1512,21 +1544,23 @@ fn run_ast_match_with_timeout(
     code: String,
     language: ScriptLanguage,
     ast_lang: SupportLang,
-    patterns: Vec<PrecompiledPattern>,
+    patterns: Arc<PatternIndex>,
     timeout: Duration,
     budget_ms: u64,
 ) -> Result<Vec<PatternMatch>, MatchError> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let start_time = Instant::now();
     let (tx, rx) = mpsc::sync_channel(1);
     // Shared cancellation flag: when the parent times out it flips this and
     // returns immediately. The worker checks it inside `check_ast_timeout`
-    // (which fires between each pattern and between `find_all` iterations) so
+    // (which fires during the traversal and after structural matches) so
     // it stops promptly instead of running for another full `timeout` window
     // after the parent has already returned. Without this, every parent
     // timeout leaks a live worker thread for the duration of the worker's
     // own deadline — under burst hook traffic that piles up.
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
+    let profile = crate::perf::capture_profile();
 
     // We don't `join` the handle on timeout — the worker may still hold a
     // tree-sitter parser mid-iteration and joining would block the hook past
@@ -1538,16 +1572,19 @@ fn run_ast_match_with_timeout(
         .spawn(move || {
             // Share the parent's `start_time` semantics by also starting the
             // worker's deadline now; cancellation is the primary stop signal.
-            let result = find_matches_ast(
-                &code,
-                language,
-                ast_lang,
-                &patterns,
-                Instant::now(),
-                timeout,
-                budget_ms,
-                &worker_cancel,
-            );
+            let result = {
+                let _profile = profile.enter();
+                find_matches_ast(
+                    &code,
+                    language,
+                    ast_lang,
+                    &patterns,
+                    Instant::now(),
+                    timeout,
+                    budget_ms,
+                    &worker_cancel,
+                )
+            };
             let _ = tx.send(result);
         })
         .map_err(|err| MatchError::Unavailable {
@@ -1575,16 +1612,20 @@ fn find_matches_ast(
     code: &str,
     language: ScriptLanguage,
     ast_lang: SupportLang,
-    patterns: &[PrecompiledPattern],
+    patterns: &PatternIndex,
     start_time: Instant,
     timeout: Duration,
     budget_ms: u64,
     cancel: &AtomicBool,
 ) -> Result<Vec<PatternMatch>, MatchError> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
 
     // Parse the code
-    let ast = AstGrep::new(code, ast_lang);
+    let ast = {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+        AstGrep::new(code, ast_lang)
+    };
     let root = ast.root();
 
     // Check timeout after parsing
@@ -1592,42 +1633,58 @@ fn find_matches_ast(
 
     let mut matches = Vec::new();
 
-    // Match each pattern
-    for compiled in patterns {
-        // Check timeout before each pattern
-        check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
+    // Walk the tree once, instead of rebuilding a DFS cursor for every rule.
+    // Only ast-grep's necessary kind condition selects candidates: strings,
+    // comments, malformed syntax and nested calls receive exactly the same
+    // structural matching as `root.find_all` for every registered pattern.
+    for (visited, candidate) in root.dfs().enumerate() {
+        // Poll even when there are no matches. The previous per-pattern
+        // traversal could walk a large clean body without observing cancel.
+        if visited.is_multiple_of(64) {
+            check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
+        }
 
-        // Find all matches for this pattern
-        for node in root.find_all(&compiled.pattern) {
-            // Check timeout during matching (a single pattern can match many nodes)
+        let specific = patterns
+            .by_kind
+            .get(usize::from(candidate.kind_id()))
+            .map_or(&[][..], Vec::as_slice);
+        for &pattern_index in specific.iter().chain(&patterns.any_kind) {
+            let compiled = &patterns.patterns[pattern_index];
+            let Some(node) = compiled.pattern.match_node(candidate.clone()) else {
+                continue;
+            };
             check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
 
             let matched_text = node.text();
             let range = node.range();
-
-            // Calculate line number (1-based)
-            let line_number = newline_positions.partition_point(|&idx| idx < range.start) + 1;
-
-            // Create preview (truncate if too long, UTF-8 safe)
-            let preview = truncate_preview(&matched_text, 60);
 
             let Some(refined) = refine_match_meta(language, &compiled.meta, &matched_text, &node)
             else {
                 continue;
             };
 
-            matches.push(PatternMatch {
-                rule_id: refined.rule_id,
-                reason: refined.reason,
-                matched_text_preview: preview,
-                start: range.start,
-                end: range.end,
-                line_number,
-                severity: refined.severity,
-                suggestion: refined.suggestion,
-            });
+            matches.push((
+                pattern_index,
+                PatternMatch {
+                    rule_id: refined.rule_id,
+                    reason: refined.reason,
+                    matched_text_preview: truncate_preview(&matched_text, 60),
+                    start: range.start,
+                    end: range.end,
+                    line_number: newline_positions.partition_point(|&idx| idx < range.start) + 1,
+                    severity: refined.severity,
+                    suggestion: refined.suggestion,
+                },
+            ));
         }
     }
+
+    check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
+    // Preserve the public API's pattern-major order, including DFS ordering
+    // within one pattern. The policy layer uses a stable source-order sort,
+    // so ties must retain the original rule precedence as well.
+    matches.sort_by_key(|(pattern_index, _)| *pattern_index);
+    let mut matches: Vec<_> = matches.into_iter().map(|(_, matched)| matched).collect();
 
     // A receiver pattern cannot match `from shutil import rmtree as wipe;
     // wipe(...)`. Resolve those bindings on the same parsed tree, using the
@@ -1637,6 +1694,7 @@ fn find_matches_ast(
         && code.contains("shutil")
         && code.contains("rmtree")
         && let Some(compiled) = patterns
+            .patterns
             .iter()
             .find(|pattern| pattern.meta.rule_id == "heredoc.python.shutil_rmtree")
     {
@@ -1662,6 +1720,7 @@ fn find_matches_ast(
         .visit(root, &mut HashMap::new(), None, 0)?;
     }
 
+    check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
     Ok(matches)
 }
 
@@ -2244,8 +2303,10 @@ impl PythonDeleteScan<'_> {
 ///
 /// If truncation occurs, appends "..." to indicate more content exists.
 fn truncate_preview(text: &str, max_chars: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
+    // Inspect only the preview window. A match may cover an entire multiline
+    // function or large literal; counting all its characters just to retain
+    // the first 60 repeats work for every overlapping structural match.
+    if text.chars().nth(max_chars).is_none() {
         text.to_string()
     } else {
         // Leave room for "..."
@@ -3252,10 +3313,11 @@ static PERL_RMDIR_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn precompile_perl_patterns() {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstPatternCompile);
     // Perl uses the bounded regex fallback rather than ast-grep. Compile its
-    // fixed patterns while constructing the matcher so first-use compilation
+    // fixed patterns when Perl is first requested so first-use compilation
     // cannot consume the per-match timeout and turn a valid first Perl scan
-    // into a tier-local timeout. Construction remains covered by the caller's
+    // into a tier-local timeout. Compilation remains covered by the caller's
     // absolute hook deadline.
     LazyLock::force(&PERL_SYSTEM_EXEC_LITERAL);
     LazyLock::force(&PERL_BACKTICKS_LITERAL);
@@ -5796,36 +5858,63 @@ pub(crate) fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>
 /// Global default matcher instance (lazy-initialized).
 pub static DEFAULT_MATCHER: LazyLock<AstMatcher> = LazyLock::new(AstMatcher::new);
 
-fn precompile_patterns(
+fn prepare_patterns(
     patterns: HashMap<ScriptLanguage, Vec<CompiledPattern>>,
-) -> HashMap<ScriptLanguage, Vec<PrecompiledPattern>> {
-    let mut out: HashMap<ScriptLanguage, Vec<PrecompiledPattern>> = HashMap::new();
+) -> HashMap<ScriptLanguage, LanguagePatterns> {
+    patterns
+        .into_iter()
+        .filter(|(language, source)| {
+            script_language_to_ast_lang(*language).is_some() && !source.is_empty()
+        })
+        .map(|(language, source)| {
+            (
+                language,
+                LanguagePatterns {
+                    source,
+                    compiled: OnceLock::new(),
+                },
+            )
+        })
+        .collect()
+}
 
-    for (language, patterns) in patterns {
-        let Some(ast_lang) = script_language_to_ast_lang(language) else {
+fn compile_patterns(patterns: &[CompiledPattern], ast_lang: SupportLang) -> PatternIndex {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstPatternCompile);
+    let mut index = PatternIndex {
+        patterns: Vec::with_capacity(patterns.len()),
+        by_kind: Vec::new(),
+        any_kind: Vec::new(),
+    };
+
+    for meta in patterns {
+        let built = match meta.selector.as_deref() {
+            Some(selector) => Pattern::contextual(&meta.pattern_str, selector, ast_lang),
+            None => Pattern::try_new(&meta.pattern_str, ast_lang),
+        };
+        let Ok(pattern) = built else {
+            // Preserve custom-corpus behavior: invalid patterns are skipped.
+            // The complete built-in corpus is compilation-tested below.
             continue;
         };
 
-        let mut compiled = Vec::with_capacity(patterns.len());
-        for meta in patterns {
-            let built = match meta.selector.as_deref() {
-                Some(selector) => Pattern::contextual(&meta.pattern_str, selector, ast_lang),
-                None => Pattern::try_new(&meta.pattern_str, ast_lang),
-            };
-            let Ok(pattern) = built else {
-                // Fail-open: skip invalid patterns silently (default patterns should be validated by tests).
-                continue;
-            };
-
-            compiled.push(PrecompiledPattern { pattern, meta });
+        let pattern_index = index.patterns.len();
+        if let Some(kinds) = pattern.potential_kinds() {
+            for kind in &kinds {
+                if index.by_kind.len() <= kind {
+                    index.by_kind.resize_with(kind + 1, Vec::new);
+                }
+                index.by_kind[kind].push(pattern_index);
+            }
+        } else {
+            index.any_kind.push(pattern_index);
         }
-
-        if !compiled.is_empty() {
-            out.insert(language, compiled);
-        }
+        index.patterns.push(PrecompiledPattern {
+            pattern,
+            meta: meta.clone(),
+        });
     }
 
-    out
+    index
 }
 
 // ============================================================================
@@ -7342,14 +7431,399 @@ mod tests {
         let expected: HashMap<ScriptLanguage, usize> =
             raw.iter().map(|(lang, pats)| (*lang, pats.len())).collect();
 
-        let compiled = precompile_patterns(raw);
+        let prepared = prepare_patterns(raw);
 
         for (lang, expected_len) in expected {
-            let got = compiled.get(&lang).map_or(0, std::vec::Vec::len);
+            let ast_lang = script_language_to_ast_lang(lang).expect("registered language");
+            let got = prepared
+                .get(&lang)
+                .map_or(0, |corpus| corpus.compiled(ast_lang).patterns.len());
             assert_eq!(
                 got, expected_len,
                 "all default patterns should compile for {lang:?}"
             );
+        }
+    }
+
+    /// The independent traversal used before #555, retained as a differential
+    /// oracle. It asks ast-grep to walk the whole tree separately for each
+    /// rule, so mistakes in our kind index or traversal cannot validate
+    /// themselves. The later imported-function safety pass is identical in
+    /// both paths. Compare the complete findings, including tie order.
+    fn reference_find_all_matches(
+        code: &str,
+        language: ScriptLanguage,
+        patterns: &PatternIndex,
+    ) -> Vec<PatternMatch> {
+        let ast_lang = script_language_to_ast_lang(language).expect("supported language");
+        let ast = AstGrep::new(code, ast_lang);
+        let root = ast.root();
+        let newline_positions: Vec<_> = memchr_iter(b'\n', code.as_bytes()).collect();
+        let mut matches = Vec::new();
+        for compiled in &patterns.patterns {
+            for node in root.find_all(&compiled.pattern) {
+                let text = node.text();
+                let Some(refined) = refine_match_meta(language, &compiled.meta, &text, &node)
+                else {
+                    continue;
+                };
+                let range = node.range();
+                matches.push(PatternMatch {
+                    rule_id: refined.rule_id,
+                    reason: refined.reason,
+                    matched_text_preview: truncate_preview(&text, 60),
+                    start: range.start,
+                    end: range.end,
+                    line_number: newline_positions.partition_point(|&idx| idx < range.start) + 1,
+                    severity: refined.severity,
+                    suggestion: refined.suggestion,
+                });
+            }
+        }
+        if language == ScriptLanguage::Python
+            && code.contains("shutil")
+            && code.contains("rmtree")
+            && let Some(compiled) = patterns
+                .patterns
+                .iter()
+                .find(|pattern| pattern.meta.rule_id == "heredoc.python.shutil_rmtree")
+        {
+            let seen_calls = matches
+                .iter()
+                .filter(|matched| {
+                    matched.rule_id == compiled.meta.rule_id
+                        || matched.rule_id.strip_prefix(compiled.meta.rule_id.as_str())
+                            == Some(".temp")
+                })
+                .map(|matched| (matched.start, matched.end))
+                .collect();
+            PythonDeleteScan {
+                meta: &compiled.meta,
+                newline_positions: &newline_positions,
+                matches: &mut matches,
+                seen_calls,
+                start_time: Instant::now(),
+                timeout: Duration::from_millis(AST_TIMEOUT_MS),
+                budget_ms: AST_TIMEOUT_MS,
+                cancel: &AtomicBool::new(false),
+                remaining_nodes: MAX_PYTHON_DELETE_NODES,
+            }
+            .visit(root, &mut HashMap::new(), None, 0)
+            .expect("reference imported-function safety analysis must complete");
+        }
+        matches
+    }
+
+    #[test]
+    fn indexed_matching_preserves_every_language_and_nested_finding_issue_555() {
+        let matcher = AstMatcher::new();
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                concat!(
+                    "# shutil.rmtree('/etc') stays a comment\n",
+                    "print(\"os.system('rm -rf /etc')\")\n",
+                    "def nested():\n",
+                    "    return subprocess.run(['sh', '-c', 'rm -rf /etc'])\n",
+                    "shutil.rmtree('/tmp')\n",
+                    "shutil.rmtree('/tmp/build')\n",
+                    "os.remove('/home/example/file')\n",
+                ),
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                concat!(
+                    "// fs.rmSync('/etc', {recursive: true})\n",
+                    "const text = `fs.rmSync('/etc')`;\n",
+                    "function nested() {\n",
+                    "  return require('child_process').execSync('rm -rf /etc');\n",
+                    "}\n",
+                    "fs.rmSync('/tmp', {recursive: true});\n",
+                    "fs.rmSync('/tmp/build', {recursive: true});\n",
+                ),
+            ),
+            (
+                ScriptLanguage::TypeScript,
+                concat!(
+                    "const text: string = 'rm -rf /etc';\n",
+                    "function nested(): void {\n",
+                    "  child_process.spawnSync('rm', ['-rf', '/home/example']);\n",
+                    "}\n",
+                    "fs.rmSync('/tmp', {recursive: true});\n",
+                ),
+            ),
+            (
+                ScriptLanguage::Ruby,
+                concat!(
+                    "# FileUtils.rm_rf('/etc')\n",
+                    "puts 'rm -rf /etc'\n",
+                    "def nested\n",
+                    "  system('rm -rf /etc')\n",
+                    "end\n",
+                    "FileUtils.rm_rf('/tmp')\n",
+                ),
+            ),
+            (
+                ScriptLanguage::Bash,
+                concat!(
+                    "# rm -rf /etc\n",
+                    "printf '%s' 'git reset --hard'\n",
+                    "nested() { git reset --hard HEAD; }\n",
+                    "printf '%s' \"$(rm -rf /etc)\"\n",
+                ),
+            ),
+            (
+                ScriptLanguage::Go,
+                concat!(
+                    "package main\nimport (\"os\"; \"os/exec\")\n",
+                    "func main() {\n",
+                    "  // os.RemoveAll(\"/etc\")\n",
+                    "  exec.Command(\"sh\", \"-c\", \"rm -rf /etc\").Run()\n",
+                    "  os.RemoveAll(\"/tmp\")\n",
+                    "  os.RemoveAll(\"/tmp/build\")\n",
+                    "}\n",
+                ),
+            ),
+            (
+                ScriptLanguage::Php,
+                concat!(
+                    "<?php\n// unlink('/etc/passwd');\n",
+                    "function nested() { system('rm -rf /etc'); }\n",
+                    "unlink('/home/example/file');\n",
+                    "echo `git reset --hard`;\n",
+                ),
+            ),
+        ] {
+            let ast_lang = script_language_to_ast_lang(language).unwrap();
+            let patterns = matcher.patterns[&language].compiled(ast_lang);
+            let reference = reference_find_all_matches(source, language, patterns);
+            assert!(
+                reference.iter().any(|hit| hit.severity.blocks_by_default()),
+                "{language:?} fixture must exercise a denial"
+            );
+            assert_eq!(
+                matcher.find_matches(source, language).unwrap(),
+                reference,
+                "all rule identities, ranges, severities and ordering for {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_matching_keeps_wildcards_and_ambiguous_syntax_issue_555() {
+        let language = ScriptLanguage::Python;
+        let source = "danger(danger('λ雪'))\npayload = [danger('nested'), 2]\nif (\n";
+        let custom = ["danger($$$)", "$VALUE", "payload = $VALUE"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                CompiledPattern::new(
+                    pattern.into(),
+                    format!("custom.python.pattern_{index}"),
+                    format!("Custom structural pattern {index}"),
+                    Severity::High,
+                    None,
+                )
+            })
+            .collect();
+        let matcher = AstMatcher::with_patterns(HashMap::from([(language, custom)]));
+        let patterns = matcher.patterns[&language].compiled(SupportLang::Python);
+        assert!(
+            !patterns.any_kind.is_empty(),
+            "root metavariables must exercise unrestricted node dispatch"
+        );
+        let reference = reference_find_all_matches(source, language, patterns);
+        assert!(
+            reference.len() > 3,
+            "nested and wildcard findings are present"
+        );
+        assert_eq!(matcher.find_matches(source, language).unwrap(), reference);
+    }
+
+    #[test]
+    fn indexed_matching_preserves_python_delete_binding_findings_issue_555() {
+        let matcher = AstMatcher::new();
+        let language = ScriptLanguage::Python;
+        let patterns = matcher.patterns[&language].compiled(SupportLang::Python);
+        for (source, findings, blocking) in [
+            (
+                concat!(
+                    "import shutil\nfrom shutil import rmtree as wipe\n",
+                    "shutil.rmtree('/tmp/build')\nwipe('/tmp')\n",
+                    "shutil.rmtree('/tmp')\nwipe('/tmp/build')\n",
+                ),
+                4,
+                2,
+            ),
+            (
+                concat!(
+                    "from shutil import rmtree as wipe\n",
+                    "def render(wipe):\n    wipe('/tmp')\n",
+                    "wipe('/tmp')\n",
+                ),
+                1,
+                1,
+            ),
+            (
+                "from shutil import rmtree as wipe\nwipe = print\nwipe('/tmp')\n",
+                0,
+                0,
+            ),
+            (
+                "from shutil import rmtree as wipe\nwipe('/tmp/build')\n",
+                1,
+                0,
+            ),
+        ] {
+            let reference = reference_find_all_matches(source, language, patterns);
+            assert_eq!(reference.len(), findings, "{source}");
+            assert_eq!(
+                reference
+                    .iter()
+                    .filter(|hit| hit.severity.blocks_by_default())
+                    .count(),
+                blocking,
+                "{source}",
+            );
+            assert_eq!(
+                matcher.find_matches(source, language).unwrap(),
+                reference,
+                "all direct and imported findings, metadata, and order: {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_matching_preserves_large_multiline_source_issue_555() {
+        let matcher = AstMatcher::new();
+        let language = ScriptLanguage::Python;
+        let patterns = matcher.patterns[&language].compiled(SupportLang::Python);
+        for lines in [1, 40, 300, 3_000] {
+            let mut source = "print('shutil.rmtree(\"/etc\") λ雪')\n".repeat(lines);
+            assert!(matcher.find_matches(&source, language).unwrap().is_empty());
+            source.push_str("def nested():\n    return subprocess.run(['rm', '-rf', '/etc'])\n");
+            let reference = reference_find_all_matches(&source, language, patterns);
+            assert_eq!(reference.len(), 1, "one late executable call");
+            assert!(reference[0].severity.blocks_by_default());
+            assert_eq!(reference[0].line_number, lines + 2);
+            assert_eq!(matcher.find_matches(&source, language).unwrap(), reference);
+        }
+    }
+
+    #[test]
+    fn language_compilation_is_lazy_shared_and_never_skips_nested_languages_issue_555() {
+        let matcher = AstMatcher::new();
+        assert!(
+            matcher
+                .patterns
+                .values()
+                .all(|corpus| corpus.compiled.get().is_none())
+        );
+        let python = "shutil.rmtree('/etc')";
+        assert!(
+            matcher
+                .find_matches(python, ScriptLanguage::Python)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.severity.blocks_by_default())
+        );
+        for (language, corpus) in &matcher.patterns {
+            assert_eq!(
+                corpus.compiled.get().is_some(),
+                *language == ScriptLanguage::Python,
+                "a Python body does not initialize the {language:?} grammar"
+            );
+        }
+        let corpus = &matcher.patterns[&ScriptLanguage::Python];
+        let first = Arc::clone(corpus.compiled(SupportLang::Python));
+        matcher
+            .find_matches(python, ScriptLanguage::Python)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, corpus.compiled(SupportLang::Python)));
+
+        let nested = "require('child_process').execSync('rm -rf /etc')";
+        assert!(
+            matcher
+                .find_matches(nested, ScriptLanguage::JavaScript)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.severity.blocks_by_default()),
+            "a later nested interpreter still initializes its full corpus"
+        );
+        assert!(
+            matcher.patterns[&ScriptLanguage::JavaScript]
+                .compiled
+                .get()
+                .is_some()
+        );
+    }
+
+    /// A paired measurement of the incumbent traversal and candidate in the
+    /// same invocation. It includes parsing, matching and match refinement;
+    /// constructor/worker/process costs are covered by the hook benchmarks.
+    #[test]
+    #[ignore = "paired CPU-path benchmark: run with --release --ignored --nocapture"]
+    fn paired_ast_traversal_benchmark_issue_555() {
+        let matcher = AstMatcher::new();
+        let language = ScriptLanguage::Python;
+        let patterns = matcher.patterns[&language].compiled(SupportLang::Python);
+        let cancel = AtomicBool::new(false);
+        let budget = Duration::from_secs(60);
+        for lines in [40, 300] {
+            for (shape, statement) in [
+                ("no_calls", "value = 'quoted rm -rf /etc'\n"),
+                ("calls", "print('quoted shutil.rmtree(\"/etc\")')\n"),
+                ("findings", "os.system('rm -rf /etc')\n"),
+            ] {
+                let source = statement.repeat(lines);
+                let run_reference = || {
+                    let started = Instant::now();
+                    let result = reference_find_all_matches(
+                        std::hint::black_box(&source),
+                        language,
+                        patterns,
+                    );
+                    (started.elapsed(), result)
+                };
+                let run_indexed = || {
+                    let started = Instant::now();
+                    let result = find_matches_ast(
+                        std::hint::black_box(&source),
+                        language,
+                        SupportLang::Python,
+                        patterns,
+                        started,
+                        budget,
+                        60_000,
+                        &cancel,
+                    )
+                    .unwrap();
+                    (started.elapsed(), result)
+                };
+                // Warm both implementations and lazily compiled refinements.
+                assert_eq!(run_reference().1, run_indexed().1);
+                let mut reference_times = Vec::new();
+                let mut indexed_times = Vec::new();
+                for sample in 0..100 {
+                    let (reference, indexed) = if sample % 2 == 0 {
+                        (run_reference(), run_indexed())
+                    } else {
+                        let indexed = run_indexed();
+                        (run_reference(), indexed)
+                    };
+                    assert_eq!(reference.1, indexed.1, "{shape}/{lines}/{sample}");
+                    reference_times.push(reference.0);
+                    indexed_times.push(indexed.0);
+                }
+                reference_times.sort_unstable();
+                indexed_times.sort_unstable();
+                eprintln!(
+                    "ast_traversal/{shape}/{lines}: reference_p50_us={:.1} indexed_p50_us={:.1} ratio={:.3}",
+                    reference_times[50].as_secs_f64() * 1_000_000.0,
+                    indexed_times[50].as_secs_f64() * 1_000_000.0,
+                    indexed_times[50].as_secs_f64() / reference_times[50].as_secs_f64(),
+                );
+            }
         }
     }
 
@@ -7499,7 +7973,7 @@ mod tests {
                 DEFAULT_MATCHER
                     .patterns
                     .get(language)
-                    .map_or(0, std::vec::Vec::len)
+                    .map_or(0, |corpus| corpus.source.len())
             );
         }
     }

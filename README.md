@@ -2516,44 +2516,57 @@ r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f"     // Complex but no lookahead
 
 dcg operates under strict latency constraints - every shell command passes through the hook, so even small delays compound into noticeable sluggishness. `src/perf.rs` is the source of truth for performance budgets, CI benchmark expectations, and hook-mode deadlines.
 
-For a phase breakdown of a real hook invocation, set
-`DCG_LOG=dcg_perf=debug`. Stderr reports `phase` and `elapsed_us` for request
-parsing, normalization, heredoc detection/structure/extraction, pattern
-evaluation, and history setup, redaction/enqueue, database open/insert and
-shutdown wait. These events contain no command text. Durations are inclusive
-wall time: nested events must not be added together, and storage work can
-overlap evaluation. The parse timer excludes waiting for stdin; `hook_total`
-includes configuration, input reading, evaluation and shutdown, but excludes
-process startup and CLI parsing. With diagnostics disabled, timers do not read
-the clock.
+For a structured phase breakdown of a real hook invocation, set
+`DCG_PROFILE=1`. DCG appends one `DCG_PROFILE ` JSON line to stderr, with call
+counts and inclusive/exclusive wall times for request parsing, normalization,
+heredoc detection/extraction, pattern evaluation, AST work, and history
+recording. Main-thread and worker measurements are separate; worker time can
+overlap the hook's wait and must not be added to its total. Incomplete calls
+remain visible when a deadline expires. Input waiting has its own phase, and
+the hook total excludes process startup and CLI setup. The profile contains
+no command text. The existing `DCG_LOG=dcg_perf=debug` trace also remains
+available, including database open/insert events; its durations are inclusive
+and cannot be summed across nested or overlapping events. Disabled timers do
+not read the clock. See the [issue #555 measurement guide](docs/performance-issue-555.md)
+for the schema, accounting rules, and security controls.
 
 To reproduce issue #555 against a live incumbent in the same run:
 
 ```bash
 python3 scripts/perf_baseline.py --bin target/release/dcg \
-  --compare-bin /path/to/incumbent/dcg --warmup 5 --runs 25 \
+  --compare-bin /path/to/incumbent/dcg --warmup 3 --runs 30 \
+  --history-profiles disabled,enabled,seeded,locked \
+  --history-seed-rows 247625 \
   --output /tmp/dcg-hook-comparison.json
-cargo bench --bench hook_latency -- issue_555
+cargo bench --locked --bench heredoc_perf -- issue_555
+cargo bench --locked --bench hook_latency -- issue_555
 ```
 
 The comparison alternates incumbent/candidate order, validates every timed
 verdict, retains raw samples, and pairs each full hook with a bypass process.
-It tests ordinary commands, compound shell syntax, and 1/40/300-line executable
-Python and quoted data heredocs (including destructive Python controls), with
-history disabled, enabled, and deliberately write-locked. On Unix it records
-child user+system CPU separately from wall time; instrumented probes run
-outside the timed samples. This diagnostic comparison is separate from the
-source-bound absolute latency gate and does not certify a loaded production
-database. CPU includes process startup; wall minus CPU is not solely storage
-contention. History has a background worker, but normal hook shutdown waits
-for it within the existing bounded budget. A quoted delimiter suppresses shell
-expansion; it does **not** stop `python3 -` or another interpreter executing its
-heredoc body.
+It tests 16 command shapes: ordinary and compound commands, 40/300-line
+executable Python and quoted data, commit-message substitutions, destructive
+Python at either end, nested interpreters, executable substitutions, and
+incomplete syntax. The command above selects four history profiles: disabled,
+enabled with a small database, seeded with 247,625 synthetic rows, and
+deliberately write-locked. Without `--history-profiles`, only disabled and
+enabled run. Each binary receives a separate database. On Unix the runner
+records child user+system CPU separately from wall time; instrumented probes
+run outside the timed samples. This diagnostic comparison is separate from
+the source-bound absolute latency gate, which also retains the 1/40/300-line
+scaling cases, and does not certify a loaded production database. CPU includes
+process startup; wall minus CPU is not solely storage contention. History has
+a background worker, but normal hook shutdown waits for it within the existing
+bounded budget. A quoted delimiter suppresses shell expansion; it does **not**
+stop `python3 -` or another interpreter executing its heredoc body.
 
-The #555 optimization avoids repeated stdin-provenance walks for each segment
-when their required raw pipeline/`exec`-redirect bytes are absent. Possible
-matches retain the complete readers; no heredoc body or security rule is
-skipped. An interleaved Linux comparison on 2026-10-12 (25 measured pairs per
+The earlier stdin-provenance optimization avoids repeated walks for each
+segment when their required raw pipeline/`exec`-redirect bytes are absent.
+Possible matches retain the complete readers; no heredoc body or security rule
+is skipped. Its [retained comparison evidence](perf/baselines/2026-10-12-issue-555-comparison.json)
+used an earlier 33-case interface (11 shapes across three history modes),
+before the broader AST and profiling changes described in the measurement
+guide. That interleaved Linux comparison on 2026-10-12 (25 measured pairs per
 case, 5 warmups, load average 6.3 at start, self-healing disabled) measured the
 following 300-line Python heredoc medians against the incumbent readers:
 
@@ -2563,8 +2576,8 @@ following 300-line Python heredoc medians against the incumbent readers:
 | Enabled, small database | 124.2 ms | 98.3 ms | 121.0 ms | 91.9 ms |
 | Write-locked database | 196.1 ms | 150.9 ms | 146.8 ms | 117.6 ms |
 
-All 33 comparison cases retained their expected verdicts. The 40-line case
-improved only modestly (36.1 to 34.9 ms with history off); short and compound
+All 33 cases in that earlier comparison retained their expected verdicts. The
+40-line case improved only modestly (36.1 to 34.9 ms with history off); short and compound
 commands were essentially unchanged. The bypass process floor was about
 2–3 ms. Lock contention added roughly 50 ms to the short-command hook while
 CPU stayed near 11 ms, independently demonstrating storage wait on the
