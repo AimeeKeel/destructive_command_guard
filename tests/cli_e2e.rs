@@ -778,6 +778,236 @@ fn documented_global_boolean_env_values_do_not_fail_clap_parsing() {
     }
 }
 
+// Issue #549: evaluate recursive-delete inputs only. No Python interpreter or
+// deletion command is ever executed by these regressions.
+mod python_temp_root_tests {
+    use super::*;
+
+    const TEMP_ROOTS: [&str; 4] = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
+
+    struct TestEnv {
+        root: tempfile::TempDir,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("create isolated CLI environment");
+            std::fs::create_dir_all(root.path().join("home/.config/dcg")).unwrap();
+            std::fs::create_dir_all(root.path().join("tmp")).unwrap();
+            std::fs::write(
+                root.path().join("config.toml"),
+                "[heredoc]\nenabled = true\ntimeout_ms = 5000\n\
+                 [history]\nenabled = false\n\
+                 [packs]\ndisabled = [\"windows.filesystem\", \"windows.system\"]\n",
+            )
+            .expect("write isolated policy config");
+            Self { root }
+        }
+
+        fn assert_verdict(&self, command: &str, expected: &str) {
+            let home = self.root.path().join("home");
+            let scratch = self.root.path().join("tmp");
+            let config = self.root.path().join("config.toml");
+            let mut child = Command::new(dcg_binary())
+                .args([
+                    "test",
+                    "--stdin",
+                    "--dialect",
+                    "posix",
+                    "--format",
+                    "json",
+                    "--config",
+                ])
+                .arg(&config)
+                .env_clear()
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("APPDATA", home.join("appdata"))
+                .env("LOCALAPPDATA", home.join("localappdata"))
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("TMPDIR", &scratch)
+                .env("TEMP", &scratch)
+                .env("TMP", &scratch)
+                .env("DCG_CONFIG", &config)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                // These are semantic regressions. A scheduling delay must not
+                // replace a completed verdict with the bounded fallback.
+                .env("DCG_AST_TIMEOUT_MS", "5000")
+                .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                .current_dir(self.root.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn dcg test");
+            child
+                .stdin
+                .take()
+                .expect("dcg stdin")
+                .write_all(command.as_bytes())
+                .expect("send command as inert evaluation input");
+            let output = child.wait_with_output().expect("wait for dcg test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let result: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!("invalid verdict JSON for {command:?}: {error}\n{stdout}\n{stderr}")
+                });
+            assert_eq!(
+                result["decision"], expected,
+                "unexpected verdict for {command:?}\n{stdout}\n{stderr}"
+            );
+        }
+
+        fn assert_python_target(&self, target: &str, expected: &str) {
+            let body = format!("import shutil; shutil.rmtree('{target}')");
+            self.assert_verdict(&format!("python3 -c \"{body}\""), expected);
+            self.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), expected);
+        }
+    }
+
+    #[test]
+    fn python_temp_roots_and_normalized_aliases_deny_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            for suffix in ["", "/", "//", "/.", "/./", "//.//./", "/build/.."] {
+                env.assert_python_target(&format!("{root}{suffix}"), "deny");
+            }
+        }
+        for target in [
+            "/./tmp",
+            "//tmp",
+            "/var//tmp",
+            "/private/./tmp",
+            "/private//var/./tmp",
+        ] {
+            env.assert_python_target(target, "deny");
+        }
+    }
+
+    #[test]
+    fn python_temp_traversal_and_prefix_lookalikes_deny_issue_549() {
+        let env = TestEnv::new();
+        for target in [
+            "/tmp/../etc",
+            "/tmp/build/../../etc",
+            "/var/tmp/../../etc",
+            "/private/tmp/../../etc",
+            "/private/var/tmp/../../../etc",
+            "/tmp//..//etc",
+            // Preserve the established rejection of every parent component,
+            // even when lexical normalization would land inside a temp tree.
+            "/tmp/build/../cache",
+            "/tmp/../tmp/build",
+            "/tmp-backup/build",
+            "/private/tmp-backup/build",
+            "/var/tmpfile/build",
+        ] {
+            env.assert_python_target(target, "deny");
+        }
+    }
+
+    #[test]
+    fn python_actual_temp_descendants_allow_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            for suffix in [
+                "/build",
+                "/build/",
+                "//build//",
+                "/./build/.",
+                "/build..cache",
+            ] {
+                env.assert_python_target(&format!("{root}{suffix}"), "allow");
+            }
+        }
+        for target in [
+            "/./tmp/build",
+            "/var//tmp/./build",
+            "/private/./tmp/build",
+            "/private//var/tmp/build",
+            "/tmp/.hidden",
+        ] {
+            env.assert_python_target(target, "allow");
+        }
+    }
+
+    #[test]
+    fn python_execution_forms_preserve_temp_boundary_issue_549() {
+        let env = TestEnv::new();
+        for (target, expected) in [("/tmp/.", "deny"), ("/tmp/build", "allow")] {
+            for command in [
+                format!("python -c 'import shutil; shutil.rmtree(\"{target}\")'"),
+                format!("python3 -I -c \"import shutil; shutil.rmtree('{target}')\""),
+                format!(
+                    "python3 -W ignore::DeprecationWarning -c \"import shutil; shutil.rmtree('{target}')\""
+                ),
+                format!(
+                    "python3 -c \"import shutil as sh; sh.rmtree('{target}', ignore_errors=True)\""
+                ),
+                format!("python3 -c \"import shutil; shutil.rmtree(path='{target}')\""),
+                format!("python3 -c \"import shutil; shutil.rmtree(('{target}'))\""),
+                format!("python3 <<'PY'\nimport shutil as sh\nsh.rmtree('{target}')\nPY"),
+                format!("python3 -I - <<'PY'\nimport shutil\nshutil.rmtree('{target}')\nPY"),
+            ] {
+                env.assert_verdict(&command, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn python_temp_exemption_cannot_borrow_unrelated_evidence_issue_549() {
+        let env = TestEnv::new();
+        for call in [
+            "shutil.rmtree('/tmp/build' + '/..')",
+            "shutil.rmtree('/tmp/build' + '/../../home/user/Documents')",
+            "shutil.rmtree('/tmp/build' + suffix)",
+            "shutil.rmtree('/tmp/build'[:-5])",
+            "shutil.rmtree(Path('/tmp/build').parent)",
+            "shutil.rmtree(os.path.join('/tmp/build', '../../etc'))",
+            "shutil.rmtree('/tmp/\\x2e')",
+            "shutil.rmtree(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+            "shutil.rmtree(Path(tempfile.mkdtemp()).parent)",
+            "shutil.rmtree(tempfile.mkdtemp() + '/..')",
+        ] {
+            let body = format!("import os, shutil, tempfile; from pathlib import Path; {call}");
+            env.assert_verdict(&format!("python3 -c \"{body}\""), "deny");
+            env.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "deny");
+        }
+    }
+
+    #[test]
+    fn python_fresh_temp_cleanup_and_inert_examples_remain_allowed_issue_549() {
+        let env = TestEnv::new();
+        for body in [
+            "import shutil, tempfile; shutil.rmtree(tempfile.mkdtemp())",
+            "import shutil; from tempfile import mkdtemp; shutil.rmtree(mkdtemp())",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.mkdtemp())",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.mkdtemp(prefix='build-'))",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.TemporaryDirectory().name)",
+        ] {
+            env.assert_verdict(&format!("python3 -c \"{body}\""), "allow");
+            env.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "allow");
+        }
+        env.assert_verdict(
+            "cat <<'PY'\nimport shutil\nshutil.rmtree('/tmp')\nPY",
+            "allow",
+        );
+        env.assert_verdict("python3 -c \"print('shutil.rmtree(/tmp)')\"", "allow");
+    }
+
+    #[test]
+    fn shell_temp_cleanup_policy_remains_supported_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            env.assert_verdict(&format!("rm -rf {root}"), "deny");
+            env.assert_verdict(&format!("rm -rf {root}/build"), "allow");
+        }
+    }
+}
+
 // ============================================================================
 // DCG EXPLAIN Tests
 // ============================================================================

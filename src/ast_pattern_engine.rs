@@ -1423,23 +1423,13 @@ static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     .expect("js exec sink literal regex compiles")
 });
 
-/// The first string literal handed to a Python call, used to read the target
-/// of `shutil.rmtree('…')` (#455).
-static PY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
+/// Only a veto for a structurally verified Python directory producer.
+/// The established name-based producer exception withheld its allowance when
+/// the first parenthesized plain literal was outside scratch. Keep that
+/// conservative restriction; this capture must never establish target safety.
+static PY_PRODUCER_LITERAL_VETO: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("python first string arg regex compiles")
-});
-
-/// A `tempfile` call whose result is a directory `tempfile` itself created.
-///
-/// `shutil.rmtree(tempfile.mkdtemp())` is the documented way to clean up after
-/// `mkdtemp`, and blocking it is a false positive on the single most common
-/// correct use of `rmtree` — the target is a fresh scratch directory by
-/// construction, so it is exactly what `is_temp_scratch_path` means, reached
-/// through a call rather than a literal (#455).
-static PY_TEMPFILE_PRODUCED_DIR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:tempfile\s*\.\s*)?(?:mkdtemp|TemporaryDirectory)\s*\(")
-        .expect("python tempfile-produced dir regex compiles")
+        .expect("python producer literal veto regex compiles")
 });
 
 /// The first string literal handed to a Go call, used to read the target of
@@ -1621,7 +1611,8 @@ fn find_matches_ast(
             // Create preview (truncate if too long, UTF-8 safe)
             let preview = truncate_preview(&matched_text, 60);
 
-            let Some(refined) = refine_match_meta(language, &compiled.meta, &matched_text) else {
+            let Some(refined) = refine_match_meta(language, &compiled.meta, &matched_text, &node)
+            else {
                 continue;
             };
 
@@ -1815,16 +1806,17 @@ static RUBY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
         .expect("ruby first string arg regex compiles")
 });
 
-fn refine_match_meta(
+fn refine_match_meta<D: ast_grep_core::Doc>(
     language: ScriptLanguage,
     meta: &CompiledPattern,
     matched_text: &str,
+    node: &ast_grep_core::Node<'_, D>,
 ) -> Option<RefinedMatchMeta> {
     match language {
         ScriptLanguage::JavaScript => refine_javascript_match(meta, matched_text),
         ScriptLanguage::TypeScript => refine_typescript_match(meta, matched_text),
         ScriptLanguage::Ruby => refine_ruby_match(meta, matched_text),
-        ScriptLanguage::Python => Some(refine_python_match(meta, matched_text)),
+        ScriptLanguage::Python => Some(refine_python_match(meta, matched_text, node)),
         ScriptLanguage::Go => Some(refine_go_match(meta, matched_text)),
         ScriptLanguage::Php => Some(refine_php_match(meta, matched_text)),
         _ => Some(RefinedMatchMeta {
@@ -1851,7 +1843,11 @@ fn refine_match_meta(
 /// Fail-safe: if the payload cannot be extracted as a literal (dynamic argument),
 /// we keep the original `Medium` warn-only meta rather than dropping the match, so
 /// the raw-shell rescan (when not masked) still has a chance to act.
-fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMeta {
+fn refine_python_match<D: ast_grep_core::Doc>(
+    meta: &CompiledPattern,
+    matched_text: &str,
+    node: &ast_grep_core::Node<'_, D>,
+) -> RefinedMatchMeta {
     let rule_id = meta.rule_id.as_str();
 
     // Exact ids, not a prefix test. A new exec-sink pattern that is not added
@@ -1910,23 +1906,130 @@ fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMat
     // correct use of the function. Both are the temp carve-out the other
     // languages get; nothing else about the rule changes, so a literal outside
     // /tmp and a target this cannot read both stay Critical.
-    if is_recursive_delete_rule(rule_id) {
-        let path = PY_FIRST_STRING_ARG
-            .captures(matched_text)
-            .and_then(|caps| string_literal_from_caps(&caps));
-        let targets_scratch = path.is_some_and(is_temp_scratch_path)
-            || (path.is_none() && PY_TEMPFILE_PRODUCED_DIR.is_match(matched_text));
-        if targets_scratch {
-            return RefinedMatchMeta {
-                rule_id: format!("{rule_id}.temp"),
-                reason: format!("{} (target is a temp directory)", meta.reason),
-                severity: Severity::Medium,
-                suggestion: meta.suggestion.clone(),
-            };
-        }
+    if is_recursive_delete_rule(rule_id) && python_delete_targets_scratch(node) {
+        return RefinedMatchMeta {
+            rule_id: format!("{rule_id}.temp"),
+            reason: format!("{} (target is a temp directory)", meta.reason),
+            severity: Severity::Medium,
+            suggestion: meta.suggestion.clone(),
+        };
     }
 
     unchanged()
+}
+
+/// Grant #455's exception only from the actual deletion target (#549).
+/// A literal nested in an arbitrary call, a sliced/concatenated path prefix,
+/// or a `mkdtemp()` in another argument does not establish that target.
+fn python_delete_targets_scratch<D: ast_grep_core::Doc>(call: &ast_grep_core::Node<'_, D>) -> bool {
+    let Some(arguments) = call.field("arguments") else {
+        return false;
+    };
+    let mut target = None;
+    let mut seen_positional = false;
+    for (index, argument) in arguments
+        .children()
+        .filter(|child| child.is_named() && child.kind() != "comment")
+        .enumerate()
+    {
+        if index >= MAX_EXEC_ARGV_OPERANDS || argument.is_error() || argument.is_missing() {
+            return false;
+        }
+        match argument.kind().as_ref() {
+            "list_splat" | "dictionary_splat" => return false,
+            "keyword_argument" => {
+                if argument
+                    .field("name")
+                    .is_some_and(|name| name.text() == "path")
+                {
+                    if target.is_some() {
+                        return false;
+                    }
+                    target = argument.field("value");
+                }
+            }
+            _ if !seen_positional => {
+                if target.is_some() {
+                    return false;
+                }
+                seen_positional = true;
+                target = Some(argument);
+            }
+            _ => {}
+        }
+    }
+    let Some(mut target) = target else {
+        return false;
+    };
+    // A transparent grouping is still the same target; tuples are not.
+    for _ in 0..MAX_EXEC_ARGV_DEPTH {
+        if target.kind() != "parenthesized_expression" {
+            let text = target.text();
+            return is_temp_scratch_path(&concatenated_operand(&text, ScriptLanguage::Python, 0))
+                || python_tempfile_directory(&target);
+        }
+        target = {
+            let mut children = target
+                .children()
+                .filter(|child| child.is_named() && child.kind() != "comment");
+            let Some(inner) = children.next() else {
+                return false;
+            };
+            if children.next().is_some() {
+                return false;
+            }
+            inner
+        };
+    }
+    false
+}
+
+/// Preserve cleanup of a freshly produced directory without treating any
+/// expression containing a producer as that directory. In particular,
+/// `Path(tempfile.mkdtemp()).parent` targets its parent, not the created child.
+fn python_tempfile_directory<D: ast_grep_core::Doc>(target: &ast_grep_core::Node<'_, D>) -> bool {
+    let (call, takes_name) = if target.kind() == "attribute"
+        && target
+            .field("attribute")
+            .is_some_and(|name| name.text() == "name")
+    {
+        let Some(object) = target.field("object") else {
+            return false;
+        };
+        (object, true)
+    } else {
+        (target.clone(), false)
+    };
+    if call.kind() != "call" {
+        return false;
+    }
+    let Some(function) = call.field("function") else {
+        return false;
+    };
+    let name = if function.kind() == "identifier" {
+        function.text()
+    } else if function.kind() == "attribute"
+        && function
+            .field("object")
+            .is_some_and(|object| object.kind() == "identifier")
+    {
+        // Preserve ordinary module aliases under the existing name-based
+        // producer policy, while the complete target shape stays mandatory.
+        let Some(attribute) = function.field("attribute") else {
+            return false;
+        };
+        attribute.text()
+    } else {
+        return false;
+    };
+    if name != "TemporaryDirectory" && (takes_name || name != "mkdtemp") {
+        return false;
+    }
+    let text = target.text();
+    PY_PRODUCER_LITERAL_VETO
+        .captures(&text)
+        .and_then(|caps| string_literal_from_caps(&caps))
+        .is_none_or(is_temp_scratch_path)
 }
 
 /// Give Go's recursive delete the same temp carve-out every other language has.
@@ -4193,17 +4296,33 @@ fn is_catastrophic_path(path: &str) -> bool {
 /// allowed too, or the policy depends on which language the agent picked
 /// (#455).
 ///
-/// Traversal disqualifies a path here for the same reason it does there:
-/// `/tmp/../etc` names `/etc`, not a scratch directory.
+/// A temp root itself is never scratch owned by the caller (#549). Ignore
+/// redundant separators and `.` components before requiring a real descendant.
+/// Reject `..` before that normalization: resolving it could escape the root,
+/// including through a symlink, and shell's exemption refuses it too.
 fn is_temp_scratch_path(path: &str) -> bool {
-    let candidate = path.strip_prefix("/private").unwrap_or(path);
     // Only a literal path is a temp target. An expansion anywhere can climb
     // out (`/tmp/$name` with `name=../home/user`), which is why the shell
     // rules deny `rm -rf /tmp/$x`; `concatenated_operand` marks a literal
     // joined to a runtime value the same way (#485).
-    (has_path_prefix(candidate, "/tmp") || has_path_prefix(candidate, "/var/tmp"))
-        && !contains_path_traversal(candidate)
-        && !candidate.contains(['$', '`'])
+    if !path.starts_with('/') || contains_path_traversal(path) || path.contains(['$', '`']) {
+        return false;
+    }
+
+    // Parse Unix command-path data explicitly, independent of the host OS.
+    let mut components = path
+        .split('/')
+        .filter(|component| !matches!(*component, "" | "."));
+    let root = match components.next() {
+        Some("private") => components.next(),
+        component => component,
+    };
+    match root {
+        Some("tmp") => {}
+        Some("var") if components.next() == Some("tmp") => {}
+        _ => return false,
+    }
+    components.next().is_some()
 }
 
 /// Go's exec-sink rule ids, the set `refine_go_match` escalates (#472).
@@ -5322,6 +5441,169 @@ mod tests {
                 matches.iter().any(|m| m.severity.blocks_by_default()),
                 "must still block: {code:?}"
             );
+        }
+    }
+
+    /// #549: only a real child of an approved temp root gets the exemption.
+    /// These are verdict checks on source text; none of the paths is accessed.
+    #[test]
+    fn python_temp_cleanup_requires_a_descendant_issue_549() {
+        let ast_matcher = AstMatcher::new();
+        for root in ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"] {
+            for (suffix, blocks) in [
+                ("", true),
+                ("/", true),
+                ("//", true),
+                ("/.", true),
+                ("/./", true),
+                ("//.//./", true),
+                ("/build/..", true),
+                ("/build/../.", true),
+                ("/build/../cache", true),
+                ("/x/../../home/user/Documents", true),
+                ("/../../etc", true),
+                ("/build", false),
+                ("/build/", false),
+                ("/./build", false),
+                ("//build//./cache/", false),
+                ("/.cache", false),
+                ("/build..old", false),
+                ("/...", false),
+            ] {
+                for receiver in ["shutil", "sh"] {
+                    let code =
+                        format!("import shutil as {receiver}\n{receiver}.rmtree('{root}{suffix}')");
+                    let matches = ast_matcher
+                        .find_matches(&code, ScriptLanguage::Python)
+                        .unwrap();
+                    assert_eq!(
+                        matches.iter().any(|m| m.severity.blocks_by_default()),
+                        blocks,
+                        "wrong deletion verdict: {code:?}"
+                    );
+                }
+            }
+        }
+
+        for (path, blocks) in [
+            ("//tmp//.", true),
+            ("/./private//var/./tmp/", true),
+            ("/tmp-other/build", true),
+            ("/private/tmp-other/build", true),
+            ("/privatevar/tmp/build", true),
+            ("tmp/build", true),
+            ("/home/user/Documents", true),
+            ("//tmp//build", false),
+            ("/./private//var/./tmp/build", false),
+        ] {
+            let code = format!("import shutil\nshutil.rmtree('{path}')");
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Python)
+                .unwrap();
+            assert_eq!(
+                matches.iter().any(|m| m.severity.blocks_by_default()),
+                blocks,
+                "wrong deletion verdict: {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_temp_exemption_uses_the_complete_target_issue_549() {
+        let ast_matcher = AstMatcher::new();
+        for call in [
+            "shutil.rmtree(path='/tmp')",
+            "shutil.rmtree(('/tmp/.'))",
+            "shutil.rmtree('/tmp/build' + '/..')",
+            "shutil.rmtree('/tmp/build' + '/../../home/user/Documents')",
+            "shutil.rmtree('/tmp/build' + suffix)",
+            "shutil.rmtree('/tmp/build'[:-5])",
+            "shutil.rmtree(Path('/tmp/build').parent)",
+            "shutil.rmtree(os.path.join('/tmp/build', '../../etc'))",
+            "shutil.rmtree('/tmp/\\x2e')",
+            "shutil.rmtree(tempfile.gettempdir())",
+            "shutil.rmtree(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+            "shutil.rmtree(tempfile.gettempdir(), onerror=lambda *args: Path('/tmp/build'))",
+            "shutil.rmtree(Path(tempfile.mkdtemp()).parent)",
+            "shutil.rmtree(tempfile.mkdtemp() + '/..')",
+            "shutil.rmtree(tempfile.TemporaryDirectory().name + '/..')",
+            "shutil.rmtree(*targets, path='/tmp/build')",
+            "shutil.rmtree('/tmp/build', **options)",
+            "shutil.rmtree(other.mkdtemp('/srv'))",
+            "shutil.rmtree(Path(tf.mkdtemp()).parent)",
+        ] {
+            let code = format!("import os, shutil, tempfile\nfrom pathlib import Path\n{call}");
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                matches.iter().any(|m| m.severity.blocks_by_default()),
+                "an unproven or root-equivalent target must block: {call:?}"
+            );
+        }
+
+        for call in [
+            "shutil.rmtree(path='/tmp/build')",
+            "shutil.rmtree(('/tmp/build'))",
+            "shutil.rmtree('/tmp/' + 'build')",
+            "shutil.rmtree('/tmp/build', ignore_errors=True)",
+            "shutil.rmtree(ignore_errors=True, path='/tmp/build')",
+            "shutil.rmtree(tempfile.mkdtemp())",
+            "shutil.rmtree(mkdtemp())",
+            "shutil.rmtree(tempfile.TemporaryDirectory().name)",
+            "shutil.rmtree(tf.mkdtemp())",
+            "shutil.rmtree(tf.mkdtemp(prefix='build-'))",
+            "shutil.rmtree(tf.TemporaryDirectory().name)",
+        ] {
+            let code = format!(
+                "import shutil, tempfile\nimport tempfile as tf\nfrom tempfile import mkdtemp\n{call}"
+            );
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                !matches.iter().any(|m| m.severity.blocks_by_default()),
+                "ordinary temporary cleanup must remain allowed: {call:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_deletes_share_the_temp_root_boundary_issue_549() {
+        let ast_matcher = AstMatcher::new();
+        for root in ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"] {
+            for (suffix, blocks) in [("", true), ("/.", true), ("/build", false)] {
+                let path = format!("{root}{suffix}");
+                for (language, code) in [
+                    (
+                        ScriptLanguage::Go,
+                        format!(
+                            "package main\nimport \"os\"\nfunc main() {{ os.RemoveAll(\"{path}\") }}"
+                        ),
+                    ),
+                    (
+                        ScriptLanguage::Ruby,
+                        format!("require 'fileutils'\nFileUtils.rm_rf('{path}')"),
+                    ),
+                    (
+                        ScriptLanguage::JavaScript,
+                        format!(
+                            "const fs = require('fs'); fs.rmSync('{path}', {{recursive: true}})"
+                        ),
+                    ),
+                    (
+                        ScriptLanguage::Perl,
+                        format!("use File::Path qw(remove_tree); remove_tree('{path}');"),
+                    ),
+                ] {
+                    let matches = ast_matcher.find_matches(&code, language).unwrap();
+                    assert_eq!(
+                        matches.iter().any(|m| m.severity.blocks_by_default()),
+                        blocks,
+                        "wrong {language:?} temporary cleanup verdict: {code:?}"
+                    );
+                }
+            }
         }
     }
 
