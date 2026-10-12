@@ -982,8 +982,17 @@ pub(crate) fn rm_segment_receives_automated_stdin(
         return false;
     }
 
-    posix_pipeline_group_is_active(command, segment_start)
-        || prior_posix_exec_redirects_stdin(command, segment_start)
+    // Both readers walk the source before this segment. Calling them for
+    // every line of a large interpreter heredoc repeatedly tokenized the
+    // entire input even when it contained no pipeline or `exec` at all (#555).
+    // These are necessary raw bytes of the existing grammars, not evidence
+    // that a command is safe: possible matches still get the complete walk.
+    // In particular, quotes, comments and heredoc bodies are NOT stripped
+    // before these conservative candidate checks.
+    (prefix.contains('|') && posix_pipeline_group_is_active(command, segment_start))
+        || (prefix.contains('<')
+            && prefix.contains("exec")
+            && prior_posix_exec_redirects_stdin(command, segment_start))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9290,6 +9299,56 @@ mod tests {
             "busybox nice rm -r ./tree",
         ] {
             assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn automated_stdin_candidates_preserve_full_reader_results() {
+        let large = format!(
+            "python3 - <<'EOF'\n{}EOF\nrm -ri ./tree",
+            "print('ordinary data')\n".repeat(300)
+        );
+        let cases = [
+            large.as_str(),
+            "yes | { echo x; rm -ri ./tree; }",
+            "yes | (echo x; rm -ri ./tree)",
+            "yes | if true; then rm -ri ./tree; fi",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "exec 0<answers.txt; rm -ri ./tree",
+            "'exec' <answers.txt; rm -ri ./tree",
+            "exec <<<yes; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "(exec <answers.txt; true); rm -ri ./tree",
+            "printf '| exec <'\nrm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "echo café && rm -ri ./tree",
+        ];
+        // Compare to the incumbent readers at every extracted segment,
+        // including heredoc lines and nested segments. This catches a
+        // candidate gate hiding a shape those readers already recognized.
+        for command in cases {
+            for segment in crate::packs::split_command_segments(command) {
+                let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                let prefix = command[..start].trim_end();
+                let direct =
+                    prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||"));
+                for dialect in [
+                    ShellDialect::Posix,
+                    ShellDialect::Unknown,
+                    ShellDialect::Cmd,
+                    ShellDialect::PowerShell,
+                ] {
+                    let incumbent = direct
+                        || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+                            && (posix_pipeline_group_is_active(command, start)
+                                || prior_posix_exec_redirects_stdin(command, start)));
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, start, dialect),
+                        incumbent,
+                        "{dialect:?} at {start}: {command}"
+                    );
+                }
+            }
         }
     }
 

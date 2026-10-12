@@ -2550,6 +2550,29 @@ for it within the existing bounded budget. A quoted delimiter suppresses shell
 expansion; it does **not** stop `python3 -` or another interpreter executing its
 heredoc body.
 
+The #555 optimization avoids repeated stdin-provenance walks for each segment
+when their required raw pipeline/`exec`-redirect bytes are absent. Possible
+matches retain the complete readers; no heredoc body or security rule is
+skipped. An interleaved Linux comparison on 2026-10-12 (25 measured pairs per
+case, 5 warmups, load average 6.3 at start, self-healing disabled) measured the
+following 300-line Python heredoc medians against the incumbent readers:
+
+| History mode | Incumbent wall | Candidate wall | Incumbent CPU | Candidate CPU |
+|---|---:|---:|---:|---:|
+| Disabled | 106.9 ms | 78.0 ms | 103.6 ms | 76.9 ms |
+| Enabled, small database | 124.2 ms | 98.3 ms | 121.0 ms | 91.9 ms |
+| Write-locked database | 196.1 ms | 150.9 ms | 146.8 ms | 117.6 ms |
+
+All 33 comparison cases retained their expected verdicts. The 40-line case
+improved only modestly (36.1 to 34.9 ms with history off); short and compound
+commands were essentially unchanged. The bypass process floor was about
+2–3 ms. Lock contention added roughly 50 ms to the short-command hook while
+CPU stayed near 11 ms, independently demonstrating storage wait on the
+normal shutdown path. These are diagnostic measurements on a changing host,
+not universal latencies or a reproduction of the reporter's 275 MB database.
+The initial run under concurrent compiler memory pressure was rejected on an
+unexpected `ask`, never counted as a successful fast allow.
+
 **Latency Tiers**:
 
 | Tier | Path | Target | Warning Above | Panic Above |
