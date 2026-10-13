@@ -312,6 +312,21 @@ fn stale_binding_refusal_keeps_native_allowlist_families_independent() {
 }
 
 #[test]
+fn failed_redirections_cannot_make_stale_dangerous_bindings_look_safe() {
+    for mutation in [
+        "S=/tmp/safe >/definitely/missing/parent/file",
+        "export S=/tmp/safe >/definitely/missing/parent/file",
+        "IFS=: >/definitely/missing/parent/file",
+        "export IFS=: >/definitely/missing/parent/file",
+    ] {
+        let source = format!(
+            "S=/tmp/a@/etc/profile; IFS=@; {mutation}; tee $S"
+        );
+        assert_decision(&source, false, Some("core.filesystem:credential-file-write"));
+    }
+}
+
+#[test]
 fn printf_count_assignments_cannot_hide_native_writer_destinations() {
     for printing in [
         "printf 'abcde%n' SEP",
