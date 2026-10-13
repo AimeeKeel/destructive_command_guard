@@ -1,0 +1,926 @@
+//! IFS-sensitive writer arguments must reach the native destination policy.
+//!
+//! This is an additional, bounded view of argv, not executable shell source.
+//! It never executes a command, opens a path, or exempts the original source.
+
+use super::{CredentialFileWrite, shell};
+use crate::normalize::{NormalizeTokenKind, ShellDialect, strip_wrapper_prefixes};
+use ast_grep_core::AstGrep;
+use ast_grep_language::SupportLang;
+use std::collections::HashMap;
+use std::ops::Range;
+
+#[cfg(test)]
+const DEFAULT_IFS: &str = " \t\n";
+const MAX_BYTES: usize = 64 * 1024;
+const MAX_VALUE_BYTES: usize = 16 * 1024;
+const MAX_FIELDS: usize = 128;
+const MAX_EVENTS: usize = 256;
+const MAX_BINDINGS: usize = 64;
+const UNCERTAIN: &str = "Cannot verify writer destinations after an IFS change: an expansion, shell mutation, or analysis limit prevents bounded literal arguments. Quote scalar destinations or provide explicit arguments for review.";
+
+#[derive(Default)]
+struct State {
+    values: HashMap<String, String>,
+    ifs: Option<String>,
+    changed: bool,
+    attributes_unknown: bool,
+}
+
+impl State {
+    fn forget(&mut self) {
+        self.values.clear();
+        self.ifs = None;
+        self.changed = true;
+    }
+
+    fn value(&self, name: &str) -> Option<&str> {
+        if name == "IFS" {
+            self.ifs.as_deref()
+        } else {
+            self.values.get(name).map(String::as_str)
+        }
+    }
+
+    fn assign(&mut self, raw: &str, certain: bool) {
+        let Some((name, append, rhs)) = assignment(raw) else {
+            self.forget();
+            return;
+        };
+        let mut value = literal(rhs).or_else(|| {
+            scalar(rhs).and_then(|(dependency, _)| self.value(dependency).map(str::to_owned))
+        });
+        if value.is_none() && scalar(rhs).is_none() {
+            // Complex expansions can assign other variables while evaluating
+            // an otherwise ordinary assignment, e.g. A=${IFS:=@}.
+            self.forget();
+        }
+        if append {
+            value = self
+                .value(name)
+                .zip(value.as_deref())
+                .and_then(|(before, after)| {
+                    (before.len().saturating_add(after.len()) <= MAX_VALUE_BYTES)
+                        .then(|| format!("{before}{after}"))
+                });
+        }
+        if !certain
+            || self.attributes_unknown
+            || maintained_variable(name)
+            || value
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_VALUE_BYTES || value.contains('\0'))
+        {
+            value = None;
+        }
+        if name == "IFS" {
+            self.ifs = value;
+            self.changed = true;
+        } else if let Some(value) = value {
+            if self.values.len() >= MAX_BINDINGS && !self.values.contains_key(name) {
+                self.values.clear();
+            }
+            self.values.insert(name.to_owned(), value);
+        } else {
+            self.values.remove(name);
+        }
+    }
+}
+
+fn maintained_variable(name: &str) -> bool {
+    name.starts_with("BASH_")
+        || matches!(
+            name,
+            "RANDOM"
+                | "SRANDOM"
+                | "SECONDS"
+                | "LINENO"
+                | "EPOCHSECONDS"
+                | "EPOCHREALTIME"
+                | "PIPESTATUS"
+                | "FUNCNAME"
+                | "DIRSTACK"
+                | "GROUPS"
+                | "PWD"
+                | "OLDPWD"
+                | "_"
+        )
+}
+
+fn identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
+        })
+}
+
+fn assignment(raw: &str) -> Option<(&str, bool, &str)> {
+    let (left, rhs) = raw.split_once('=')?;
+    let name = left.strip_suffix('+').unwrap_or(left);
+    identifier(name).then_some((name, left != name, rhs))
+}
+
+/// A complete scalar expansion only; mixed words, arrays, parameter operators
+/// and substitutions need an expansion/provenance model, not text replacement.
+fn scalar(raw: &str) -> Option<(&str, bool)> {
+    let (raw, quoted) = match raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(inner) => (inner, true),
+        None => (raw, false),
+    };
+    let name = raw
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+        .or_else(|| raw.strip_prefix('$'))?;
+    identifier(name).then_some((name, quoted))
+}
+
+/// Quote removal for static scalar assignments. Runtime expansions, tilde
+/// expansion, locale/ANSI-C quotes and array initializers forfeit the proof.
+/// This deliberately does not ask the host environment what a value means.
+fn literal(raw: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut quote = None;
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => result.push(ch),
+            (None, '\'' | '"') => quote = Some(ch),
+            (_, '\\') => {
+                let next = chars.next()?;
+                if next == '\n' {
+                    continue;
+                }
+                if quote == Some('"') && !matches!(next, '$' | '`' | '"' | '\\') {
+                    result.push('\\');
+                }
+                result.push(next);
+            }
+            (_, '$' | '`') | (None, '~' | '(' | ')') => return None,
+            _ => result.push(ch),
+        }
+    }
+    quote.is_none().then_some(result)
+}
+
+/// Only characters from unquoted expansions undergo IFS splitting. Quotes
+/// present in the variable's value are ordinary characters, not shell syntax.
+fn unquoted_expansion(raw: &str) -> bool {
+    let mut quote = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {}
+            (None, '\'' | '"') => quote = Some(ch),
+            (_, '\\') => {
+                if quote.is_none()
+                    || chars
+                        .peek()
+                        .is_some_and(|next| matches!(*next, '$' | '`' | '"' | '\\' | '\n'))
+                {
+                    chars.next();
+                }
+            }
+            (None, '$') if chars.peek() == Some(&'\'') => {
+                chars.next();
+                while let Some(ch) = chars.next() {
+                    if ch == '\\' {
+                        chars.next();
+                    } else if ch == '\'' {
+                        break;
+                    }
+                }
+            }
+            (None, '$' | '`') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// POSIX distinguishes IFS whitespace from other separators. Empty fields
+/// before/interior to non-whitespace separators survive; a final separator
+/// terminates the preceding field rather than inventing a final argument.
+fn fields<'a>(value: &'a str, ifs: &str) -> Result<Vec<&'a str>, ()> {
+    if value.len() > MAX_VALUE_BYTES
+        || ifs.len() > MAX_VALUE_BYTES
+        || !ifs.is_ascii()
+        || value.contains('\0')
+        || ifs.contains('\0')
+    {
+        return Err(());
+    }
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let separator = |byte: u8| ifs.as_bytes().contains(&byte);
+    let whitespace = |byte: u8| matches!(byte, b' ' | b'\t' | b'\n') && separator(byte);
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && whitespace(bytes[start]) {
+        start += 1;
+    }
+    while end > start && whitespace(bytes[end - 1]) {
+        end -= 1;
+    }
+    let mut result = Vec::new();
+    while start < end {
+        let mut cursor = start;
+        while cursor < end && !separator(bytes[cursor]) {
+            cursor += 1;
+        }
+        let field = &value[start..cursor];
+        // Pathname expansion happens after splitting, so a glob character
+        // consumed as an IFS separator is not a glob in any resulting field.
+        if field.contains(['*', '?', '[', '(']) || result.len() >= MAX_FIELDS {
+            return Err(());
+        }
+        result.push(field);
+        if cursor == end {
+            break;
+        }
+        if whitespace(bytes[cursor]) {
+            while cursor < end && whitespace(bytes[cursor]) {
+                cursor += 1;
+            }
+            if cursor < end && separator(bytes[cursor]) {
+                cursor += 1;
+            }
+        } else {
+            cursor += 1;
+        }
+        while cursor < end && whitespace(bytes[cursor]) {
+            cursor += 1;
+        }
+        start = cursor;
+    }
+    Ok(result)
+}
+
+fn expand(raw: &str, state: &State) -> Result<Vec<String>, ()> {
+    if let Some((name, quoted)) = scalar(raw) {
+        let value = state.value(name).ok_or(())?;
+        if quoted {
+            return Ok(vec![value.to_owned()]);
+        }
+        return fields(value, state.ifs.as_deref().ok_or(())?)
+            .map(|fields| fields.into_iter().map(str::to_owned).collect());
+    }
+    let value = literal(raw).ok_or(())?;
+    // A bare glob is not a literal argument, even without parameter expansion.
+    // Leave ordinary literal commands to the existing shell classifier; an
+    // argv reconstruction may not falsely quote away their expansion.
+    if live_pattern(raw) {
+        return Err(());
+    }
+    Ok(vec![value])
+}
+
+/// Mixed quoting does not neutralize a pattern in the unquoted portion:
+/// `"/tmp/"*` is still a glob. Check provenance, not equality after decoding.
+fn live_pattern(raw: &str) -> bool {
+    let mut quote = None;
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {}
+            (None, '\'' | '"') => quote = Some(ch),
+            (_, '\\') => {
+                chars.next();
+            }
+            (None, '*' | '?' | '[' | '{' | '(') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn uncertain(span: Range<usize>) -> Vec<CredentialFileWrite> {
+    // Unknown destinations may name either protected family. A grant for
+    // credentials must not silently grant an unverified .git destination.
+    [
+        shell::CREDENTIAL_FILE_WRITE_NAME,
+        shell::GIT_INTERNALS_WRITE_NAME,
+    ]
+    .into_iter()
+    .map(|rule| CredentialFileWrite {
+        span: span.clone(),
+        reason: UNCERTAIN.to_owned(),
+        rule,
+    })
+    .collect()
+}
+
+fn render(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| shell_words::quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWrite>, ()> {
+    let Some(name) = argv.first() else {
+        return Ok(Vec::new());
+    };
+    let basename = name.rsplit('/').next().unwrap_or(name);
+    let mut hits = Vec::new();
+    if matches!(basename, "tee" | "gtee") {
+        let mut append = false;
+        let mut options = true;
+        let mut destinations = Vec::new();
+        for word in &argv[1..] {
+            if options && word == "--" {
+                options = false;
+                continue;
+            }
+            if options && matches!(word.as_str(), "--help" | "--version") {
+                return Ok(hits);
+            }
+            if options && word.starts_with('-') && word != "-" {
+                if word == "--append" {
+                    append = true;
+                } else if word == "--ignore-interrupts"
+                    || word == "--output-error"
+                    || word.starts_with("--output-error=")
+                {
+                    // These flags do not change destinations or append mode.
+                } else if word[1..].chars().all(|ch| matches!(ch, 'a' | 'i' | 'p')) {
+                    append |= word.contains('a');
+                } else {
+                    return Err(());
+                }
+            } else {
+                destinations.push(word);
+            }
+        }
+        // Ask the same native path policy once for EACH tee destination. This
+        // also keeps credential and Git rules independent under allowlisting.
+        for path in destinations {
+            let invocation = format!(
+                "tee {}-- {}",
+                if append { "-a " } else { "" },
+                shell_words::quote(path)
+            );
+            if let Some(mut hit) =
+                shell::classify_credential_file_write(&invocation, ShellDialect::Posix)
+            {
+                hit.span = span.clone();
+                hits.push(hit);
+            }
+        }
+    } else if let Some(mut hit) =
+        shell::classify_credential_file_write(&render(argv), ShellDialect::Posix)
+    {
+        hit.span = span;
+        hits.push(hit);
+    }
+    Ok(hits)
+}
+
+fn mutates_shell(name: &str) -> bool {
+    matches!(
+        name,
+        "read"
+            | "mapfile"
+            | "readarray"
+            | "eval"
+            | "."
+            | "source"
+            | "let"
+            | "declare"
+            | "typeset"
+            | "local"
+            | "readonly"
+            | "unset"
+            | "getopts"
+            | "trap"
+            | "alias"
+            | "unalias"
+            | "set"
+            | "shopt"
+            | "enable"
+            | "builtin"
+            | "command"
+    )
+}
+
+fn special_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        ":"
+            | "."
+            | "break"
+            | "continue"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "readonly"
+            | "return"
+            | "set"
+            | "shift"
+            | "times"
+            | "trap"
+            | "unset"
+    )
+}
+
+/// Scan the original source, before segmentation discards earlier bindings.
+/// Unsupported control flow removes facts instead of preserving stale paths.
+pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) || !candidate(command) {
+        return Vec::new();
+    }
+    if command.len() > MAX_BYTES {
+        return uncertain(0..command.len());
+    }
+    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+        return uncertain(0..command.len());
+    };
+    if ast.root().get_inner_node().has_error() {
+        return uncertain(0..command.len());
+    }
+    let mut pending = vec![ast.root()];
+    let mut events = Vec::new();
+    let mut visited = 0;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > MAX_EVENTS * 64 {
+            return uncertain(0..command.len());
+        }
+        let kind = node.kind();
+        let owned = kind == "variable_assignment"
+            && node.parent().is_some_and(|parent| {
+                matches!(parent.kind().as_ref(), "command" | "declaration_command")
+            });
+        let effect = matches!(
+            kind.as_ref(),
+            "command"
+                | "variable_assignment"
+                | "declaration_command"
+                | "unset_command"
+                | "arithmetic_expansion"
+                | "test_command"
+                | "for_statement"
+                | "c_style_for_statement"
+                | "if_statement"
+                | "case_statement"
+                | "while_statement"
+                | "function_definition"
+                | "compound_statement"
+                | "subshell"
+        );
+        if !owned && effect || kind == "expansion" && scalar(node.text().as_ref()).is_none() {
+            events.push(node.clone());
+            if events.len() > MAX_EVENTS {
+                return uncertain(0..command.len());
+            }
+        }
+        pending.extend(node.children());
+    }
+    events.sort_by_key(|node| node.range().start);
+    // Do not import the guard process's IFS, or assume a persistent caller
+    // has its default value. An explicit assignment can establish the value;
+    // appending to an unknown IFS must remain unknown (it may contain other
+    // delimiters). This also preserves caller-side expansion of prefixes.
+    let mut state = State::default();
+    let mut hits = Vec::new();
+    for node in events {
+        let raw = node.text();
+        let span = node.range();
+        let mut ancestor = node.parent();
+        let mut certain = true;
+        let mut straight_line = true;
+        while let Some(parent) = ancestor {
+            match parent.kind().as_ref() {
+                "program" | "redirected_statement" | "variable_assignments" => {}
+                "pipeline" => certain = false,
+                _ => {
+                    certain = false;
+                    straight_line = false;
+                }
+            }
+            ancestor = parent.parent();
+        }
+        let following = command[span.end..].trim_start();
+        certain &= !following.starts_with('&') || following.starts_with("&&");
+        match node.kind().as_ref() {
+            "variable_assignment" => state.assign(raw.as_ref(), certain),
+            "declaration_command" => {
+                let tokens =
+                    crate::normalize::tokenize_for_shell_dialect(raw.as_ref(), ShellDialect::Posix);
+                let words: Vec<_> = tokens
+                    .iter()
+                    .filter(|token| token.kind == NormalizeTokenKind::Word)
+                    .filter_map(|token| token.text(raw.as_ref()))
+                    .collect();
+                // Export RHSs use the caller's environment, not values of
+                // earlier arguments of the same declaration builtin.
+                if words.first() == Some(&"export")
+                    && words.iter().skip(1).all(|word| {
+                        identifier(word)
+                            || assignment(word).is_some_and(|(_, _, rhs)| literal(rhs).is_some())
+                    })
+                {
+                    for word in words
+                        .into_iter()
+                        .skip(1)
+                        .filter(|word| assignment(word).is_some())
+                    {
+                        state.assign(word, certain);
+                    }
+                } else {
+                    state.forget();
+                    state.attributes_unknown = true;
+                }
+            }
+            "command" => {
+                if !straight_line {
+                    state.forget();
+                }
+                let prefixes: Vec<_> = node
+                    .children()
+                    .filter(|child| child.kind() == "variable_assignment")
+                    .map(|child| child.text().into_owned())
+                    .collect();
+                let prefix_ifs = prefixes
+                    .iter()
+                    .any(|prefix| assignment(prefix).is_some_and(|(name, _, _)| name == "IFS"));
+                let words: Vec<_> = node
+                    .children()
+                    .filter(|child| {
+                        child.is_named()
+                            && !matches!(
+                                child.kind().as_ref(),
+                                "variable_assignment"
+                                    | "file_redirect"
+                                    | "heredoc_redirect"
+                                    | "herestring_redirect"
+                                    | "comment"
+                            )
+                    })
+                    .map(|child| child.text().into_owned())
+                    .collect();
+                let original_name = words.first().and_then(|word| literal(word));
+                if prefixes.iter().any(|prefix| {
+                    assignment(prefix)
+                        .is_none_or(|(_, _, rhs)| literal(rhs).is_none() && scalar(rhs).is_none())
+                }) || words.iter().any(|word| {
+                    literal(word).is_none() && scalar(word).is_none() && word.contains(['$', '`'])
+                }) {
+                    state.forget();
+                }
+                let joined = words.join(" ");
+                let stripped = strip_wrapper_prefixes(&joined);
+                let tokens = crate::normalize::tokenize_for_shell_dialect(
+                    stripped.normalized.as_ref(),
+                    ShellDialect::Posix,
+                );
+                let arguments: Vec<_> = tokens
+                    .iter()
+                    .filter(|token| token.kind == NormalizeTokenKind::Word)
+                    .filter_map(|token| token.text(stripped.normalized.as_ref()))
+                    .collect();
+                let name = arguments
+                    .first()
+                    .and_then(|raw| expand(raw, &state).ok())
+                    .and_then(|argv| argv.into_iter().next());
+                let writer = name
+                    .as_deref()
+                    .map(|name| name.rsplit('/').next().unwrap_or(name))
+                    .is_none_or(shell::is_credential_writer);
+                let active = state.changed
+                    || prefix_ifs
+                    || words
+                        .iter()
+                        .any(|word| assignment(word).is_some_and(|(name, _, _)| name == "IFS"));
+                let expands = arguments.iter().any(|word| {
+                    unquoted_expansion(word)
+                        || literal(word).is_none()
+                            && (word.contains("$@")
+                                || word.contains("${@}")
+                                || word.contains("[@]"))
+                });
+                if active && writer && expands {
+                    // Temporary prefixes do not supply this invocation's argv.
+                    let mut argv = Vec::new();
+                    let mut complete = true;
+                    let mut bytes = 0usize;
+                    for argument in arguments {
+                        let Ok(fields) = expand(argument, &state) else {
+                            complete = false;
+                            break;
+                        };
+                        for field in fields {
+                            bytes = bytes.saturating_add(field.len());
+                            argv.push(field);
+                        }
+                        if bytes > MAX_BYTES || argv.len() > MAX_FIELDS {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if complete {
+                        match classify(&argv, span.clone()) {
+                            Ok(found) => hits.extend(found),
+                            Err(()) => hits.extend(uncertain(span.clone())),
+                        }
+                    } else {
+                        hits.extend(uncertain(span.clone()));
+                    }
+                }
+                if original_name.as_deref().is_some_and(special_builtin) {
+                    // POSIX mode can retain these values; ordinary Bash can
+                    // restore them. Neither is a proven value for later argv.
+                    for prefix in &prefixes {
+                        state.assign(prefix, false);
+                    }
+                }
+                if original_name.as_deref().is_none_or(mutates_shell)
+                    || original_name.as_deref() == Some("printf")
+                        && words.iter().any(|word| word.starts_with("-v"))
+                {
+                    state.forget();
+                    state.attributes_unknown = true;
+                }
+            }
+            "function_definition" => {
+                // A later literal command name can invoke this function and
+                // mutate any binding. Until calls/scopes are modeled, do not
+                // re-establish scalar facts after seeing the definition.
+                state.forget();
+                state.attributes_unknown = true;
+            }
+            _ => state.forget(),
+        }
+    }
+    hits
+}
+
+/// A cheap candidate gate, NOT a claim that a write exists. Keep this at the
+/// pack-selection boundary too: a runtime-only destination has no raw `/etc`
+/// substring from which the keyword gate could select the filesystem pack.
+pub(super) fn candidate(command: &str) -> bool {
+    if !command.contains(['$', '`']) {
+        return false;
+    }
+    if command.contains("IFS") {
+        return true;
+    }
+    // Declaration builtins also accept quote-removed names: export I'F'S=@.
+    // Ignore quote/escape characters only for this lexical superset; the AST
+    // analyzer still treats an unmodeled declaration as unknown state.
+    let mut prefix = 0;
+    for ch in command.chars().filter(|ch| !matches!(*ch, '\'' | '"' | '\\')) {
+        prefix = match (prefix, ch) {
+            (_, 'I') => 1,
+            (1, 'F') => 2,
+            (2, 'S') => return true,
+            _ => 0,
+        };
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splitting_preserves_posix_whitespace_and_empty_field_rules() {
+        for (value, ifs, expected) in [
+            ("", "@", vec![]),
+            ("a@b", "@", vec!["a", "b"]),
+            ("@a@@b@", "@", vec!["", "a", "", "b"]),
+            ("@@", "@", vec!["", ""]),
+            (" a \t b\n", DEFAULT_IFS, vec!["a", "b"]),
+            ("  @ a @ @ b @  ", " @", vec!["", "a", "", "b"]),
+            ("a@b", "", vec!["a@b"]),
+            ("a b@c d", "@", vec!["a b", "c d"]),
+            ("α@β", "@", vec!["α", "β"]),
+            ("/tmp/a@/etc/profile", "@", vec!["/tmp/a", "/etc/profile"]),
+            ("a*b", "*", vec!["a", "b"]),
+        ] {
+            assert_eq!(fields(value, ifs), Ok(expected), "{value:?}, {ifs:?}");
+        }
+    }
+
+    #[test]
+    fn expansion_bounds_and_unresolved_pathname_expansion_fail_closed() {
+        for (value, ifs) in [("*.txt", "@"), ("x", "é"), ("x\0y", "@")] {
+            assert!(fields(value, ifs).is_err());
+        }
+        assert!(fields(&"x".repeat(MAX_VALUE_BYTES + 1), "@").is_err());
+        assert!(fields(&"x@".repeat(MAX_FIELDS + 1), "@").is_err());
+        assert_eq!(
+            fields(&"x@".repeat(MAX_FIELDS), "@").unwrap().len(),
+            MAX_FIELDS
+        );
+    }
+
+    #[test]
+    fn assignment_quotes_do_not_protect_later_unquoted_fields() {
+        let mut state = State {
+            ifs: Some(DEFAULT_IFS.to_owned()),
+            ..State::default()
+        };
+        state.assign("S='/tmp/a@/etc/profile'", true);
+        state.assign("IFS+=@", true);
+        assert_eq!(expand("$S", &state).unwrap(), ["/tmp/a", "/etc/profile"]);
+        assert_eq!(expand(r#""$S""#, &state).unwrap(), ["/tmp/a@/etc/profile"]);
+        state.assign("IFS=", true);
+        assert_eq!(expand("${S}", &state).unwrap(), ["/tmp/a@/etc/profile"]);
+    }
+
+    #[test]
+    fn static_quote_removal_retains_pattern_provenance() {
+        let state = State::default();
+        for raw in [r#""/tmp/"*"#, r"/tmp/\a?", r"/tmp/{a,b}"] {
+            assert!(expand(raw, &state).is_err(), "{raw}");
+        }
+        for raw in [r"'/tmp/*'", r"/tmp/\*", r#""/tmp/*""#] {
+            assert_eq!(expand(raw, &state).unwrap(), ["/tmp/*"]);
+        }
+        assert!(!unquoted_expansion(r#""$S""#));
+        assert!(!unquoted_expansion(r"\$S"));
+        assert!(!unquoted_expansion(r"'$S'"));
+        assert!(unquoted_expansion(r#""prefix"${S}"#));
+        assert!(unquoted_expansion(r#""$S"$T"#));
+    }
+
+    #[test]
+    fn native_policy_sees_every_rebound_ifs_destination() {
+        for source in [
+            "S=/tmp/a@/etc/profile; IFS=@; echo x | tee $S",
+            "IFS=@; S=/tmp/a@/etc/profile; tee $S",
+            "S=/tmp/a@/etc/profile IFS=@; tee $S",
+            "IFS=@ S=/tmp/a@/etc/profile; tee ${S}",
+            "IFS=' '; S=/tmp/a@/etc/profile; IFS+=@; tee $S",
+            "S=/tmp/a@/etc/profile; export IFS=@; tee $S",
+            "export S=/tmp/a@/etc/profile IFS=@; tee $S",
+            "S=/etc/profile@/tmp/a; IFS=@; tee $S",
+            "S=/tmp/a@/tmp/b@/etc/profile; IFS=@; tee $S",
+            "S=/tmp/a@/etc/profile; IFS=@; command tee -- $S",
+            "S=/tmp/a@/etc/profile; IFS=@; /usr/bin/tee $S",
+            "S=/tmp/a@/etc/profile; IFS=@; gtee $S",
+            "S=/tmp/a@/etc/profile; IFS=@; tee -a $S",
+        ] {
+            let hits = scan(source, ShellDialect::Posix);
+            assert!(
+                hits.iter()
+                    .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME),
+                "{source}: {hits:?}"
+            );
+            assert!(
+                hits.iter().any(|hit| hit.reason != UNCERTAIN),
+                "must resolve literal fields: {source}"
+            );
+            assert!(hits.iter().all(|hit| source[hit.span.clone()].contains("tee")));
+        }
+    }
+
+    #[test]
+    fn each_native_rule_family_survives_the_same_tee_invocation() {
+        let source = "S=/tmp/a@/etc/profile@.git/config; IFS=@; tee $S";
+        let hits = scan(source, ShellDialect::Posix);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME)
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rule == shell::GIT_INTERNALS_WRITE_NAME)
+        );
+    }
+
+    #[test]
+    fn quoted_scalars_read_idioms_and_safe_paths_remain_harmless() {
+        for source in [
+            "S=/tmp/scratch/a@/tmp/scratch/b; IFS=@; echo x | tee $S",
+            "S=/tmp/a@/etc/profile; IFS=@; tee \"$S\"",
+            "S=/tmp/a@/etc/profile; IFS=@; tee \"${S}\"",
+            "S=/tmp/a@/etc/profile; IFS=; tee $S",
+            "S=/tmp/a@/etc/profile; IFS=@; tee '$S'",
+            "S=/tmp/a@/etc/profile; IFS=@; printf '%s' \"$S\"",
+            "S=/tmp/a@/etc/profile; IFS=@; echo 'tee $S'",
+            "S=/tmp/a@/etc/profile; IFS=@",
+            "OIFS=$IFS",
+            "while IFS= read -r l; do :; done < /etc/hostname",
+            "IFS=, read a b <<< 'x,y'",
+            "S=/tmp/safe; IFS=@; S=/tmp/a@/etc/profile IFS=: tee $S",
+            "IFS=@; S=/tmp/a@/tmp/b; tee $S; tee /tmp/other",
+        ] {
+            assert!(scan(source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn unknown_state_and_unsupported_expansions_require_native_review() {
+        for source in [
+            "S=/tmp/a@/etc/profile; IFS+=@; tee $S",
+            "S=/tmp/a@/etc/profile IFS=@ tee $S",
+            "S=/tmp/a@/etc/profile; IFS=$CUSTOM; tee $S",
+            "IFS=@; tee $UNKNOWN",
+            "S=/tmp/a@/etc/profile; IFS=@; tee prefix${S}",
+            "S=/tmp/a@/etc/profile; IFS=@; tee $S \"/tmp/\"*",
+            "S=/tmp/safe; IFS=@; S=/tmp/a@/etc/profile :; tee $S",
+            "S=/tmp/safe; IFS=@; printf -v S /tmp/a@/etc/profile; tee $S",
+            "f() { S=/tmp/a@/etc/profile; }; S=/tmp/safe; IFS=@; f; tee $S",
+            "declare -n S=T; T=/tmp/a@/etc/profile; IFS=@; tee $S",
+            "IFS=@; A=(/tmp/a /etc/profile); tee \"${A[@]}\"",
+            "S=/tmp/a@/etc/profile; export I'F'S=@; tee $S",
+        ] {
+            let hits = scan(source, ShellDialect::Posix);
+            assert!(
+                hits.iter().any(|hit| hit.reason == UNCERTAIN),
+                "{source}: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_arguments_are_not_limited_to_tee() {
+        for source in [
+            "S=/tmp/source@/etc/profile; IFS=@; cp $S",
+            "S=/tmp/source@/etc/profile; IFS=@; mv $S",
+            "S=if=/tmp/source@of=/etc/profile; IFS=@; dd $S",
+        ] {
+            let hits = scan(source, ShellDialect::Posix);
+            assert!(
+                hits.iter()
+                    .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME),
+                "{source}: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_gate_and_original_source_entry_point_do_not_lose_bindings() {
+        let source = "S=/tmp/a@/etc/profile; IFS=@; tee $S";
+        let hits = super::super::classify_embedded_credential_file_writes(
+            source,
+            ShellDialect::Posix,
+            |_, _| false,
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME)
+        );
+        assert!(super::super::may_name_protected_path("IFS=@; tee $UNKNOWN"));
+        assert!(!candidate("tee /tmp/safe"));
+        assert!(scan(source, ShellDialect::PowerShell).is_empty());
+        assert!(scan(source, ShellDialect::Cmd).is_empty());
+    }
+
+    /// This checks the production Rust splitter against a real POSIX shell.
+    /// The script is constant and only prints argv; values are passed as data
+    /// in the child environment. No analyzed command or destination is run.
+    #[test]
+    #[cfg(unix)]
+    fn field_splitting_matches_posix_shell_argv() {
+        use std::process::Command;
+
+        let values = [
+            "",
+            "a",
+            "@",
+            "@@",
+            "@a",
+            "a@",
+            "a@@b@",
+            " a ",
+            " a b ",
+            " a\tb\n",
+            " @ a @ @ b @ ",
+            "a,b:c",
+            "α@β",
+            "a'@'b",
+            "/tmp/a@/etc/profile",
+        ];
+        for ifs in ["", DEFAULT_IFS, "@", " @", "@\t\n", ",:", "a", "/"] {
+            for value in values {
+                let output = Command::new("/bin/sh")
+                    .args(["-c", "IFS=$DCG_TEST_IFS; set -- $DCG_TEST_VALUE; printf '%s\\0' \"$#\"; for arg; do printf '%s\\0' \"$arg\"; done"])
+                    .env_clear()
+                    .env("DCG_TEST_IFS", ifs)
+                    .env("DCG_TEST_VALUE", value)
+                    .output()
+                    .expect("POSIX shell argv probe");
+                assert!(output.status.success());
+                let printed = String::from_utf8(output.stdout).expect("UTF-8 argv");
+                let mut parts = printed.split_terminator('\0');
+                let count: usize = parts.next().expect("argc").parse().expect("numeric argc");
+                let actual: Vec<_> = parts.collect();
+                assert_eq!(actual.len(), count);
+                assert_eq!(
+                    fields(value, ifs).unwrap(),
+                    actual,
+                    "IFS={ifs:?}, value={value:?}"
+                );
+            }
+        }
+    }
+}

@@ -6,6 +6,7 @@
 
 mod embedded;
 mod shell;
+mod word_splitting;
 
 pub(crate) use embedded::{scan_extracted, source_scan_required};
 // Rule NAMES are deliberately not re-exported: every hit carries the
@@ -15,8 +16,8 @@ pub(crate) use embedded::{scan_extracted, source_scan_required};
 // guessing at something the classifier already decided.
 pub(crate) use shell::{
     CREDENTIAL_FILE_WRITE_SUGGESTIONS, CredentialFileWrite, GIT_INTERNALS_WRITE_SUGGESTIONS,
-    classify_credential_file_write, classify_git_redirect_writes, may_name_protected_path,
-    names_protected_file, names_protected_git_internal, names_windows_shell_writer,
+    classify_credential_file_write, classify_git_redirect_writes, names_protected_file,
+    names_protected_git_internal, names_windows_shell_writer,
 };
 
 use crate::normalize::ShellDialect;
@@ -25,9 +26,18 @@ pub(crate) fn is_credential_writer(executable: &str) -> bool {
     shell::is_credential_writer(executable) || embedded::is_interpreter(executable)
 }
 
+/// Include IFS-dependent argv in pack selection even when a dynamic target
+/// has no literal protected-path anchor. The classifier, not this candidate
+/// gate, determines whether the command writes a protected destination.
+pub(crate) fn may_name_protected_path(command: &str) -> bool {
+    shell::may_name_protected_path(command) || word_splitting::candidate(command)
+}
+
 /// Inspect executable source before shell segmentation or masking removes it.
 /// Shell syntax uses the separate [`classify_credential_file_write`] above;
 /// inline scripts, heredocs, and here-strings use their proven interpreter.
+/// The IFS view retains preceding assignments until each writer's arguments
+/// have been split, then delegates every destination to the same path policy.
 /// Apply explicit language/content exemptions to each decoded program, not
 /// to another program or shell writer in the same command.
 /// Retain all rule families, including coincident spans from a single rename.
@@ -37,7 +47,9 @@ pub(crate) fn classify_embedded_credential_file_writes(
     dialect: ShellDialect,
     source_is_exempt: impl FnMut(&str, crate::heredoc::ScriptLanguage) -> bool,
 ) -> Vec<CredentialFileWrite> {
-    embedded::scan_command(command, dialect, source_is_exempt)
+    let mut hits = word_splitting::scan(command, dialect);
+    hits.extend(embedded::scan_command(command, dialect, source_is_exempt));
+    hits
 }
 
 #[cfg(test)]
