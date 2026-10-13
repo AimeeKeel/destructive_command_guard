@@ -413,6 +413,23 @@ fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWri
     Ok(hits)
 }
 
+/// `printf -v` is an assignment, including when quote removal or expansion
+/// supplies the option. Only the first non-vanishing argument is an option:
+/// `printf '%s' -v` prints data, and `printf -- -v` has ended option parsing.
+/// Unknown or unbounded leading arguments may supply `-v` and must forfeit
+/// old bindings. Inspect them before applying any of this command's effects.
+fn printf_may_assign(words: &[String], state: &State) -> bool {
+    for raw in words.iter().skip(1) {
+        let Ok(fields) = expand(raw, state) else {
+            return true;
+        };
+        if let Some(first) = fields.first() {
+            return first.starts_with("-v");
+        }
+    }
+    false
+}
+
 fn mutates_shell(name: &str) -> bool {
     matches!(
         name,
@@ -427,6 +444,10 @@ fn mutates_shell(name: &str) -> bool {
             | "typeset"
             | "local"
             | "readonly"
+            // Bare export uses the declaration-command path. A quoted or
+            // escaped spelling can instead be parsed as an ordinary command;
+            // its decoded name still mutates variables (ex''port S=value).
+            | "export"
             | "unset"
             | "getopts"
             | "trap"
@@ -668,7 +689,7 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                 }
                 if original_name.as_deref().is_none_or(mutates_shell)
                     || original_name.as_deref() == Some("printf")
-                        && words.iter().any(|word| word.starts_with("-v"))
+                        && printf_may_assign(&words, &state)
                 {
                     state.forget();
                     state.attributes_unknown = true;
@@ -887,6 +908,93 @@ mod tests {
                     .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME),
                 "{source}: {hits:?}"
             );
+        }
+    }
+
+    #[test]
+    fn printf_assignment_options_follow_expansion_and_format_boundaries() {
+        let mut state = State::default();
+        state.assign("IFS=@", true);
+        state.assign("F=-v", true);
+        state.assign("A=-v@S", true);
+        state.assign("E=", true);
+        state.assign("FORMAT=%s", true);
+        for (arguments, expected) in [
+            (vec!["-v", "S", "%s", "value"], true),
+            (vec!["'-v'", "S", "%s", "value"], true),
+            (vec![r#""-v""#, "S", "%s", "value"], true),
+            (vec!["-''v", "S", "%s", "value"], true),
+            (vec![r"\-v", "S", "%s", "value"], true),
+            (vec!["'-vS'", "%s", "value"], true),
+            (vec!["$F", "S", "%s", "value"], true),
+            (vec![r#""$F""#, "S", "%s", "value"], true),
+            (vec!["$A", "%s", "value"], true),
+            (vec!["$E", "'-v'", "S", "%s", "value"], true),
+            (vec!["$UNKNOWN", "S", "%s", "value"], true),
+            (vec![r#""$UNKNOWN""#, "S", "%s", "value"], true),
+            (vec!["--", "-v", "S", "value"], false),
+            (vec!["'%s'", "-v", "S", "value"], false),
+            (vec![r#""$FORMAT""#, "-v", "S", "value"], false),
+            (vec!["''", "-v", "S", "value"], false),
+            (vec![r#""$E""#, "-v", "S", "value"], false),
+            (vec!["$E"], false),
+            (vec![], false),
+        ] {
+            let words: Vec<_> = std::iter::once("printf")
+                .chain(arguments)
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(printf_may_assign(&words, &state), expected, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn decoded_assignment_builtins_cannot_leave_stale_writer_destinations() {
+        for mutation in [
+            "ex''port S=/tmp/a@/etc/profile",
+            r#""export" S=/tmp/a@/etc/profile"#,
+            r"\export S=/tmp/a@/etc/profile",
+            r#"e'x'p"o"rt S=/tmp/a@/etc/profile"#,
+            "printf '-v' S '%s' /tmp/a@/etc/profile",
+            r#"printf "-v" S %s /tmp/a@/etc/profile"#,
+            "printf -''v S %s /tmp/a@/etc/profile",
+            r"printf \-v S %s /tmp/a@/etc/profile",
+            "printf '-vS' %s /tmp/a@/etc/profile",
+            "F=-v; printf $F S %s /tmp/a@/etc/profile",
+            r#"F=-v; printf "$F" S %s /tmp/a@/etc/profile"#,
+            "F=-v@S; printf $F %s /tmp/a@/etc/profile",
+            "E=; printf $E '-v' S %s /tmp/a@/etc/profile",
+            "printf $UNKNOWN S %s /tmp/a@/etc/profile",
+            "ex''port IFS=:; S=/tmp/a:/etc/profile",
+            "printf '-v' IFS %s :; S=/tmp/a:/etc/profile",
+        ] {
+            let source = format!("S=/tmp/safe; IFS=@; {mutation}; tee $S");
+            let hits = scan(&source, ShellDialect::Posix);
+            for rule in [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ] {
+                assert!(
+                    hits.iter()
+                        .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                    "{source}: missing {rule}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn printf_data_arguments_do_not_invalidate_safe_destination_bindings() {
+        for printing in [
+            "printf '%s' '-v' S /tmp/a@/etc/profile",
+            "printf -- '-v' S /tmp/a@/etc/profile",
+            "printf '' '-v' S /tmp/a@/etc/profile",
+            r#"F=%s; printf "$F" '-v' S /tmp/a@/etc/profile"#,
+            r#"E=; printf "$E" -v S /tmp/a@/etc/profile"#,
+            "printf '%s' '$@' '-v' S /tmp/a@/etc/profile",
+        ] {
+            let source = format!("S=/tmp/safe; IFS=@; {printing}; tee $S");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
         }
     }
 
