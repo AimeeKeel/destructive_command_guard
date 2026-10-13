@@ -30,6 +30,7 @@ jobs:
       RCH_ENABLED: '0'
       RUST_BACKTRACE: '1'
       SOURCE_BLOB: 494a1b4bc5203def4960a96bf48f5e4f0442b0c1
+      SOURCE_CORRECTIONS_BLOB: 25f68cd11226b0a8a070e5cae70357b423c804ed
       EVALUATOR_PATCH_BLOB: fbce7f0942c8e197f625bb5ca483e78877b59ccd
       TEST_PATCH_BLOB: f3de543f5f30c816c344aef2b0c89085be92ba77
     defaults:
@@ -77,6 +78,7 @@ jobs:
             test "$(git hash-object "$2")" = "$1"
           }
           fetch_blob "$SOURCE_BLOB" target/ifs-558/word_splitting.rs
+          fetch_blob "$SOURCE_CORRECTIONS_BLOB" target/ifs-558/scope-corrections.patch
           fetch_blob "$EVALUATOR_PATCH_BLOB" target/ifs-558/evaluator.patch
           fetch_blob "$TEST_PATCH_BLOB" target/ifs-558/tests.patch
           git apply --check target/ifs-558/evaluator.patch
@@ -103,6 +105,8 @@ jobs:
           mkdir -p src/evaluator
           test ! -e src/evaluator/word_splitting.rs
           cp target/ifs-558/word_splitting.rs src/evaluator/word_splitting.rs
+          git apply --check target/ifs-558/scope-corrections.patch
+          git apply target/ifs-558/scope-corrections.patch
           git apply --check target/ifs-558/evaluator.patch
           git apply target/ifs-558/evaluator.patch
           rustfmt --edition 2024 --config skip_children=true \
@@ -177,6 +181,7 @@ jobs:
               'base_commit': parent,
               'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
               'source_blob': os.environ['SOURCE_BLOB'],
+              'source_corrections_blob': os.environ['SOURCE_CORRECTIONS_BLOB'],
               'evaluator_patch_blob': os.environ['EVALUATOR_PATCH_BLOB'],
               'test_patch_blob': os.environ['TEST_PATCH_BLOB'],
               'files': [],
