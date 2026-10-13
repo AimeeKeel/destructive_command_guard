@@ -1377,7 +1377,7 @@ mod tests {
         ];
         for ifs in ["", DEFAULT_IFS, "@", " @", "@\t\n", ",:", "a", "/"] {
             for value in values {
-                let output = std::process::Command::new("/bin/sh")
+                let output = Command::new("/bin/sh")
                     .args(["-c", "IFS=$DCG_TEST_IFS; set -- $DCG_TEST_VALUE; printf '%s\\0' \"$#\"; for arg; do printf '%s\\0' \"$arg\"; done"])
                     .env_clear()
                     .env("DCG_TEST_IFS", ifs)

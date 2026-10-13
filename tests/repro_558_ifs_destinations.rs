@@ -304,8 +304,65 @@ fn stale_binding_refusal_keeps_native_allowlist_families_independent() {
         for source in [
             "S=/tmp/safe; IFS=@; ex''port S=/tmp/a@.git/config; tee $S",
             "S=/tmp/safe; IFS=@; printf '-v' S %s /tmp/a@/etc/profile; tee $S",
+            "SEP=@; IFS=@; S=/tmp/a5/etc/profile; printf 'abcde%n' SEP; IFS=$SEP; tee $S",
         ] {
             assert_decision_with_grant(source, false, Some(remaining), Some(grant));
         }
+    }
+}
+
+#[test]
+fn printf_count_assignments_cannot_hide_native_writer_destinations() {
+    for printing in [
+        "printf 'abcde%n' SEP",
+        "printf -- 'abcde%n' SEP",
+        "printf 'abcde%05n' SEP",
+        "printf 'abcde%*.*n' 0 0 SEP",
+        "printf 'abcde%ln' SEP",
+        "printf '%s%n' abcde SEP",
+        r#"F=abcde%n; printf "$F" SEP"#,
+        "F=--@abcde%n@SEP; printf $F",
+        "E=; printf $E 'abcde%n' SEP",
+        "p''rintf 'abcde%n' SEP",
+    ] {
+        let source = format!(
+            "SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S"
+        );
+        assert_decision(&source, false, Some("core.filesystem:credential-file-write"));
+    }
+    // %n can also replace IFS itself. Reassignment forces shells that cache
+    // their splitting table to observe the new value before the writer runs.
+    assert_decision(
+        "S=/tmp/a5/etc/profile; IFS=@; printf 'abcde%n' IFS; IFS=$IFS; tee $S",
+        false,
+        Some("core.filesystem:credential-file-write"),
+    );
+    for writer in ["tee $S", "cp $S", "mv $S", "install $S", "ln -s $S"] {
+        let source = format!(
+            "SEP=@; IFS=@; S=/tmp/a5/etc/profile; printf 'abcde%n' SEP; IFS=$SEP; {writer}"
+        );
+        assert_decision(&source, false, Some("core.filesystem:credential-file-write"));
+    }
+}
+
+#[test]
+fn printf_count_shaped_data_and_time_formats_remain_allowed() {
+    for printing in [
+        "printf '%s' 'abcde%n' SEP",
+        "printf '%b' 'abcde%n' SEP",
+        "printf '%q' 'abcde%n' SEP",
+        "printf '%%n' SEP",
+        "printf '%dn' 5",
+        r"printf '\045n' SEP",
+        "printf '%(%n)T' 0",
+        "printf '%(a(b)%n)T' 0",
+        "printf -- -- 'abcde%n' SEP",
+        r#"F=%%n; printf "$F" SEP"#,
+        r#"E=; printf "$E" 'abcde%n' SEP"#,
+    ] {
+        let source = format!(
+            "SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S"
+        );
+        assert_decision(&source, true, None);
     }
 }
