@@ -35,7 +35,21 @@ fn isolated_dcg(temp: &tempfile::TempDir) -> Command {
 }
 
 fn assert_decision(source: &str, allowed: bool, rule: Option<&str>) {
+    assert_decision_with_grant(source, allowed, rule, None);
+}
+
+fn assert_decision_with_grant(source: &str, allowed: bool, rule: Option<&str>, grant: Option<&str>) {
     let temp = tempfile::tempdir().expect("tempdir");
+    if let Some(grant) = grant {
+        let allowlist = format!(
+            "[[allow]]\nrule = \"{grant}\"\nreason = \"isolated single-family regression grant\"\n"
+        );
+        for path in ["home/config/dcg", "home/.config/dcg", "home/appdata/dcg"] {
+            let dir = temp.path().join(path);
+            std::fs::create_dir_all(&dir).expect("isolated allowlist directory");
+            std::fs::write(dir.join("allowlist.toml"), &allowlist).expect("isolated rule grant");
+        }
+    }
     let cli = isolated_dcg(&temp)
         .args(["test", source])
         .stdin(Stdio::null())
@@ -227,5 +241,71 @@ fn quoted_scalar_results_and_literal_list_text_remain_data() {
         r#"IFS=@; tee "$(printf '%s' "$@")""#,
     ] {
         assert_decision(source, true, None);
+    }
+}
+
+#[test]
+fn quoted_and_expanded_assignment_builtins_cannot_hide_later_writes() {
+    for source in [
+        "S=/tmp/safe; IFS=@; ex''port S=/tmp/a@/etc/profile; tee $S",
+        r#"S=/tmp/safe; IFS=@; "export" S=/tmp/a@/etc/profile; tee $S"#,
+        r"S=/tmp/safe; IFS=@; \export S=/tmp/a@/etc/profile; tee $S",
+        r#"S=/tmp/safe; IFS=@; e'x'p"o"rt S=/tmp/a@/etc/profile; tee $S"#,
+        "S=/tmp/safe; IFS=@; printf '-v' S '%s' /tmp/a@/etc/profile; tee $S",
+        r#"S=/tmp/safe; IFS=@; printf "-v" S %s /tmp/a@/etc/profile; tee $S"#,
+        "S=/tmp/safe; IFS=@; printf -''v S %s /tmp/a@/etc/profile; tee $S",
+        r"S=/tmp/safe; IFS=@; printf \-v S %s /tmp/a@/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; printf '-vS' %s /tmp/a@/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; F=-v; printf $F S %s /tmp/a@/etc/profile; tee $S",
+        r#"S=/tmp/safe; IFS=@; F=-v; printf "$F" S %s /tmp/a@/etc/profile; tee $S"#,
+        "S=/tmp/safe; IFS=@; F=-v@S; printf $F %s /tmp/a@/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; E=; printf $E '-v' S %s /tmp/a@/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; printf $UNKNOWN S %s /tmp/a@/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; ex''port IFS=:; S=/tmp/a:/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; printf '-v' IFS %s :; S=/tmp/a:/etc/profile; tee $S",
+    ] {
+        assert_decision(source, false, Some("core.filesystem:credential-file-write"));
+    }
+}
+
+#[test]
+fn printf_option_text_after_the_format_preserves_harmless_bindings() {
+    for source in [
+        "S=/tmp/safe; IFS=@; printf '%s' '-v' S /tmp/a@/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; printf -- '-v' S /tmp/a@/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; printf '' '-v' S /tmp/a@/etc/profile; tee $S",
+        r#"S=/tmp/safe; IFS=@; F=%s; printf "$F" '-v' S /tmp/a@/etc/profile; tee $S"#,
+        r#"S=/tmp/safe; IFS=@; E=; printf "$E" -v S /tmp/a@/etc/profile; tee $S"#,
+        "S=/tmp/safe; IFS=@; printf '%s' '$@' '-v' S /tmp/a@/etc/profile; tee $S",
+        "IFS=@; export S=/tmp/a@/tmp/b; tee $S",
+        "export IFS=@ S=/tmp/a@/tmp/b; tee $S",
+    ] {
+        assert_decision(source, true, None);
+    }
+}
+
+#[test]
+fn stale_binding_refusal_keeps_native_allowlist_families_independent() {
+    for (grant, control, remaining) in [
+        (
+            "core.filesystem:credential-file-write",
+            "tee /etc/profile",
+            "core.filesystem:git-internals-write",
+        ),
+        (
+            "core.filesystem:git-internals-write",
+            "tee .git/config",
+            "core.filesystem:credential-file-write",
+        ),
+    ] {
+        // Prove the grant was loaded, rather than mistaking an ignored
+        // allowlist for evidence that the other family stayed protected.
+        assert_decision_with_grant(control, true, None, Some(grant));
+        for source in [
+            "S=/tmp/safe; IFS=@; ex''port S=/tmp/a@.git/config; tee $S",
+            "S=/tmp/safe; IFS=@; printf '-v' S %s /tmp/a@/etc/profile; tee $S",
+        ] {
+            assert_decision_with_grant(source, false, Some(remaining), Some(grant));
+        }
     }
 }
