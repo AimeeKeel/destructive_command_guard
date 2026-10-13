@@ -5,7 +5,7 @@
 
 use super::{CredentialFileWrite, shell};
 use crate::normalize::{NormalizeTokenKind, ShellDialect, strip_wrapper_prefixes};
-use ast_grep_core::AstGrep;
+use ast_grep_core::{AstGrep, Node, tree_sitter::StrDoc};
 use ast_grep_language::SupportLang;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -163,37 +163,64 @@ fn literal(raw: &str) -> Option<String> {
     quote.is_none().then_some(result)
 }
 
-/// Only characters from unquoted expansions undergo IFS splitting. Quotes
-/// present in the variable's value are ordinary characters, not shell syntax.
-fn unquoted_expansion(raw: &str) -> bool {
-    let mut quote = None;
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match (quote, ch) {
-            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
-            (Some('\''), _) => {}
-            (None, '\'' | '"') => quote = Some(ch),
-            (_, '\\') => {
-                if quote.is_none()
-                    || chars
-                        .peek()
-                        .is_some_and(|next| matches!(*next, '$' | '`' | '"' | '\\' | '\n'))
-                {
-                    chars.next();
+/// Double quotes suppress scalar field splitting, but not list-valued `@`
+/// expansions and their parameter operators. Indirection can name `@` or an
+/// array list, so it is not a scalar proof either. The AST supplies exactly
+/// one live expansion here, not quoted argument data or a substring match.
+fn parameter_can_produce_multiple_fields(raw: &str) -> bool {
+    let Some(parameter) = raw.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
+        return raw == "$@";
+    };
+    if parameter.starts_with('#') {
+        return false;
+    }
+    if parameter.starts_with('@') {
+        return true;
+    }
+    let indirect = parameter.starts_with('!');
+    let parameter = parameter.strip_prefix('!').unwrap_or(parameter);
+    let name_end = parameter
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    if name_end == 0 {
+        return false;
+    }
+    let operator = &parameter[name_end..];
+    operator.starts_with("[@]") || indirect && !matches!(operator, "[*]" | "*")
+}
+
+/// Preserve the parser's quoting and execution boundaries. A `$@` inside
+/// `"$(printf '%s' "$@")"` belongs to the nested command, not the outer argv;
+/// its quoted output is one scalar. Nested commands are scanned separately.
+/// Assignment and redirect words likewise do not supply this command's argv.
+fn argv_needs_field_analysis(node: Node<'_, StrDoc<SupportLang>>) -> bool {
+    let mut pending = vec![(node, false)];
+    while let Some((part, quoted)) = pending.pop() {
+        match part.kind().as_ref() {
+            "variable_assignment"
+            | "file_redirect"
+            | "heredoc_redirect"
+            | "herestring_redirect"
+            | "process_substitution"
+            | "raw_string"
+            | "ansi_c_string"
+            | "comment" => {}
+            "string" => pending.extend(part.children().map(|child| (child, true))),
+            "command_substitution" | "arithmetic_expansion" => {
+                if !quoted {
+                    return true;
                 }
             }
-            (None, '$') if chars.peek() == Some(&'\'') => {
-                chars.next();
-                while let Some(ch) = chars.next() {
-                    if ch == '\\' {
-                        chars.next();
-                    } else if ch == '\'' {
-                        break;
-                    }
+            "simple_expansion" | "expansion" => {
+                if !quoted || parameter_can_produce_multiple_fields(part.text().as_ref()) {
+                    return true;
                 }
+                // An operator's replacement can itself contain a live list,
+                // e.g. "${S:+$@}". Do not stop at the scalar parameter name.
+                pending.extend(part.children().map(|child| (child, quoted)));
             }
-            (None, '$' | '`') => return true,
-            _ => {}
+            _ => pending.extend(part.children().map(|child| (child, quoted))),
         }
     }
     false
@@ -353,6 +380,12 @@ fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWri
                     return Err(());
                 }
             } else {
+                // POSIXLY_CORRECT can stop getopt at the first operand. A
+                // later --help is then a filename, not proof of no writes;
+                // a later -a cannot prove earlier targets are append-only.
+                // Retain this valid, more destructive reading even when a
+                // GNU option-permuting invocation would do less damage.
+                options = false;
                 destinations.push(word);
             }
         }
@@ -597,13 +630,7 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                     || words
                         .iter()
                         .any(|word| assignment(word).is_some_and(|(name, _, _)| name == "IFS"));
-                let expands = arguments.iter().any(|word| {
-                    unquoted_expansion(word)
-                        || literal(word).is_none()
-                            && (word.contains("$@")
-                                || word.contains("${@}")
-                                || word.contains("[@]"))
-                });
+                let expands = argv_needs_field_analysis(node.clone());
                 if active && writer && expands {
                     // Temporary prefixes do not supply this invocation's argv.
                     let mut argv = Vec::new();
@@ -744,11 +771,17 @@ mod tests {
         for raw in [r"'/tmp/*'", r"/tmp/\*", r#""/tmp/*""#] {
             assert_eq!(expand(raw, &state).unwrap(), ["/tmp/*"]);
         }
-        assert!(!unquoted_expansion(r#""$S""#));
-        assert!(!unquoted_expansion(r"\$S"));
-        assert!(!unquoted_expansion(r"'$S'"));
-        assert!(unquoted_expansion(r#""prefix"${S}"#));
-        assert!(unquoted_expansion(r#""$S"$T"#));
+        for (raw, expected) in [
+            (r#""$S""#, false),
+            (r"\$S", false),
+            (r"'$S'", false),
+            (r#""prefix"${S}"#, true),
+            (r#""$S"$T"#, true),
+        ] {
+            let source = format!("tee {raw}");
+            let ast = AstGrep::try_new(source.as_str(), SupportLang::Bash).unwrap();
+            assert_eq!(argv_needs_field_analysis(ast.root()), expected, "{raw}");
+        }
     }
 
     #[test]
@@ -873,6 +906,141 @@ mod tests {
         assert!(!candidate("tee /tmp/safe"));
         assert!(scan(source, ShellDialect::PowerShell).is_empty());
         assert!(scan(source, ShellDialect::Cmd).is_empty());
+    }
+
+    #[test]
+    fn quoted_list_parameters_and_operators_are_not_scalar_proofs() {
+        for raw in [
+            "$@",
+            "${@}",
+            "${@:1}",
+            "${@:1:2}",
+            "${@#prefix}",
+            "${@%suffix}",
+            "${@/old/new}",
+            "${@:-fallback}",
+            "${@@Q}",
+            "${A[@]:1}",
+            "${!A[@]}",
+            "${!prefix@}",
+            "${!S}",
+            "${!1}",
+        ] {
+            assert!(parameter_can_produce_multiple_fields(raw), "{raw}");
+        }
+        for raw in [
+            "$S",
+            "$*",
+            "$!",
+            "${S}",
+            "${#@}",
+            "${#A[@]}",
+            "${A[*]}",
+            "${!A[*]}",
+            "${!prefix*}",
+            "${!}",
+            "${S@Q}",
+        ] {
+            assert!(!parameter_can_produce_multiple_fields(raw), "{raw}");
+        }
+    }
+
+    #[test]
+    fn argv_analysis_keeps_quote_and_execution_provenance() {
+        for (raw, expected) in [
+            (r#""${@:1}""#, true),
+            (r#""${!S}""#, true),
+            (r#""${S:+$@}""#, true),
+            (r#""${S:-"$@"}""#, true),
+            (r#""${S[@]:0:2}""#, true),
+            (r#"é"${@:1}"ø"#, true),
+            (r#"$(printf '%s' "$@")"#, true),
+            (r#""$S"'${@:1}'"#, false),
+            (r#""$S"'[@]'"#, false),
+            (r#""\${@:1}""#, false),
+            (r"'${@:1}'", false),
+            (r"$'${@:1}'", false),
+            (r#""${#@}""#, false),
+            (r#""${#S[@]}""#, false),
+            (r#""${S[*]}""#, false),
+            (r#""${!S[*]}""#, false),
+            (r#""$(printf '%s' "$@")""#, false),
+            (r#""$((1 + ${#S[@]}))""#, false),
+        ] {
+            let source = format!("tee {raw}");
+            let ast = AstGrep::try_new(source.as_str(), SupportLang::Bash).unwrap();
+            assert!(!ast.root().get_inner_node().has_error(), "{raw}");
+            assert_eq!(argv_needs_field_analysis(ast.root()), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn quoted_list_destinations_require_native_review_without_custom_packs() {
+        for source in [
+            r#"set -- /tmp/a /etc/profile; IFS=@; tee "${@:1}""#,
+            r#"set -- /tmp/a /etc/profile; IFS=@; tee "${@#/missing/}""#,
+            r#"set -- /tmp/a /etc/profile; IFS=@; tee "${@%/missing}""#,
+            r#"set -- /tmp/a /etc/profile; IFS=@; S=@; tee "${!S}""#,
+            r#"IFS=@; A=(/tmp/a /etc/profile); S='A[@]'; tee "${!S}""#,
+            r#"IFS=@; A=(/tmp/a /etc/profile); tee "${A[@]:0:2}""#,
+            r#"set -- /tmp/a /etc/profile; IFS=@; tee "${S:-"$@"}""#,
+        ] {
+            let hits = scan(source, ShellDialect::Posix);
+            for rule in [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ] {
+                assert!(
+                    hits.iter()
+                        .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                    "{source}: missing {rule}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn literal_list_text_and_quoted_scalar_results_do_not_trigger_ifs_refusal() {
+        for source in [
+            r#"IFS=@; S=ok; tee "$S"'[@]'"#,
+            r#"IFS=@; S=ok; tee "$S"'${@:1}'"#,
+            r#"IFS=@; tee "\${@:1}""#,
+            r#"IFS=@; tee '${@:1}'"#,
+            r#"IFS=@; tee "${#@}""#,
+            r#"IFS=@; tee "${#A[@]}""#,
+            r#"IFS=@; tee "${A[*]}""#,
+            r#"IFS=@; tee "$(printf '%s' "$@")""#,
+        ] {
+            assert!(scan(source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn later_tee_options_cannot_exempt_earlier_destinations() {
+        for source in [
+            "S=/tmp/a@/etc/profile@--help; IFS=@; POSIXLY_CORRECT=1 tee $S",
+            "S=/tmp/a@/etc/profile@--version; IFS=@; env POSIXLY_CORRECT=1 tee $S",
+            "S=/tmp/a@/etc/profile@--help; IFS=@; tee $S",
+            "S=/home/example/.ssh/known_hosts@-a; IFS=@; POSIXLY_CORRECT=1 tee $S",
+            "S=/home/example/.ssh/known_hosts@--append; IFS=@; tee $S",
+        ] {
+            let hits = scan(source, ShellDialect::Posix);
+            assert!(
+                hits.iter().any(|hit| {
+                    hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME && hit.reason != UNCERTAIN
+                }),
+                "must check the concrete destination: {source}: {hits:?}"
+            );
+        }
+        for argv in [
+            vec!["tee", "--help", "/etc/profile"],
+            vec!["tee", "--version", "/etc/profile"],
+            vec!["tee", "-a", "/home/example/.ssh/known_hosts"],
+            vec!["tee", "--append", "/home/example/.ssh/known_hosts"],
+        ] {
+            let argv: Vec<_> = argv.into_iter().map(str::to_owned).collect();
+            assert!(classify(&argv, 0..0).unwrap().is_empty(), "{argv:?}");
+        }
     }
 
     /// This checks the production Rust splitter against a real POSIX shell.
