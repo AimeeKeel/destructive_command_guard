@@ -611,8 +611,13 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
         let mut straight_line = true;
         while let Some(parent) = ancestor {
             match parent.kind().as_ref() {
-                "program" | "redirected_statement" | "variable_assignments" => {}
-                "pipeline" => certain = false,
+                "program" | "variable_assignments" => {}
+                // A redirection is part of command setup. If opening it fails,
+                // an assignment-only command or a special/declaration builtin
+                // may never establish the binding that follows. Treat the
+                // state effect as uncertain while still analyzing the command
+                // itself for protected writer destinations.
+                "redirected_statement" | "pipeline" => certain = false,
                 _ => {
                     certain = false;
                     straight_line = false;
@@ -1194,6 +1199,25 @@ mod tests {
         ] {
             let source = format!("S=/tmp/safe; IFS=@; {printing}; tee $S");
             assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn redirected_state_changes_cannot_replace_older_dangerous_bindings() {
+        for mutation in [
+            "S=/tmp/safe >/definitely/missing/parent/file",
+            "export S=/tmp/safe >/definitely/missing/parent/file",
+            "IFS=: >/definitely/missing/parent/file",
+            "export IFS=: >/definitely/missing/parent/file",
+        ] {
+            let source = format!(
+                "S=/tmp/a@/etc/profile; IFS=@; {mutation}; tee $S"
+            );
+            let hits = scan(&source, ShellDialect::Posix);
+            assert!(
+                hits.iter().any(|hit| hit.reason == UNCERTAIN),
+                "{source}: {hits:?}"
+            );
         }
     }
 
