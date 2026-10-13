@@ -413,18 +413,79 @@ fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWri
     Ok(hits)
 }
 
-/// `printf -v` is an assignment, including when quote removal or expansion
-/// supplies the option. Only the first non-vanishing argument is an option:
-/// `printf '%s' -v` prints data, and `printf -- -v` has ended option parsing.
-/// Unknown or unbounded leading arguments may supply `-v` and must forfeit
-/// old bindings. Inspect them before applying any of this command's effects.
+/// Bash's `%n` conversion assigns the byte count to a named shell variable.
+/// Do not confuse it with `%%n`, an ordinary conversion followed by `n`, or
+/// strftime's `%n` (a newline) inside `%(...)T`. Width, precision and length
+/// modifiers do not make a count assignment harmless. Backslash escapes do
+/// not protect a source `%`: `\%n` still performs the assignment, whereas
+/// `\045n` only prints percent/n and must not be re-parsed as a conversion.
+fn printf_format_may_assign(format: &str) -> bool {
+    let bytes = format.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if bytes.get(index) == Some(&b'%') {
+            index += 1;
+            continue;
+        }
+        // This is a conservative conversion prefix, not a printf validator.
+        // Invalid combinations can only add a refusal; they cannot conceal
+        // an `n` accepted by Bash's width/precision/modifier parser.
+        while bytes.get(index).is_some_and(|byte| {
+            byte.is_ascii_digit() || b"#-+ '.*hlLjzt".contains(byte)
+        }) {
+            index += 1;
+        }
+        match bytes.get(index) {
+            Some(b'n') => return true,
+            Some(b'(') => {
+                let mut depth = 1usize;
+                index += 1;
+                while depth > 0 {
+                    match bytes.get(index) {
+                        Some(b'(') => depth += 1,
+                        Some(b')') => depth -= 1,
+                        Some(_) => {}
+                        None => return true,
+                    }
+                    index += 1;
+                }
+                // Only a complete time conversion owns the nested percent
+                // sequences. Anything else is outside our bounded proof.
+                if bytes.get(index) != Some(&b'T') {
+                    return true;
+                }
+            }
+            Some(conversion) if b"%bqQcCsSdiouxXaAeEfFgG".contains(conversion) => {}
+            Some(_) => return true,
+            None => break,
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Both `-v` and a live `%n` in the format can mutate shell bindings. Find
+/// the format after expanding leading arguments and the optional `--`;
+/// unquoted empty words vanish, quoted empties do not. Arguments AFTER the
+/// format are data, even when they contain `-v` or `%n`. Unknown leading
+/// arguments can select either assignment form and forfeit the old values.
 fn printf_may_assign(words: &[String], state: &State) -> bool {
+    let mut options = true;
     for raw in words.iter().skip(1) {
         let Ok(fields) = expand(raw, state) else {
             return true;
         };
-        if let Some(first) = fields.first() {
-            return first.starts_with("-v");
+        for field in fields {
+            if options && field == "--" {
+                options = false;
+                continue;
+            }
+            return options && field.starts_with("-v") || printf_format_may_assign(&field);
         }
     }
     false
@@ -949,6 +1010,144 @@ mod tests {
     }
 
     #[test]
+    fn printf_count_conversions_preserve_format_ownership() {
+        for format in [
+            "%n", "abcde%n", "%5n", "%+05.2n", "%*.*n", "%hn", "%lln", "%zn",
+            "%jn", "%tn", "%Ln", "%%%n", r"\%n", r"\\%n", "%(%n)T%n",
+        ] {
+            assert!(printf_format_may_assign(format), "{format}");
+        }
+        for format in [
+            "", "%s", "%b", "%q", "n", "%%n", "%%%%n", "%dn", "%sn", "%s%%n",
+            r"\045n", r"\x25n", "%(%n)T", "%(a(b)%n)T", "%10(%n)T", "%(%%n)T",
+        ] {
+            assert!(!printf_format_may_assign(format), "{format}");
+        }
+        for format in ["%(", "%(%n", "%(date)%n", "%I64n", "%Y"] {
+            assert!(printf_format_may_assign(format), "{format}");
+        }
+
+        let mut state = State::default();
+        state.assign("IFS=@", true);
+        state.assign("F=abcde%n", true);
+        state.assign("A=--@abcde%n@SEP", true);
+        state.assign("E=", true);
+        for arguments in [
+            vec!["'abcde%n'", "SEP"],
+            vec!["--", "'abcde%n'", "SEP"],
+            vec![r#""$F""#, "SEP"],
+            vec!["$A"],
+            vec!["$E", "--", "'abcde%n'", "SEP"],
+        ] {
+            let words: Vec<_> = std::iter::once("printf")
+                .chain(arguments)
+                .map(str::to_owned)
+                .collect();
+            assert!(printf_may_assign(&words, &state), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn printf_count_assignment_cannot_leave_stale_separator_facts() {
+        for printing in [
+            "printf 'abcde%n' SEP",
+            "printf -- 'abcde%n' SEP",
+            "printf 'abcde%05n' SEP",
+            "printf 'abcde%*.*n' 0 0 SEP",
+            "printf 'abcde%ln' SEP",
+            "printf '%s%n' abcde SEP",
+            r#"F=abcde%n; printf "$F" SEP"#,
+            "F=--@abcde%n@SEP; printf $F",
+            "E=; printf $E 'abcde%n' SEP",
+            "p''rintf 'abcde%n' SEP",
+        ] {
+            let source = format!(
+                "SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S"
+            );
+            let hits = scan(&source, ShellDialect::Posix);
+            for rule in [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ] {
+                assert!(
+                    hits.iter()
+                        .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                    "{source}: missing {rule}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn printf_literal_count_text_does_not_forfeit_safe_separator_facts() {
+        for printing in [
+            "printf '%s' 'abcde%n' SEP",
+            "printf '%b' 'abcde%n' SEP",
+            "printf '%q' 'abcde%n' SEP",
+            "printf '%%n' SEP",
+            "printf '%dn' 5",
+            r"printf '\045n' SEP",
+            "printf '%(%n)T' 0",
+            "printf '%(a(b)%n)T' 0",
+            "printf -- -- 'abcde%n' SEP",
+            r#"F=%%n; printf "$F" SEP"#,
+            r#"E=; printf "$E" 'abcde%n' SEP"#,
+        ] {
+            let source = format!(
+                "SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S"
+            );
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+    }
+
+    /// Exercise this Rust predicate against Bash's real builtin, not a model
+    /// translated into another language. The constant script only mutates
+    /// its private COUNT variable; neither shell source nor paths are input.
+    #[test]
+    #[cfg(unix)]
+    fn printf_count_detection_matches_bash_builtin() {
+        for (format, arguments) in [
+            ("%n", vec!["COUNT"]),
+            ("abcde%n", vec!["COUNT"]),
+            ("%5n", vec!["COUNT"]),
+            ("%*n", vec!["5", "COUNT"]),
+            ("%.*n", vec!["2", "COUNT"]),
+            ("%ln", vec!["COUNT"]),
+            ("%%%n", vec!["COUNT"]),
+            (r"\%n", vec!["COUNT"]),
+            ("%%n", vec!["COUNT"]),
+            ("%s", vec!["%n"]),
+            ("%b", vec!["%n"]),
+            ("%q", vec!["%n"]),
+            ("%dn", vec!["5"]),
+            (r"\045n", vec!["COUNT"]),
+            ("%(%n)T", vec!["0"]),
+            ("%(a(b)%n)T", vec!["0"]),
+        ] {
+            let output = std::process::Command::new("/bin/bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    "COUNT=untouched; printf -- \"$@\" >/dev/null; printf '%s' \"$COUNT\"",
+                    "dcg-printf-count-probe",
+                    format,
+                ])
+                .args(arguments)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .output()
+                .expect("Bash builtin count probe");
+            assert!(output.status.success(), "{format}: {output:?}");
+            assert_eq!(
+                printf_format_may_assign(format),
+                output.stdout.as_slice() != b"untouched",
+                "{format}: {output:?}"
+            );
+        }
+    }
+
+    #[test]
     fn decoded_assignment_builtins_cannot_leave_stale_writer_destinations() {
         for mutation in [
             "ex''port S=/tmp/a@/etc/profile",
@@ -1178,7 +1377,7 @@ mod tests {
         ];
         for ifs in ["", DEFAULT_IFS, "@", " @", "@\t\n", ",:", "a", "/"] {
             for value in values {
-                let output = Command::new("/bin/sh")
+                let output = std::process::Command::new("/bin/sh")
                     .args(["-c", "IFS=$DCG_TEST_IFS; set -- $DCG_TEST_VALUE; printf '%s\\0' \"$#\"; for arg; do printf '%s\\0' \"$arg\"; done"])
                     .env_clear()
                     .env("DCG_TEST_IFS", ifs)
