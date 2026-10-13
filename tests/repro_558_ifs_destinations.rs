@@ -179,3 +179,53 @@ fn quoting_safe_destinations_and_read_idioms_remain_allowed() {
         assert_decision(source, true, None);
     }
 }
+
+#[test]
+fn quoted_positional_and_indirect_lists_require_native_review() {
+    for source in [
+        r#"set -- /tmp/a /etc/profile; IFS=@; tee "${@:1}""#,
+        r#"set -- /tmp/a /etc/profile; IFS=@; tee "${@#/missing/}""#,
+        r#"set -- /tmp/a /etc/profile; IFS=@; tee "${@%/missing}""#,
+        r#"set -- /tmp/a /etc/profile; IFS=@; S=@; tee "${!S}""#,
+        r#"IFS=@; A=(/tmp/a /etc/profile); S='A[@]'; tee "${!S}""#,
+        r#"IFS=@; A=(/tmp/a /etc/profile); tee "${A[@]:0:2}""#,
+        r#"set -- /tmp/a /etc/profile; IFS=@; tee "${S:-"$@"}""#,
+    ] {
+        assert_decision(source, false, Some("core.filesystem:credential-file-write"));
+    }
+}
+
+#[test]
+fn late_tee_options_cannot_hide_or_downgrade_native_destination_checks() {
+    for source in [
+        "S=/tmp/a@/etc/profile@--help; IFS=@; POSIXLY_CORRECT=1 tee $S",
+        "S=/tmp/a@/etc/profile@--version; IFS=@; env POSIXLY_CORRECT=1 tee $S",
+        "S=/tmp/a@/etc/profile@--help; IFS=@; tee $S",
+        "S=/home/example/.ssh/known_hosts@-a; IFS=@; POSIXLY_CORRECT=1 tee $S",
+        "S=/home/example/.ssh/known_hosts@--append; IFS=@; tee $S",
+    ] {
+        assert_decision(source, false, Some("core.filesystem:credential-file-write"));
+    }
+    assert_decision(
+        "S=/tmp/a@.git/config@--help; IFS=@; POSIXLY_CORRECT=1 tee $S",
+        false,
+        Some("core.filesystem:git-internals-write"),
+    );
+}
+
+#[test]
+fn quoted_scalar_results_and_literal_list_text_remain_data() {
+    for source in [
+        r#"IFS=@; S=ok; tee "$S"'[@]'"#,
+        r#"IFS=@; S=ok; tee "$S"'${@:1}'"#,
+        r#"IFS=@; tee "\${@:1}""#,
+        r#"IFS=@; tee '${@:1}'"#,
+        r#"IFS=@; tee "${#@}""#,
+        r#"IFS=@; tee "${#A[@]}""#,
+        r#"IFS=@; A=(/tmp/a /tmp/b); tee "${A[*]}""#,
+        r#"set -- /tmp/a /tmp/b; IFS=@; tee "$*""#,
+        r#"IFS=@; tee "$(printf '%s' "$@")""#,
+    ] {
+        assert_decision(source, true, None);
+    }
+}
