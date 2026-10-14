@@ -211,7 +211,7 @@ fn quoted_positional_and_indirect_lists_require_native_review() {
         r#"set -- /tmp/a /etc/profile; IFS=@; tee "${@%/missing}""#,
         r#"set -- /tmp/a /etc/profile; IFS=@; S=@; tee "${!S}""#,
         r#"IFS=@; A=(/tmp/a /etc/profile); S='A[@]'; tee "${!S}""#,
-        r#"IFS=@; A=(/tmp/a /etc/profile); tee "${A[@]:0:2}""#,
+        r#"IFS=@; A=(/tmp/a /etc/profile); IFS=@; tee "${A[@]:0:2}""#,
         r#"set -- /tmp/a /etc/profile; IFS=@; tee "${S:-"$@"}""#,
     ] {
         assert_decision(source, false, Some("core.filesystem:credential-file-write"));
@@ -394,5 +394,74 @@ fn printf_count_shaped_data_and_time_formats_remain_allowed() {
     ] {
         let source = format!("SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S");
         assert_decision(&source, true, None);
+    }
+}
+
+#[test]
+fn scalar_log_paths_and_later_read_prefixes_remain_data_566() {
+    for source in [
+        "S=/tmp/work; IFS= ; sed -n 3,8p $S/e2e.log",
+        "S=/tmp/work; sed -n 3,8p $S/e2e.log | while IFS= read -r l; do echo \"$l\"; done",
+        "S=/tmp/work; sed -n p $S/e2e.log | while IFS= read -r l; do echo; done",
+        "S=/tmp/work; IFS=@; sed -n p ${S}/a@b",
+        "S='/tmp/élève work'; IFS=; sed -n p \"$S\"/e2e.log",
+    ] {
+        assert_decision(source, true, None);
+    }
+}
+
+#[test]
+fn scalar_path_reconstruction_does_not_exempt_native_writers_566() {
+    for source in [
+        "S=/etc; IFS=; tee $S/shadow",
+        "S=/etc; IFS=; cp source ${S}/shadow",
+        "S=/etc; IFS=; dd of=${S}/shadow",
+        "S=/etc; IFS=; sed -i s/x/y/ $S/shadow",
+    ] {
+        assert_decision(source, false, Some("core.filesystem:credential-file-write"));
+    }
+    assert_decision(
+        "S=.git; IFS=; tee ${S}/config",
+        false,
+        Some("core.filesystem:git-internals-write"),
+    );
+}
+
+#[test]
+fn scalar_path_unknowns_and_caller_side_splitting_still_require_review_566() {
+    for source in [
+        "S=/tmp/a@/etc; IFS=@; IFS= tee ${S}/shadow",
+        "S=/tmp/work; IFS=$CUSTOM; tee ${S}/shadow",
+        "S=/tmp/safe; IFS=; printf -v S /etc; tee $S/shadow",
+        "S=-i@/etc; IFS=@; sed -n p ${S}/shadow",
+    ] {
+        assert_decision(source, false, None);
+    }
+}
+
+#[test]
+fn scalar_path_uncertainty_preserves_independent_rule_grants_566() {
+    for (grant, control, remaining) in [
+        (
+            "core.filesystem:credential-file-write",
+            "tee /etc/shadow",
+            "core.filesystem:git-internals-write",
+        ),
+        (
+            "core.filesystem:git-internals-write",
+            "tee .git/config",
+            "core.filesystem:credential-file-write",
+        ),
+    ] {
+        // Both sides of the control prove that this grant is effective.
+        // An unknown destination may still name the other protected family.
+        assert_decision(control, false, Some(grant));
+        assert_decision_with_grant(control, true, None, Some(grant));
+        assert_decision_with_grant(
+            "IFS=; tee ${UNRESOLVED}/file",
+            false,
+            Some(remaining),
+            Some(grant),
+        );
     }
 }
