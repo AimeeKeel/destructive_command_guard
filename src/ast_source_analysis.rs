@@ -27,6 +27,7 @@ enum DocumentationValue {
     Scalar,
     File,
     NodeFs,
+    JavaScriptRegex,
 }
 
 /// Literal ranges whose shell-looking bytes retain a proven data role (#544).
@@ -137,6 +138,16 @@ impl DocumentationProof {
             }
             "identifier" => self.values.get(node.text().as_ref()).copied(),
             "integer" | "float" | "number" | "true" | "false" | "none" | "null" => Some(Scalar),
+            "regex" if self.language == ScriptLanguage::JavaScript => {
+                // #560: regex source is literal data, not a shell program.
+                // Keep its object type: only a known text replacement may
+                // consume it. Callbacks, property writes and prototype changes
+                // still invalidate the complete program's data proof.
+                if node.text().contains('`') || node.text().contains("$(") {
+                    self.literals.push(node.range());
+                }
+                Some(DocumentationValue::JavaScriptRegex)
+            }
             "string" | "template_string" => {
                 // F-string/template expressions execute. They participate in
                 // the same proof; quote shape alone never establishes safety.
@@ -198,7 +209,7 @@ impl DocumentationProof {
         node: &ast_grep_core::Node<'_, D>,
         depth: usize,
     ) -> Option<DocumentationValue> {
-        use DocumentationValue::{File, NodeFs, Scalar, Text};
+        use DocumentationValue::{File, JavaScriptRegex, NodeFs, Scalar, Text};
         if depth >= 64 {
             return None;
         }
@@ -212,17 +223,23 @@ impl DocumentationProof {
             .children()
             .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
             .collect();
-        for argument in &args {
+        let mut regex_search = false;
+        for (index, argument) in args.iter().enumerate() {
             let value = if argument.kind().as_ref() == "keyword_argument" {
                 self.expression(&argument.field("value")?, depth + 1)?
             } else {
                 self.expression(argument, depth + 1)?
             };
-            if !matches!(value, Text | Scalar) {
-                return None; // file/module capabilities may not escape
+            if value == JavaScriptRegex && index == 0 && args.len() == 2 {
+                regex_search = true;
+            } else if !matches!(value, Text | Scalar) || (regex_search && value != Text) {
+                return None; // capabilities may not escape; a replacement must be text
             }
         }
         if function.kind().as_ref() == "identifier" {
+            if regex_search {
+                return None;
+            }
             return match (self.language, function.text().as_ref()) {
                 (ScriptLanguage::Python, "print") => Some(Scalar),
                 (ScriptLanguage::Python, "open") if !args.is_empty() => {
@@ -278,10 +295,17 @@ impl DocumentationProof {
             && object.kind().as_ref() == "identifier"
             && object.text() == "console"
         {
-            return matches!(method.text().as_ref(), "log" | "info" | "warn" | "error")
-                .then_some(Scalar);
+            return (!regex_search
+                && matches!(method.text().as_ref(), "log" | "info" | "warn" | "error"))
+            .then_some(Scalar);
         }
         let receiver = self.expression(&object, depth + 1)?;
+        if regex_search {
+            return (self.language == ScriptLanguage::JavaScript
+                && receiver == Text
+                && matches!(method.text().as_ref(), "replace" | "replaceAll"))
+            .then_some(Text);
+        }
         match (receiver, method.text().as_ref()) {
             (
                 Text,
@@ -2801,6 +2825,132 @@ mod tests {
                 assert_eq!(commands.len(), 1);
                 assert_eq!(commands[0].command, "git reset --hard");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod javascript_regex_regressions_560 {
+    use super::*;
+
+    const LANGUAGE: ScriptLanguage = ScriptLanguage::JavaScript;
+
+    fn assert_data(source: &str) -> Vec<std::ops::Range<usize>> {
+        let ranges = inert_documentation_literal_ranges(source, LANGUAGE);
+        assert!(!ranges.is_empty(), "missing regex text-edit proof: {source}");
+        assert!(ranges.iter().all(|range| source.get(range.clone()).is_some()));
+        assert!(
+            interpreter_literal_shell_commands_inner(source, LANGUAGE, true)
+                .expect("bounded complete data program")
+                .is_empty(),
+            "a regex text edit is not shell execution: {source}"
+        );
+        ranges
+    }
+
+    #[test]
+    fn literal_and_aliased_regex_edits_keep_exact_source_ranges() {
+        for source in [
+            "const pattern = /x$/; const text = \"it's `tool --help`\"; console.log(text.replace(pattern, 'x'));",
+            "const text = 'x'.replace(/x$/, \"it's `tool --help`\"); console.log(text);",
+            "const text = 'xx'.replaceAll(/x/g, '$(git reset --hard)'); console.log(text);",
+            "const pattern = /x/; const alias = pattern; const text = 'x'.replace(alias, '`git reset --hard`'); console.log(text);",
+        ] {
+            assert_data(source);
+        }
+        let source = "const note = 'élève'; const pattern = /`git reset --hard`/g; const text = 'x'.replace(pattern, 'y'); console.log(text);";
+        let ranges = assert_data(source);
+        assert_eq!(ranges.len(), 1);
+        let start = source.find("/`git reset --hard`/g").unwrap();
+        assert_eq!(ranges[0], start..start + "/`git reset --hard`/g".len());
+        assert_eq!(source.get(ranges[0].clone()), Some("/`git reset --hard`/g"));
+    }
+
+    #[test]
+    fn regex_values_do_not_escape_their_search_argument_role() {
+        for source in [
+            "const pattern = /x/; console.log(pattern, '`git reset --hard`');",
+            "const fs = require('fs'); fs.writeFileSync(/x/, '`git reset --hard`');",
+            "const text = 'x'.replace('`git reset --hard`', /x/);",
+            "const text = 'x'.replace(/x/, 1); const note = '`git reset --hard`';",
+            "const text = 'x'.trim(/x/, '`git reset --hard`');",
+            "const text = 'x'.replace(/x/, '`git reset --hard`', 'extra');",
+            "const pattern = /x/; const text = pattern + '`git reset --hard`';",
+        ] {
+            assert!(
+                inert_documentation_literal_ranges(source, LANGUAGE).is_empty(),
+                "regex objects must not acquire arbitrary scalar/text roles: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn callbacks_mutations_and_unknown_regex_factories_withdraw_the_proof() {
+        for source in [
+            "const text = 'x'.replace(/x/, () => run('$(git reset --hard)'));",
+            "const text = 'x'.replace(/x/, callback); const note = '`git reset --hard`';",
+            "const pattern = new RegExp('x'); const text = 'x'.replace(pattern, '`git reset --hard`');",
+            "const text = 'x'.replace(pattern, '`git reset --hard`');",
+            "const pattern = /x/; pattern[Symbol.replace] = run; const text = 'x'.replace(pattern, '`git reset --hard`');",
+            "const pattern = /x/; const alias = pattern; alias.exec = run; const text = 'x'.replace(pattern, '`git reset --hard`');",
+            "String.prototype.replace = run; const text = 'x'.replace(/x/, '`git reset --hard`');",
+            "RegExp.prototype[Symbol.replace] = run; const text = 'x'.replace(/x/, '`git reset --hard`');",
+            "const text = 'x'.replace(/x/, '`git reset --hard`'); function require() { return helper; }",
+        ] {
+            assert!(
+                inert_documentation_literal_ranges(source, LANGUAGE).is_empty(),
+                "executable hooks and unproved bindings retain original analysis: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn regex_data_still_requires_the_independent_outer_consumer_proof() {
+        let source = "const text = 'x'.replace(/x/, 'echo $(git reset --hard)'); console.log(text);";
+        assert_data(source);
+        let commands = interpreter_literal_shell_commands_inner(source, LANGUAGE, false)
+            .expect("an unproved outer consumer retains the conservative literal evidence");
+        assert!(
+            commands.iter().any(|command| command.command == "echo $(git reset --hard)"),
+            "a source proof cannot authorize a later shell consumer"
+        );
+    }
+
+    #[test]
+    fn regex_text_edits_do_not_authorize_protected_writes() {
+        for (path, rule) in [
+            ("/etc/shadow", "core.filesystem.credential-file-write"),
+            (".git/config", "core.filesystem.git-internals-write"),
+        ] {
+            let source = format!(
+                "const fs = require('node:fs'); const text = 'x'.replace(/x/, '`git reset --hard`'); fs.writeFileSync('{path}', text);"
+            );
+            assert_data(&source);
+            for hits in [
+                scan_filesystem_sink_fallback(&source, LANGUAGE),
+                DEFAULT_MATCHER.find_matches(&source, LANGUAGE).unwrap(),
+            ] {
+                assert!(
+                    hits.iter().any(|hit| hit.rule_id == rule && hit.severity.blocks_by_default()),
+                    "literal data must retain the original protected-write policy: {source}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn regex_replacements_do_not_hide_indirect_execution() {
+        for sink in ["run(text);", "require('child_process').execSync(text);"] {
+            let source = format!(
+                "const text = 'x'.replace(/x/, 'echo $(git reset --hard)'); {sink}"
+            );
+            assert!(inert_documentation_literal_ranges(&source, LANGUAGE).is_empty());
+            let commands = interpreter_literal_shell_commands_inner(&source, LANGUAGE, true)
+                .expect("indirect execution retains its source evidence");
+            assert!(
+                commands.iter().any(|command| command.command == "echo $(git reset --hard)"),
+                "the data proof must fail for the whole executable program: {source}"
+            );
         }
     }
 }
