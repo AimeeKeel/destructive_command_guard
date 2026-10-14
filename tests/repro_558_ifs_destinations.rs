@@ -38,7 +38,12 @@ fn assert_decision(source: &str, allowed: bool, rule: Option<&str>) {
     assert_decision_with_grant(source, allowed, rule, None);
 }
 
-fn assert_decision_with_grant(source: &str, allowed: bool, rule: Option<&str>, grant: Option<&str>) {
+fn assert_decision_with_grant(
+    source: &str,
+    allowed: bool,
+    rule: Option<&str>,
+    grant: Option<&str>,
+) {
     let temp = tempfile::tempdir().expect("tempdir");
     if let Some(grant) = grant {
         let allowlist = format!(
@@ -76,7 +81,11 @@ fn assert_decision_with_grant(source: &str, allowed: bool, rule: Option<&str>, g
     if let Some(rule) = rule {
         let (pack, pattern) = rule.split_once(':').expect("pack:pattern");
         assert_eq!(field("Pack:"), Some(pack), "{source}: {stdout}\n{stderr}");
-        assert_eq!(field("Pattern:"), Some(pattern), "{source}: {stdout}\n{stderr}");
+        assert_eq!(
+            field("Pattern:"),
+            Some(pattern),
+            "{source}: {stdout}\n{stderr}"
+        );
     }
 
     let mut hook = isolated_dcg(&temp)
@@ -233,7 +242,7 @@ fn quoted_scalar_results_and_literal_list_text_remain_data() {
         r#"IFS=@; S=ok; tee "$S"'[@]'"#,
         r#"IFS=@; S=ok; tee "$S"'${@:1}'"#,
         r#"IFS=@; tee "\${@:1}""#,
-        r#"IFS=@; tee '${@:1}'"#,
+        r"IFS=@; tee '${@:1}'",
         r#"IFS=@; tee "${#@}""#,
         r#"IFS=@; tee "${#A[@]}""#,
         r#"IFS=@; A=(/tmp/a /tmp/b); tee "${A[*]}""#,
@@ -319,10 +328,12 @@ fn failed_redirections_cannot_make_stale_dangerous_bindings_look_safe() {
         "IFS=: >/definitely/missing/parent/file",
         "export IFS=: >/definitely/missing/parent/file",
     ] {
-        let source = format!(
-            "S=/tmp/a@/etc/profile; IFS=@; {mutation}; tee $S"
+        let source = format!("S=/tmp/a@/etc/profile; IFS=@; {mutation}; tee $S");
+        assert_decision(
+            &source,
+            false,
+            Some("core.filesystem:credential-file-write"),
         );
-        assert_decision(&source, false, Some("core.filesystem:credential-file-write"));
     }
 }
 
@@ -340,10 +351,12 @@ fn printf_count_assignments_cannot_hide_native_writer_destinations() {
         "E=; printf $E 'abcde%n' SEP",
         "p''rintf 'abcde%n' SEP",
     ] {
-        let source = format!(
-            "SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S"
+        let source = format!("SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S");
+        assert_decision(
+            &source,
+            false,
+            Some("core.filesystem:credential-file-write"),
         );
-        assert_decision(&source, false, Some("core.filesystem:credential-file-write"));
     }
     // %n can also replace IFS itself. Reassignment forces shells that cache
     // their splitting table to observe the new value before the writer runs.
@@ -356,7 +369,11 @@ fn printf_count_assignments_cannot_hide_native_writer_destinations() {
         let source = format!(
             "SEP=@; IFS=@; S=/tmp/a5/etc/profile; printf 'abcde%n' SEP; IFS=$SEP; {writer}"
         );
-        assert_decision(&source, false, Some("core.filesystem:credential-file-write"));
+        assert_decision(
+            &source,
+            false,
+            Some("core.filesystem:credential-file-write"),
+        );
     }
 }
 
@@ -375,9 +392,7 @@ fn printf_count_shaped_data_and_time_formats_remain_allowed() {
         r#"F=%%n; printf "$F" SEP"#,
         r#"E=; printf "$E" 'abcde%n' SEP"#,
     ] {
-        let source = format!(
-            "SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S"
-        );
+        let source = format!("SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S");
         assert_decision(&source, true, None);
     }
 }

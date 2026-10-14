@@ -29,9 +29,11 @@ fn assert_decision(source: &str, expected: &str) {
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env("DCG_NO_SELF_HEAL", "1")
             .env("DCG_HISTORY_ENABLED", "false")
-            // Semantic tests use the existing #412 test envelope. Production
-            // budgets remain unchanged; performance requires a separate replay.
+            // Semantic tests use the existing #412/#438 test envelopes.
+            // Production budgets remain unchanged; performance requires a
+            // separate replay without these test-only timeout overrides.
             .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .env("DCG_AST_TIMEOUT_MS", "5000")
             .current_dir(temp.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -112,5 +114,77 @@ fn shell_consumers_and_unquoted_expansions_remain_blocked() {
         "git reset --hard; python3 - <<'EOF'\nprint('safe')\nEOF",
     ] {
         assert_decision(source, "deny");
+    }
+}
+
+/// Keep each source below the byte/node caps while crossing the 128-literal
+/// boundary. Escaped newlines trigger literal analysis even with no raw shell
+/// substitution markers; the classifier must decode them as ordinary data.
+fn literal_heavy_source(interpreter: &str, count: usize, tail: &str) -> String {
+    let mut source = format!("{interpreter} - <<'DCG_LITERAL_560'\n");
+    for index in 0..count {
+        let statement = match interpreter {
+            "python3" => format!("value_{index} = 'entry_{index}\\n'\n"),
+            "node" => format!("const value_{index} = 'entry_{index}\\n';\n"),
+            _ => panic!("unsupported test interpreter"),
+        };
+        source.push_str(&statement);
+    }
+    source.push_str(tail);
+    source.push_str("\nDCG_LITERAL_560");
+    source
+}
+
+#[test]
+fn plain_literal_programs_cross_the_candidate_boundary_without_becoming_indeterminate() {
+    for interpreter in ["python3", "node"] {
+        for count in [127, 128, 129, 160] {
+            assert_decision(&literal_heavy_source(interpreter, count, ""), "allow");
+        }
+    }
+}
+
+#[test]
+fn literal_heavy_programs_retain_execution_and_protected_write_denials() {
+    for (interpreter, tail) in [
+        ("python3", "import os\nos.system('git reset --hard')"),
+        (
+            "python3",
+            "import os\ncommand = 'echo $(git reset --hard)'\nos.system(command)",
+        ),
+        (
+            "python3",
+            "import os\ncommand = 'echo \\x24\\x28git reset --hard)'\nos.system(command)",
+        ),
+        ("python3", "import shutil\nshutil.rmtree('/etc')"),
+        ("python3", "open('/etc/shadow', 'w').write('x')"),
+        (
+            "node",
+            "require('child_process').execSync('git reset --hard');",
+        ),
+        (
+            "node",
+            "const command = 'echo $(git reset --hard)'; require('child_process').execSync(command);",
+        ),
+        (
+            "node",
+            "const command = 'echo \\u0024\\u0028git reset --hard)'; require('child_process').execSync(command);",
+        ),
+        (
+            "node",
+            "require('fs').rmSync('/etc', {recursive:true, force:true});",
+        ),
+        ("node", "require('fs').writeFileSync('/etc/shadow', 'x');"),
+    ] {
+        assert_decision(&literal_heavy_source(interpreter, 160, tail), "deny");
+    }
+}
+
+#[test]
+fn literal_heavy_programs_do_not_hide_following_shell_commands() {
+    for interpreter in ["python3", "node"] {
+        let mut source = literal_heavy_source(interpreter, 160, "");
+        source.push_str("\ngit reset --hard");
+        assert_decision(&source, "deny");
     }
 }

@@ -499,6 +499,9 @@ pub struct EvaluationResult {
     pub effective_mode: Option<crate::packs::DecisionMode>,
     /// Whether evaluation skipped deeper analysis due to a deadline overrun.
     pub skipped_due_to_budget: bool,
+    /// A regex failed during this request. Positive evidence may still deny,
+    /// but a policy/confidence downgrade cannot authorize incomplete work.
+    pub regex_evaluation_incomplete: bool,
     /// Whether the evaluator proved that no enabled-pack keyword was present
     /// and returned through the bounded quick-reject fast path.
     pub quick_rejected: bool,
@@ -525,6 +528,7 @@ impl EvaluationResult {
             effective_mode: None,
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -554,6 +558,7 @@ impl EvaluationResult {
             effective_mode: None,
             skipped_due_to_budget: false,
             quick_rejected: true,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -572,6 +577,7 @@ impl EvaluationResult {
             effective_mode: None,
             skipped_due_to_budget: true,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -600,6 +606,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -628,6 +635,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -667,6 +675,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -726,6 +735,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -792,6 +802,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Warn),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -821,6 +832,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -849,6 +861,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -884,6 +897,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -919,6 +933,7 @@ impl EvaluationResult {
             effective_mode: Some(severity.default_mode()),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -957,6 +972,7 @@ impl EvaluationResult {
             effective_mode: Some(severity.default_mode()),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -983,6 +999,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -14048,6 +14065,54 @@ fn dialect_view_may_expose_hidden_execution(
 /// dialect the enclosing view established.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_command_with_pack_order_deadline_at_path_inner(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    shell_dialect: crate::normalize::ShellDialect,
+    nested_command_depth: usize,
+    inherited_automated_stdin: bool,
+) -> EvaluationResult {
+    let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+    let mut result = evaluate_command_in_dialect_union(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        shell_dialect,
+        nested_command_depth,
+        inherited_automated_stdin,
+    );
+    // A positive denial remains decisive. An exact-command grant explicitly
+    // authorizes the whole request. Every other would-be allow (including a
+    // warn/log result or a rule-scoped exemption) requires complete analysis.
+    // A failed regex search is not a successful proof that no rule matched.
+    if scope.has_failed() && result.bypass_method != Some(BypassMethod::AllowOnce) {
+        if result.decision != EvaluationDecision::Deny {
+            result = EvaluationResult {
+                decision: EvaluationDecision::Indeterminate,
+                ..EvaluationResult::allowed()
+            };
+        }
+        result.regex_evaluation_incomplete = true;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_command_in_dialect_union(
     command: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
@@ -31207,6 +31272,7 @@ fn evaluate_heredoc(
                         effective_mode: Some(crate::packs::DecisionMode::Deny),
                         skipped_due_to_budget: false,
                         quick_rejected: false,
+                        regex_evaluation_incomplete: false,
                         branch_context: None,
                         session_occurrence: None,
                         graduated_response: None,
@@ -31278,14 +31344,21 @@ fn evaluate_heredoc(
             // operations have no enabled shell-pack keyword. Preserve nested
             // interpreter and heredoc triggers as independent reasons to
             // evaluate the complete executable source.
-            let body_has_keywords = context.keyword_index.map_or_else(
-                || {
-                    context.enabled_keywords.iter().any(|kw| {
-                        memchr::memmem::find(content.content.as_bytes(), kw.as_bytes()).is_some()
-                    })
-                },
-                |index| index.has_any_keyword(&content.content),
-            );
+            // A keyword-less pack promises to inspect every executable
+            // command. The outer quick-reject already honors that contract;
+            // shell payload recursion must not silently discard it here.
+            let body_has_keywords = context.enabled_keywords.is_empty()
+                || crate::packs::get_external_packs()
+                    .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
+                || context.keyword_index.map_or_else(
+                    || {
+                        context.enabled_keywords.iter().any(|kw| {
+                            memchr::memmem::find(content.content.as_bytes(), kw.as_bytes())
+                                .is_some()
+                        })
+                    },
+                    |index| index.has_any_keyword(&content.content),
+                );
 
             if body_has_keywords || check_triggers(&content.content) == TriggerResult::Triggered {
                 // A payload arriving on `psql`'s stdin is PostgreSQL, and the
@@ -31432,6 +31505,7 @@ fn evaluate_heredoc(
                                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                                 skipped_due_to_budget: false,
                                 quick_rejected: false,
+                                regex_evaluation_incomplete: false,
                                 branch_context: None,
                                 session_occurrence: None,
                                 graduated_response: None,
@@ -31540,6 +31614,7 @@ fn evaluate_heredoc(
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
                 quick_rejected: false,
+                regex_evaluation_incomplete: false,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -31741,6 +31816,7 @@ fn exec_sink_backstop_verdict(
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -32157,6 +32233,7 @@ fn check_credential_write_fallback(
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
                 quick_rejected: false,
+                regex_evaluation_incomplete: false,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -32542,6 +32619,16 @@ fn apply_effective_confidence(
         score: None,
         downgraded: false,
     };
+    if result.regex_evaluation_incomplete {
+        return ConfidenceResult {
+            mode: if mode == crate::packs::DecisionMode::Deny || config.unverified_denies() {
+                crate::packs::DecisionMode::Deny
+            } else {
+                crate::packs::DecisionMode::Ask
+            },
+            ..unchanged
+        };
+    }
     let Some(info) = result
         .pattern_info
         .as_ref()
@@ -32553,6 +32640,8 @@ fn apply_effective_confidence(
     if !config.confidence.enabled {
         return unchanged;
     }
+
+    let regex_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
 
     let sanitized = sanitize_for_pattern_matching(command);
     let normalized_command = crate::normalize::normalize_command(command);
@@ -32618,7 +32707,14 @@ fn apply_effective_confidence(
             downgraded: false,
         };
     }
-    scored
+    // Failure while looking for further occurrences supplies no evidence for
+    // weakening the original finding. This path also runs after the primary
+    // evaluator has returned, so it needs its own request-local scope.
+    if regex_scope.has_failed() {
+        unchanged
+    } else {
+        scored
+    }
 }
 
 /// Upper bound on the other occurrences [`confident_repeat_of_rule`] scores
@@ -32971,6 +33067,17 @@ pub fn apply_confidence_scoring(
     current_mode: crate::packs::DecisionMode,
     config: &crate::config::ConfidenceConfig,
 ) -> ConfidenceResult {
+    if result.regex_evaluation_incomplete {
+        return ConfidenceResult {
+            mode: if current_mode == crate::packs::DecisionMode::Deny {
+                current_mode
+            } else {
+                crate::packs::DecisionMode::Ask
+            },
+            score: None,
+            downgraded: false,
+        };
+    }
     // If confidence scoring is disabled, return unchanged mode
     if !config.enabled {
         return ConfidenceResult {
@@ -33065,6 +33172,9 @@ pub fn apply_branch_strictness(
     config: &Config,
     project_path: Option<&Path>,
 ) -> EvaluationResult {
+    if result.regex_evaluation_incomplete {
+        return result;
+    }
     // Early return if git awareness is disabled
     let git_awareness = &config.git_awareness;
     if !git_awareness.enabled {
@@ -47628,6 +47738,7 @@ mod tests {
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
                 quick_rejected: false,
+                regex_evaluation_incomplete: false,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -47816,6 +47927,7 @@ mod tests {
                 effective_mode: None,
                 skipped_due_to_budget: false,
                 quick_rejected: false,
+                regex_evaluation_incomplete: false,
                 session_occurrence: None,
                 graduated_response: None,
                 bypass_method: None,
@@ -51493,7 +51605,10 @@ mod issue_560_process_substitution_masking_tests {
         assert!(!view.contains("<(not_shell)"));
         let mut sinks = Vec::new();
         collect_posix_process_substitution_sinks(view.as_ref(), &mut sinks);
-        assert!(sinks.is_empty(), "interpreter data became outer shell syntax: {sinks:?}");
+        assert!(
+            sinks.is_empty(),
+            "interpreter data became outer shell syntax: {sinks:?}"
+        );
     }
 
     #[test]
@@ -51505,7 +51620,6 @@ mod issue_560_process_substitution_masking_tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod issue_561_git_bash_cmd_switch_tests {
@@ -51524,8 +51638,7 @@ mod issue_561_git_bash_cmd_switch_tests {
             ("//K", "cmd /k"),
         ] {
             let segment = format!("cmd {switch} \"ver\"");
-            let WindowsLauncherParse::Envelope(envelope) =
-                parsed(&segment, ShellDialect::Posix)
+            let WindowsLauncherParse::Envelope(envelope) = parsed(&segment, ShellDialect::Posix)
             else {
                 panic!("Git Bash spelling was not recognized: {segment}");
             };
