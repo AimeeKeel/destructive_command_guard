@@ -295,14 +295,112 @@ fn expand(raw: &str, state: &State) -> Result<Vec<String>, ()> {
         return fields(value, state.ifs.as_deref().ok_or(())?)
             .map(|fields| fields.into_iter().map(str::to_owned).collect());
     }
-    let value = literal(raw).ok_or(())?;
-    // A bare glob is not a literal argument, even without parameter expansion.
-    // Leave ordinary literal commands to the existing shell classifier; an
-    // argv reconstruction may not falsely quote away their expansion.
-    if live_pattern(raw) {
-        return Err(());
+    if let Some(value) = literal(raw) {
+        // A bare glob is not a literal argument, even without expansion.
+        if live_pattern(raw) {
+            return Err(());
+        }
+        return Ok(vec![value]);
     }
-    Ok(vec![value])
+    // #566: $ROOT/file and "${ROOT}"/file are scalar words, not mutations.
+    // Only reconstruct a concatenation when every expansion stays in one
+    // field. Literal prefix/suffix bytes are never subject to IFS splitting.
+    // The general standalone-scalar splitter above remains unchanged.
+    let (value, present) = scalar_word(raw, |name, quoted| {
+        let value = state.value(name)?;
+        if !quoted {
+            let ifs = state.ifs.as_deref()?;
+            if !ifs.is_ascii()
+                || ifs.contains('\0')
+                || value.chars().any(|ch| ifs.contains(ch))
+                || value.contains(['*', '?', '[', '('])
+            {
+                return None;
+            }
+        }
+        Some(value.to_owned())
+    })
+    .ok_or(())?;
+    Ok(if present { vec![value] } else { Vec::new() })
+}
+
+/// Decode only literal pieces and simple scalar parameter reads. The resolver
+/// owns value/splitting checks; a syntax-only caller may provide empty values
+/// to prove that a word cannot assign IFS or other bindings while expanding.
+/// This is not an argv safety grant. Unknown values still fail in `expand`.
+/// Parameter operators, arrays, indirection, arithmetic, substitutions and
+/// unquoted patterns are deliberately unsupported. No host lookup or eval.
+fn scalar_word(
+    raw: &str,
+    mut resolve: impl FnMut(&str, bool) -> Option<String>,
+) -> Option<(String, bool)> {
+    if raw.len() > MAX_VALUE_BYTES || raw.contains('\0') {
+        return None;
+    }
+    let mut result = String::new();
+    let mut present = false;
+    let mut quote = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {
+                result.push(ch);
+                present = true;
+            }
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                present = true; // explicit null arguments survive
+            }
+            (_, '\\') => {
+                let next = chars.next()?;
+                if next == '\n' {
+                    continue;
+                }
+                if quote == Some('"') && !matches!(next, '$' | '`' | '"' | '\\') {
+                    result.push('\\');
+                }
+                result.push(next);
+                present = true;
+            }
+            (_, '$') => {
+                let braced = chars.next_if_eq(&'{').is_some();
+                let mut name = String::new();
+                while chars
+                    .peek()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                {
+                    name.push(chars.next()?);
+                }
+                if !identifier(&name) || braced && chars.next() != Some('}') {
+                    return None;
+                }
+                let value = resolve(&name, quote == Some('"'))?;
+                if result.len().saturating_add(value.len()) > MAX_VALUE_BYTES || value.contains('\0')
+                {
+                    return None;
+                }
+                present |= !value.is_empty();
+                result.push_str(&value);
+            }
+            (_, '`')
+            | (
+                None,
+                '~' | '{' | '}' | '*' | '?' | '[' | '(' | ')' | ';' | '&' | '|' | '<' | '>',
+            ) => {
+                return None;
+            }
+            (None, ch) if ch.is_whitespace() => return None,
+            _ => {
+                result.push(ch);
+                present = true;
+            }
+        }
+        if result.len() > MAX_VALUE_BYTES {
+            return None;
+        }
+    }
+    quote.is_none().then_some((result, present))
 }
 
 /// Mixed quoting does not neutralize a pattern in the unquoted portion:
@@ -689,7 +787,14 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                     assignment(prefix)
                         .is_none_or(|(_, _, rhs)| literal(rhs).is_none() && scalar(rhs).is_none())
                 }) || words.iter().any(|word| {
-                    literal(word).is_none() && scalar(word).is_none() && word.contains(['$', '`'])
+                    // A passive scalar read must not manufacture an IFS
+                    // mutation before a later `while IFS= read` (#566).
+                    // Real effects and unsupported expansions still erase
+                    // facts; unknown scalar values still fail reconstruction.
+                    literal(word).is_none()
+                        && scalar(word).is_none()
+                        && word.contains(['$', '`'])
+                        && scalar_word(word, |_, _| Some(String::new())).is_none()
                 }) {
                     state.forget();
                 }
@@ -805,6 +910,215 @@ pub(super) fn candidate(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_word_syntax_distinguishes_reads_from_effects_566() {
+        for raw in [
+            "$S/e2e.log",
+            "${S}/e2e.log",
+            r#""${S}"/e2e.log"#,
+            "prefix${S}${T}/file",
+            r#"${S}'$(not executed)'"#,
+        ] {
+            assert!(
+                scalar_word(raw, |_, _| Some(String::new())).is_some(),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "${IFS:=@}/file",
+            "${S:-$T}",
+            "${!S}",
+            "${S[0]}",
+            "${S[@]}",
+            "$@/file",
+            "${@:1}",
+            "$((IFS=1))",
+            "$(command)/file",
+            "`command`/file",
+            "$'text'${S}",
+            "$S/*",
+            "~/$S",
+            "${S}{a,b}",
+            "\"${S}",
+            r#"${S}"`not executed`""#,
+        ] {
+            assert!(
+                scalar_word(raw, |_, _| Some(String::new())).is_none(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_field_scalar_paths_preserve_quotes_and_null_arguments_566() {
+        let mut state = State::default();
+        state.assign("IFS=", true);
+        state.assign("S='/tmp/élève work'", true);
+        state.assign("E=", true);
+        for (raw, expected) in [
+            ("$S/e2e.log", vec!["/tmp/élève work/e2e.log"]),
+            ("${S}/e2e.log", vec!["/tmp/élève work/e2e.log"]),
+            (r#""$S"/e2e.log"#, vec!["/tmp/élève work/e2e.log"]),
+            ("${E}${E}", vec![]),
+            ("${E}''${E}", vec![""]),
+            ("${E}/file", vec!["/file"]),
+            (r#"${S}'*'"#, vec!["/tmp/élève work*"]),
+        ] {
+            assert_eq!(expand(raw, &state).unwrap(), expected, "{raw}");
+        }
+        state.assign("S=/tmp/work", true);
+        state.assign("IFS=@", true);
+        assert_eq!(expand("$S/a@b", &state).unwrap(), ["/tmp/work/a@b"]);
+        state.assign("IFS=/", true);
+        assert!(expand("$S/file", &state).is_err());
+        assert_eq!(expand(r#""$S"/file"#, &state).unwrap(), ["/tmp/work/file"]);
+    }
+
+    #[test]
+    fn concatenation_never_quotes_away_unknown_splitting_or_patterns_566() {
+        let mut state = State::default();
+        state.assign("S=/tmp/work", true);
+        assert!(
+            expand("$S/file", &state).is_err(),
+            "IFS is not inherited from dcg"
+        );
+        state.assign("IFS=@", true);
+        for value in ["/tmp/a@/etc", "-i@/etc", "*.txt", "a?", "[ab]", "@(a|b)"] {
+            state.values.insert("S".into(), value.into());
+            assert!(expand("${S}/profile", &state).is_err(), "{value}");
+            assert_eq!(
+                expand(r#""${S}"/profile"#, &state).unwrap(),
+                [format!("{value}/profile")]
+            );
+        }
+        assert!(expand("${UNRESOLVED}/file", &state).is_err());
+        state.values.insert("S".into(), "x".repeat(MAX_VALUE_BYTES));
+        assert!(expand("${S}/file", &state).is_err());
+        assert!(scalar_word(&"x".repeat(MAX_VALUE_BYTES + 1), |_, _| None).is_none());
+    }
+
+    #[test]
+    fn log_readers_do_not_invent_an_earlier_ifs_mutation_566() {
+        for source in [
+            "S=/tmp/work; IFS= ; sed -n 3,8p $S/e2e.log",
+            "S=/tmp/work; sed -n 3,8p $S/e2e.log | while IFS= read -r l; do echo \"$l\"; done",
+            "S=/tmp/work; sed -n p $S/e2e.log | while IFS= read -r l; do echo; done",
+            "S=/tmp/work; cat log | sed -n p ${S}/e2e.log | while IFS= read -r l; do echo; done",
+            "S=/tmp/work; IFS=@; sed -n p $S/e2e.log",
+        ] {
+            assert!(scan(source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn resolved_scalar_paths_reach_native_writers_with_original_spans_566() {
+        for (source, rule) in [
+            (
+                "S=/etc; IFS=; tee $S/profile",
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+            ),
+            (
+                "S=.git; IFS=; tee ${S}/config",
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ),
+            (
+                "S=/etc; IFS=; cp source $S/profile",
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+            ),
+            (
+                "S=/etc; IFS=; dd of=${S}/profile",
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+            ),
+            (
+                "S=/etc; IFS=; sed -i s/x/y/ $S/profile",
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+            ),
+        ] {
+            let start = source.rfind("; ").unwrap() + 2;
+            let hits = scan(source, ShellDialect::Posix);
+            assert!(
+                hits.iter().any(|hit| hit.rule == rule
+                    && hit.reason != UNCERTAIN
+                    && hit.span == (start..source.len())),
+                "resolved paths must not bypass native policy: {source}: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_scalar_paths_keep_both_rule_families_566() {
+        for source in [
+            "S=/tmp/a@/etc/profile; IFS=@; tee prefix${S}",
+            "S=/tmp/a@/etc; IFS=@; IFS= tee ${S}/profile",
+            "S=/tmp/work; IFS=$CUSTOM; tee ${S}/profile",
+            "S=/tmp/safe; IFS=; printf -v S /etc; tee $S/profile",
+            "S=/tmp/work; IFS=; tee ${UNRESOLVED}/profile",
+            "S=-i@/etc; IFS=@; sed -n p ${S}/profile",
+            "S=/tmp/work; IFS=@; echo ${S}; tee ${S}/${IFS:=/}",
+        ] {
+            let hits = scan(source, ShellDialect::Posix);
+            for rule in [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ] {
+                assert!(
+                    hits.iter().any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                    "uncertainty cannot grant either family: {source}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    /// Only fixed parameter-read words are executed by this oracle. Values
+    /// arrive through the environment and are never evaluated as shell source.
+    #[test]
+    #[cfg(unix)]
+    fn reconstructed_scalar_words_match_native_shell_argv_566() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for ifs in ["", "@", DEFAULT_IFS] {
+                for value in ["", "/tmp/work", "élève", "a b", "a@b", "literal*text"] {
+                    for raw in [
+                        "${S}/file",
+                        r#""${S}"/file"#,
+                        "${E}${E}",
+                        "${E}''",
+                        "${S}/a@b",
+                    ] {
+                        let mut state = State {
+                            ifs: Some(ifs.into()),
+                            ..State::default()
+                        };
+                        state.values.insert("S".into(), value.into());
+                        state.values.insert("E".into(), String::new());
+                        let Ok(expected) = expand(raw, &state) else {
+                            continue; // no claim about unsupported field joins/globs
+                        };
+                        let script = format!(
+                            "IFS=$DCG_TEST_IFS; S=$DCG_TEST_VALUE; E=; set -- {raw}; printf '%s\\0' \"$#\"; for arg; do printf '%s\\0' \"$arg\"; done"
+                        );
+                        let output = std::process::Command::new(shell)
+                            .args(["-c", &script])
+                            .env_clear()
+                            .env("DCG_TEST_IFS", ifs)
+                            .env("DCG_TEST_VALUE", value)
+                            .output()
+                            .expect("native scalar-word oracle");
+                        assert!(output.status.success(), "{shell}: {output:?}");
+                        let printed = String::from_utf8(output.stdout).unwrap();
+                        let mut parts = printed.split_terminator('\0');
+                        let count: usize = parts.next().unwrap().parse().unwrap();
+                        let actual: Vec<_> = parts.collect();
+                        assert_eq!(count, actual.len());
+                        assert_eq!(
+                            expected, actual,
+                            "{shell}: IFS={ifs:?}, S={value:?}, word={raw}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn splitting_preserves_posix_whitespace_and_empty_field_rules() {
