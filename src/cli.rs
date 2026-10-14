@@ -15516,9 +15516,11 @@ pub(crate) const OMP_EXTENSION_MARKER: &str = "dcg-omp-extension";
 ///
 /// dcg's ordinary evaluator deadline is 1 second and the broad Windows preset
 /// defaults to 3 seconds, but an operator may configure a larger deadline.
-/// Keep this pathological-hang backstop generous enough not to compete with
-/// those evaluator budgets while still bounding a wedged child at the bridge.
-pub(crate) const OMP_CHILD_EVALUATION_TIMEOUT_MS: u64 = 30_000;
+/// Keep this pathological-hang backstop generous enough for those budgets,
+/// but shorter than OMP's default 30-second tool_call handler deadline. Its
+/// own watchdog must fire first so an operator sees dcg's failure diagnostic
+/// rather than a generic host handler timeout (#563).
+pub(crate) const OMP_CHILD_EVALUATION_TIMEOUT_MS: u64 = 25_000;
 
 /// Maximum time to drain stdout/stderr after Bun reports child termination.
 ///
@@ -15533,7 +15535,8 @@ pub(crate) const OMP_CHILD_PIPE_DRAIN_GRACE_MS: u64 = 250;
 /// Bun's native child timeout normally settles first. The extra two drain
 /// windows cover signal/reap propagation plus one bounded post-exit drain; if
 /// the exit capability itself never settles, this outer watchdog still closes
-/// the local observation boundary.
+/// the local observation boundary. Total is 25_500 ms, leaving 4_500 ms for
+/// the handler to finish under OMP's default 30_000 ms ceiling.
 pub(crate) const OMP_CHILD_OBSERVATION_TIMEOUT_MS: u64 =
     OMP_CHILD_EVALUATION_TIMEOUT_MS + 2 * OMP_CHILD_PIPE_DRAIN_GRACE_MS;
 
@@ -15868,12 +15871,15 @@ const DCG_OBSERVATION_ABORTED = Symbol("dcg-child-observation-aborted");
 // that the unverified posture may still turn into a block. A dcg that started
 // and then died (a signal, or an exit status dcg never uses for a verdict)
 // without a blocking verdict is a "crash": it blocks unless
-// DCG_BRIDGE_CRASH_DECISION=allow.
+// DCG_BRIDGE_CRASH_DECISION=allow. Exit 0/2 with empty, malformed or unknown
+// stdout is UNVERIFIED, not an allow: only an explicit robot JSON allow is
+// proof of a clean decision. The infrastructure row logs the failure and
+// honors DCG_UNVERIFIED_DECISION=deny (#564).
 const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
   "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
-  "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
+  "exit-0": {{ empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-1": {{ empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }},
-  "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
+  "exit-2": {{ empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-other": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
   "signal": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
 }};
@@ -24859,9 +24865,14 @@ if ($errors.Count -ne 0) {
                     > crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS,
                 "the bridge backstop must leave headroom above the largest shipped evaluator default"
             );
+            // OMP's default tool_call timeout is 30_000ms; reserve at least
+            // four seconds for the extension to finish after its watchdog.
+            const OMP_DEFAULT_HANDLER_TIMEOUT_MS: u64 = 30_000;
+            const REQUIRED_HANDLER_MARGIN_MS: u64 = 4_000;
             assert!(
-                OMP_CHILD_EVALUATION_TIMEOUT_MS <= 60_000,
-                "a wedged evaluator must not stall an OMP bash call for more than one minute"
+                OMP_CHILD_OBSERVATION_TIMEOUT_MS + REQUIRED_HANDLER_MARGIN_MS
+                    <= OMP_DEFAULT_HANDLER_TIMEOUT_MS,
+                "the generated guard watchdog must beat OMP's host handler timeout"
             );
         }
         assert!(source.contains(&format!(
@@ -25256,9 +25267,9 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("const DCG_CHILD_TRANSITIONS:"));
         for row in [
             r#""spawn-throw": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
-            r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
+            r#""exit-0": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
             r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#,
-            r#""exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
+            r#""exit-2": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
             r#""exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
             r#""signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
         ] {
@@ -25530,9 +25541,9 @@ const verdictFixtures = {
 } as const;
 const expectedActions = {
   "spawn-throw": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
-  "exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
+  "exit-0": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
   "exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" },
-  "exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
+  "exit-2": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
   "exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
   "signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
 } as const;
@@ -25759,7 +25770,7 @@ const recordUnhandledRejection = (reason: unknown): void => {
 process.on("unhandledRejection", recordUnhandledRejection);
 (performance as unknown as { now: () => number }).now = (): number => virtualNowMs;
 
-// Execute production watchdog branches without waiting 30 seconds. Clearing a
+// Execute production watchdog branches without waiting 25 seconds. Clearing a
 // known watchdog transfers ownership to at most one rearm, so a shortened
 // absolute-deadline delay is still recognized. Advancing the monotonic virtual
 // clock by the requested delay keeps deadline arithmetic faithful while wall
@@ -25814,7 +25825,7 @@ globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>): void => {
   if (activeChild.spawnError) throw new Error(activeChild.spawnError);
   if (observedExecutable === undefined) observedExecutable = argv[0];
   equal(argv[0], observedExecutable, "callback/spawn/executable-stability");
-  equal(options.timeout, 30_000, "callback/spawn/parent-timeout");
+  equal(options.timeout, 25_000, "callback/spawn/parent-timeout");
   equal(options.killSignal, "SIGKILL", "callback/spawn/kill-signal");
   const record: SpawnRecord = {
     argv: [...argv],
@@ -25938,7 +25949,7 @@ globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>): void => {
       () => { record.stderrCancelCalls += 1; },
     ),
     // Model Bun's native timeout without making the certificate wait for the
-    // production 30-second ceiling. The exact configured value and kill
+    // production 25-second ceiling. The exact configured value and kill
     // signal are asserted above, so removing either production option turns
     // this replay red before the compressed timer can resolve.
     exited: Promise.all([childExit, stdinCollected]).then(([exitCode]) => exitCode),
@@ -26034,7 +26045,7 @@ try {
   equal(replay.spawns[0]!.stdin, " \t", "callback/whitespace-allow/stdin-bytes");
   equal(replay.spawns[0]!.cwd, process.cwd(), "callback/whitespace-allow/cwd");
   equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix", "--format", "json", "--omp-bridge-output"], "callback/whitespace-allow/argv");
-  equal(replay.spawns[0]!.timeout, 30_000, "callback/whitespace-allow/parent-timeout");
+  equal(replay.spawns[0]!.timeout, 25_000, "callback/whitespace-allow/parent-timeout");
   equal(replay.spawns[0]!.killSignal, "SIGKILL", "callback/whitespace-allow/kill-signal");
   equal(replay.errors, ["[dcg] OMP guard dcg stderr: allow diagnostic"], "callback/whitespace-allow/diagnostics");
 
@@ -26124,6 +26135,24 @@ try {
   equal(replay.result, undefined, "callback/allow-then-stdout-fault/result");
   check(replay.errors.some(error => error.includes("stdout read failed: Error: after apparent allow")), "callback/allow-then-stdout-fault/diagnostic");
 
+
+  // The default posture still permits unavailable verdicts, but the child
+  // must never vanish silently. A missing robot frame always logs diagnostic.
+  for (const [caseId, exitCode] of [
+    ["callback/zero-empty-visible", 0],
+    ["callback/two-empty-visible", 2],
+  ] as const) {
+    replay = await invoke(
+      caseId,
+      { toolName: "bash", input: { command: "echo safe" } },
+      { stdout: "", exitCode },
+    );
+    equal(replay.result, undefined, `${caseId}/default-unverified-posture`);
+    equal(replay.errors, [
+      `[dcg] OMP guard infrastructure failure (exit ${exitCode})`,
+    ], `${caseId}/diagnostic`);
+  }
+
   replay = await invoke(
     "callback/malformed-exit-zero-visible",
     { toolName: "bash", input: { command: "echo safe" } },
@@ -26158,7 +26187,7 @@ try {
     { stdout: "", stderr: JSON.stringify({ decision: "deny", reason: "wrong channel" }), exitCode: 0 },
   );
   equal(replay.result, undefined, "callback/stderr-json-is-diagnostic/result");
-  equal(replay.errors, ["[dcg] OMP guard dcg stderr: {\"decision\":\"deny\",\"reason\":\"wrong channel\"}"], "callback/stderr-json-is-diagnostic/diagnostics");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 0): {\"decision\":\"deny\",\"reason\":\"wrong channel\"}"], "callback/stderr-json-is-diagnostic/diagnostics");
 
   replay = await invoke(
     "callback/exit-one-stderr-only",
@@ -26514,7 +26543,7 @@ try {
   equal(replay.watchdogFires, 1, "callback/exit-one-tick-before-hard-deadline/watchdog-fire-count");
   equal(replay.peakWatchdogs, 1, "callback/exit-one-tick-before-hard-deadline/peak-active-watchdog");
   equal(replay.errors, [
-    "[dcg] OMP guard infrastructure failure (exit 0): child observation exceeded the 30500-millisecond outer deadline",
+    "[dcg] OMP guard infrastructure failure (exit 0): child observation exceeded the 25500-millisecond outer deadline",
   ], "callback/exit-one-tick-before-hard-deadline/diagnostic-exactly-once");
   const absoluteDeadlineDiagnostics = [...diagnostics];
   const absoluteDeadlineFires = watchdogFireCount;
@@ -26557,7 +26586,7 @@ try {
   equal(replay.watchdogSchedules, 1, "callback/hard-deadline-after-deny/one-watchdog-at-a-time");
   equal(replay.watchdogFires, 1, "callback/hard-deadline-after-deny/watchdog-fire-count");
   equal(replay.errors, [
-    "[dcg] OMP guard infrastructure failure (exit status unavailable): child observation exceeded the 30500-millisecond outer deadline",
+    "[dcg] OMP guard infrastructure failure (exit status unavailable): child observation exceeded the 25500-millisecond outer deadline",
   ], "callback/hard-deadline-after-deny/no-unobserved-signal-diagnostic");
   const settledDiagnostics = [...diagnostics];
   const settledWatchdogFires = watchdogFireCount;
@@ -26635,6 +26664,31 @@ try {
   // infrastructure outcome into a block; `ask` keeps the #346 fail-open.
   process.env.DCG_UNVERIFIED_DECISION = " Deny ";
   try {
+
+    // #564: no stdout or unparsable stdout on exit 0/2 is unverified.
+    // The strict posture must block, with one visible error per invocation.
+    for (const [caseId, exitCode, stdout, detail] of [
+      ["callback/strict-zero-empty", 0, "", ""],
+      ["callback/strict-zero-malformed", 0, "{", ": dcg stdout was malformed"],
+      ["callback/strict-zero-unknown", 0, '{"decision":"future"}', ": dcg stdout carried an unrecognized decision"],
+      ["callback/strict-two-empty", 2, "", ""],
+      ["callback/strict-two-malformed", 2, "{", ": dcg stdout was malformed"],
+      ["callback/strict-two-unknown", 2, '{"decision":"future"}', ": dcg stdout carried an unrecognized decision"],
+    ] as const) {
+      replay = await invoke(
+        caseId,
+        { toolName: "bash", input: { command: "echo safe" } },
+        { stdout, exitCode },
+      );
+      equal(replay.result, {
+        block: true,
+        reason: `Blocked by dcg: the command could not be verified (dcg infrastructure failure (exit ${exitCode})) and DCG_UNVERIFIED_DECISION=deny`,
+      }, `${caseId}/result`);
+      equal(replay.errors, [
+        `[dcg] OMP guard infrastructure failure (exit ${exitCode})${detail}`,
+      ], `${caseId}/diagnostics`);
+    }
+
     replay = await invoke(
       "callback/spawn-throw-unverified-deny",
       { toolName: "bash", input: { command: "echo safe" } },
@@ -27095,8 +27149,8 @@ console.log(JSON.stringify({
             .map(str::to_string)
         );
 
-        let exit_zero_row = r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#;
-        let mutated_exit_zero_row = r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "allow", ask: "block", indeterminate: "block", unknown: "allow" }"#;
+        let exit_zero_row = r#""exit-0": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#;
+        let mutated_exit_zero_row = r#""exit-0": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "allow", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#;
         assert_eq!(
             source.matches(exit_zero_row).count(),
             1,
