@@ -47,12 +47,12 @@ impl DefaultPolicyMatcher {
         language: ScriptLanguage,
     ) -> Result<Vec<PatternMatch>, MatchError> {
         let matches = source_analysis::DEFAULT_MATCHER.find_matches(code, language)?;
-        Ok(tempfile_provenance::validate(
+        complete_python_deletion_matches(
             code,
             language,
             matches,
             source_analysis::protected_scan_budget(),
-        ))
+        )
     }
 
     /// Match source with an explicit budget. The producer proof uses only the
@@ -70,12 +70,12 @@ impl DefaultPolicyMatcher {
         let started = Instant::now();
         let matches = source_analysis::DEFAULT_MATCHER
             .find_matches_with_timeout(code, language, timeout)?;
-        Ok(tempfile_provenance::validate(
+        complete_python_deletion_matches(
             code,
             language,
             matches,
             timeout.saturating_sub(started.elapsed()),
-        ))
+        )
     }
 
     /// Return the first blocking match from the complete default policy.
@@ -86,6 +86,90 @@ impl DefaultPolicyMatcher {
             .into_iter()
             .find(|hit| hit.severity.blocks_by_default())
     }
+}
+
+// These are invocations of a statically named deletion member, not mere
+// lookups. Keep both quote spellings explicit: matching must not depend on a
+// grammar's treatment of quote tokens. Like the existing $M.rmtree pattern,
+// the receiver is deliberately not restricted to one module variable name.
+const PYTHON_REFLECTIVE_DELETE_CALLEES: [&str; 7] = [
+    "getattr($M, 'rmtree')",
+    "getattr($M, \"rmtree\")",
+    "$B.getattr($M, 'rmtree')",
+    "$B.getattr($M, \"rmtree\")",
+    "$M.__dict__['rmtree']",
+    "$M.__dict__[\"rmtree\"]",
+    "$M.rmtree.__call__",
+];
+
+static PYTHON_REFLECTIVE_DELETE_MATCHER: LazyLock<AstMatcher> = LazyLock::new(|| {
+    // Reuse the registered rule, including its target refinement, rather than
+    // harvesting a receiver's first literal ('rmtree') as the deletion path.
+    // Explicit user-created AstMatcher corpora remain unchanged.
+    let meta = source_analysis::default_patterns()
+        .remove(&ScriptLanguage::Python)
+        .and_then(|patterns| {
+            patterns
+                .into_iter()
+                .find(|meta| meta.rule_id == "heredoc.python.shutil_rmtree")
+        })
+        .expect("the default Python corpus registers its recursive-deletion rule");
+    let mut patterns = Vec::new();
+    for callee in PYTHON_REFLECTIVE_DELETE_CALLEES {
+        for pattern in [format!("{callee}($$$)"), format!("({callee})($$$)")] {
+            let mut pattern_meta = meta.clone();
+            pattern_meta.pattern_str = pattern;
+            patterns.push(pattern_meta);
+        }
+    }
+    AstMatcher::with_patterns(std::collections::HashMap::from([(
+        ScriptLanguage::Python,
+        patterns,
+    )]))
+});
+
+fn complete_python_deletion_matches(
+    code: &str,
+    language: ScriptLanguage,
+    mut matches: Vec<PatternMatch>,
+    budget: Duration,
+) -> Result<Vec<PatternMatch>, MatchError> {
+    let started = Instant::now();
+    if language == ScriptLanguage::Python
+        && code.contains("rmtree")
+        && ["getattr", "__dict__", "__call__"]
+            .iter()
+            .any(|name| code.contains(name))
+    {
+        // The ordinary AST worker supplies byte bounds, cancellation and the
+        // error contract. An incomplete extra scan is not an empty success.
+        let extra = PYTHON_REFLECTIVE_DELETE_MATCHER.find_matches_with_timeout(
+            code,
+            language,
+            budget.saturating_sub(started.elapsed()),
+        )?;
+        let mut seen: std::collections::HashSet<_> = matches
+            .iter()
+            .map(|hit| (hit.start, hit.end, hit.rule_id.clone()))
+            .collect();
+        for hit in extra {
+            if seen.insert((hit.start, hit.end, hit.rule_id.clone())) {
+                matches.push(hit);
+            }
+        }
+        // Keep the original finding's precedence on a tie. The supplemental
+        // corpus also resolves imported aliases; do not duplicate those hits.
+        matches.sort_by_key(|hit| hit.start);
+    }
+    // A reflected call gets exactly the existing descendant and factory
+    // policies. New .temp matches must not bypass factory/dependency proofs.
+    // Share the remaining budget; do not grant the proof a fresh deadline.
+    Ok(tempfile_provenance::validate(
+        code,
+        language,
+        matches,
+        budget.saturating_sub(started.elapsed()),
+    ))
 }
 
 /// Recover literal shell values only from source with execution evidence.
@@ -298,6 +382,86 @@ fn literal_execution_name(name: &str) -> bool {
 #[cfg(test)]
 mod literal_execution_evidence_tests {
     use super::*;
+
+    #[test]
+    fn python_reflective_rmtree_uses_the_existing_path_policy() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            id: String,
+            decision: String,
+            source: String,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/python_reflective_rmtree.json"
+        )))
+        .expect("valid reflective-deletion verdict fixtures");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let matches = DEFAULT_MATCHER
+                .find_matches_with_timeout(
+                    &case.source,
+                    ScriptLanguage::Python,
+                    Duration::from_secs(5),
+                )
+                .unwrap_or_else(|error| panic!("{}: {error:?}", case.id));
+            assert_eq!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                case.decision == "deny",
+                "{}: {}",
+                case.id,
+                case.source,
+            );
+        }
+    }
+
+    #[test]
+    fn reflective_deletion_budget_exhaustion_is_not_a_clean_result() {
+        assert!(
+            complete_python_deletion_matches(
+                "import shutil\ngetattr(shutil, 'rmtree')('/tmp')",
+                ScriptLanguage::Python,
+                Vec::new(),
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+        assert!(
+            complete_python_deletion_matches(
+                "print('ready')",
+                ScriptLanguage::Python,
+                Vec::new(),
+                Duration::ZERO,
+            )
+            .expect("unrelated source does not start a supplemental scan")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn reflective_deletion_merge_preserves_primary_rule_identity() {
+        let source = "import shutil\nfrom shutil import rmtree as wipe\nwipe('/tmp')\ngetattr(shutil, 'copy')";
+        let original = source_analysis::DEFAULT_MATCHER
+            .find_matches_with_timeout(source, ScriptLanguage::Python, Duration::from_secs(5))
+            .expect("complete primary deletion analysis");
+        let primary = original
+            .iter()
+            .find(|hit| hit.rule_id == "heredoc.python.shutil_rmtree")
+            .expect("the imported deletion has the established rule")
+            .clone();
+        let matches = complete_python_deletion_matches(
+            source,
+            ScriptLanguage::Python,
+            original,
+            Duration::from_secs(5),
+        )
+        .expect("complete supplemental scan");
+        assert_eq!(
+            matches.iter().filter(|hit| **hit == primary).count(),
+            1,
+            "do not duplicate or replace the primary finding",
+        );
+    }
 
     #[test]
     fn unproved_outer_consumers_keep_the_original_recovery_560() {

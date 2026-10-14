@@ -93,6 +93,35 @@ fn check_cases(hook: bool) {
     }
 }
 
+fn check_reflective_cases(hook: bool) {
+    let cases: Vec<Case> = serde_json::from_str(include_str!(
+        "fixtures/python_reflective_rmtree.json"
+    ))
+    .expect("valid reflective-deletion fixtures");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let quoted = format!("'{}'", case.source.replace('\'', "'\\''"));
+        for command in [
+            format!("python3 -c {quoted}"),
+            format!("python3 -I -c {quoted}"),
+            format!("python3 - <<'PY'\n{}\nPY", case.source),
+            format!("python3 -I - <<'PY'\n{}\nPY", case.source),
+        ] {
+            assert_verdict(&case, &command, hook);
+        }
+    }
+}
+
+#[test]
+fn reflective_rmtree_cli_verdicts() {
+    check_reflective_cases(false);
+}
+
+#[test]
+fn reflective_rmtree_hook_verdicts() {
+    check_reflective_cases(true);
+}
+
 #[test]
 fn tempfile_provenance_cli_verdicts() {
     check_cases(false);
