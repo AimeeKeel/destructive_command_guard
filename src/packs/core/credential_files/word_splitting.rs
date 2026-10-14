@@ -1013,9 +1013,12 @@ mod tests {
 
     #[test]
     fn resolved_scalar_paths_reach_native_writers_with_original_spans_566() {
+        // Use destinations present in the shared native policy. In
+        // particular, /etc/profile is not yet in that policy's table;
+        // the pre-existing #558 vectors for it exercise a separate gap.
         for (source, rule) in [
             (
-                "S=/etc; IFS=; tee $S/profile",
+                "S=/etc; IFS=; tee $S/shadow",
                 shell::CREDENTIAL_FILE_WRITE_NAME,
             ),
             (
@@ -1023,15 +1026,15 @@ mod tests {
                 shell::GIT_INTERNALS_WRITE_NAME,
             ),
             (
-                "S=/etc; IFS=; cp source $S/profile",
+                "S=/etc; IFS=; cp source $S/shadow",
                 shell::CREDENTIAL_FILE_WRITE_NAME,
             ),
             (
-                "S=/etc; IFS=; dd of=${S}/profile",
+                "S=/etc; IFS=; dd of=${S}/shadow",
                 shell::CREDENTIAL_FILE_WRITE_NAME,
             ),
             (
-                "S=/etc; IFS=; sed -i s/x/y/ $S/profile",
+                "S=/etc; IFS=; sed -i s/x/y/ $S/shadow",
                 shell::CREDENTIAL_FILE_WRITE_NAME,
             ),
         ] {
