@@ -197,33 +197,20 @@ pub(crate) fn interpreter_literal_shell_commands(
     allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
     budget: Duration,
 ) -> Result<Vec<ReconstructedCommand>, MatchError> {
-    // Let the existing implementation own its cheap gate and byte-limit error.
-    // Avoid allocating a second unbounded source before its worker starts.
-    if !source_analysis::has_interpreter_literal_candidates(code, language)
-        || code.len() > LITERAL_EVIDENCE_MAX_BYTES
-    {
-        return source_analysis::interpreter_literal_shell_commands(
-            code,
-            language,
-            allow_documentation_literals,
-            budget,
-        );
-    }
-    let started = Instant::now();
-    let source = code.to_owned();
-    source_analysis::interpreter_literal_shell_commands(
+    // The source analyzer owns the only source copy, parse, worker permit and
+    // deadline. Screen its parsed tree instead of reparsing a captured copy in
+    // the outer-consumer callback. That callback still runs first and once.
+    source_analysis::interpreter_literal_shell_commands_with_execution_evidence(
         code,
         language,
-        move || {
-            // Preserve the caller's unsupported-inline and outer-consumer
-            // contracts. The callback is invoked exactly once, as before.
-            let allow_documentation = allow_documentation_literals()?;
-            literal_recovery_scope(&source, language, allow_documentation)
-        },
-        budget.saturating_sub(started.elapsed()),
+        allow_documentation_literals,
+        budget,
+        true,
     )
 }
 
+// Retain the previous two-parse composition only as a differential oracle.
+#[cfg(test)]
 fn literal_recovery_scope(
     code: &str,
     language: ScriptLanguage,
@@ -240,9 +227,11 @@ fn literal_recovery_scope(
 
 // Independent bounds on this optional screen. Crossing either withholds the
 // screen, leaving the existing source analyzer's hard bounds and errors intact.
+#[cfg(test)]
 const LITERAL_EVIDENCE_MAX_BYTES: usize = 256 * 1024;
 const LITERAL_EVIDENCE_MAX_NODES: usize = 4096;
 
+#[cfg(test)]
 fn literal_source_has_execution_evidence(code: &str, language: ScriptLanguage) -> bool {
     use ast_grep_core::AstGrep;
     use ast_grep_language::SupportLang;
@@ -263,7 +252,16 @@ fn literal_source_has_execution_evidence(code: &str, language: ScriptLanguage) -
     let Ok(ast) = ast else {
         return true;
     };
-    let root = ast.root();
+    literal_root_has_execution_evidence(&ast.root(), language)
+}
+
+/// Inspect the recovery worker's tree; do not derive a new source exemption.
+/// A negative answer still requires the caller's independent outer-consumer
+/// proof. All original node, syntax, callee and identifier checks remain here.
+fn literal_root_has_execution_evidence<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> bool {
     for (index, node) in root.dfs().enumerate() {
         if index >= LITERAL_EVIDENCE_MAX_NODES || node.is_error() || node.is_missing() {
             return true;
@@ -377,6 +375,280 @@ fn literal_execution_name(name: &str) -> bool {
                 | "module"
                 | "require"
         )
+}
+
+#[cfg(test)]
+mod shared_literal_ast_tests {
+    use super::*;
+
+    type Snapshot = Result<Vec<(String, usize, usize)>, String>;
+
+    fn snapshot(result: Result<Vec<ReconstructedCommand>, MatchError>) -> Snapshot {
+        result
+            .map(|commands| {
+                commands
+                    .into_iter()
+                    .map(|command| (command.command, command.start, command.end))
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn incumbent(code: &str, language: ScriptLanguage, isolated: bool) -> Snapshot {
+        let result = match literal_recovery_scope(code, language, isolated) {
+            Some(allow_documentation) => {
+                source_analysis::interpreter_literal_shell_commands_inner(
+                    code,
+                    language,
+                    allow_documentation,
+                )
+            }
+            None => Ok(Vec::new()),
+        };
+        snapshot(result)
+    }
+
+    fn shared(code: &str, language: ScriptLanguage, isolated: bool) -> Snapshot {
+        snapshot(
+            source_analysis::interpreter_literal_shell_commands_inner_with_execution_evidence(
+                code, language, isolated, true,
+            ),
+        )
+    }
+
+    fn execution_source(language: ScriptLanguage, lines: usize) -> String {
+        match language {
+            ScriptLanguage::Python => format!(
+                "import os\n{}command = 'echo $(git reset --hard)'\ndispatch = os.system\ndispatch(command)\n",
+                "value = 1\n".repeat(lines),
+            ),
+            ScriptLanguage::JavaScript => format!(
+                "const cp = require('child_process');\n{}const command = 'echo $(git reset --hard)';\nconst dispatch = cp.execSync; dispatch(command);\n",
+                "var value = 1;\n".repeat(lines),
+            ),
+            _ => unreachable!("the fixture covers the two literal-recovery languages"),
+        }
+    }
+
+    #[test]
+    fn shared_literal_ast_matches_the_two_parse_execution_reference() {
+        for language in [ScriptLanguage::Python, ScriptLanguage::JavaScript] {
+            for lines in [0, 40, 300] {
+                let source = execution_source(language, lines);
+                for isolated in [false, true] {
+                    let expected = incumbent(&source, language, isolated);
+                    let actual = shared(&source, language, isolated);
+                    assert_eq!(actual, expected, "{language:?}, {lines}, {isolated}");
+                    let commands = actual.expect("complete execution fixture");
+                    assert!(
+                        commands.iter().any(|(command, _, _)| {
+                            command == "echo $(git reset --hard)"
+                        }),
+                        "an indirect executable payload must survive AST sharing"
+                    );
+                    for (_, start, end) in commands {
+                        assert!(source.get(start..end).is_some(), "original UTF-8 byte span");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_literal_ast_preserves_data_and_outer_consumer_boundaries() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "text = ('echo $(git reset --hard)', 'data')\nprint(text)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const text = ['echo $(git reset --hard)', 'data']; console.log(text);",
+            ),
+            (
+                ScriptLanguage::Python,
+                "text = 'élève $(git reset --hard)'\nedit(text)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const text = 'élève $(git reset --hard)'; edit(text);",
+            ),
+        ] {
+            for isolated in [false, true] {
+                let actual = shared(source, language, isolated);
+                assert_eq!(actual, incumbent(source, language, isolated), "{source}");
+                let commands = actual.expect("complete literal fixture");
+                assert_eq!(commands.is_empty(), isolated, "{source}");
+            }
+        }
+        for (language, source) in [
+            (ScriptLanguage::Python, "import os\nf = getattr(os, 'system')\nf('$(git reset --hard)')"),
+            (ScriptLanguage::Python, "def f(value):\n    os.system(value)\nf('$(git reset --hard)')"),
+            (ScriptLanguage::JavaScript, "const f = cp['execSync']; f('$(git reset --hard)');"),
+            (ScriptLanguage::JavaScript, "tag`echo $(git reset --hard)`;"),
+        ] {
+            let actual = shared(source, language, true);
+            assert_eq!(actual, incumbent(source, language, true), "{source}");
+            assert!(!actual.expect("complete reflective fixture").is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn shared_literal_ast_keeps_incomplete_analysis_and_cheap_gates() {
+        let oversized = format!("#{}\ntext = '$(git reset --hard)'", "x".repeat(LITERAL_EVIDENCE_MAX_BYTES));
+        let many_nodes = format!("{}text = '$(git reset --hard)'", "pass\n".repeat(LITERAL_EVIDENCE_MAX_NODES));
+        for (language, source) in [
+            (ScriptLanguage::Python, "import os\ntext = '$(git reset --hard)'\nos.system("),
+            (ScriptLanguage::JavaScript, "const text = '$(git reset --hard)'; cp.execSync("),
+            (ScriptLanguage::Python, oversized.as_str()),
+            (ScriptLanguage::Python, many_nodes.as_str()),
+        ] {
+            for isolated in [false, true] {
+                let actual = shared(source, language, isolated);
+                assert_eq!(actual, incumbent(source, language, isolated), "{language:?}");
+                assert!(actual.is_err(), "an incomplete tree cannot become empty success");
+            }
+        }
+        for source in [
+            "text = '$(git reset --hard)'",
+            "import os\ntext = '$(git reset --hard)'\nos.system(text)",
+        ] {
+            assert!(matches!(
+                interpreter_literal_shell_commands(
+                    source,
+                    ScriptLanguage::Python,
+                    || panic!("zero budget must stop before the callback or parser"),
+                    Duration::ZERO,
+                ),
+                Err(MatchError::Timeout { .. })
+            ));
+        }
+        assert!(
+            interpreter_literal_shell_commands(
+                "print('ordinary text')",
+                ScriptLanguage::Python,
+                || panic!("the no-candidate fast path must not run the callback"),
+                Duration::ZERO,
+            )
+            .expect("no candidates need no recovery budget")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn shared_literal_worker_preserves_the_outer_callback_contract() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A callback declining an unsupported extraction must run before the
+        // interpreter parser. These deliberately malformed programs would be
+        // errors if tree construction moved ahead of that decision.
+        for (language, source) in [
+            (ScriptLanguage::Python, "print('$(git reset --hard)'"),
+            (ScriptLanguage::JavaScript, "edit('$(git reset --hard)'"),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let commands = interpreter_literal_shell_commands(
+                source,
+                language,
+                move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    None
+                },
+                Duration::from_secs(5),
+            )
+            .expect("unsupported extraction stays with its original analysis path");
+            assert!(commands.is_empty());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+
+        // Exercise the actual worker for both consumer modes, not just the
+        // inner recovery function. Verify source spans and payloads after the
+        // worker has released its source, tree, and permit.
+        for language in [ScriptLanguage::Python, ScriptLanguage::JavaScript] {
+            let source = execution_source(language, 40);
+            for isolated in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&calls);
+                let actual = snapshot(interpreter_literal_shell_commands(
+                    &source,
+                    language,
+                    move || {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                        Some(isolated)
+                    },
+                    Duration::from_secs(5),
+                ));
+                let expected = incumbent(&source, language, isolated);
+                assert!(
+                    expected.as_ref().is_ok_and(|commands| !commands.is_empty()),
+                    "the execution reference must be complete and nonempty"
+                );
+                assert_eq!(actual, expected, "{language:?}, isolated={isolated}");
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+
+    /// Same-process paired component comparison, not a shipping hook gate.
+    /// Timed work includes each strategy's parser(s), scans and output allocation.
+    /// Fixture construction and output comparison are outside both timers.
+    #[test]
+    #[ignore = "paired component benchmark; run release with --test-threads=1"]
+    fn paired_shared_literal_ast_benchmark() {
+        use std::hint::black_box;
+
+        const RUNS: usize = 60;
+        const WARMUP: usize = 6;
+        for (shape, language, lines, isolated) in [
+            ("python_small", ScriptLanguage::Python, 0, true),
+            ("python_40", ScriptLanguage::Python, 40, true),
+            ("python_300", ScriptLanguage::Python, 300, true),
+            ("javascript_small", ScriptLanguage::JavaScript, 0, true),
+            ("javascript_40", ScriptLanguage::JavaScript, 40, true),
+            ("javascript_300", ScriptLanguage::JavaScript, 300, true),
+            ("unproved_consumer_300", ScriptLanguage::Python, 300, false),
+        ] {
+            let source = execution_source(language, lines);
+            let expected = incumbent(&source, language, isolated).expect("reference completes");
+            assert!(!expected.is_empty(), "do not benchmark missing recovery as success");
+            let mut old_ns = Vec::with_capacity(RUNS);
+            let mut shared_ns = Vec::with_capacity(RUNS);
+            for pair in 0..WARMUP + RUNS {
+                for use_shared in [pair % 2 == 0, pair % 2 != 0] {
+                    let started = Instant::now();
+                    let actual = if use_shared {
+                        shared(black_box(&source), language, isolated)
+                    } else {
+                        incumbent(black_box(&source), language, isolated)
+                    };
+                    let elapsed_ns = started.elapsed().as_nanos();
+                    assert_eq!(actual.as_ref(), Ok(&expected), "{shape}");
+                    if pair >= WARMUP {
+                        if use_shared {
+                            shared_ns.push(elapsed_ns);
+                        } else {
+                            old_ns.push(elapsed_ns);
+                        }
+                    }
+                    let _ = black_box(actual);
+                }
+            }
+            println!("{}", serde_json::json!({
+                "kind": "paired_shared_literal_ast",
+                "scope": "in_process_literal_recovery",
+                "reference_source": "36596fab6ca26aa5d40a70f4acbdced3db0d1886",
+                "reference": "previous_composition_with_shared_predicates",
+                "shape": shape,
+                "source_bytes": source.len(),
+                "runs": RUNS,
+                "warmup": WARMUP,
+                "old_ns": old_ns,
+                "shared_ns": shared_ns,
+            }));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -947,11 +947,32 @@ fn evaluated_literal_commands<D: ast_grep_core::Doc>(
 /// so an existing allowlist grant is not denied under a new rule.
 /// Original source, including interpolation and unsupported values, still runs
 /// through the normal interpreter and raw-pattern analysis.
+// Existing source-analysis tests exercise the unscreened reference. Production
+// enters through the default-policy wrapper with the evidence screen enabled.
+#[cfg(test)]
 pub(crate) fn interpreter_literal_shell_commands(
     code: &str,
     language: ScriptLanguage,
     allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
     budget: Duration,
+) -> Result<Vec<ReconstructedCommand>, MatchError> {
+    interpreter_literal_shell_commands_with_execution_evidence(
+        code,
+        language,
+        allow_documentation_literals,
+        budget,
+        false,
+    )
+}
+
+/// Run both policies inside one bounded worker using one owned source/AST.
+/// The unscreened mode is retained for differential and existing module tests.
+pub(super) fn interpreter_literal_shell_commands_with_execution_evidence(
+    code: &str,
+    language: ScriptLanguage,
+    allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
+    budget: Duration,
+    screen_execution_evidence: bool,
 ) -> Result<Vec<ReconstructedCommand>, MatchError> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1002,11 +1023,14 @@ pub(crate) fn interpreter_literal_shell_commands(
                 let _profile = profile.enter();
                 let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
                 match allow_documentation_literals() {
-                    Some(allow_documentation_literals) => interpreter_literal_shell_commands_inner(
-                        &source,
-                        language,
-                        allow_documentation_literals,
-                    ),
+                    Some(allow_documentation_literals) => {
+                        interpreter_literal_shell_commands_inner_with_execution_evidence(
+                            &source,
+                            language,
+                            allow_documentation_literals,
+                            screen_execution_evidence,
+                        )
+                    }
                     None => Ok(Vec::new()),
                 }
             };
@@ -1047,10 +1071,25 @@ fn interpreter_literal_parse_error(language: ScriptLanguage, detail: &str) -> Ma
     }
 }
 
-fn interpreter_literal_shell_commands_inner(
+#[cfg(test)]
+pub(super) fn interpreter_literal_shell_commands_inner(
     code: &str,
     language: ScriptLanguage,
     allow_documentation_literals: bool,
+) -> Result<Vec<ReconstructedCommand>, MatchError> {
+    interpreter_literal_shell_commands_inner_with_execution_evidence(
+        code,
+        language,
+        allow_documentation_literals,
+        false,
+    )
+}
+
+pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
+    code: &str,
+    language: ScriptLanguage,
+    allow_documentation_literals: bool,
+    screen_execution_evidence: bool,
 ) -> Result<Vec<ReconstructedCommand>, MatchError> {
     use ast_grep_core::{AstGrep, Node};
     use ast_grep_language::SupportLang;
@@ -1072,6 +1111,16 @@ fn interpreter_literal_shell_commands_inner(
             .map_err(|_| interpreter_literal_parse_error(language, "source grammar"))?
     };
     let root = ast.root();
+    // The evidence screen already requires a complete bounded tree before
+    // answering false. Running it here preserves the data-only fast path and
+    // all predicates, but avoids a second parse when recovery is required.
+    // An unproved outer consumer always retains the unscreened recovery.
+    if screen_execution_evidence
+        && allow_documentation_literals
+        && !super::literal_root_has_execution_evidence(&root, language)
+    {
+        return Ok(Vec::new());
+    }
     for (index, node) in root.dfs().enumerate() {
         if index >= MAX_INTERPRETER_LITERAL_NODES {
             return Err(interpreter_literal_parse_error(language, "AST node limit"));
