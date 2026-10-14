@@ -211,7 +211,7 @@ fn quoted_positional_and_indirect_lists_require_native_review() {
         r#"set -- /tmp/a /etc/profile; IFS=@; tee "${@%/missing}""#,
         r#"set -- /tmp/a /etc/profile; IFS=@; S=@; tee "${!S}""#,
         r#"IFS=@; A=(/tmp/a /etc/profile); S='A[@]'; tee "${!S}""#,
-        r#"IFS=@; A=(/tmp/a /etc/profile); IFS=@; tee "${A[@]:0:2}""#,
+        r#"IFS=@; A=(/tmp/a /etc/profile); tee "${A[@]:0:2}""#,
         r#"set -- /tmp/a /etc/profile; IFS=@; tee "${S:-"$@"}""#,
     ] {
         assert_decision(source, false, Some("core.filesystem:credential-file-write"));
