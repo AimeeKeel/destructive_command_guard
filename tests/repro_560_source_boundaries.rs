@@ -188,3 +188,39 @@ fn literal_heavy_programs_do_not_hide_following_shell_commands() {
         assert_decision(&source, "deny");
     }
 }
+
+#[test]
+fn quoted_javascript_regex_text_edits_keep_literal_data() {
+    for source in [
+        "node - <<'JS'\nconst text = 'x'.replace(/x$/, \"it's `tool --help`\"); console.log(text);\nJS",
+        "node - <<'JS'\nconst text = 'xx'.replaceAll(/x/g, '$(git reset --hard)'); console.log(text);\nJS",
+        "node - <<'JS'\nconst pattern = /x/; const alias = pattern; const text = 'x'.replace(alias, '`git reset --hard`'); console.log(text);\nJS",
+        "node - <<'JS'\nconst note = 'élève'; const pattern = /`git reset --hard`/g; const text = 'x'.replace(pattern, 'y'); console.log(text);\nJS",
+    ] {
+        assert_decision(source, "allow");
+    }
+}
+
+#[test]
+fn regex_edits_do_not_hide_executable_interpreter_work() {
+    for source in [
+        "node - <<'JS'\nconst text = 'x'.replace(/x/, () => require('child_process').execSync('git reset --hard'));\nJS",
+        "node - <<'JS'\nconst text = 'x'.replace(/x/, 'echo $(git reset --hard)'); require('child_process').execSync(text);\nJS",
+        "node - <<'JS'\nconst pattern = /x/; pattern[Symbol.replace] = () => require('child_process').execSync('git reset --hard'); 'x'.replace(pattern, 'text');\nJS",
+        "node - <<'JS'\nconst fs = require('node:fs'); const text = 'x'.replace(/x/, '`git reset --hard`'); fs.writeFileSync('/etc/shadow', text);\nJS",
+        "node - <<'JS'\nconst fs = require('node:fs'); const text = 'x'.replace(/x/, '`git reset --hard`'); fs.writeFileSync('.git/config', text);\nJS",
+    ] {
+        assert_decision(source, "deny");
+    }
+}
+
+#[test]
+fn regex_edit_data_does_not_suppress_outer_shell_execution() {
+    for source in [
+        "node - <<JS\nconst text = 'x'.replace(/x/, '$(git reset --hard)'); console.log(text);\nJS",
+        "node - <<'JS' | sh\nconst text = 'x'.replace(/x/, 'echo $(git reset --hard)'); console.log(text);\nJS",
+        "node - <<'JS'\nconst text = 'x'.replace(/x/, 'data'); console.log(text);\nJS\ngit reset --hard",
+    ] {
+        assert_decision(source, "deny");
+    }
+}
