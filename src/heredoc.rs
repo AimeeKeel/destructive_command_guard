@@ -8120,15 +8120,15 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
 /// command solely because the quoted interpreter body is not shell grammar,
 /// inspect only the operator's physical-line prefix. That prefix is shell
 /// syntax; the quoted body is not. The fallback deliberately accepts only one
-/// literal program plus an optional `-` stdin operand, with no assignments,
+/// literal program plus an optional stdin marker, with no assignments,
 /// wrappers, redirects, substitutions, lists, pipelines, or groups.
 fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool {
     let owner = plain_heredoc_command_at(command, operator_start).or_else(|| {
         let prefix = command.get(..operator_start)?;
         let line_start = prefix.rfind(['\n', '\r']).map_or(0, |index| index + 1);
         let header = prefix.get(line_start..)?.trim();
-        if header.is_empty()
-            || header.contains(['
+        let dynamic_or_control = header.bytes().any(|byte| {
+            byte == b'
 /// interpreter. This proof supplies a language, never an allow:
 /// both the language-aware checks and conservative raw-pattern scan remain.
 struct WrittenHeredocInterpreter {
@@ -19812,8 +19812,11 @@ EOF";
         }
     }
 }
-, '`', ';', '|', '&', '(', ')', '<', '>', '\n', '\r'])
-        {
+
+                || byte == 0x60
+                || matches!(byte, b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>')
+        });
+        if header.is_empty() || dynamic_or_control {
             return None;
         }
         let words = shell_words::split(header).ok()?;
@@ -31542,11 +31545,11 @@ mod issue_560_masking_tests {
 
     #[test]
     fn quoted_python_body_parse_errors_do_not_reenter_outer_shell_grammar() {
-        let command = r#"python3 - <<'EOF'
-import re
-s = re.sub(r'x$', \"it's `tool --help`\", 'x')
-EOF"#;
-        let masked = mask_inert_interpreter_stdin(command);
+        let tick = char::from(96);
+        let command = format!(
+            "python3 - <<'EOF'\nimport re\ns = re.sub(r'x$', \"it's {tick}tool --help{tick}\", 'x')\nEOF"
+        );
+        let masked = mask_inert_interpreter_stdin(&command);
         assert!(masked.starts_with("python3 - <<'EOF'\n"));
         assert!(!masked.contains("tool --help"));
         assert_eq!(
