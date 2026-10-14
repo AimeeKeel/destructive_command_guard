@@ -12227,7 +12227,13 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
         let mut interpreter_heredocs = Vec::new();
         collect_posix_pipeline_executable_sinks(command, &mut sinks, &mut interpreter_heredocs);
-        collect_posix_process_substitution_sinks(command, &mut sinks);
+        // Process-substitution syntax inside a proven quoted non-shell
+        // interpreter body belongs to that language, not to the outer shell
+        // (#560). Unlike data-heredoc masking, this does not hide `cat <<EOF |
+        // bash`: only direct interpreter-owned bodies are blanked, while shell
+        // heredocs and ambiguous receivers stay byte-for-byte visible.
+        let process_view = crate::heredoc::mask_inert_interpreter_stdin(command);
+        collect_posix_process_substitution_sinks(process_view.as_ref(), &mut sinks);
         collect_data_heredoc_output_sinks(command, &interpreter_heredocs, &mut sinks);
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
@@ -51463,6 +51469,30 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "{:?}",
             started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_560_process_substitution_masking_tests {
+    use super::*;
+
+    #[test]
+    fn quoted_python_process_syntax_is_not_an_outer_shell_sink() {
+        let command = "python3 - <<'PY'\ntext = \"<(not_shell)\"\nPY";
+        let view = crate::heredoc::mask_inert_interpreter_stdin(command);
+        assert!(!view.contains("<(not_shell)"));
+        let mut sinks = Vec::new();
+        collect_posix_process_substitution_sinks(view.as_ref(), &mut sinks);
+        assert!(sinks.is_empty(), "interpreter data became outer shell syntax: {sinks:?}");
+    }
+
+    #[test]
+    fn quoted_shell_body_remains_visible_to_shell_sink_analysis() {
+        let command = "bash <<'SH'\ncat <(printf dangerous)\nSH";
+        assert_eq!(
+            crate::heredoc::mask_inert_interpreter_stdin(command).as_ref(),
+            command
         );
     }
 }
