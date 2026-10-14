@@ -33,6 +33,23 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
     shell::may_name_protected_path(command) || word_splitting::candidate(command)
 }
 
+/// IFS assignments and expansions belong to the outer shell, not to a quoted
+/// Python/Node program supplied on stdin (#560). Reuse the existing ownership
+/// proof instead of letting source text establish shell state or exhaust the
+/// shell event budget. It rejects unquoted bodies and ambiguous receivers.
+///
+/// The view preserves every byte offset and newline, including command bytes
+/// before and after each body. This is NOT an interpreter-source exemption:
+/// `embedded::scan_command` below must always receive the original command.
+/// Do not apply a POSIX-only proof when the caller's dialect is unknown.
+fn scan_outer_writer_arguments(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
+    if dialect != ShellDialect::Posix || !word_splitting::candidate(command) {
+        return word_splitting::scan(command, dialect);
+    }
+    let outer = crate::heredoc::mask_inert_interpreter_stdin(command);
+    word_splitting::scan(outer.as_ref(), dialect)
+}
+
 /// Inspect executable source before shell segmentation or masking removes it.
 /// Shell syntax uses the separate [`classify_credential_file_write`] above;
 /// inline scripts, heredocs, and here-strings use their proven interpreter.
@@ -47,15 +64,19 @@ pub(crate) fn classify_embedded_credential_file_writes(
     dialect: ShellDialect,
     source_is_exempt: impl FnMut(&str, crate::heredoc::ScriptLanguage) -> bool,
 ) -> Vec<CredentialFileWrite> {
-    let mut hits = word_splitting::scan(command, dialect);
+    let mut hits = scan_outer_writer_arguments(command, dialect);
     hits.extend(embedded::scan_command(command, dialect, source_is_exempt));
     hits
 }
 
 #[cfg(test)]
 mod source_ownership_tests {
-    use super::scan_extracted;
+    use super::{
+        classify_embedded_credential_file_writes, scan_extracted, scan_outer_writer_arguments, shell,
+        word_splitting,
+    };
     use crate::heredoc::{ExtractionLimits, ExtractionResult, extract_content};
+    use crate::normalize::ShellDialect;
 
     #[test]
     fn executable_perl_heredocs_must_not_be_exempted_as_literal_print_data() {
@@ -82,5 +103,126 @@ mod source_ownership_tests {
                 "the protected write must remain visible: {command}"
             );
         }
+    }
+
+    fn data_program(interpreter: &str, tail: &str) -> String {
+        let body = match interpreter {
+            "python3" => "note = \"IFS=@; it's `tool --help`; $DEST; élève\"\nprint(note)",
+            "node" => "const note = \"IFS=@; it's `tool --help`; $DEST; élève\";\nconsole.log(note);",
+            _ => panic!("unsupported test interpreter"),
+        };
+        format!("{interpreter} - <<'CODE'\n{body}\n{tail}\nCODE")
+    }
+
+    #[test]
+    fn interpreter_data_does_not_establish_outer_ifs_state_560() {
+        for interpreter in ["python3", "node"] {
+            let command = data_program(interpreter, "");
+            assert!(word_splitting::candidate(&command));
+            let outer = crate::heredoc::mask_inert_interpreter_stdin(&command);
+            assert_eq!(outer.len(), command.len());
+            assert!(!word_splitting::candidate(outer.as_ref()));
+            assert!(scan_outer_writer_arguments(&command, ShellDialect::Posix).is_empty());
+            assert!(
+                classify_embedded_credential_file_writes(&command, ShellDialect::Posix, |_, _| false)
+                    .is_empty(),
+                "literal interpreter data is not a protected write: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn outer_ifs_writers_keep_original_spans_and_independent_rules_560() {
+        let writer = "IFS=@; tee $UNRESOLVED";
+        for interpreter in ["python3", "node"] {
+            let program = data_program(interpreter, "");
+            for command in [format!("{writer}\n{program}"), format!("{program}\n{writer}")] {
+                let start = command.find("tee $UNRESOLVED").unwrap();
+                let expected_span = start..start + "tee $UNRESOLVED".len();
+                // Even an explicit interpreter exemption must not grant a
+                // separate outer shell writer access to either policy family.
+                let hits = classify_embedded_credential_file_writes(
+                    &command,
+                    ShellDialect::Posix,
+                    |_, _| true,
+                );
+                for rule in [
+                    shell::CREDENTIAL_FILE_WRITE_NAME,
+                    shell::GIT_INTERNALS_WRITE_NAME,
+                ] {
+                    assert!(
+                        hits.iter()
+                            .any(|hit| hit.rule == rule && hit.span == expected_span),
+                        "the outer writer lost its rule or original byte span: {command}: {hits:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outer_view_does_not_exempt_interpreter_protected_writes_560() {
+        for (interpreter, tail, rule) in [
+            (
+                "python3",
+                "open('/etc/shadow', 'w').write('x')",
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+            ),
+            (
+                "python3",
+                "open('.git/config', 'w').write('x')",
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ),
+            (
+                "node",
+                "require('fs').writeFileSync('/etc/shadow', 'x');",
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+            ),
+            (
+                "node",
+                "require('fs').writeFileSync('.git/config', 'x');",
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ),
+        ] {
+            let command = data_program(interpreter, tail);
+            let outer = crate::heredoc::mask_inert_interpreter_stdin(&command);
+            assert!(!outer.contains(tail), "the test must exercise a masked body");
+            let hits = classify_embedded_credential_file_writes(
+                &command,
+                ShellDialect::Posix,
+                |_, _| false,
+            );
+            assert!(
+                hits.iter()
+                    .any(|hit| hit.rule == rule && command.get(hit.span.clone()).is_some()),
+                "masking the outer view must not mask interpreter execution: {command}: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unquoted_expansions_and_shell_receivers_keep_the_original_ifs_analysis_560() {
+        for command in [
+            "cat <<CODE\n$(IFS=@; tee $UNRESOLVED)\nCODE",
+            "python3 - <<CODE\nprint('$(IFS=@; tee $UNRESOLVED)')\nCODE",
+            "sh <<'CODE'\nIFS=@; tee $UNRESOLVED\nCODE",
+            "python3 -c 'import os,sys; os.system(sys.stdin.read())' <<'CODE'\nIFS=@; tee $UNRESOLVED\nCODE",
+        ] {
+            let original = word_splitting::scan(command, ShellDialect::Posix);
+            let outer = scan_outer_writer_arguments(command, ShellDialect::Posix);
+            assert_eq!(
+                outer, original,
+                "unproved source must not gain a mask: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_dialects_do_not_borrow_a_posix_source_proof_560() {
+        let command = data_program("python3", "");
+        assert_eq!(
+            scan_outer_writer_arguments(&command, ShellDialect::Unknown),
+            word_splitting::scan(&command, ShellDialect::Unknown),
+        );
     }
 }
