@@ -224,3 +224,60 @@ fn regex_edit_data_does_not_suppress_outer_shell_execution() {
         assert_decision(source, "deny");
     }
 }
+
+#[test]
+fn tuples_and_text_helpers_do_not_promote_literal_data_to_shell() {
+    for source in [
+        "python3 - <<'PY'\ny = ('x', \"it's `tool --help`\")\nPY",
+        "python3 - <<'PY'\ny = f('x', \"it's `tool --help`\")\nPY",
+        "python3 - <<'PY'\nrep('''use core::fav;\n    fn with_store<R>(\n    /// The items `zone` belongs to (`list_items`).''')\nPY",
+        "python3 - <<'PY'\nimport re\ns = re.match(r'x$', \"it's `tool --help`\")\nPY",
+        "python3 - <<'PY'\nold = ''\nnew = ('echo $(date)\\n' '(task >\"$W/out.log\")\\n' + old)\nPY",
+        "node - <<'JS'\nedit(\"it's `tool --help`\");\nJS",
+        "node - <<'JS'\nconst pieces = ['x', \"it's `tool --help`\"];\nJS",
+        "node - <<'JS'\nrep('fn with_store<R>( `zone`');\nJS",
+    ] {
+        assert_decision(source, "allow");
+    }
+}
+
+#[test]
+fn aliased_and_local_execution_helpers_retain_destructive_literals() {
+    for source in [
+        "python3 - <<'PY'\nfrom os import system as edit\ntext = 'echo $(git reset --hard)'\nedit(text)\nPY",
+        "python3 - <<'PY'\nimport os\ndef edit(text):\n    os.system(text)\nedit('echo $(git reset --hard)')\nPY",
+        "python3 - <<'PY'\nimport os\nedit = getattr(os, 'sys' + 'tem')\ntext = 'echo $(git reset --hard)'\nedit(text)\nPY",
+        "node - <<'JS'\nconst cp = require('child_process'); const edit = cp.execSync; const text = 'echo $(git reset --hard)'; edit(text);\nJS",
+        "node - <<'JS'\nconst cp = require('child_process'); function edit(text) { cp.execSync(text); } edit('echo $(git reset --hard)');\nJS",
+        "node - <<'JS'\nconst cp = require('child_process'); const edit = cp['exe' + 'cSync']; const text = 'echo $(git reset --hard)'; edit(text);\nJS",
+    ] {
+        assert_decision(source, "deny");
+    }
+}
+
+#[test]
+fn known_shell_values_keep_non_substitution_grammar() {
+    for source in [
+        "python3 - <<'PY'\nimport os\ntext = 'echo $(date); git reset --hard'\nos.system(text)\nPY",
+        "python3 - <<'PY'\nimport os\ntext = 'echo $(date); (task >\"$W/out.log\")'\nos.system(text)\nPY",
+        "node - <<'JS'\nconst cp = require('child_process'); const text = 'echo $(date); git reset --hard'; cp.execSync(text);\nJS",
+        "node - <<'JS'\nconst cp = require('child_process'); const text = 'echo $(date); (task >\"$W/out.log\")'; cp.execSync(text);\nJS",
+    ] {
+        assert_decision(source, "deny");
+    }
+}
+
+#[test]
+fn many_inert_shell_looking_literals_do_not_exhaust_recovery_budget() {
+    for interpreter in ["python3", "node"] {
+        let mut source = format!("{interpreter} - <<'LITERAL_DATA'\n");
+        for index in 0..160 {
+            let declaration = if interpreter == "node" { "const " } else { "" };
+            source.push_str(&format!(
+                "{declaration}item_{index} = \"it's `tool --help` $(date)\";\n"
+            ));
+        }
+        source.push_str("LITERAL_DATA");
+        assert_decision(&source, "allow");
+    }
+}
