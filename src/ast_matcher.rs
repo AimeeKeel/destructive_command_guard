@@ -100,7 +100,9 @@ impl DefaultPolicyMatcher {
 /// uses reflective/computed dispatch: retain the complete original recovery,
 /// including every indirect literal and exec/eval dependency. This is a
 /// program-level evidence screen, not a proof of non-execution or a taint analysis.
-/// Unknown helper calls alone do not establish a shell-command role.
+/// Unknown helper calls alone do not establish a shell-command role in an
+/// isolated interpreter program. An unproved outer consumer still requires
+/// the original recovery: even a print-only program can feed a later shell.
 ///
 /// The screen runs INSIDE the existing worker's permit and deadline, including
 /// parsing. No extra worker or fresh time envelope is created. A failed or
@@ -132,11 +134,24 @@ pub(crate) fn interpreter_literal_shell_commands(
             // Preserve the caller's unsupported-inline and outer-consumer
             // contracts. The callback is invoked exactly once, as before.
             let allow_documentation = allow_documentation_literals()?;
-            literal_source_has_execution_evidence(&source, language)
-                .then_some(allow_documentation)
+            literal_recovery_scope(&source, language, allow_documentation)
         },
         budget.saturating_sub(started.elapsed()),
     )
+}
+
+fn literal_recovery_scope(
+    code: &str,
+    language: ScriptLanguage,
+    isolated_source: bool,
+) -> Option<bool> {
+    // No source-local absence of execution APIs proves where stdout or a
+    // generated file goes. Keep the caller's stricter interpretation before
+    // attempting this screen, including pipelines, wrappers and later readers.
+    if !isolated_source {
+        return Some(false);
+    }
+    literal_source_has_execution_evidence(code, language).then_some(true)
 }
 
 // Independent bounds on this optional screen. Crossing either withholds the
@@ -283,6 +298,23 @@ fn literal_execution_name(name: &str) -> bool {
 #[cfg(test)]
 mod literal_execution_evidence_tests {
     use super::*;
+
+    #[test]
+    fn unproved_outer_consumers_keep_the_original_recovery_560() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "text = 'echo $(git reset --hard)'\nprint(text)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const text = 'echo $(git reset --hard)'; console.log(text);",
+            ),
+        ] {
+            assert_eq!(literal_recovery_scope(source, language, false), Some(false));
+            assert_eq!(literal_recovery_scope(source, language, true), None);
+        }
+    }
 
     #[test]
     fn python_data_literals_do_not_establish_shell_execution_560() {
