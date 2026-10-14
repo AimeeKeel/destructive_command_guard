@@ -100,6 +100,11 @@ enum ImportKind {
     Module,
     Mkdtemp,
     TemporaryDirectory,
+    // tempfile shares os/path module objects with other imports. Replacing
+    // os.path.abspath can make the real mkdtemp return an existing root.
+    // These handles may veto a factory grant, but never establish one.
+    DependencyModule,
+    DependencyCarrier,
 }
 
 struct Import {
@@ -200,6 +205,21 @@ fn prove(
                 (Some("tempfile"), "TemporaryDirectory") => {
                     Some(ImportKind::TemporaryDirectory)
                 }
+                (
+                    None,
+                    "os" | "os.path" | "posixpath" | "ntpath" | "genericpath",
+                )
+                | (Some("os"), "path")
+                | (
+                    Some("os.path" | "posixpath" | "ntpath" | "genericpath" | "shutil"
+                        | "pathlib" | "pathlib._local"),
+                    "os" | "genericpath",
+                )
+                | (Some("tempfile"), "_os") => {
+                    Some(ImportKind::DependencyModule)
+                }
+                (None, "shutil" | "pathlib" | "pathlib._local")
+                | (Some("tempfile"), "_shutil") => Some(ImportKind::DependencyCarrier),
                 _ => None,
             };
             declarations
@@ -282,6 +302,9 @@ fn reflective_name(name: &str) -> bool {
             | "locals"
             | "__builtins__"
             | "__import__"
+            | "__setattr__"
+            | "__delattr__"
+            | "__getattribute__"
             | "import_module"
     )
 }
@@ -335,9 +358,29 @@ fn literal_target<D: Doc>(node: &Node<'_, D>, depth: usize) -> bool {
 }
 
 fn read_only_use<D: Doc>(name: &Node<'_, D>, kind: ImportKind) -> bool {
+    if kind == ImportKind::DependencyModule {
+        return dependency_read_only_use(name);
+    }
     let Some(parent) = name.parent() else {
         return false;
     };
+    if kind == ImportKind::DependencyCarrier {
+        // shutil/pathlib can expose the same os module. Their other members
+        // are not tempfile dependencies: capturing shutil.rmtree as a local
+        // deletion alias must retain its established cleanup policy.
+        return parent.kind() == "attribute"
+            && parent
+                .field("object")
+                .is_some_and(|object| object.range() == name.range())
+            && parent.field("attribute").is_some_and(|attribute| {
+                let member = attribute.text();
+                !member.starts_with("__")
+                    && (!matches!(
+                        member.as_ref(),
+                        "os" | "_os" | "posixpath" | "ntpath" | "genericpath" | "_local"
+                    ) || dependency_read_only_use(name))
+            });
+    }
     if kind != ImportKind::Module {
         return parent.kind() == "call"
             && parent
@@ -372,6 +415,64 @@ fn read_only_use<D: Doc>(name: &Node<'_, D>, kind: ImportKind) -> bool {
                 .field("function")
                 .is_some_and(|function| function.range() == parent.range())
     })
+}
+
+/// A shared dependency may be called, not replaced or handed to unknown code.
+/// Follow the whole attribute chain: checking only `os.path` would mistake
+/// `os.path.abspath = ...` and `shutil.os.path.abspath = ...` for reads.
+/// The whole-body pass also catches a write after the call in a loop, or a
+/// write through a second import of the same module. No host imports run here.
+fn dependency_read_only_use<D: Doc>(name: &Node<'_, D>) -> bool {
+    let mut value = name.clone();
+    for _ in 0..MAX_DEPTH {
+        let Some(parent) = value.parent() else {
+            return false;
+        };
+        if parent.kind() == "attribute"
+            && parent
+                .field("object")
+                .is_some_and(|object| object.range() == value.range())
+        {
+            let Some(attribute) = parent.field("attribute") else {
+                return false;
+            };
+            if attribute.text().starts_with("__") {
+                return false;
+            }
+            value = parent;
+            continue;
+        }
+        if parent.kind() == "parenthesized_expression" {
+            value = parent;
+            continue;
+        }
+        if parent.kind() == "call" {
+            return parent
+                .field("function")
+                .is_some_and(|function| function.range() == value.range());
+        }
+        // Known immutable module constants can be read without exposing a
+        // module or callable. Preserve ordinary os.name checks and path
+        // separators, but not writes, deletes, or ambiguous binding positions.
+        let scalar = value.kind() == "attribute"
+            && value.field("attribute").is_some_and(|attribute| {
+                matches!(
+                    attribute.text().as_ref(),
+                    "name" | "sep" | "altsep" | "curdir" | "pardir" | "pathsep"
+                        | "defpath" | "extsep" | "devnull"
+                )
+            });
+        return scalar
+            && (matches!(
+                parent.kind().as_ref(),
+                "argument_list" | "keyword_argument" | "comparison_operator"
+                    | "binary_operator" | "return_statement" | "expression_statement"
+            ) || parent.kind() == "assignment"
+                && parent
+                    .field("right")
+                    .is_some_and(|right| right.range() == value.range()));
+    }
+    false
 }
 
 fn deletion_target<'a, D: Doc>(call: &Node<'a, D>) -> Option<Node<'a, D>> {
