@@ -1,0 +1,116 @@
+//! Issue #560: interpreter source is not outer POSIX shell syntax.
+//! All fixtures are classifier input only; no fixture is executed.
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+fn assert_decision(source: &str, expected: &str) {
+    for hook in [false, true] {
+        let temp = tempfile::tempdir().expect("isolated working directory");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).expect("isolated home");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
+        let input = if hook {
+            command.args(["hook", "--batch"]);
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": source},
+            })
+            .to_string()
+        } else {
+            command.args(["test", "--stdin", "--dialect", "posix", "--format", "json"]);
+            source.to_string()
+        };
+        let mut child = command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .env("DCG_HISTORY_ENABLED", "false")
+            // Semantic tests use the existing #412 test envelope. Production
+            // budgets remain unchanged; performance requires a separate replay.
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn classifier");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input.as_bytes())
+            .expect("write classifier input");
+        let output = child.wait_with_output().expect("wait for classifier");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let verdict: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+            panic!("hook={hook}, {error}; stdout={stdout}; stderr={stderr}")
+        });
+        assert_eq!(
+            verdict["decision"].as_str(),
+            Some(expected),
+            "hook={hook}, source={source:?}, status={}, verdict={verdict}, stderr={stderr}",
+            output.status
+        );
+    }
+}
+
+#[test]
+fn quoted_interpreter_source_does_not_acquire_posix_quote_state() {
+    for source in [
+        "python3 - <<'EOF'\nimport re\ns = re.sub(r'x$', \"it's `tool --help`\", 'x')\nEOF",
+        "python3 - <<'EOF'\nimport re\ns = re.sub(r'x$', \"it's Vec<(&'static str, usize)>\", 'x')\nEOF",
+        "node - <<'JS'\nconst pattern = /x$/;\nconst text = \"it's `tool --help`\";\nconsole.log(text.replace(pattern, 'x'));\nJS",
+        "node - <<'JS'\nconst text = \"Vec<(&'static str, usize)>\";\nconsole.log(text);\nJS",
+    ] {
+        assert_decision(source, "allow");
+    }
+}
+
+#[test]
+fn quoted_delimiter_spellings_preserve_the_same_source_boundary() {
+    for delimiter in ["'EOF'", "\"EOF\"", "E'OF'", "E\\OF"] {
+        let source = format!(
+            "python3 - <<{delimiter}\nimport re\ns = re.sub(r'x$', \"it's `tool --help`\", 'x')\nEOF"
+        );
+        assert_decision(&source, "allow");
+    }
+    assert_decision(
+        "python3 - <<-'EOF'\n\timport re\n\ts = re.sub(r'x$', \"it's `tool --help`\", 'x')\n\tEOF",
+        "allow",
+    );
+}
+
+#[test]
+fn interpreter_execution_sinks_remain_blocked() {
+    for source in [
+        "python3 - <<'PY'\nimport shutil\nshutil.rmtree('/etc')\nPY",
+        "python3 - <<'PY'\nimport os\nos.system('git reset --hard')\nPY",
+        "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'reset', '--hard'])\nPY",
+        "python3 - <<'PY'\nimport os\ncommand = 'echo $(git reset --hard)'\nos.system(command)\nPY",
+        "node - <<'JS'\nrequire('child_process').execSync('git reset --hard');\nJS",
+        "node - <<'JS'\nrequire('fs').rmSync('/etc', {recursive:true, force:true});\nJS",
+    ] {
+        assert_decision(source, "deny");
+    }
+}
+
+#[test]
+fn shell_consumers_and_unquoted_expansions_remain_blocked() {
+    for source in [
+        "bash <<'SH'\ngit reset --hard\nSH",
+        "cat <<'SH' | sh\ngit reset --hard\nSH",
+        "cat <<EOF\n$(git reset --hard)\nEOF",
+        "python3 - <<PY\nprint('$(git reset --hard)')\nPY",
+        "python3 -c 'import os,sys; os.system(sys.stdin.read())' <<'EOF'\ngit reset --hard\nEOF",
+        "python3(){ sh; }; python3 - <<'EOF'\ngit reset --hard\nEOF",
+        "python3 - <<'EOF'\nprint('safe')\nEOF\ngit reset --hard",
+        "git reset --hard; python3 - <<'EOF'\nprint('safe')\nEOF",
+    ] {
+        assert_decision(source, "deny");
+    }
+}
