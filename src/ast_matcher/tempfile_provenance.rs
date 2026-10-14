@@ -27,8 +27,224 @@ type Span = (usize, usize);
 fn needs_proof(code: &str, hit: &PatternMatch) -> bool {
     hit.rule_id == TEMP_RULE
         && code.get(hit.start..hit.end).is_some_and(|text| {
-            text.contains("mkdtemp") || text.contains("TemporaryDirectory")
+            (text.contains("mkdtemp") || text.contains("TemporaryDirectory"))
+                && !has_literal_first_target(text)
         })
+}
+
+/// Preserve a grant the AST engine already established for a literal target.
+/// This is NOT a path-safety check: it is used only after `TEMP_RULE` matched.
+/// A factory name in a filename or a later argument must not make that grant
+/// depend on another AST parse, the whole-program proof, or its time budget.
+///
+/// Recognize only a simple callee and a complete constant first target (also
+/// `path=`). Reject calls, attributes, subscripts, interpolations and operators
+/// other than string concatenation. Unsupported spellings keep the existing
+/// bounded AST proof. The byte/depth caps are independent of that proof's
+/// optional budget, so exhaustion cannot revoke these already-proved literals.
+fn has_literal_first_target(text: &str) -> bool {
+    if text.len() > MAX_SOURCE_BYTES {
+        return false;
+    }
+    LiteralTarget {
+        bytes: text.as_bytes(),
+        cursor: 0,
+    }
+    .parse()
+    .is_some()
+}
+
+struct LiteralTarget<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> LiteralTarget<'a> {
+    fn space(&mut self) {
+        while self
+            .bytes
+            .get(self.cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.cursor += 1;
+        }
+    }
+
+    fn take(&mut self, byte: u8) -> bool {
+        if self.bytes.get(self.cursor) != Some(&byte) {
+            return false;
+        }
+        self.cursor += 1;
+        true
+    }
+
+    fn identifier(&mut self) -> Option<&'a [u8]> {
+        let start = self.cursor;
+        let first = *self.bytes.get(start)?;
+        if first != b'_' && !first.is_ascii_alphabetic() {
+            return None;
+        }
+        self.cursor += 1;
+        while self
+            .bytes
+            .get(self.cursor)
+            .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+        {
+            self.cursor += 1;
+        }
+        Some(&self.bytes[start..self.cursor])
+    }
+
+    fn string(&mut self) -> Option<()> {
+        let mut prefix = [0; 2];
+        let mut length = 0;
+        while self
+            .bytes
+            .get(self.cursor)
+            .is_some_and(u8::is_ascii_alphabetic)
+        {
+            *prefix.get_mut(length)? = self.bytes[self.cursor].to_ascii_lowercase();
+            length += 1;
+            self.cursor += 1;
+        }
+        // In particular, f-strings and template strings can execute code.
+        if !matches!(&prefix[..length], b"" | b"r" | b"u" | b"b" | b"br" | b"rb") {
+            return None;
+        }
+        let quote = *self.bytes.get(self.cursor)?;
+        if !matches!(quote, b'\'' | b'"') {
+            return None;
+        }
+        let width = if self
+            .bytes
+            .get(self.cursor..self.cursor + 3)
+            .is_some_and(|bytes| bytes == [quote; 3])
+        {
+            3
+        } else {
+            1
+        };
+        self.cursor += width;
+        while let Some(&byte) = self.bytes.get(self.cursor) {
+            if self
+                .bytes
+                .get(self.cursor..self.cursor + width)
+                .is_some_and(|end| end.iter().all(|byte| *byte == quote))
+            {
+                self.cursor += width;
+                return Some(());
+            }
+            if byte == b'\\' {
+                self.cursor += 1;
+                self.bytes.get(self.cursor)?;
+            } else if width == 1 && matches!(byte, b'\n' | b'\r') {
+                return None;
+            }
+            self.cursor += 1;
+        }
+        None
+    }
+
+    /// The callee's opening parenthesis must belong to this WHOLE call, not
+    /// `receiver('literal', ...).rmtree(factory())`. Balance the remaining
+    /// arguments without evaluating them, declining interpolated strings.
+    fn finish_call(&mut self) -> Option<()> {
+        let mut depth = 1;
+        while let Some(&byte) = self.bytes.get(self.cursor) {
+            match byte {
+                b'\'' | b'"' => self.string()?,
+                b'#' => {
+                    while self.bytes.get(self.cursor).is_some_and(|byte| *byte != b'\n') {
+                        self.cursor += 1;
+                    }
+                }
+                b'(' => {
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        return None;
+                    }
+                    self.cursor += 1;
+                }
+                b')' => {
+                    self.cursor += 1;
+                    depth -= 1;
+                    if depth == 0 {
+                        self.space();
+                        return (self.cursor == self.bytes.len()).then_some(());
+                    }
+                }
+                _ if byte == b'_' || byte.is_ascii_alphabetic() => {
+                    let start = self.cursor;
+                    self.identifier()?;
+                    if matches!(self.bytes.get(self.cursor), Some(b'\'' | b'"')) {
+                        self.cursor = start;
+                        self.string()?;
+                    }
+                }
+                _ => self.cursor += 1,
+            }
+        }
+        None
+    }
+
+    fn parse(&mut self) -> Option<()> {
+        self.space();
+        self.identifier()?;
+        self.space();
+        while self.take(b'.') {
+            self.space();
+            self.identifier()?;
+            self.space();
+        }
+        if !self.take(b'(') {
+            return None;
+        }
+        self.space();
+        let start = self.cursor;
+        if self.identifier() == Some(b"path".as_slice()) {
+            self.space();
+            if !self.take(b'=') {
+                self.cursor = start;
+            }
+        } else {
+            self.cursor = start;
+        }
+
+        let mut depth = 0;
+        let mut operand = true;
+        let mut adjacent = false;
+        loop {
+            self.space();
+            if operand {
+                if self.take(b'(') {
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        return None;
+                    }
+                    continue;
+                }
+                self.string()?;
+                operand = false;
+                adjacent = true;
+            } else if self.bytes.get(self.cursor) == Some(&b')') {
+                if depth == 0 {
+                    return self.finish_call();
+                }
+                self.cursor += 1;
+                depth -= 1;
+                adjacent = false;
+            } else if depth == 0 && self.bytes.get(self.cursor) == Some(&b',') {
+                return self.finish_call();
+            } else if self.take(b'+') {
+                operand = true;
+                adjacent = false;
+            } else if adjacent {
+                self.string()?;
+            } else {
+                return None;
+            }
+        }
+    }
 }
 
 /// Tighten only existing producer grants. All unrelated matches, including
@@ -39,7 +255,7 @@ pub(super) fn validate(
     mut matches: Vec<PatternMatch>,
     budget: Duration,
 ) -> Vec<PatternMatch> {
-    if language != ScriptLanguage::Python || !matches.iter().any(|hit| needs_proof(code, hit)) {
+    if language != ScriptLanguage::Python {
         return matches;
     }
     let candidates: HashSet<_> = matches
@@ -47,9 +263,15 @@ pub(super) fn validate(
         .filter(|hit| needs_proof(code, hit))
         .map(|hit| (hit.start, hit.end))
         .collect();
-    let proved = prove_bounded(code, candidates, budget).unwrap_or_default();
+    if candidates.is_empty() {
+        return matches;
+    }
+    let proved = prove_bounded(code, candidates.clone(), budget).unwrap_or_default();
     for hit in &mut matches {
-        if needs_proof(code, hit) && !proved.contains(&(hit.start, hit.end)) {
+        if hit.rule_id == TEMP_RULE
+            && candidates.contains(&(hit.start, hit.end))
+            && !proved.contains(&(hit.start, hit.end))
+        {
             // Restore the registered recursive-deletion rule, not a novel rule
             // that could bypass an existing per-rule policy or allowlist.
             hit.rule_id = DELETE_RULE.to_string();
@@ -617,6 +839,129 @@ mod tests {
     }
 
     #[test]
+    fn literal_target_recognizer_never_borrows_nested_literals() {
+        for target in [
+            "mkdtemp()",
+            "tempfile.mkdtemp()",
+            "tempfile.TemporaryDirectory().name",
+            "Path('/tmp/mkdtemp-cache').parent",
+            "'/tmp/mkdtemp-cache'[:-1]",
+            "'/tmp/mkdtemp-cache'.replace('cache', '..')",
+            "('/tmp/mkdtemp-cache',)[0]",
+            "('/tmp/mkdtemp-cache',)",
+            "'/tmp/mkdtemp-cache' + suffix",
+            "prefix + '/tmp/mkdtemp-cache'",
+            "'/tmp/mkdtemp-cache' if ready else '/tmp'",
+            "'/tmp/mkdtemp-cache' and '/tmp'",
+            "f'/tmp/{mkdtemp()}'",
+            "rf'/tmp/{mkdtemp()}'",
+            "f'/tmp/mkdtemp-cache'",
+            "t'/tmp/{mkdtemp()}'",
+            "*['/tmp/mkdtemp-cache']",
+            "**{'path': '/tmp/mkdtemp-cache'}",
+            "(lambda: '/tmp/mkdtemp-cache')()",
+            "('/tmp/mkdtemp-cache')('/tmp')",
+            "'/tmp/mkdtemp-cache'('/tmp')",
+            "('/tmp/mkdtemp-cache'",
+            "'/tmp/mkdtemp-cache",
+            "'/tmp/mkdtemp-cache' +",
+        ] {
+            for prefix in ["", "path="] {
+                let source = format!("shutil.rmtree({prefix}{target})");
+                assert!(
+                    !has_literal_first_target(&source),
+                    "only a complete constant target can skip the factory proof: {source}"
+                );
+            }
+        }
+        for source in [
+            "receiver('/tmp/mkdtemp-cache').rmtree(tempfile.mkdtemp())",
+            "receiver('/tmp/mkdtemp-cache', ready=True).rmtree(tempfile.mkdtemp())",
+            "receiver('/tmp/mkdtemp-cache', onerror=lambda: '(text)').rmtree(mkdtemp())",
+            "receiver(path='/tmp/mkdtemp-cache').rmtree(mkdtemp())",
+            "shutil.rmtree(ignore_errors=True, path=tempfile.mkdtemp())",
+            "shutil.rmtree(path=tempfile.mkdtemp(), onerror='/tmp/mkdtemp-cache')",
+            "shutil.rmtree('/tmp/mkdtemp-cache', onerror=f'{callback()}')",
+        ] {
+            assert!(!has_literal_first_target(source), "{source}");
+        }
+        let nested = format!(
+            "shutil.rmtree({}'/tmp/mkdtemp-cache'{})",
+            "(".repeat(MAX_DEPTH + 1),
+            ")".repeat(MAX_DEPTH + 1),
+        );
+        assert!(!has_literal_first_target(&nested));
+        assert!(!has_literal_first_target(&" ".repeat(MAX_SOURCE_BYTES + 1)));
+    }
+
+    #[test]
+    fn exhausted_factory_proof_preserves_constant_cleanup_targets() {
+        for target in [
+            "'/tmp/mkdtemp-cache'",
+            "\"/tmp/TemporaryDirectory-cache\"",
+            "r'/tmp/mkdtemp-cache'",
+            "u'/tmp/mkdtemp-cache'",
+            "b'/tmp/mkdtemp-cache'",
+            "br'/tmp/mkdtemp-cache'",
+            "RB'/tmp/mkdtemp-cache'",
+            "'''/tmp/mkdtemp-cache'''",
+            "\"\"\"/tmp/TemporaryDirectory-cache\"\"\"",
+            "('/tmp/mkdtemp-cache')",
+            "(('/tmp/mkdtemp-cache'))",
+            "'/tmp/' 'mkdtemp-cache'",
+            "'/tmp/' + 'mkdtemp-cache'",
+            "('/tmp/' + 'mkdtemp-cache')",
+            "'/tmp/' + ('mkdtemp-cache')",
+            "('/tmp/') + 'mkdtemp-cache'",
+            "'/tmp/' + ('mkdtemp-' 'cache')",
+            "'/private/./var//tmp/TemporaryDirectory-cache/.'",
+        ] {
+            for prefix in ["", "path="] {
+                let source = format!("import shutil\nshutil.rmtree({prefix}{target})");
+                let original = super::super::source_analysis::DEFAULT_MATCHER
+                    .find_matches_with_timeout(
+                        &source,
+                        ScriptLanguage::Python,
+                        Duration::from_secs(5),
+                    )
+                    .expect("the original AST path policy must complete");
+                // Do not broaden path policy for spellings the engine itself
+                // does not exempt. The independent proof cannot change their
+                // verdict in either direction, even with no remaining time.
+                let denied = original.iter().any(|hit| hit.severity.blocks_by_default());
+                let actual = validate(&source, ScriptLanguage::Python, original, Duration::ZERO);
+                assert_eq!(
+                    actual.iter().any(|hit| hit.severity.blocks_by_default()),
+                    denied,
+                    "factory analysis must not change a constant-target verdict: {source}",
+                );
+                assert!(has_literal_first_target(&format!("shutil.rmtree({prefix}{target})")));
+            }
+        }
+    }
+
+    #[test]
+    fn factory_proof_exhaustion_does_not_weaken_other_matches() {
+        let source = "import shutil, tempfile\nshutil.rmtree('/tmp/mkdtemp-cache')\nshutil.rmtree(tempfile.mkdtemp())\nshutil.rmtree('/tmp')";
+        let original = super::super::source_analysis::DEFAULT_MATCHER
+            .find_matches_with_timeout(source, ScriptLanguage::Python, Duration::from_secs(5))
+            .expect("complete initial AST matches");
+        let actual = validate(source, ScriptLanguage::Python, original, Duration::ZERO);
+        for (call, denied) in [
+            ("shutil.rmtree('/tmp/mkdtemp-cache')", false),
+            ("shutil.rmtree(tempfile.mkdtemp())", true),
+            ("shutil.rmtree('/tmp')", true),
+        ] {
+            let start = source.find(call).expect("fixture contains each complete call");
+            assert_eq!(
+                actual.iter().any(|hit| hit.start == start && hit.severity.blocks_by_default()),
+                denied,
+                "each deletion keeps its own proof requirement: {call}",
+            );
+        }
+    }
+
+    #[test]
     fn default_policy_tempfile_provenance_verdicts() {
         let cases: Vec<Case> = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -650,6 +995,18 @@ mod tests {
                 true,
             ),
             ("import shutil\nshutil.rmtree('/tmp/build')", false),
+            ("import shutil\nshutil.rmtree('/tmp/mkdtemp-cache')", false),
+            ("import shutil\nshutil.rmtree('/tmp/TemporaryDirectory-cache')", false),
+            ("import shutil\nshutil.rmtree('/tmp/' + 'mkdtemp-cache')", false),
+            ("import shutil\nshutil.rmtree(path='/tmp/mkdtemp-cache')", false),
+            ("from shutil import rmtree as wipe\nwipe('/tmp/mkdtemp-cache')", false),
+            ("import shutil\nshutil.rmtree('/tmp/cache', onerror=mkdtemp)", false),
+            ("import shutil\nshutil.rmtree('/tmp/cache', onerror=lambda *args: mkdtemp())", false),
+            ("import shutil\nshutil.rmtree('/tmp/.')", true),
+            ("import shutil\nshutil.rmtree('/tmp/mkdtemp-cache/..')", true),
+            ("import shutil\nshutil.rmtree('/tmp/mkdtemp-cache/../../etc')", true),
+            ("import shutil\nshutil.rmtree(Path('/tmp/mkdtemp-cache').parent)", true),
+            ("import shutil\nshutil.rmtree(path=mkdtemp())", true),
             ("import shutil\nshutil.rmtree('/tmp')", true),
         ] {
             let original = super::super::source_analysis::DEFAULT_MATCHER
