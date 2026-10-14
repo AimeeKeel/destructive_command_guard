@@ -2059,6 +2059,38 @@ impl PythonDeleteScan<'_> {
         Ok(())
     }
 
+    /// Visit definition-time parameter expressions once, capturing each default
+    /// before a later default can change its enclosing binding. Parameter names
+    /// are not installed in that scope: in `def f(a=wipe, b=a)`, the second
+    /// default reads the enclosing `a`, not the first parameter's default.
+    fn parameter_defaults<D: ast_grep_core::Doc>(
+        &mut self,
+        parameters: &ast_grep_core::Node<'_, D>,
+        bindings: &mut PythonDeleteBindings,
+        class_enclosing: Option<&PythonDeleteBindings>,
+        depth: usize,
+    ) -> Result<PythonDeleteBindings, MatchError> {
+        self.check(depth)?;
+        if parameters.is_error() || parameters.is_missing() {
+            return Err(MatchError::ParseError {
+                language: ScriptLanguage::Python,
+                detail: "Python deletion binding analysis encountered invalid syntax".to_string(),
+            });
+        }
+        let mut defaults = HashMap::new();
+        for parameter in parameters.children().filter(ast_grep_core::Node::is_named) {
+            self.visit(parameter.clone(), bindings, class_enclosing, depth + 1)?;
+            if matches!(parameter.kind().as_ref(), "default_parameter" | "typed_default_parameter")
+                && let Some(name) = parameter.field("name")
+                && let Some(value) = parameter.field("value")
+            {
+                let binding = self.binding(&value, bindings, depth + 1)?;
+                set_python_delete_binding(&mut defaults, name.text().into_owned(), binding);
+            }
+        }
+        Ok(defaults)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn visit<D: ast_grep_core::Doc>(
         &mut self,
@@ -2083,6 +2115,8 @@ impl PythonDeleteScan<'_> {
             }
             "function_definition" | "lambda" | "class_definition" => {
                 let body = node.field("body");
+                let parameters = node.field("parameters");
+                let mut defaults = HashMap::new();
                 // Defaults, annotations, and class bases execute in the outer
                 // scope, before the definition replaces its own name.
                 for child in node.children().filter(ast_grep_core::Node::is_named) {
@@ -2090,7 +2124,14 @@ impl PythonDeleteScan<'_> {
                         .as_ref()
                         .is_none_or(|body| child.range() != body.range())
                     {
-                        self.visit(child, bindings, class_enclosing, depth + 1)?;
+                        if parameters
+                            .as_ref()
+                            .is_some_and(|parameters| child.range() == parameters.range())
+                        {
+                            defaults = self.parameter_defaults(&child, bindings, class_enclosing, depth + 1)?;
+                        } else {
+                            self.visit(child, bindings, class_enclosing, depth + 1)?;
+                        }
                     }
                 }
                 if let Some(name) = node.field("name") {
@@ -2110,6 +2151,9 @@ impl PythonDeleteScan<'_> {
                     for name in names.difference(&nonlocals) {
                         local.remove(name);
                     }
+                    // Defaults are captured at definition time. Required parameters
+                    // remain shadowing because they do not appear in this map.
+                    merge_python_delete_bindings(&mut local, &defaults);
                 }
                 if let Some(body) = body {
                     self.visit(
@@ -5926,6 +5970,44 @@ fn compile_patterns(patterns: &[CompiledPattern], ast_lang: SupportLang) -> Patt
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn python_default_parameter_captures_preserve_rmtree_binding() {
+        let matcher = AstMatcher::new().with_timeout(Duration::from_secs(5));
+        for (source, denied) in [
+            ("import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove('/tmp')\ncleanup()", true),
+            ("import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove('/tmp/build')\ncleanup()", false),
+            ("from shutil import rmtree as remove\ndef cleanup(remove):\n    remove('/tmp')\ncleanup(print)", false),
+            ("import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove = print\n    remove('/tmp')\ncleanup()", false),
+        ] {
+            let matches = matcher
+                .find_matches(source, ScriptLanguage::Python)
+                .expect("complete default-argument binding analysis");
+            assert_eq!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                denied,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn python_default_parameter_capture_respects_definition_order() {
+        let matcher = AstMatcher::new().with_timeout(Duration::from_secs(5));
+        for (source, denied) in [
+            ("from shutil import rmtree as erase\ndef cleanup(remove=erase, marker=(erase := print)):\n    remove('/tmp')\ncleanup()", true),
+            ("from shutil import rmtree as erase\ndef cleanup(marker=(erase := print), remove=erase):\n    remove('/tmp')\ncleanup()", false),
+        ] {
+            let matches = matcher
+                .find_matches(source, ScriptLanguage::Python)
+                .expect("definition-order defaults must remain analyzable");
+            assert_eq!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                denied,
+                "{source}",
+            );
+        }
+    }
 
     /// A per-call budget overrides the matcher's own, in both directions: an
     /// exhausted one reports a transient failure (never an empty match list),
