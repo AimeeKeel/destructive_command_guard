@@ -258,20 +258,25 @@ pub(super) fn validate(
     if language != ScriptLanguage::Python {
         return matches;
     }
-    let candidates: HashSet<_> = matches
-        .iter()
-        .filter(|hit| needs_proof(code, hit))
-        .map(|hit| (hit.start, hit.end))
-        .collect();
+    // Keep the exact candidate indices as well as their deduplicated spans.
+    // The proof does not resize matches, so applying the result needs neither
+    // another fragment scan nor a clone of the candidate set. Preserve the
+    // literal-target exclusions and duplicate-span findings independently.
+    let mut candidate_indices = Vec::new();
+    let mut candidates = HashSet::new();
+    for (index, hit) in matches.iter().enumerate() {
+        if needs_proof(code, hit) {
+            candidate_indices.push(index);
+            candidates.insert((hit.start, hit.end));
+        }
+    }
     if candidates.is_empty() {
         return matches;
     }
-    let proved = prove_bounded(code, candidates.clone(), budget).unwrap_or_default();
-    for hit in &mut matches {
-        if hit.rule_id == TEMP_RULE
-            && candidates.contains(&(hit.start, hit.end))
-            && !proved.contains(&(hit.start, hit.end))
-        {
+    let proved = prove_bounded(code, candidates, budget).unwrap_or_default();
+    for index in candidate_indices {
+        let hit = &mut matches[index];
+        if !proved.contains(&(hit.start, hit.end)) {
             // Restore the registered recursive-deletion rule, not a novel rule
             // that could bypass an existing per-rule policy or allowlist.
             hit.rule_id = DELETE_RULE.to_string();
@@ -341,8 +346,21 @@ struct Proof {
     imports: Vec<Import>,
 }
 
-#[allow(clippy::too_many_lines)] // Keep the two bounded import-proof passes together.
 fn prove(
+    code: &str,
+    candidates: &HashSet<Span>,
+    started: Instant,
+    budget: Duration,
+    cancel: &AtomicBool,
+) -> Option<HashSet<Span>> {
+    prove_with_binding_index::<true>(code, candidates, started, budget, cancel)
+}
+
+// The false specialization retains the two-walk incumbent for in-module
+// differential tests and paired benchmarks. Runtime callers always use true;
+// the compiler removes the unused strategy, not any security predicate.
+#[allow(clippy::too_many_lines)] // Keep import collection and binding validation together.
+fn prove_with_binding_index<const INDEX_BINDINGS: bool>(
     code: &str,
     candidates: &HashSet<Span>,
     started: Instant,
@@ -365,6 +383,7 @@ fn prove(
     let mut handles = HashSet::new();
     let mut import_ranges = Vec::new();
     let mut calls = Vec::new();
+    let mut binding_uses = Vec::new();
     let mut immutable = true;
 
     for (index, node) in root.dfs().enumerate() {
@@ -375,6 +394,17 @@ fn prove(
         // spelled identifier for proof that a trusted binding is untouched.
         if node.kind() == "identifier" && !node.text().is_ascii() {
             immutable = false;
+        }
+        // Only these kinds can affect reflects_bindings/read_only_use. Retain
+        // all of them, even before the first trusted import: a later import
+        // can identify an earlier alias or write as relevant. Original DFS
+        // indices preserve node-limit accounting; the complete first walk
+        // still validates every node, including syntax errors and missing nodes.
+        if INDEX_BINDINGS
+            && immutable
+            && matches!(node.kind().as_ref(), "identifier" | "attribute")
+        {
+            binding_uses.push((index, node.clone()));
         }
         let range = node.range();
         if node.kind() == "call" && candidates.contains(&(range.start, range.end)) {
@@ -470,27 +500,23 @@ fn prove(
         .retain(|import| declarations.get(&import.name) == Some(&Some(import.kind)));
     import_ranges.sort_unstable_by_key(|range| range.start);
     if immutable && !proof.imports.is_empty() {
-        for (index, node) in root.dfs().enumerate() {
-            if !check(index) {
-                return None;
-            }
-            let range = node.range();
-            let before = import_ranges.partition_point(|import| import.start <= range.start);
-            if before > 0 && range.end <= import_ranges[before - 1].end {
-                continue;
-            }
-            if reflects_bindings(&node) {
-                immutable = false;
-                break;
-            }
-            if node.kind() == "identifier" && handles.contains(node.text().as_ref()) {
-                let kind = declarations.get(node.text().as_ref()).copied().flatten();
-                if !kind.is_some_and(|kind| read_only_use(&node, kind)) {
-                    immutable = false;
-                    break;
-                }
-            }
-        }
+        immutable = if INDEX_BINDINGS {
+            bindings_are_immutable(
+                binding_uses.into_iter(),
+                &declarations,
+                &handles,
+                &import_ranges,
+                &check,
+            )?
+        } else {
+            bindings_are_immutable(
+                root.dfs().enumerate(),
+                &declarations,
+                &handles,
+                &import_ranges,
+                &check,
+            )?
+        };
     }
     let mut proved = HashSet::new();
     for call in calls {
@@ -509,6 +535,35 @@ fn prove(
         }
     }
     Some(proved)
+}
+
+fn bindings_are_immutable<'a, D: Doc + 'a>(
+    nodes: impl Iterator<Item = (usize, Node<'a, D>)>,
+    declarations: &HashMap<String, Option<ImportKind>>,
+    handles: &HashSet<String>,
+    import_ranges: &[Range<usize>],
+    check: &impl Fn(usize) -> bool,
+) -> Option<bool> {
+    for (index, node) in nodes {
+        if !check(index) {
+            return None;
+        }
+        let range = node.range();
+        let before = import_ranges.partition_point(|import| import.start <= range.start);
+        if before > 0 && range.end <= import_ranges[before - 1].end {
+            continue;
+        }
+        if reflects_bindings(&node) {
+            return Some(false);
+        }
+        if node.kind() == "identifier" && handles.contains(node.text().as_ref()) {
+            let kind = declarations.get(node.text().as_ref()).copied().flatten();
+            if !kind.is_some_and(|kind| read_only_use(&node, kind)) {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
 }
 
 fn reflective_name(name: &str) -> bool {
@@ -1057,5 +1112,274 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn candidate_spans(source: &str) -> HashSet<Span> {
+        super::super::source_analysis::DEFAULT_MATCHER
+            .find_matches_with_timeout(source, ScriptLanguage::Python, Duration::from_secs(60))
+            .expect("complete source classification for the proof comparison")
+            .iter()
+            .filter(|hit| needs_proof(source, hit))
+            .map(|hit| (hit.start, hit.end))
+            .collect()
+    }
+
+    fn compare_proof_strategies(source: &str, candidates: &HashSet<Span>) {
+        let cancelled = AtomicBool::new(false);
+        let budget = Duration::from_secs(60);
+        let incumbent = prove_with_binding_index::<false>(
+            source,
+            candidates,
+            Instant::now(),
+            budget,
+            &cancelled,
+        );
+        let indexed = prove(source, candidates, Instant::now(), budget, &cancelled);
+        assert_eq!(indexed, incumbent, "{source}");
+    }
+
+    #[test]
+    fn indexed_binding_proof_matches_two_walk_incumbent() {
+        let cases: Vec<Case> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/python_tempfile_provenance.json"
+        )))
+        .expect("valid shared verdict fixtures");
+        let mut compared_candidates = 0;
+        for case in cases {
+            let candidates = candidate_spans(&case.source);
+            compared_candidates += candidates.len();
+            compare_proof_strategies(&case.source, &candidates);
+        }
+        assert!(
+            compared_candidates > 0,
+            "the differential proof must not be vacuous"
+        );
+        for lines in [1, 40, 300] {
+            let source = format!(
+                "import shutil, tempfile\n{}shutil.rmtree(tempfile.mkdtemp())\n",
+                "value = (1, 2, 3, 'quoted os.path.abspath = unsafe')\n".repeat(lines),
+            );
+            let candidates = candidate_spans(&source);
+            assert!(!candidates.is_empty());
+            compare_proof_strategies(&source, &candidates);
+            let proved = prove(
+                &source,
+                &candidates,
+                Instant::now(),
+                Duration::from_secs(60),
+                &AtomicBool::new(false),
+            )
+            .expect("complete bounded proof");
+            assert_eq!(
+                proved, candidates,
+                "literal data must not poison a real factory"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_index_keeps_uses_before_imports_and_after_cleanup() {
+        for source in [
+            "def poison():\n    os.path.abspath = lambda path: '/etc'\nimport os, shutil, tempfile\npoison()\nshutil.rmtree(tempfile.mkdtemp())\n",
+            "import os, shutil, tempfile\nfor step in range(2):\n    shutil.rmtree(tempfile.mkdtemp())\n    os.path.abspath = lambda path: '/etc'\n",
+            "reflect = globals\nimport shutil, tempfile\nshutil.rmtree(tempfile.mkdtemp())\n",
+        ] {
+            let candidates = candidate_spans(source);
+            // Exercise the proof directly even when another source-analysis
+            // backstop has already withheld the preliminary .temp exemption.
+            let ast = AstGrep::try_new(source, SupportLang::Python).expect("valid Python fixture");
+            let cleanup_calls: HashSet<_> = ast
+                .root()
+                .dfs()
+                .filter(|node| {
+                    node.kind() == "call"
+                        && node
+                            .field("function")
+                            .is_some_and(|callee| callee.text() == "shutil.rmtree")
+                })
+                .map(|node| {
+                    let range = node.range();
+                    (range.start, range.end)
+                })
+                .collect();
+            assert!(!cleanup_calls.is_empty());
+            compare_proof_strategies(source, &candidates);
+            compare_proof_strategies(source, &cleanup_calls);
+            let proved = prove(
+                source,
+                &cleanup_calls,
+                Instant::now(),
+                Duration::from_secs(60),
+                &AtomicBool::new(false),
+            )
+            .expect("complete negative proof");
+            assert!(
+                proved.is_empty(),
+                "a shared or reflective mutation must withhold the grant"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_validation_preserves_duplicate_spans_and_unrelated_hits() {
+        let source = "mkdtemp";
+        let candidate = PatternMatch {
+            rule_id: TEMP_RULE.to_string(),
+            reason: "preliminary producer exemption".to_string(),
+            matched_text_preview: source.to_string(),
+            start: 0,
+            end: source.len(),
+            line_number: 1,
+            severity: Severity::Medium,
+            suggestion: None,
+        };
+        let mut unrelated = candidate.clone();
+        unrelated.rule_id = "heredoc.python.other".to_string();
+        unrelated.severity = Severity::High;
+        let mut not_a_candidate = candidate.clone();
+        not_a_candidate.end = 0;
+        let original = vec![
+            unrelated.clone(),
+            candidate.clone(),
+            not_a_candidate.clone(),
+            candidate,
+        ];
+        assert_eq!(
+            validate(source, ScriptLanguage::Bash, original.clone(), Duration::ZERO),
+            original,
+        );
+        let result = validate(source, ScriptLanguage::Python, original, Duration::ZERO);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0], unrelated);
+        assert_eq!(result[2], not_a_candidate);
+        for index in [1, 3] {
+            assert_eq!(result[index].rule_id, DELETE_RULE);
+            assert_eq!(result[index].severity, Severity::Critical);
+            assert_eq!(result[index].start, 0);
+            assert_eq!(result[index].end, source.len());
+        }
+        assert_eq!(result[1], result[3]);
+    }
+
+    #[test]
+    fn indexed_proof_retains_incomplete_analysis_refusal() {
+        let oversized = " ".repeat(MAX_SOURCE_BYTES + 1);
+        let too_many_nodes = "value = 0\n".repeat(MAX_NODES / 2 + 1);
+        assert!(too_many_nodes.len() < MAX_SOURCE_BYTES);
+        for (source, budget, cancelled) in [
+            ("import tempfile", Duration::ZERO, false),
+            ("import tempfile", Duration::from_secs(60), true),
+            (oversized.as_str(), Duration::from_secs(60), false),
+            (too_many_nodes.as_str(), Duration::from_secs(60), false),
+            ("import tempfile\nvalue = (", Duration::from_secs(60), false),
+        ] {
+            let candidates = HashSet::new();
+            let cancel = AtomicBool::new(cancelled);
+            let incumbent = prove_with_binding_index::<false>(
+                source,
+                &candidates,
+                Instant::now(),
+                budget,
+                &cancel,
+            );
+            let indexed = prove(source, &candidates, Instant::now(), budget, &cancel);
+            assert!(incumbent.is_none(), "incumbent accepted incomplete input");
+            assert!(indexed.is_none(), "index accepted incomplete input");
+        }
+    }
+
+    /// Component-only comparison: each sample parses the same source afresh.
+    /// Includes index construction and its allocation; excludes fixture setup,
+    /// candidate discovery, and result comparison equally for both strategies.
+    /// Does not measure worker spawning, fresh hook processes, or history I/O.
+    #[test]
+    #[ignore = "paired component benchmark; run in release mode without competing builds"]
+    #[allow(clippy::too_many_lines)] // Keep the paired setup, verification, and raw samples together.
+    fn paired_tempfile_binding_index_benchmark() {
+        use std::hint::black_box;
+
+        const RUNS: usize = 50;
+        const WARMUP: usize = 5;
+        for (shape, body) in [
+            ("small", "value = (1, 2, 3)\n".to_string()),
+            (
+                "literal_heavy_40",
+                "value = (1, 2, 3, 'os.path.abspath = unsafe')\n".repeat(40),
+            ),
+            (
+                "literal_heavy_300",
+                "value = (1, 2, 3, 'os.path.abspath = unsafe')\n".repeat(300),
+            ),
+            (
+                "binding_dense_300",
+                "value = max(min(left, right), abs(other))\n".repeat(300),
+            ),
+        ] {
+            let source = format!(
+                "import shutil, tempfile\n{body}shutil.rmtree(tempfile.mkdtemp())\n"
+            );
+            let candidates = candidate_spans(&source);
+            assert!(!candidates.is_empty());
+            let cancelled = AtomicBool::new(false);
+            let mut old_samples = Vec::with_capacity(RUNS);
+            let mut indexed_samples = Vec::with_capacity(RUNS);
+            for pair in 0..RUNS + WARMUP {
+                let mut results = Vec::with_capacity(2);
+                for indexed in [pair % 2 == 0, pair % 2 != 0] {
+                    let started = Instant::now();
+                    let result = if indexed {
+                        prove(
+                            black_box(&source),
+                            black_box(&candidates),
+                            started,
+                            Duration::from_secs(60),
+                            &cancelled,
+                        )
+                    } else {
+                        prove_with_binding_index::<false>(
+                            black_box(&source),
+                            black_box(&candidates),
+                            started,
+                            Duration::from_secs(60),
+                            &cancelled,
+                        )
+                    };
+                    let elapsed = started.elapsed().as_nanos();
+                    if pair >= WARMUP {
+                        if indexed {
+                            indexed_samples.push(elapsed);
+                        } else {
+                            old_samples.push(elapsed);
+                        }
+                    }
+                    results.push(black_box(result));
+                }
+                assert_eq!(results[0], results[1], "{shape}");
+                assert_eq!(results[0].as_ref(), Some(&candidates), "{shape}");
+            }
+            let median = |samples: &[u128]| {
+                let mut sorted = samples.to_vec();
+                sorted.sort_unstable();
+                sorted[sorted.len() / 2]
+            };
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "paired_tempfile_binding_index",
+                    "scope": "in_process_ast_proof",
+                    "reference_source_blob": "53ec6cbc0fa35a333197a706ac42d5968cb97141",
+                    "baseline": "two_walk_strategy_shared_semantic_checks",
+                    "shape": shape,
+                    "source_bytes": source.len(),
+                    "runs": RUNS,
+                    "warmup": WARMUP,
+                    "old_median_ns": median(&old_samples),
+                    "indexed_median_ns": median(&indexed_samples),
+                    "old_ns": old_samples,
+                    "indexed_ns": indexed_samples,
+                })
+            );
+        }
     }
 }
