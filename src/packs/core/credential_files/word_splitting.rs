@@ -435,9 +435,10 @@ fn printf_format_may_assign(format: &str) -> bool {
         // This is a conservative conversion prefix, not a printf validator.
         // Invalid combinations can only add a refusal; they cannot conceal
         // an `n` accepted by Bash's width/precision/modifier parser.
-        while bytes.get(index).is_some_and(|byte| {
-            byte.is_ascii_digit() || b"#-+ '.*hlLjzt".contains(byte)
-        }) {
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_digit() || b"#-+ '.*hlLjzt".contains(byte))
+        {
             index += 1;
         }
         match bytes.get(index) {
@@ -525,8 +526,7 @@ fn mutates_shell(name: &str) -> bool {
 fn special_builtin(name: &str) -> bool {
     matches!(
         name,
-        ":"
-            | "."
+        ":" | "."
             | "break"
             | "continue"
             | "eval"
@@ -788,7 +788,10 @@ pub(super) fn candidate(command: &str) -> bool {
     // Ignore quote/escape characters only for this lexical superset; the AST
     // analyzer still treats an unmodeled declaration as unknown state.
     let mut prefix = 0;
-    for ch in command.chars().filter(|ch| !matches!(*ch, '\'' | '"' | '\\')) {
+    for ch in command
+        .chars()
+        .filter(|ch| !matches!(*ch, '\'' | '"' | '\\'))
+    {
         prefix = match (prefix, ch) {
             (_, 'I') => 1,
             (1, 'F') => 2,
@@ -898,7 +901,10 @@ mod tests {
                 hits.iter().any(|hit| hit.reason != UNCERTAIN),
                 "must resolve literal fields: {source}"
             );
-            assert!(hits.iter().all(|hit| source[hit.span.clone()].contains("tee")));
+            assert!(
+                hits.iter()
+                    .all(|hit| source[hit.span.clone()].contains("tee"))
+            );
         }
     }
 
@@ -1017,14 +1023,28 @@ mod tests {
     #[test]
     fn printf_count_conversions_preserve_format_ownership() {
         for format in [
-            "%n", "abcde%n", "%5n", "%+05.2n", "%*.*n", "%hn", "%lln", "%zn",
-            "%jn", "%tn", "%Ln", "%%%n", r"\%n", r"\\%n", "%(%n)T%n",
+            "%n", "abcde%n", "%5n", "%+05.2n", "%*.*n", "%hn", "%lln", "%zn", "%jn", "%tn", "%Ln",
+            "%%%n", r"\%n", r"\\%n", "%(%n)T%n",
         ] {
             assert!(printf_format_may_assign(format), "{format}");
         }
         for format in [
-            "", "%s", "%b", "%q", "n", "%%n", "%%%%n", "%dn", "%sn", "%s%%n",
-            r"\045n", r"\x25n", "%(%n)T", "%(a(b)%n)T", "%10(%n)T", "%(%%n)T",
+            "",
+            "%s",
+            "%b",
+            "%q",
+            "n",
+            "%%n",
+            "%%%%n",
+            "%dn",
+            "%sn",
+            "%s%%n",
+            r"\045n",
+            r"\x25n",
+            "%(%n)T",
+            "%(a(b)%n)T",
+            "%10(%n)T",
+            "%(%%n)T",
         ] {
             assert!(!printf_format_may_assign(format), "{format}");
         }
@@ -1066,9 +1086,8 @@ mod tests {
             "E=; printf $E 'abcde%n' SEP",
             "p''rintf 'abcde%n' SEP",
         ] {
-            let source = format!(
-                "SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S"
-            );
+            let source =
+                format!("SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S");
             let hits = scan(&source, ShellDialect::Posix);
             for rule in [
                 shell::CREDENTIAL_FILE_WRITE_NAME,
@@ -1098,9 +1117,8 @@ mod tests {
             r#"F=%%n; printf "$F" SEP"#,
             r#"E=; printf "$E" 'abcde%n' SEP"#,
         ] {
-            let source = format!(
-                "SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S"
-            );
+            let source =
+                format!("SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S");
             assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
         }
     }
@@ -1210,9 +1228,7 @@ mod tests {
             "IFS=: >/definitely/missing/parent/file",
             "export IFS=: >/definitely/missing/parent/file",
         ] {
-            let source = format!(
-                "S=/tmp/a@/etc/profile; IFS=@; {mutation}; tee $S"
-            );
+            let source = format!("S=/tmp/a@/etc/profile; IFS=@; {mutation}; tee $S");
             let hits = scan(&source, ShellDialect::Posix);
             assert!(
                 hits.iter().any(|hit| hit.reason == UNCERTAIN),
@@ -1336,7 +1352,7 @@ mod tests {
             r#"IFS=@; S=ok; tee "$S"'[@]'"#,
             r#"IFS=@; S=ok; tee "$S"'${@:1}'"#,
             r#"IFS=@; tee "\${@:1}""#,
-            r#"IFS=@; tee '${@:1}'"#,
+            r"IFS=@; tee '${@:1}'",
             r#"IFS=@; tee "${#@}""#,
             r#"IFS=@; tee "${#A[@]}""#,
             r#"IFS=@; tee "${A[*]}""#,
