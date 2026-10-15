@@ -8075,6 +8075,9 @@ fn inert_interpreter_stdin_body(command: &str, heredoc: &ActiveHeredoc) -> Optio
     };
     let target = extract_heredoc_target_command(command, heredoc.operator_start)?;
     (is_non_shell_interpreter_stdin_command(&target)
+        // All exemption consumers must prove that stdin supplies the program,
+        // not data consumed by a -c/-e expression or script file (#560).
+        && direct_interpreter_stdin_owner(command, heredoc.operator_start)
         && !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target))
     .then_some(body_start..body_end)
 }
@@ -8103,7 +8106,6 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
     }
     let bodies: Vec<_> = heredocs
         .iter()
-        .filter(|heredoc| direct_interpreter_stdin_owner(command, heredoc.operator_start))
         .filter_map(|heredoc| inert_interpreter_stdin_body(command, heredoc))
         .collect();
     if bodies.is_empty() {
@@ -8118,17 +8120,39 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
 ///
 /// Prefer the full AST when it is available. If tree-sitter rejects the whole
 /// command solely because the quoted interpreter body is not shell grammar,
-/// inspect only the operator's physical-line prefix. That prefix is shell
-/// syntax; the quoted body is not. The fallback deliberately accepts only one
-/// literal program plus an optional stdin marker, with no assignments,
-/// wrappers, redirects, substitutions, lists, pipelines, or groups.
+/// inspect the complete physical header, including words AFTER the delimiter.
+/// A valid AST that does not prove ownership must never fall back to a looser
+/// prefix proof. Recovery accepts only one literal program, an optional stdin
+/// marker and one delimiter on the first nonblank physical line; no wrappers,
+/// extra operands, redirects, substitutions, pipelines or continued commands.
 fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool {
     let owner = plain_heredoc_command_at(command, operator_start).or_else(|| {
+        // A size or parser-work failure cannot justify weaker ownership.
+        if command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+            || longest_pipeline_stages(command) > MAX_PARSED_PIPELINE_STAGES
+        {
+            return None;
+        }
+        let ast = try_parse_shell_ast(command).ok()?;
+        if !ast.root().get_inner_node().has_error() {
+            return None;
+        }
         let prefix = command.get(..operator_start)?;
         let line_start = prefix.rfind(['\n', '\r']).map_or(0, |index| index + 1);
+        // Earlier source might continue a -c/-e invocation or open quote.
+        if !prefix.get(..line_start)?.bytes().all(|byte| matches!(byte, b' ' | b'\t' | b'\n')) {
+            return None;
+        }
         let header = prefix.get(line_start..)?.trim();
+        let redirect = command.get(operator_start..)?.split('\n').next()?;
+        let delimiter = redirect.strip_prefix("<<")?;
+        let delimiter = delimiter.strip_prefix('-').unwrap_or(delimiter);
         const CONTROL_BYTES: [u8; 9] = [0x24, 0x60, 0x3b, 0x7c, 0x26, 0x28, 0x29, 0x3c, 0x3e];
-        if header.is_empty() || header.bytes().any(|byte| CONTROL_BYTES.contains(&byte)) {
+        if header.is_empty()
+            || header.bytes().any(|byte| CONTROL_BYTES.contains(&byte))
+            || delimiter.bytes().any(|byte| CONTROL_BYTES.contains(&byte))
+            || shell_words::split(delimiter).ok()?.len() != 1
+        {
             return None;
         }
         let words = shell_words::split(header).ok()?;
