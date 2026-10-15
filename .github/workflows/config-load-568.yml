@@ -1,185 +1,94 @@
-name: Trusted configuration failure regression (#568)
+name: Verify trusted configuration failures (#568)
 
 on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a reviewed patch to main only after all verification passes
+        required: false
+        default: 'false'
+        type: boolean
   push:
     branches: [main]
-    paths: ['.github/workflows/config-load-568.yml']
-  workflow_dispatch:
+    paths:
+      - src/config.rs
+      - src/main.rs
+      - src/cli.rs
+      - src/evaluator.rs
+      - tests/repro_568_config_load.rs
+      - .github/workflows/config-load-568.yml
+      - .github/patches/config-load-568.patch
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: config-load-568-${{ github.ref }}
+  group: config-load-568-verification
   cancel-in-progress: false
 
 jobs:
-  validate:
+  verify:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    outputs:
-      candidate: ${{ steps.patch.outputs.candidate }}
-    env:
-      CARGO_TERM_COLOR: never
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
-          persist-credentials: false
-      - name: Apply immutable candidate to the inspected source blobs
-        id: patch
-        env:
-          GH_TOKEN: ${{ github.token }}
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - name: Record exact source for review
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/dcg568"
-          python3 - <<'PY'
-          import base64, hashlib, io, json, os, pathlib, subprocess, tarfile
-          chunks = [
-              '68ece99f552a703fd43acbf0fb0ad5ec7ee80584',
-              'a4b1cc7d606b24571f00d0cd5a742e10edc2825a',
-              '038a0cdf143599600154760dbe28c95927ea811b',
-              '6901211061a8224074a232d0cbfa0b5d96751e1c',
-              'b99958e7957783669b0e352669868bc34c3c991f',
-              '121ed1255a8bb48c95557a4a69de7a67b41b4c17',
-              'bb4b6394e551a5c43b1ed905d1292e395b2a8f9d',
-          ]
-          encoded = b''
-          for sha in chunks:
-              blob = json.loads(subprocess.check_output([
-                  'gh', 'api', f'repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}'
-              ]))
-              part = base64.b64decode(blob['content'])
-              assert hashlib.sha1(f'blob {len(part)}\0'.encode() + part).hexdigest() == sha
-              encoded += part
-          data = base64.b64decode(encoded, validate=True)
-          assert hashlib.sha1(f'blob {len(data)}\0'.encode() + data).hexdigest() == '8a8202da56093d3bb8c56303ddaee1a0706ca0af'
-          destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'dcg568'
-          with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
-              assert set(archive.getnames()) == {'apply.py', 'config_load_regression_tests.rs', 'repro_568_config_load.rs'}
-              archive.extractall(destination, filter='data')
-          subprocess.run(['python3', str(destination / 'apply.py')], check=True)
-          PY
-          echo 'candidate=true' >> "$GITHUB_OUTPUT"
-      - name: Activate repository Rust toolchain
+          git rev-parse HEAD
+          git archive --format=tar HEAD > "$RUNNER_TEMP/dcg-source.tar"
+          for symbol in 'pub fn run_command' 'fn test_command_with_options'; do
+            grep -n -F "$symbol" src/cli.rs || true
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: config-568-source
+          path: ${{ runner.temp }}/dcg-source.tar
+          retention-days: 3
+      - name: Apply reviewed diff on explicitly requested publication
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
         run: |
-          rustup show active-toolchain
-          rustup component add rustfmt clippy
-          rustc --version
-          cargo --version
-      - name: Format changed Rust modules
-        run: |
-          rustfmt --edition 2024 --config skip_children=true src/config.rs src/main.rs src/evaluator.rs src/cli.rs src/config_load_regression_tests.rs tests/repro_568_config_load.rs
+          test -f .github/patches/config-load-568.patch
+          git apply --check .github/patches/config-load-568.patch
+          git apply .github/patches/config-load-568.patch
           git diff --check
-      - name: Run security regressions and configuration unit tests
+      - name: Install the repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Format publication candidate
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        run: cargo fmt
+      - name: Trusted-policy process regressions
+        run: cargo test --locked --test repro_568_config_load -- --test-threads=1
+      - name: Configuration and hook unit regressions
+        run: |
+          cargo test --locked --lib config:: -- --test-threads=1
+          cargo test --locked --bin dcg -- --test-threads=1
+      - name: Check every target
+        run: cargo check --locked --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Real-binary harness conformance
+        run: bash scripts/e2e_harness_matrix.sh --binary target/debug/dcg --json
+      - name: Publish verified source directly to main
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p verification-568
-          cargo test --locked --lib config:: -- --test-threads=1 2>&1 | tee verification-568/config-tests.log
-          cargo test --locked --test repro_568_config_load -- --test-threads=1 2>&1 | tee verification-568/protocol-tests.log
-          cargo test --locked --bin dcg -- --test-threads=1 2>&1 | tee verification-568/hook-tests.log
-          cargo check --locked --all-targets 2>&1 | tee verification-568/check-all-targets.log
-      - name: Prepare verified source and read-only permanent regression workflow
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          Path('.github/workflows/config-load-568.yml').write_text('''name: Trusted configuration failure regression (#568)
-          on:
-            push:
-              branches: [main]
-              paths:
-                - src/config.rs
-                - src/main.rs
-                - src/evaluator.rs
-                - src/cli.rs
-                - src/config_load_regression_tests.rs
-                - tests/repro_568_config_load.rs
-                - .github/workflows/config-load-568.yml
-            workflow_dispatch:
-          permissions:
-            contents: read
-          jobs:
-            regression:
-              runs-on: ubuntu-latest
-              timeout-minutes: 45
-              env:
-                CARGO_BUILD_JOBS: '2'
-                CARGO_PROFILE_DEV_DEBUG: '0'
-                CARGO_PROFILE_TEST_DEBUG: '0'
-              steps:
-                - uses: actions/checkout@v7
-                  with:
-                    persist-credentials: false
-                - run: rustup show active-toolchain
-                - run: cargo test --locked --lib config:: -- --test-threads=1
-                - run: cargo test --locked --test repro_568_config_load -- --test-threads=1
-                - run: cargo test --locked --bin dcg -- --test-threads=1
-                - run: cargo check --locked --all-targets
-          ''')
-          PY
-          git diff --stat
+          test "${GITHUB_REF}" = refs/heads/main
+          base=$(git rev-parse HEAD)
+          remote=$(git ls-remote origin refs/heads/main | cut -f1)
+          test "$base" = "$remote" || { echo 'main advanced; refusing to publish a stale candidate'; exit 1; }
           git diff --check
-          git diff > verification-568/production.patch
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: config-load-568-verification
-          path: verification-568/
-          if-no-files-found: warn
-      - uses: actions/upload-artifact@v7
-        with:
-          name: config-load-568-verified-source
-          include-hidden-files: true
-          path: |
-            src/config.rs
-            src/main.rs
-            src/evaluator.rs
-            src/cli.rs
-            src/config_load_regression_tests.rs
-            tests/repro_568_config_load.rs
-            .github/workflows/config-load-568.yml
-  record-candidate:
-    needs: validate
-    if: needs.validate.outputs.candidate == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          name: config-load-568-verified-source
-          path: candidate
-      - name: Record verified candidate objects without changing any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import base64, json, os, pathlib, subprocess
-          repo = os.environ['GITHUB_REPOSITORY']
-          parent = os.environ['GITHUB_SHA']
-          def api(endpoint, payload=None):
-              args = ['gh', 'api', f'repos/{repo}/{endpoint}']
-              if payload is not None:
-                  args += ['--method', 'POST', '--input', '-']
-              return json.loads(subprocess.check_output(args, input=None if payload is None else json.dumps(payload).encode()))
-          base = api(f'git/commits/{parent}')['tree']['sha']
-          paths = ['src/config.rs', 'src/main.rs', 'src/evaluator.rs', 'src/cli.rs', 'src/config_load_regression_tests.rs', 'tests/repro_568_config_load.rs', '.github/workflows/config-load-568.yml']
-          tree = []
-          for name in paths:
-              content = (pathlib.Path('candidate') / name).read_bytes()
-              blob = api('git/blobs', {'encoding': 'base64', 'content': base64.b64encode(content).decode()})['sha']
-              tree.append({'path': name, 'mode': '100644', 'type': 'blob', 'sha': blob})
-          tree_sha = api('git/trees', {'base_tree': base, 'tree': tree})['sha']
-          commit = api('git/commits', {
-              'message': 'fix(config): fail closed when required trusted policy cannot load (#568)\n\nPreserve fatal trusted-source failures across precedence and evaluation; keep automatic project errors non-fatal. Share explicit CLI selection with the runtime loader and emit protocol-safe hook denials and CLI configuration errors.\n\nVerified by configuration unit tests, #568 subprocess regressions, hook binary tests, and cargo check --locked --all-targets.\n\nFixes #568',
-              'tree': tree_sha, 'parents': [parent],
-          })['sha']
-          print(f'VERIFIED_CANDIDATE_COMMIT={commit}')
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
-              out.write(f'Verified candidate: `{commit}`\n\nNo branch or tag was changed. Fast-forward publication remains an explicit owner action.\n')
-          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/config.rs src/evaluator.rs src/main.rs src/cli.rs tests/repro_568_config_load.rs
+          if test -f src/config_load_regression_tests.rs; then git add src/config_load_regression_tests.rs; fi
+          git diff --cached --quiet && { echo 'No source changes to publish'; exit 1; }
+          git commit -m 'fix(config): preserve trusted policy failures across evaluation and hook protocols (#568)'
+          git push origin HEAD:main
+          echo "Published $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
