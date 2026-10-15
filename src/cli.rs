@@ -2434,9 +2434,40 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let (config, config_sources) = if needs_config_trace {
         let loaded_config = Config::load_with_report();
         (loaded_config.config, Some(loaded_config.sources))
+    } else if let Some(Command::TestCommand {
+        config: Some(path), ..
+    }) = &cli.command
+    {
+        (Config::load_with_explicit_path(path), None)
     } else {
         (Config::load(), None)
     };
+    // Diagnostics and repair-oriented config commands remain available. Other
+    // CLI operations must not report success using partially loaded policy.
+    // Explicit batch hooks have their own indexed JSONL denial contract.
+    if let Some(reason) = config.configuration_error() {
+        if !matches!(
+            &cli.command,
+            Some(
+                Command::Doctor { .. }
+                    | Command::ShowConfig { .. }
+                    | Command::Completions { .. }
+                    | Command::Hook(_)
+            )
+        ) {
+            crate::emit_stdout!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "decision": "deny",
+                    "error": { "kind": "configuration_error", "message": reason },
+                    "reason": reason,
+                })
+            );
+            crate::emit_stderr!("Error: {reason}");
+            std::process::exit(crate::exit_codes::EXIT_CONFIG_ERROR);
+        }
+    }
     crate::output::install_theme_config(&config);
     let verbosity = Verbosity::from_cli(&cli);
     let explicit_omp_agent = is_explicit_omp_agent(cli.agent.as_deref());
@@ -2558,7 +2589,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::TestCommand {
             command,
             stdin,
-            config: config_path,
+            config: _,
             with_packs,
             explain,
             format,
@@ -2578,16 +2609,9 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             validate_omp_bridge_output_agent(omp_bridge_output, robot_mode, explicit_omp_agent)?;
             let effective_format = if robot_mode { TestFormat::Json } else { format };
 
-            // Load specific config file if provided, otherwise use default
-            let effective_config = if let Some(ref path) = config_path {
-                Config::load_from_file(path).unwrap_or_else(|| {
-                    eprintln!("Warning: Failed to load config from {}", path.display());
-                    config.clone()
-                })
-            } else {
-                config.clone()
-            };
-
+            // The shared loader already selected --config, preserving
+            // system policy, environment overrides and fatal load failures.
+            let effective_config = config.clone();
             let command = if stdin {
                 read_test_command_from_stdin(
                     effective_config.general.max_command_bytes(),
@@ -2900,6 +2924,13 @@ fn write_completions(shell: CompletionShell) -> Result<(), Box<dyn std::error::E
 fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn std::error::Error>> {
     use std::io::{self, BufRead, Write};
 
+    // A broken trusted layer must deny before allowlists, external packs or
+    // policy modes can authorize a line. Preserve the batch protocol instead
+    // of emitting the generic CLI error or a host-specific hook envelope.
+    if let Some(reason) = config.configuration_error() {
+        return run_hook_configuration_error(reason);
+    }
+
     // `dcg hook` reads JSONL hook payloads from stdin and writes one result
     // line per (non-empty) input line. `--batch` is accepted for explicitness
     // but is no longer required — a single JSON object on stdin is processed as
@@ -3154,6 +3185,37 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         crate::exit_codes::EXIT_SUCCESS
     };
     Ok(exit_code)
+}
+
+/// Refuse each nonblank input with the established batch JSONL/exit-1 contract.
+/// Even malformed or non-UTF-8 inputs cannot hide a missing trusted policy.
+fn run_hook_configuration_error(reason: &str) -> Result<i32, Box<dyn std::error::Error>> {
+    use std::io::{self, BufRead, Write};
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let mut index = 0usize;
+    for line in stdin.lock().lines() {
+        if line.as_ref().is_ok_and(|text| text.trim().is_empty()) {
+            continue;
+        }
+        let can_continue = batch_read_can_continue(&line);
+        // Keep `error` a string for existing batch clients; the additive kind
+        // lets callers distinguish a configuration failure without parsing it.
+        let verdict = serde_json::json!({
+            "index": index,
+            "decision": "deny",
+            "error_kind": "configuration_error",
+            "error": reason,
+        });
+        writeln!(output, "{verdict}")?;
+        index += 1;
+        if !can_continue {
+            break;
+        }
+    }
+    Ok(crate::exit_codes::EXIT_DENIED)
 }
 
 /// Whether `BufRead::lines()` can still make progress after this outcome.

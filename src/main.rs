@@ -2019,6 +2019,37 @@ fn main() {
     let max_input_bytes = config.general.max_hook_input_bytes();
     let hook_read = hook::read_hook_input(max_input_bytes);
 
+    // A config error is not a command-policy match and cannot be allowlisted.
+    // Read the envelope only to select the correct blocking wire protocol.
+    // Do this before self-heal, pack loading, history, and evaluation budgets.
+    if let Some(reason) = config.configuration_error() {
+        let protocol = match &hook_read {
+            Ok(input) => {
+                let Some(extracted) = hook::extract_command_with_context(input) else {
+                    set_hook_panic_policy(None);
+                    if input.requests_explicit_verdict() {
+                        let _ = hook::output_explicit_allow();
+                    }
+                    return;
+                };
+                extracted.protocol
+            }
+            Err(error) => {
+                let prefix = match error {
+                    hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
+                    hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
+                    hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
+                    hook::HookReadError::Io(_) => None,
+                };
+                payloadless_hook_protocol(&detected_agent, prefix)
+            }
+        };
+        emit_stderr!("Error: {reason}");
+        let delivery = hook::output_indeterminate_for_protocol(protocol, reason, true);
+        finish_hook_mode(blocking_verdict_exit_code(protocol, delivery));
+        return;
+    }
+
     // Start the evaluation deadline immediately after the input read so that
     // EVERYTHING dcg does on its own clock — self-heal, external pack
     // loading, and evaluation — is bounded by `hook_timeout_ms` (issue #293;

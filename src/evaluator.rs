@@ -14079,6 +14079,11 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     nested_command_depth: usize,
     inherited_automated_stdin: bool,
 ) -> EvaluationResult {
+    // Required trusted policy must be intact before any authorization path (#568).
+    if let Some(reason) = compiled_overrides.configuration_error.as_deref() {
+        return EvaluationResult::denied_by_config(reason.to_string());
+    }
+
     let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
     let mut result = evaluate_command_in_dialect_union(
         command,
@@ -30668,6 +30673,11 @@ where
     S: LegacySafePattern,
     D: LegacyDestructivePattern,
 {
+    // Required trusted policy must be intact before any authorization path (#568).
+    if let Some(reason) = compiled_overrides.configuration_error.as_deref() {
+        return EvaluationResult::denied_by_config(reason.to_string());
+    }
+
     // Empty commands are allowed (no-op)
     if command.is_empty() {
         return EvaluationResult::allowed();
