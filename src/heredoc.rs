@@ -14764,13 +14764,11 @@ mod tests {
         fn multi_word_payload_keeps_raw_span_and_adds_the_joined_line() {
             // The local shell removes each word's quotes and ssh joins the
             // argv with spaces, so the remote shell runs `cd /app && ls`:
-            // the locally quoted `'&&'` is an operator there. The raw span
-            // stays (it carries the content range); the joined line is what
-            // runs (review of 7273b28: `ssh host 'git reset' --hard`).
-            assert_eq!(
-                ssh_payloads("ssh host cd /app '&&' ls"),
-                ["cd /app '&&' ls", "cd /app && ls"]
-            );
+            // the locally quoted `'&&'` is an operator there. Since #570
+            // (ec28682) only the joined line, the program that actually runs,
+            // is emitted; it has no content range because it is not a slice
+            // of the source (review of 7273b28: `ssh host 'git reset' --hard`).
+            assert_eq!(ssh_payloads("ssh host cd /app '&&' ls"), ["cd /app && ls"]);
             assert_eq!(ssh_payloads("ssh host cd /app"), ["cd /app"]);
         }
 
