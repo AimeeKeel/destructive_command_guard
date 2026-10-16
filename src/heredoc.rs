@@ -1995,6 +1995,112 @@ fn extract_content_with_scan_view(
     }
 }
 
+/// One decoded argument, with a source span only when its bytes are unchanged.
+struct InlineProgram<'a> {
+    content: Cow<'a, str>,
+    content_range: Option<Range<usize>>,
+    word_range: Range<usize>,
+    resolved: bool,
+}
+
+/// Decode a complete argv word using normalization's shell lexer and decoder.
+/// `fallback` is the legacy source span, retained only if nested syntax cannot
+/// establish a word boundary. Such a reading is always reported as partial.
+fn inline_program_at<'a>(
+    command: &'a str,
+    start: usize,
+    fallback: Range<usize>,
+    skip_reasons: &mut Vec<SkipReason>,
+) -> InlineProgram<'a> {
+    let end = crate::normalize::consume_posix_word_token(
+        command.as_bytes(),
+        start,
+        command.len(),
+    );
+    if end >= fallback.end
+        && end > start
+        && let Some(raw) = command.get(start..end)
+    {
+        if let Some(content) = crate::normalize::decode_posix_literal_word(raw) {
+            let inner = unquoted_payload_range(raw, start);
+            let content_range = (command.get(inner.clone()) == Some(content.as_ref()))
+                .then_some(inner);
+            return InlineProgram {
+                content,
+                content_range,
+                word_range: start..end,
+                resolved: true,
+            };
+        }
+        // Keep the whole word, not the first regex fragment. The existing
+        // evaluator chooses bounded fallback or strict denial; an unresolved
+        // suffix must never inherit a benign prefix's complete-analysis claim.
+        let inner = unquoted_payload_range(raw, start);
+        skip_reasons.push(SkipReason::MalformedInput {
+            reason: format!("inline program at bytes {start}..{end} is not a static shell word"),
+        });
+        return InlineProgram {
+            content: Cow::Borrowed(&command[inner]),
+            content_range: None,
+            word_range: start..end,
+            resolved: false,
+        };
+    }
+    skip_reasons.push(SkipReason::MalformedInput {
+        reason: format!("cannot recover the complete inline program at byte {start}"),
+    });
+    InlineProgram {
+        content: Cow::Borrowed(command.get(fallback.clone()).unwrap_or("")),
+        content_range: None,
+        word_range: start..fallback.end.max(end),
+        resolved: false,
+    }
+}
+
+/// Recover the original word around an existing payload locator's inner span.
+/// The locators retain their option/consumer grammar; quote removal happens
+/// once, here, rather than independently in every interpreter extractor.
+fn inline_program<'a>(
+    command: &'a str,
+    content: Range<usize>,
+    skip_reasons: &mut Vec<SkipReason>,
+) -> InlineProgram<'a> {
+    let bytes = command.as_bytes();
+    let mut start = content.start;
+    if start > 0
+        && matches!(bytes.get(start - 1), Some(b'\'' | b'"'))
+        && bytes.get(start - 1) == bytes.get(content.end)
+    {
+        start -= 1;
+        if start > 0 && bytes[start - 1] == b'$' {
+            start -= 1;
+        }
+    }
+    inline_program_at(command, start, content, skip_reasons)
+}
+
+/// The existing interpreter/option grammar, used only to locate a SEPARATE
+/// argument's first byte. Its complete word is read by the shared lexer. This
+/// reaches unquoted prefixes, ANSI-C quotes and malformed/dynamic arguments
+/// without inventing another shell parser or changing attached-flag grammar.
+static INLINE_SCRIPT_ARGUMENT: LazyLock<Regex> = LazyLock::new(|| {
+    let prefix = INLINE_SCRIPT_SINGLE_QUOTE
+        .as_str()
+        .strip_suffix(r"\s*'([^']*)'")
+        .expect("inline locator has the documented payload suffix");
+    Regex::new(&format!(r"{prefix}\s+(\S)"))
+        .expect("inline argument locator compiles")
+});
+
+static INLINE_SHELL_ARGUMENT_AFTER_C: LazyLock<Regex> = LazyLock::new(|| {
+    let prefix = INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE
+        .as_str()
+        .strip_suffix(r"\s+'([^']*)'")
+        .expect("shell locator has the documented payload suffix");
+    Regex::new(&format!(r"{prefix}\s+(\S)"))
+        .expect("shell argument locator compiles")
+});
+
 /// Extract inline scripts from -c/-e flags.
 fn extract_inline_scripts(
     command: &str,
@@ -2023,15 +2129,13 @@ fn extract_inline_scripts(
         .chain(redirect_view.as_deref())
         .any(may_have_option_after_c_flag);
     let mut hit_limit = false;
-    let mut extract_from_pattern = |pattern: &Regex| {
+    let mut seen_words = Vec::new();
+    let mut covered_programs: Vec<Range<usize>> = Vec::new();
+    let mut extract_from_pattern = |pattern: &Regex, raw_argument: bool| {
         let views = std::iter::once(command).chain(redirect_view.as_deref());
         for cap in views.flat_map(|view| pattern.captures_iter(view)) {
             if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
                 return;
-            }
-            if extracted.len() >= limits.max_heredocs {
-                hit_limit = true;
-                break;
             }
 
             let cmd_name = cap.get(1).map_or("", |m| m.as_str());
@@ -2089,27 +2193,67 @@ fn extract_inline_scripts(
                 continue;
             }
 
-            // Enforce content size limit
-            if content.len() > limits.max_body_bytes {
-                // Skip but don't add to skip_reasons (would be too noisy)
+            // Native PowerShell has a different quoting language. Preserve
+            // its existing locators; the new raw-word path is POSIX only.
+            if raw_argument && is_powershell {
                 continue;
             }
 
             let full_match = cap.get(0).unwrap();
-            let content_range = content_match.map(|m| m.start()..m.end());
-            if content_range.is_some()
-                && extracted
-                    .iter()
-                    .any(|seen| seen.content_range == content_range)
+            if covered_programs.iter().any(|range| range.contains(&full_match.start())) {
+                // The downstream language analyzer owns this complete source.
+                // Do not mine its string literals as new outer-shell launches.
+                continue;
+            }
+            let Some(content_match) = content_match else { continue };
+            let captured = content_match.start()..content_match.end();
+            let program = if is_powershell {
+                InlineProgram {
+                    content: Cow::Borrowed(content),
+                    content_range: Some(captured.clone()),
+                    word_range: captured,
+                    resolved: false, // native dialect remains on its existing path
+                }
+            } else if raw_argument {
+                inline_program_at(command, captured.start, captured, skip_reasons)
+            } else {
+                inline_program(command, captured, skip_reasons)
+            };
+            // The shell consumes these as options after -c, not as code.
+            // The dedicated options-after-c locator recovers the operand.
+            if raw_argument
+                && ScriptLanguage::from_command(cmd_name) == ScriptLanguage::Bash
+                && program.content.starts_with(['-', '+'])
             {
                 continue;
             }
+            let identity = (full_match.start(), program.word_range.clone());
+            if seen_words.contains(&identity) {
+                continue;
+            }
+            seen_words.push(identity);
+            if program.resolved {
+                covered_programs.push(program.word_range.clone());
+            }
+            // Deduplicate BEFORE charging the shared extraction budget: a
+            // second locator/view is not a second executable program.
+            if extracted.len() >= limits.max_heredocs {
+                hit_limit = true;
+                break;
+            }
+            if program.content.len() > limits.max_body_bytes {
+                skip_reasons.push(SkipReason::ExceededBodySize {
+                    size: program.content.len(),
+                    limit: limits.max_body_bytes,
+                });
+                continue;
+            }
             extracted.push(ExtractedContent {
-                content: content.to_string(),
+                content: program.content.into_owned(),
                 language: ScriptLanguage::from_command(cmd_name),
                 delimiter: None,
-                byte_range: full_match.start()..full_match.end(),
-                content_range,
+                byte_range: full_match.start()..full_match.end().max(program.word_range.end),
+                content_range: program.content_range,
                 quoted: true, // -c/-e content is always in quotes
                 heredoc_type: None,
                 target_command: Some(cmd_name.to_string()), // -c/-e content is executed by the interpreter
@@ -2118,15 +2262,19 @@ fn extract_inline_scripts(
     };
 
     // Extract from both single-quoted and double-quoted patterns
-    extract_from_pattern(&INLINE_SCRIPT_SINGLE_QUOTE);
-    extract_from_pattern(&INLINE_SCRIPT_DOUBLE_QUOTE);
-    extract_from_pattern(&INLINE_SCRIPT_UNQUOTED_DYNAMIC);
+    extract_from_pattern(&INLINE_SCRIPT_ARGUMENT, true);
+    if option_after_c_flag {
+        extract_from_pattern(&INLINE_SHELL_ARGUMENT_AFTER_C, true);
+    }
+    extract_from_pattern(&INLINE_SCRIPT_SINGLE_QUOTE, false);
+    extract_from_pattern(&INLINE_SCRIPT_DOUBLE_QUOTE, false);
+    extract_from_pattern(&INLINE_SCRIPT_UNQUOTED_DYNAMIC, true);
     // Built and run only when some flag ending in `c` is followed by an
     // option, which few commands have; building them costs every other one
     // about a millisecond.
     if option_after_c_flag {
-        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE);
-        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE);
+        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE, false);
+        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE, false);
     }
 
     if hit_limit {
@@ -2678,16 +2826,14 @@ fn extract_mise_inline_scripts(
             continue;
         }
         for payload in mise_exec_inline_payloads(command, &tokens, index) {
-            let Some(content) = command.get(payload.content.clone()) else {
-                continue;
-            };
+            let program = inline_program(command, payload.content, skip_reasons);
             if !push_windows_inner(
                 extracted,
                 skip_reasons,
                 limits,
-                content,
+                &program.content,
                 payload.full,
-                Some(payload.content),
+                program.content_range,
                 "mise",
             ) {
                 return;
@@ -3114,17 +3260,17 @@ struct SshRemotePayload {
 fn joined_payload_words(raw: &str) -> Option<String> {
     let tokens = crate::normalize::tokenize_for_normalization(raw);
     let mut out = String::with_capacity(raw.len());
-    for token in &tokens {
+    for (index, token) in tokens.iter().enumerate() {
         if token.kind != crate::normalize::NormalizeTokenKind::Word {
             return None;
         }
         let text = token.text(raw)?;
-        if !out.is_empty() {
+        if index > 0 {
             out.push(' ');
         }
-        out.push_str(&crate::normalize::decode_posix_syntax_token(text));
+        out.push_str(&crate::normalize::decode_posix_literal_word(text)?);
     }
-    (out != raw).then_some(out)
+    Some(out)
 }
 
 /// Push a runner or `ssh` payload for re-evaluation: the raw span, and for a
@@ -3142,31 +3288,38 @@ fn push_joined_payload(
     let Some(content) = command.get(payload.content.clone()) else {
         return true;
     };
-    if !push_windows_inner(
+    let program = if payload.joined {
+        match joined_payload_words(content) {
+            Some(joined) => InlineProgram {
+                content_range: (joined == content).then_some(payload.content.clone()),
+                content: Cow::Owned(joined),
+                word_range: payload.content,
+                resolved: true,
+            },
+            None => {
+                skip_reasons.push(SkipReason::MalformedInput {
+                    reason: format!("{target} has an unresolved joined program argument"),
+                });
+                InlineProgram {
+                    content: Cow::Borrowed(content),
+                    content_range: None,
+                    word_range: payload.content,
+                    resolved: false,
+                }
+            }
+        }
+    } else {
+        inline_program(command, payload.content, skip_reasons)
+    };
+    push_windows_inner(
         extracted,
         skip_reasons,
         limits,
-        content,
-        payload.full.clone(),
-        Some(payload.content.clone()),
+        &program.content,
+        payload.full,
+        program.content_range,
         target,
-    ) {
-        return false;
-    }
-    if payload.joined
-        && let Some(joined) = joined_payload_words(content)
-    {
-        return push_windows_inner(
-            extracted,
-            skip_reasons,
-            limits,
-            &joined,
-            payload.full,
-            None,
-            target,
-        );
-    }
-    true
+    )
 }
 
 /// ssh short options that consume a value (OpenSSH `getopt` string; the value
@@ -3268,16 +3421,14 @@ fn extract_bun_exec_inline_scripts(
         let Some(payload) = subcommand_inline_payload(command, &tokens, index, "exec", &[]) else {
             continue;
         };
-        let Some(content) = command.get(payload.content.clone()) else {
-            continue;
-        };
+        let program = inline_program(command, payload.content, skip_reasons);
         if !push_windows_inner(
             extracted,
             skip_reasons,
             limits,
-            content,
+            &program.content,
             payload.full,
-            Some(payload.content),
+            program.content_range,
             "bun",
         ) {
             return;
@@ -3326,24 +3477,22 @@ fn extract_deno_eval_inline_scripts(
         else {
             continue;
         };
-        let Some(content) = command.get(payload.content.clone()) else {
-            continue;
-        };
+        let program = inline_program(command, payload.content, skip_reasons);
         if extracted.len() >= limits.max_heredocs {
             skip_reasons.push(SkipReason::ExceededHeredocLimit {
                 limit: limits.max_heredocs,
             });
             return;
         }
-        if content.len() > limits.max_body_bytes {
+        if program.content.len() > limits.max_body_bytes {
             continue;
         }
         extracted.push(ExtractedContent {
-            content: content.to_string(),
+            content: program.content.into_owned(),
             language: ScriptLanguage::from_command("deno"),
             delimiter: None,
             byte_range: payload.full,
-            content_range: Some(payload.content),
+            content_range: program.content_range,
             quoted: true,
             heredoc_type: None,
             target_command: Some("deno".to_string()),
@@ -3489,21 +3638,22 @@ fn extract_awk_inline_scripts(
                 continue;
             }
             seen.push(program.clone());
-            let Some(program_text) = command.get(program.clone()) else {
-                continue;
-            };
-            let payloads = awk_shell_payload_ranges(program_text, program.start);
+            let decoded = inline_program(command, program.clone(), skip_reasons);
+            let payloads = awk_shell_payload_ranges(&decoded.content, 0);
             for payload in payloads.commands {
-                let Some(content) = command.get(payload.clone()) else {
+                let Some(content) = decoded.content.get(payload.clone()) else {
                     continue;
                 };
+                let content_range = decoded.content_range.as_ref().map(|source| {
+                    source.start + payload.start..source.start + payload.end
+                });
                 if !push_windows_inner(
                     extracted,
                     skip_reasons,
                     limits,
                     content,
                     program.clone(),
-                    Some(payload),
+                    content_range,
                     "awk",
                 ) {
                     return;
@@ -3534,7 +3684,9 @@ fn extract_awk_inline_scripts(
                     limits,
                     &script,
                     program.clone(),
-                    Some(printed.range),
+                    decoded.content_range.as_ref().map(|source| {
+                        source.start + printed.range.start..source.start + printed.range.end
+                    }),
                     "awk",
                 ) {
                     return;
@@ -4505,20 +4657,21 @@ fn extract_osascript_inline_scripts(
             continue;
         }
         for program in osascript_program_ranges(command, &tokens, index) {
-            let Some(program_text) = command.get(program.clone()) else {
-                continue;
-            };
-            for payload in osascript_shell_payload_ranges(program_text, program.start) {
-                let Some(content) = command.get(payload.clone()) else {
+            let decoded = inline_program(command, program.clone(), skip_reasons);
+            for payload in osascript_shell_payload_ranges(&decoded.content, 0) {
+                let Some(content) = decoded.content.get(payload.clone()) else {
                     continue;
                 };
+                let content_range = decoded.content_range.as_ref().map(|source| {
+                    source.start + payload.start..source.start + payload.end
+                });
                 if !push_windows_inner(
                     extracted,
                     skip_reasons,
                     limits,
                     content,
                     program.clone(),
-                    Some(payload),
+                    content_range,
                     "osascript",
                 ) {
                     return;
