@@ -1,0 +1,136 @@
+name: Verify complete inline arguments (#570)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/patches/inline-program-570.patch
+      - .github/workflows/inline-program-570.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: inline-program-570-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'Dicklesworthstone/destructive_command_guard'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - name: Record source and relevant architecture work items
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git archive --format=tar HEAD > "$RUNNER_TEMP/inline-570-base.tar"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path('.beads/issues.jsonl')
+          if path.exists():
+              for line in path.read_text().splitlines():
+                  item = json.loads(line)
+                  text = json.dumps(item).lower()
+                  if 'inline' in text and any(word in text for word in ('extract', 'quot', 'normaliz')):
+                      print(json.dumps(item, ensure_ascii=False)[:6000])
+          PY
+      - name: Apply the exact reviewed correction
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD:src/heredoc.rs)" = 39bba26c7ecf79a3c35bcc4a31c734ccf60970f6
+          test "$(git rev-parse HEAD:src/normalize.rs)" = bdfe9ae58aa3bb6fe96a1f3e5c3f49ab40a1d34b
+          git apply --check --whitespace=error .github/patches/inline-program-570.patch
+          git apply --whitespace=error .github/patches/inline-program-570.patch
+          git diff --check
+          test "$(git diff --name-only)" = $'src/heredoc.rs\nsrc/normalize.rs'
+      - name: Install the repository-pinned toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Format only the reviewed source and regression files
+        run: >-
+          rustfmt --edition 2024 --config skip_children=true
+          src/heredoc.rs src/normalize.rs tests/repro_570_inline_programs.rs
+      - name: Complete argv, CLI, hook, and uncertainty regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked --test repro_570_inline_programs -- --nocapture --test-threads=1 2>&1 | tee inline-570-regressions.log
+      - name: Existing normalization and heredoc regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib normalize::tests:: -- --test-threads=1 2>&1 | tee inline-570-normalize.log
+          cargo test --locked --lib heredoc::tests:: -- --test-threads=1 2>&1 | tee inline-570-heredoc.log
+      - name: Check every target
+        run: cargo check --locked --all-targets
+      - name: Clippy (full-quality result retained, including baseline failures)
+        id: clippy
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee inline-570-clippy.log
+      - name: Formatting (full-tree result retained, including baseline failures)
+        id: formatting
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo fmt --check 2>&1 | tee inline-570-format.log
+      - name: Preserve exact tested source blobs for reviewed GitHub publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git diff --check
+          rustfmt --edition 2024 --config skip_children=true --check src/heredoc.rs src/normalize.rs tests/repro_570_inline_programs.rs
+          if git diff --name-only | grep -v -x -e src/heredoc.rs -e src/normalize.rs -e tests/repro_570_inline_programs.rs; then
+            echo 'Unexpected changed path; refusing candidate acquisition'
+            exit 1
+          fi
+          python3 - <<'PYCODE'
+          import json, os, subprocess, tempfile
+          from pathlib import Path
+          result = {'base': os.environ['GITHUB_SHA'], 'blobs': {}}
+          for name in ('src/heredoc.rs', 'src/normalize.rs', 'tests/repro_570_inline_programs.rs'):
+              with tempfile.NamedTemporaryFile(mode='w+', encoding='utf-8') as payload:
+                  json.dump({'encoding': 'utf-8', 'content': Path(name).read_text()}, payload)
+                  payload.flush()
+                  sha = subprocess.check_output([
+                      'gh', 'api', '-X', 'POST',
+                      'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs',
+                      '--input', payload.name, '--jq', '.sha',
+                  ], text=True).strip()
+              local = subprocess.check_output(['git', 'hash-object', name], text=True).strip()
+              if sha != local:
+                  raise SystemExit('uploaded blob differs from tested source: ' + name)
+              result['blobs'][name] = sha
+          Path('inline-570-candidate-blobs.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          PYCODE
+      - name: Preserve a failing overall status when full-quality gates fail
+        if: steps.clippy.outcome == 'failure' || steps.formatting.outcome == 'failure'
+        run: |
+          echo 'Targeted verification completed; full-quality gates are not green. Review the exact diagnostics before any publication.'
+          exit 1
+      - name: Retain exact candidate source and verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: inline-570-${{ github.run_id }}
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/inline-570-base.tar
+            src/heredoc.rs
+            src/normalize.rs
+            tests/repro_570_inline_programs.rs
+            inline-570-*.log
+            inline-570-candidate-blobs.json
+            target/debug/dcg
