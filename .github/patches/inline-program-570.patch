@@ -348,8 +348,8 @@ diff --git a/src/heredoc.rs b/src/heredoc.rs
 +                break;
 +            }
 +            if program.content.len() > limits.max_body_bytes {
-+                skip_reasons.push(SkipReason::ExceededBodySize {
-+                    size: program.content.len(),
++                skip_reasons.push(SkipReason::ExceededSizeLimit {
++                    actual: program.content.len(),
 +                    limit: limits.max_body_bytes,
 +                });
 +                continue;

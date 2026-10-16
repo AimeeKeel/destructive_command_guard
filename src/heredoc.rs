@@ -2242,8 +2242,8 @@ fn extract_inline_scripts(
                 break;
             }
             if program.content.len() > limits.max_body_bytes {
-                skip_reasons.push(SkipReason::ExceededBodySize {
-                    size: program.content.len(),
+                skip_reasons.push(SkipReason::ExceededSizeLimit {
+                    actual: program.content.len(),
                     limit: limits.max_body_bytes,
                 });
                 continue;
