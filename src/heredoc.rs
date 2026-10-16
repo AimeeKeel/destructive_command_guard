@@ -15965,9 +15965,20 @@ mod tests {
                 ),
             ];
             for (command, expected) in cases {
-                let ExtractionResult::Extracted(contents) = extract_content(command, &limits)
-                else {
-                    panic!("expected Extracted for {command:?}");
+                let contents = match extract_content(command, &limits) {
+                    ExtractionResult::Extracted(contents) => contents,
+                    // Locale quoting is never a resolved literal (the message
+                    // catalog may replace the program), so the reading is
+                    // Partial; the payload is still extracted and evaluated.
+                    ExtractionResult::Partial { extracted, skipped }
+                        if command.contains("$\"")
+                            && skipped.iter().any(|reason| {
+                                matches!(reason, SkipReason::MalformedInput { .. })
+                            }) =>
+                    {
+                        extracted
+                    }
+                    other => panic!("expected Extracted for {command:?}: {other:?}"),
                 };
                 let content = contents
                     .iter()
@@ -19717,6 +19728,17 @@ EOF";
             );
             let contents = match extract_content(command, &ExtractionLimits::default()) {
                 ExtractionResult::Extracted(contents) => contents,
+                // A dynamic word is not a static shell program: the whole word
+                // is extracted, and the reading is Partial so the evaluator's
+                // fallback/strict policy owns it (#570).
+                ExtractionResult::Partial { extracted, skipped }
+                    if payload.starts_with('$')
+                        && skipped
+                            .iter()
+                            .any(|reason| matches!(reason, SkipReason::MalformedInput { .. })) =>
+                {
+                    extracted
+                }
                 other => panic!("{command:?}: {other:?}"),
             };
             let reads = contents.iter().filter(|c| c.content == payload).count();
