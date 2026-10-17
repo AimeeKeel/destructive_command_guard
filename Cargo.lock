@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "destructive_command_guard"
-version = "0.14.4"
+version = "0.15.2"
 dependencies = [
  "aho-corasick",
  "assert_cmd",
@@ -992,6 +992,7 @@ dependencies = [
  "insta",
  "libc",
  "memchr",
+ "nix",
  "once_cell",
  "predicates",
  "proptest",
