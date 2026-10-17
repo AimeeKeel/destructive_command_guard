@@ -386,6 +386,11 @@ impl LayeredAllowlist {
 
         let mut cached_session_id = SessionIdCache::Unresolved;
         let cwd = cwd.map(ScopeCwd::new);
+        // Ids this rule was split out of (#509). An entry for one of them
+        // still covers the rule, but only when no entry names the rule itself
+        // (or the pack wildcard) in any layer.
+        let legacy_names = crate::packs::legacy_rule_names(pack_id, pattern_name);
+        let mut legacy_hit: Option<AllowlistHit<'_>> = None;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
@@ -409,10 +414,24 @@ impl LayeredAllowlist {
                         entry,
                     });
                 }
+
+                // The agent layer's rule entries are in-memory grants
+                // (`with_rule_grants`) for exactly the finding they name; a
+                // grant past `branch-force-delete` must not also hide a
+                // `branch-delete` finding on the same line.
+                if legacy_hit.is_none()
+                    && layer.layer != AllowlistLayer::Agent
+                    && legacy_names.contains(&rule_id.pattern_name.as_str())
+                {
+                    legacy_hit = Some(AllowlistHit {
+                        layer: layer.layer,
+                        entry,
+                    });
+                }
             }
         }
 
-        None
+        legacy_hit
     }
 
     /// Find the first allowlist entry that matches a rule, with no known cwd.
@@ -1841,14 +1860,22 @@ pub(crate) fn user_allowlist_path() -> PathBuf {
 /// directory tree. The CLI separately enforces the explicit project-policy
 /// trust requirement before any project-layer mutation.
 pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
-    if let Some(root) =
-        crate::config::find_repo_root(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
-    {
+    project_allowlist_path_within(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
+}
+
+/// [`project_allowlist_path`] with the upward search limited to `max_hops`
+/// parents of `start` (both for the repository root and for an existing
+/// allowlist). Tests pass the depth of their temporary tree so the answer
+/// does not depend on what lies above it: a temporary directory created
+/// inside a checkout (as a remote build worker's `TMPDIR` can be) would
+/// otherwise resolve to that checkout's root.
+fn project_allowlist_path_within(start: &Path, max_hops: usize) -> PathBuf {
+    if let Some(root) = crate::config::find_repo_root(start, max_hops) {
         return root.join(".dcg").join("allowlist.toml");
     }
 
     let mut current = Some(start);
-    for _ in 0..=crate::config::REPO_ROOT_SEARCH_MAX_HOPS {
+    for _ in 0..=max_hops {
         let Some(dir) = current else {
             break;
         };
@@ -2150,11 +2177,16 @@ fn get_timestamp_string(tbl: &toml::value::Table, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // These tests bound the upward search to their temporary tree: the
+    // system temporary directory can itself sit inside a Git checkout (a
+    // remote build worker points `TMPDIR` at `<checkout>/.rch-tmp`), and an
+    // unbounded search then answers with that checkout's root.
+
     #[test]
     fn project_allowlist_path_falls_back_to_cwd_outside_git() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            project_allowlist_path(tmp.path()),
+            project_allowlist_path_within(tmp.path(), 0),
             tmp.path().join(".dcg").join("allowlist.toml")
         );
     }
@@ -2168,7 +2200,12 @@ mod tests {
         let nested = tmp.path().join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(project_allowlist_path(&nested), root_allowlist);
+        assert_eq!(project_allowlist_path_within(&nested, 2), root_allowlist);
+        // Below the bound, the nested directory governs itself.
+        assert_eq!(
+            project_allowlist_path_within(&nested, 1),
+            nested.join(".dcg").join("allowlist.toml")
+        );
     }
 
     #[test]
@@ -2176,6 +2213,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            project_allowlist_path_within(&nested, 2),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
+
+    /// The production entry point searches the full default depth.
+    #[test]
+    fn project_allowlist_path_searches_the_default_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
         std::fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(
@@ -2663,6 +2714,86 @@ mod tests {
             .expect("wildcard should match");
         assert_eq!(hit.layer, AllowlistLayer::Project);
         assert_eq!(hit.entry.reason, "allow all git rules in this pack");
+    }
+
+    /// #509: an entry for `branch-force-delete` keeps covering the split-out
+    /// `branch-delete`, an entry for `branch-delete` covers only itself, and an
+    /// in-memory grant for the old id stays exact.
+    #[test]
+    fn legacy_rule_entry_covers_split_rule_but_grants_stay_exact_509() {
+        let layer_with = |layer: AllowlistLayer, pattern: &str, reason: &str| {
+            let mut entry = make_test_entry();
+            entry.selector = AllowSelector::Rule(RuleId {
+                pack_id: "core.git".to_string(),
+                pattern_name: pattern.to_string(),
+            });
+            entry.reason = reason.to_string();
+            LoadedAllowlistLayer {
+                layer,
+                path: PathBuf::from("test"),
+                file: AllowlistFile {
+                    entries: vec![entry],
+                    errors: Vec::new(),
+                },
+            }
+        };
+
+        let legacy = LayeredAllowlist {
+            layers: vec![layer_with(
+                AllowlistLayer::User,
+                "branch-force-delete",
+                "legacy",
+            )],
+        };
+        assert!(
+            legacy
+                .match_rule("core.git", "branch-force-delete")
+                .is_some()
+        );
+        let hit = legacy
+            .match_rule("core.git", "branch-delete")
+            .expect("legacy entry still covers the split-out rule");
+        assert_eq!(hit.entry.reason, "legacy");
+        assert!(
+            legacy.match_rule("other.pack", "branch-delete").is_none(),
+            "the legacy link is pack-specific"
+        );
+
+        let split = LayeredAllowlist {
+            layers: vec![layer_with(AllowlistLayer::User, "branch-delete", "split")],
+        };
+        assert!(split.match_rule("core.git", "branch-delete").is_some());
+        assert!(
+            split
+                .match_rule("core.git", "branch-force-delete")
+                .is_none(),
+            "the new id must not allow the forced forms"
+        );
+
+        // An exact entry in a lower layer is preferred over a legacy entry in
+        // a higher one: the more specific id wins.
+        let mixed = LayeredAllowlist {
+            layers: vec![
+                layer_with(AllowlistLayer::Project, "branch-force-delete", "legacy"),
+                layer_with(AllowlistLayer::User, "branch-delete", "split"),
+            ],
+        };
+        let hit = mixed.match_rule("core.git", "branch-delete").expect("hit");
+        assert_eq!(hit.entry.reason, "split");
+
+        // A re-evaluation grant past `branch-force-delete` must not also hide
+        // a `branch-delete` finding.
+        let granted = LayeredAllowlist { layers: Vec::new() }.with_rule_grants(
+            &[("core.git", "branch-force-delete")],
+            "grant",
+            "test",
+        );
+        assert!(
+            granted
+                .match_rule("core.git", "branch-force-delete")
+                .is_some()
+        );
+        assert!(granted.match_rule("core.git", "branch-delete").is_none());
     }
 
     // ==========================================================================

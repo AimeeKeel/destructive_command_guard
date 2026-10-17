@@ -568,6 +568,14 @@ pub enum Command {
         /// replacement for `dcg test --format json`.
         #[arg(long, hide = true)]
         omp_bridge_output: bool,
+
+        /// The working directory the host reported for the command, when the
+        /// generated OMP bridge had to start dcg somewhere else because that
+        /// directory does not exist (#504). Directory-scoped allowlist entries
+        /// are judged against this path, never against dcg's own cwd. Internal
+        /// to the OMP bridge protocol.
+        #[arg(long, hide = true, value_name = "PATH", requires = "omp_bridge_output")]
+        command_cwd: Option<std::path::PathBuf>,
     },
 
     /// Generate a sample configuration file
@@ -1499,6 +1507,11 @@ pub enum HistoryAction {
     },
 
     /// Analyze pack effectiveness and generate recommendations
+    ///
+    /// Works from recorded decisions (allow, deny, warn, bypass), not command
+    /// outcomes: dcg's hooks run before a command executes, so `exit_code` is
+    /// NULL (unknown) on the rows they write. With no recorded commands it
+    /// reports that there is nothing to analyze.
     #[command(name = "analyze")]
     Analyze {
         /// Time period in days (default: 30)
@@ -2555,6 +2568,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             force,
             dialect,
             omp_bridge_output,
+            command_cwd,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
@@ -2622,6 +2636,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     force,
                     dialect,
                     omp_bridge_output,
+                    command_cwd.as_deref(),
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
                 if was_blocked {
@@ -5054,6 +5069,7 @@ fn test_command(
     force: bool,
     dialect: DialectArg,
     omp_bridge_output: bool,
+    command_cwd: Option<&std::path::Path>,
 ) -> bool {
     use std::time::{Duration, Instant};
 
@@ -5167,8 +5183,19 @@ fn test_command(
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
     };
 
-    // Use shared evaluator for consistent behavior with hook mode
-    let project_path = std::env::current_dir().ok();
+    // Use shared evaluator for consistent behavior with hook mode.
+    //
+    // A host-reported command cwd (the OMP bridge, #504) is the directory the
+    // command runs in; dcg's own cwd is only where it could be started. As in
+    // hook mode (#387), a reported cwd that is not an absolute directory
+    // leaves directory-scoped allowlist entries inapplicable rather than
+    // judging them against an unrelated directory.
+    let project_path = match command_cwd {
+        Some(reported) => Some(reported)
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .map(std::path::Path::to_path_buf),
+        None => std::env::current_dir().ok(),
+    };
     let start = Instant::now();
     let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
         evaluate_command_with_pack_order_deadline_at_path_in_dialect(
@@ -5222,7 +5249,9 @@ fn test_command(
     // drop wait by the same remaining deadline that governs the robot reply.
     let _robot_history_writer =
         if should_record_robot_history(robot_mode, effective_config.history.enabled) {
-            let working_dir = project_path.as_ref().map_or_else(
+            // Record where the command was going to run, even when that
+            // directory does not exist and so cannot scope anything.
+            let working_dir = command_cwd.or(project_path.as_deref()).map_or_else(
                 || "<unknown>".to_string(),
                 |path| path.to_string_lossy().into_owned(),
             );
@@ -10320,7 +10349,9 @@ fn history_analyze(
     // Get enabled packs from config
     let config = Config::load();
     let enabled_pack_ids = config.enabled_pack_ids();
-    let enabled_packs: Vec<&str> = enabled_pack_ids.iter().map(String::as_str).collect();
+    let mut enabled_packs: Vec<&str> = enabled_pack_ids.iter().map(String::as_str).collect();
+    // A set has no order; sort so the listing is stable from run to run.
+    enabled_packs.sort_unstable();
 
     let analysis = db.analyze_pack_effectiveness(days, &enabled_packs)?;
 
@@ -10340,6 +10371,36 @@ fn history_analyze(
         analysis.period_days,
         analysis.total_commands.to_string().yellow()
     );
+
+    // Nothing recorded means nothing was judged. Printing the usual sections
+    // here produced green "no gaps" checks and advice to disable `core` drawn
+    // from zero commands (#513).
+    if !analysis.has_data {
+        println!(
+            "{}",
+            format!(
+                "No command history in the last {} days, so there is nothing to analyze.",
+                analysis.period_days
+            )
+            .yellow()
+        );
+        if crate::history::history_disabled_by_env() {
+            println!(
+                "History collection is turned off by {ENV_HISTORY_DISABLED} in this environment."
+            );
+        } else if config.history.enabled {
+            println!(
+                "History collection is enabled; rows appear as the hook evaluates commands \
+                 (database: {}).",
+                ResolvedHistoryPath::resolve(&config.history).path.display()
+            );
+        } else {
+            println!(
+                "History collection is off. Enable it in config.toml with:\n\n  [history]\n  enabled = true\n"
+            );
+        }
+        return Ok(());
+    }
 
     // Show recommendations (always unless specific view requested)
     if !false_positives && !gaps || recommendations_only {
@@ -10439,11 +10500,14 @@ fn history_analyze(
             );
         }
 
-        // Show inactive packs
+        // Show inactive packs. A guard pack that never fired is working, so
+        // this is a listing, not advice to disable anything (#513).
         if !analysis.inactive_packs.is_empty() {
             println!(
-                "\n{} Inactive packs (enabled but never triggered): {}",
+                "\n{} Enabled packs with no matches in these {} commands (expected for \
+                 guard packs; not a reason to disable them): {}",
                 "ℹ️ ".dimmed(),
+                analysis.total_commands,
                 analysis.inactive_packs.join(", ").dimmed()
             );
         }
@@ -10954,7 +11018,7 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             "  Hook registered with wrong matcher: {:?}",
             hook_diag.wrong_matcher_hooks
         );
-        println!("  → dcg must match both Claude shell tools ({CLAUDE_SHELL_MATCHER})");
+        println!("  → dcg must match all Claude shell tools ({CLAUDE_SHELL_MATCHER})");
         if fix {
             println!("  Attempting to migrate the hook...");
             if install_hook(true, false).is_ok() {
@@ -12960,8 +13024,8 @@ fn collect_doctor_report(
     }
 }
 
-const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell";
-const LEGACY_CLAUDE_SHELL_MATCHER: &str = "Bash";
+const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell|Monitor";
+const LEGACY_CLAUDE_SHELL_MATCHERS: &[&str] = &["Bash", "Bash|PowerShell"];
 const ANTIGRAVITY_SHELL_MATCHER: &str = "Bash";
 
 fn current_dcg_executable() -> std::io::Result<std::path::PathBuf> {
@@ -13531,7 +13595,7 @@ fn install_dcg_hook_into_settings(
         settings,
         force,
         CLAUDE_SHELL_MATCHER,
-        &[LEGACY_CLAUDE_SHELL_MATCHER],
+        LEGACY_CLAUDE_SHELL_MATCHERS,
         desired_hook,
     )
 }
@@ -14646,15 +14710,19 @@ fn project_opencode_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::err
 /// Generate the OpenCode `tool.execute.before` plugin source (#318).
 ///
 /// The legacy OpenCode v1 plugin routes every `bash` tool call through dcg's
-/// Claude-compatible hook protocol: an empty stdout means allow; a
-/// `hookSpecificOutput.permissionDecision` of `deny` (or `ask`, since
-/// OpenCode has no operator-review state) aborts the v1 tool hook by throwing.
+/// Claude-compatible hook protocol with `"dcg_explicit_verdict": true`, so an
+/// allowed command is answered with `{"dcg_verdict":"allow"}` rather than
+/// silence; a `hookSpecificOutput.permissionDecision` of `deny` (or `ask`,
+/// since OpenCode has no operator-review state) aborts the v1 tool hook by
+/// throwing.
 /// OpenCode v2 changed both its module/runtime contract and its interception
 /// APIs; dcg refuses to install or bless this v1 bridge when v2+ is detected
-/// until an authoritative veto path is verified (#419). Infrastructure
-/// failures (dcg missing/unrunnable) fail open with a stderr notice, matching
-/// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
-/// inside dcg.
+/// until an authoritative veto path is verified (#419).
+///
+/// A dcg that ran but gave no verdict (killed by a signal or the plugin's
+/// timeout, a non-zero exit, or exit 0 without the allow line) blocks unless
+/// `DCG_BRIDGE_CRASH_DECISION=allow`. Only a dcg that could not be started at
+/// all (missing or not executable) fails open, with a stderr notice.
 ///
 /// The dcg binary path is embedded as a JSON string literal (valid JSON
 /// strings are valid JS string literals), NOT shell-quoted — the plugin
@@ -14678,14 +14746,21 @@ fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result
 // Guard) before execution. Remove with `uninstall.sh` or by deleting this
 // file. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
 //
-// One file serves both plugin contracts (#419). OpenCode v1 loads the named
-// `DcgGuard` export and calls `tool.execute.before(input, output)`; v2 loads
-// the default export and requires `{{ id, setup(ctx) }}`, registering through
-// `ctx.tool.hook("execute.before", cb)` with a single `event` argument. An ES
-// module may carry both, and each loader reads only the shape it knows, so
-// the plugin does not depend on detecting the runtime — which matters because
+// One file serves every OpenCode plugin loader (#419, #516), because
 // `dcg update` regenerates this file and the installed OpenCode may have
-// changed major version since `dcg install` ran.
+// changed version since `dcg install` ran:
+//
+// - OpenCode v1 from 1.3.4 reads a default export that has an `id` as a
+//   plugin module and requires `server(input, options)` to return the hook
+//   map; without `server()` it rejects the whole file ("must default export an
+//   object with server()") and the bash tool runs unguarded. It then ignores
+//   the named export.
+// - OpenCode v1 up to 1.3.3 calls every export as a plugin function, so it
+//   registers the named `DcgGuard` export (and logs an error for the default
+//   object, which it cannot call).
+// - OpenCode v2 requires a default export `{{ id, setup(ctx) }}` and registers
+//   through `ctx.tool.hook("execute.before", cb)` with a single `event`
+//   argument; it drops keys it does not know, such as `server`.
 //
 // `node:child_process` rather than `Bun.spawn`: v2 migrated Bun -> Node, so
 // `Bun` is undefined there, while Bun implements the `node:` modules — so the
@@ -14694,16 +14769,38 @@ import {{ spawnSync }} from "node:child_process";
 
 const DCG_BIN = {path_literal};
 
-// Returns a deny reason, or null to allow. Infrastructure failures (dcg
-// missing, unrunnable, timed out) fail OPEN with a stderr notice, matching
-// the hook-envelope failure policy; the *evaluation* itself stays fail-closed
-// inside dcg.
+// dcg's own boolean spelling for environment flags.
+function envFlag(name) {{
+  const value = process.env[name];
+  return typeof value === "string" && ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
+}}
+
+// dcg ran but gave no verdict: it was killed (a signal, or this plugin's
+// timeout), exited non-zero, or exited 0 without its explicit allow line.
+// That is not an allow. Block, unless the operator opted out with
+// DCG_BRIDGE_CRASH_DECISION=allow.
+function noVerdict(detail) {{
+  const setting = process.env.DCG_BRIDGE_CRASH_DECISION;
+  if (typeof setting === "string" && setting.trim().toLowerCase() === "allow") {{
+    console.error(`[dcg] OpenCode guard got no verdict from dcg (${{detail}}); allowed because DCG_BRIDGE_CRASH_DECISION=allow`);
+    return null;
+  }}
+  console.error(`[dcg] OpenCode guard got no verdict from dcg (${{detail}}); blocking`);
+  return `Blocked by dcg: the command could not be verified because dcg gave no verdict (${{detail}}). Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`;
+}}
+
+// Returns a deny reason, or null to allow. dcg is asked for an explicit allow
+// line, so an empty stdout means it never answered. Only a dcg that could not
+// be started at all (missing or not executable) fails OPEN, with a stderr
+// notice, so that a broken install does not block every command.
 function dcgDenyReason(command) {{
   if (typeof command !== "string" || command.length === 0) return null;
+  // dcg's escape hatch exits before reading its input, so it never answers.
+  if (envFlag("DCG_BYPASS")) return null;
   let result;
   try {{
     result = spawnSync(process.env.DCG_BIN || DCG_BIN, {{
-      input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }} }}),
+      input: JSON.stringify({{ tool_name: "Bash", tool_input: {{ command }}, dcg_explicit_verdict: true }}),
       encoding: "utf8",
       env: {{ ...process.env, OPENCODE: "1" }},
       timeout: 10000,
@@ -14712,31 +14809,47 @@ function dcgDenyReason(command) {{
     console.error(`[dcg] OpenCode guard could not run dcg: ${{err}}`);
     return null;
   }}
-  if (!result || result.error) {{
-    console.error(`[dcg] OpenCode guard could not run dcg: ${{result && result.error}}`);
+  if (!result) {{
+    console.error("[dcg] OpenCode guard could not run dcg: no result");
+    return null;
+  }}
+  // Never started: Node reports status null, Bun leaves it undefined.
+  if (result.error && result.status == null && !result.signal) {{
+    console.error(`[dcg] OpenCode guard could not run dcg: ${{result.error}}`);
     return null;
   }}
 
   const text = (result.stdout || "").trim();
-  if (!text) return null; // empty stdout = allow
-
-  let decision;
-  try {{
-    decision = JSON.parse(text);
-  }} catch {{
-    return null; // non-JSON stdout: treat as allow (matches other harnesses)
+  let decision = null;
+  if (text) {{
+    try {{
+      decision = JSON.parse(text);
+    }} catch {{
+      decision = null;
+    }}
   }}
-  const hso = decision.hookSpecificOutput;
+  const hso = decision && typeof decision === "object" ? decision.hookSpecificOutput : undefined;
   const verdict = hso && hso.permissionDecision;
-  // OpenCode has no operator-review state, so `ask` fails closed.
+  // OpenCode has no operator-review state, so `ask` fails closed. A blocking
+  // verdict stands whatever happened to the process afterwards.
   if (verdict === "deny" || verdict === "ask") {{
     return (hso && hso.permissionDecisionReason) || "Blocked by dcg";
   }}
-  return null;
+
+  const stderr = (result.stderr || "").trim().slice(-500);
+  const tail = stderr ? `: ${{stderr}}` : "";
+  if (result.signal) {{
+    const timedOut = result.error && result.error.code === "ETIMEDOUT" ? ", timed out" : "";
+    return noVerdict(`dcg was killed by ${{result.signal}}${{timedOut}}${{tail}}`);
+  }}
+  if (result.status !== 0) return noVerdict(`dcg exited ${{result.status}}${{tail}}`);
+  if (!text) return noVerdict(`dcg exited 0 with nothing on stdout${{tail}}`);
+  if (decision && typeof decision === "object" && decision.dcg_verdict === "allow") return null;
+  return noVerdict("dcg stdout was not a verdict");
 }}
 
-// OpenCode v1: named export, hook map, command in `output.args`.
-export const DcgGuard = async () => {{
+// OpenCode v1 hook map, command in `output.args`.
+function v1Hooks() {{
   return {{
     "tool.execute.before": async (input, output) => {{
       if (!input || input.tool !== "bash") return;
@@ -14744,11 +14857,16 @@ export const DcgGuard = async () => {{
       if (reason) throw new Error(reason);
     }},
   }};
-}};
+}}
 
-// OpenCode v2: default export with `id` + `setup`, command in `event.input`.
+// OpenCode v1 up to 1.3.3: every export is called as a plugin function.
+export const DcgGuard = async () => v1Hooks();
+
 export default {{
   id: "dcg-guard",
+  // OpenCode v1 from 1.3.4: `server(input, options)` returns the hook map.
+  server: async () => v1Hooks(),
+  // OpenCode v2: `setup(ctx)` registers the hook, command in `event.input`.
   async setup(ctx) {{
     await ctx.tool.hook("execute.before", async (event) => {{
       if (!event || event.tool !== "bash") return;
@@ -15581,8 +15699,13 @@ fn project_omp_extension_path() -> std::io::Result<std::path::PathBuf> {
 /// Generate an OMP ExtensionAPI module that gates every `bash` tool call on
 /// dcg's robot-mode evaluator. The command is sent on stdin and dcg is spawned
 /// directly (never through a shell). A deny-like JSON verdict or exit 1 is a
-/// safety block; status-only infrastructure failures fail open with a visible
-/// diagnostic, consistent with dcg's other generated integration bridges. A
+/// safety block. A dcg that started and then died without a blocking verdict
+/// (a signal, or an exit status dcg never uses for a verdict) is a crash and
+/// blocks unless `DCG_BRIDGE_CRASH_DECISION=allow`; a dcg that could not be
+/// started at all fails open with a visible diagnostic unless
+/// `DCG_UNVERIFIED_DECISION=deny`, which blocks both. A cwd that does not
+/// exist still gets a verdict: dcg starts from its nearest existing ancestor
+/// and receives the real cwd as `--command-cwd` (#504). A
 /// separate generous parent-side ceiling kills a pathologically wedged child;
 /// it does not replace dcg's own configurable evaluation deadline.
 fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<String> {
@@ -15591,6 +15714,8 @@ fn build_omp_extension_source(executable: &std::path::Path) -> std::io::Result<S
         r#"// {OMP_EXTENSION_MARKER}: generated by `dcg install --omp` — do not edit.
 // Routes every Oh My Pi bash tool call through dcg (Destructive Command Guard)
 // before execution. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+import {{ statSync }} from "node:fs";
+import path from "node:path";
 import type {{ ExtensionAPI }} from "@oh-my-pi/pi-coding-agent";
 import {{ settings }} from "@oh-my-pi/pi-coding-agent/config/settings";
 import {{ procmgr }} from "@oh-my-pi/pi-utils";
@@ -15610,7 +15735,7 @@ export const DCG_STDIN_CHUNK_CODE_UNITS = {OMP_CHILD_STDIN_CHUNK_CODE_UNITS};
 const DCG_SIGNAL_CODE_MAX_CHARS = 64;
 type DcgChildOutcome = "spawn-throw" | "exit-0" | "exit-1" | "exit-2" | "exit-other" | "signal";
 type DcgParsedVerdict = "empty" | "malformed" | "allow" | "deny" | "ask" | "indeterminate" | "unknown";
-type DcgBridgeAction = "allow" | "block" | "infrastructure";
+type DcgBridgeAction = "allow" | "block" | "infrastructure" | "crash";
 type DcgParsedOutput = {{
   verdict: DcgParsedVerdict;
   reason?: string;
@@ -15634,16 +15759,19 @@ type OmpToolCallClassification =
 
 const BLOCKING_DECISIONS: ReadonlySet<DcgParsedVerdict> = new Set<DcgParsedVerdict>(["deny", "ask", "indeterminate"]);
 const DCG_OBSERVATION_ABORTED = Symbol("dcg-child-observation-aborted");
-// Bun exposes no stdout when spawn itself throws. That runtime catch remains a
-// visible infrastructure fail-open; this total row makes the pure classifier
-// exhaustive for replay/model tests and preserves deny-like monotonicity.
+// Bun exposes no stdout when spawn itself throws, so the runtime catch reads
+// the "spawn-throw" row's empty-output cell: a visible infrastructure failure
+// that the unverified posture may still turn into a block. A dcg that started
+// and then died (a signal, or an exit status dcg never uses for a verdict)
+// without a blocking verdict is a "crash": it blocks unless
+// DCG_BRIDGE_CRASH_DECISION=allow.
 const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
   "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
   "exit-1": {{ empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }},
   "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
-  "exit-other": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
-  "signal": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
+  "exit-other": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
+  "signal": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
 }};
 
 // OMP's agent loop schema-validates built-in bash arguments before emitting
@@ -15728,6 +15856,60 @@ export function classifyDcgChild(
 ): {{ action: DcgBridgeAction; output: DcgParsedOutput }} {{
   const output = parseDcgOutput(stdoutText);
   return {{ action: DCG_CHILD_TRANSITIONS[outcome][output.verdict], output }};
+}}
+
+function isExistingDirectory(candidate: string): boolean {{
+  try {{
+    return statSync(candidate).isDirectory();
+  }} catch {{
+    return false;
+  }}
+}}
+
+// A command's cwd can be missing: an agent removed its scratch directory, or
+// the call names a directory it has yet to create. Bun then reports ENOENT for
+// the dcg binary, not for the directory, and dcg never runs (#504). The command
+// still needs a verdict, so start dcg from the nearest directory that exists:
+// an ancestor keeps the same project config, allowlists and Git branch. The
+// caller passes the reported cwd separately so dcg never judges a
+// directory-scoped allowlist entry against the ancestor. Returns undefined only
+// when no ancestor exists at all.
+export function dcgSpawnDirectory(commandCwd: string): string | undefined {{
+  let candidate = path.resolve(commandCwd);
+  while (true) {{
+    if (isExistingDirectory(candidate)) return candidate;
+    const parent = path.dirname(candidate);
+    if (parent === candidate) return undefined;
+    candidate = parent;
+  }}
+}}
+
+// An infrastructure failure means dcg produced no verdict. By default that
+// fails open with a visible diagnostic (#346), so a broken install cannot
+// block every command. `DCG_UNVERIFIED_DECISION=deny` (#338) asks for the
+// opposite posture: block whatever dcg could not judge. dcg's own config file
+// is out of reach when dcg did not run, so the environment override is the
+// posture this bridge can honour; `ask` and anything else keep the default.
+export function unverifiedPostureDenies(): boolean {{
+  const value = process.env.DCG_UNVERIFIED_DECISION;
+  return typeof value === "string" && value.trim().toLowerCase() === "deny";
+}}
+
+function unverifiedBlockReason(detail: string): string {{
+  return `Blocked by dcg: the command could not be verified (${{detail}}) and DCG_UNVERIFIED_DECISION=deny`;
+}}
+
+// A dcg that started and then crashed or was killed gave no verdict. That
+// blocks by default: dcg ran, so the install works, and the failure says
+// nothing about the command. DCG_BRIDGE_CRASH_DECISION=allow restores the
+// fail-open posture for crashes.
+export function crashPostureAllows(): boolean {{
+  const value = process.env.DCG_BRIDGE_CRASH_DECISION;
+  return typeof value === "string" && value.trim().toLowerCase() === "allow";
+}}
+
+function crashBlockReason(terminationDetail: string): string {{
+  return `Blocked by dcg: dcg ended without a verdict${{terminationDetail}}, so the command could not be verified. Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`;
 }}
 
 function isDcgSignalName(signalCode: string): boolean {{
@@ -16076,15 +16258,28 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       }}
     }}
 
+    // Start dcg in the command's cwd whenever it exists, so an ordinary call
+    // keeps the exact argv and directory context. Otherwise start it from the
+    // nearest existing ancestor (or dcg's own directory) and report the real
+    // cwd as data (#504).
+    const dcgArgv = [
+      DCG_BIN,
+      "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
+      "--format", "json",
+      "--omp-bridge-output",
+    ];
+    let spawnCwd = commandCwd;
+    if (!isExistingDirectory(commandCwd)) {{
+      spawnCwd = dcgSpawnDirectory(commandCwd) ?? path.dirname(DCG_BIN);
+      // One `--flag=value` word, so a cwd spelled like an option can never
+      // be parsed as one.
+      dcgArgv.push(`--command-cwd=${{commandCwd}}`);
+    }}
+
     let proc: Bun.ReadableSubprocess;
     try {{
-      proc = Bun.spawn([
-        DCG_BIN,
-        "--robot", "test", "--stdin", "--agent", "omp", "--dialect", shellDialect,
-        "--format", "json",
-        "--omp-bridge-output",
-      ], {{
-        cwd: commandCwd,
+      proc = Bun.spawn(dcgArgv, {{
+        cwd: spawnCwd,
         stdin: commandStdin(command),
         stdout: "pipe",
         stderr: "pipe",
@@ -16094,7 +16289,22 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
         killSignal: "SIGKILL",
       }});
     }} catch (err) {{
-      console.error(`[dcg] OMP guard could not run dcg: ${{describeChildCollectionFailure(err)}}`);
+      // Bun names the binary for any ENOENT from posix_spawn, including a
+      // missing cwd, so say which directory was used as well. The cwd comes
+      // from tool input; JSON quoting keeps a control character in it from
+      // forging a separate diagnostic line.
+      const location = spawnCwd === commandCwd
+        ? `in ${{JSON.stringify(spawnCwd)}}`
+        : `in ${{JSON.stringify(spawnCwd)}} (command cwd ${{JSON.stringify(commandCwd)}} does not exist)`;
+      const detail = boundedDiagnosticText(
+        `could not start ${{DCG_BIN}} ${{location}}: ${{describeChildCollectionFailure(err)}}`,
+      );
+      // No child means no stdout: the transition table's empty-output cell.
+      const spawnAction = DCG_CHILD_TRANSITIONS["spawn-throw"].empty;
+      console.error(`[dcg] OMP guard infrastructure failure (dcg did not start): ${{detail}}`);
+      if (spawnAction === "infrastructure" && unverifiedPostureDenies()) {{
+        return {{ block: true, reason: unverifiedBlockReason("dcg did not start") }};
+      }}
       return;
     }}
 
@@ -16182,6 +16392,7 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
     }}
     const hasInfrastructureDiagnostic =
       classification.action === "infrastructure" ||
+      classification.action === "crash" ||
       childOutcome === "exit-other" ||
       isDcgSignalCode(signalCode) ||
       Boolean(protocolDetail) ||
@@ -16192,6 +16403,13 @@ export default function dcgGuard(pi: ExtensionAPI): void {{
       console.error(`[dcg] OMP guard infrastructure failure${{terminationDetail}}${{details ? `: ${{details}}` : ""}}`);
       // A collection fault is not allowed to erase a completed deny-like
       // stdout verdict or the independent blocking exit-1 signal.
+      const unverified = classification.action === "infrastructure" || classification.action === "crash";
+      if (unverified && unverifiedPostureDenies()) {{
+        return {{ block: true, reason: unverifiedBlockReason(`dcg infrastructure failure${{terminationDetail}}`) }};
+      }}
+      if (classification.action === "crash" && !crashPostureAllows()) {{
+        return {{ block: true, reason: crashBlockReason(terminationDetail) }};
+      }}
       if (classification.action !== "block") return;
     }}
     if (!hasInfrastructureDiagnostic && stderrDetail) {{
@@ -22349,38 +22567,51 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     }
 
     #[test]
-    fn install_into_settings_migrates_legacy_bash_hook_without_widening_siblings() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": [
-                        { "type": "command", "command": "dcg" },
-                        { "type": "command", "command": "bash-only-hook" }
-                    ],
-                    "customField": "preserve"
-                }]
-            }
-        });
+    fn install_into_settings_migrates_legacy_matchers_without_widening_siblings() {
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let mut settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": [
+                            { "type": "command", "command": "dcg" },
+                            { "type": "command", "command": "original-tool-hook" }
+                        ],
+                        "customField": "preserve"
+                    }]
+                }
+            });
 
-        let changed = install_dcg_hook_into_settings(&mut settings, false).expect("migration ok");
-        assert!(changed, "legacy matcher should be migrated without --force");
+            let changed =
+                install_dcg_hook_into_settings(&mut settings, false).expect("migration ok");
+            assert!(
+                changed,
+                "{legacy_matcher} should be migrated without --force"
+            );
 
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(
-            pre.iter().filter(|entry| is_dcg_hook_entry(entry)).count(),
-            1
-        );
-        assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
-        assert_eq!(pre[0]["hooks"][0], claude_dcg_hook().expect("desired hook"));
+            let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(
+                pre.iter().filter(|entry| is_dcg_hook_entry(entry)).count(),
+                1
+            );
+            assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
+            assert_eq!(pre[0]["hooks"][0], claude_dcg_hook().expect("desired hook"));
 
-        let legacy = pre
-            .iter()
-            .find(|entry| entry["matcher"] == LEGACY_CLAUDE_SHELL_MATCHER)
-            .expect("Bash-only sibling entry must remain");
-        assert!(entry_has_hook_command(legacy, "bash-only-hook"));
-        assert_eq!(legacy["customField"], "preserve");
-        assert!(!entry_has_hook_command(legacy, "dcg"));
+            let legacy = pre
+                .iter()
+                .find(|entry| entry["matcher"] == *legacy_matcher)
+                .expect("sibling entry must retain its original matcher");
+            assert!(entry_has_hook_command(legacy, "original-tool-hook"));
+            assert_eq!(legacy["customField"], "preserve");
+            assert!(!entry_has_hook_command(legacy, "dcg"));
+
+            let installed = settings.clone();
+            assert!(!install_dcg_hook_into_settings(&mut settings, false).unwrap());
+            assert_eq!(
+                settings, installed,
+                "{legacy_matcher} migration is idempotent"
+            );
+        }
     }
 
     #[test]
@@ -22518,23 +22749,28 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
 
     #[test]
     fn install_into_settings_refuses_malformed_legacy_matcher_hooks() {
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": { "not": "an array" }
-                }]
-            }
-        });
-        let original = settings.clone();
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let mut settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": { "not": "an array" }
+                    }]
+                }
+            });
+            let original = settings.clone();
 
-        let err = install_dcg_hook_into_settings(&mut settings, false)
-            .expect_err("malformed legacy entry must fail closed");
-        assert!(err.to_string().contains("legacy Bash matcher hooks"));
-        assert_eq!(
-            settings, original,
-            "in-memory settings must remain unchanged on validation failure"
-        );
+            let err = install_dcg_hook_into_settings(&mut settings, false)
+                .expect_err("malformed legacy entry must fail closed");
+            assert!(
+                err.to_string()
+                    .contains(&format!("legacy {legacy_matcher} matcher hooks"))
+            );
+            assert_eq!(
+                settings, original,
+                "in-memory settings must remain unchanged on validation failure"
+            );
+        }
     }
 
     #[test]
@@ -23985,7 +24221,8 @@ if ($errors.Count -ne 0) {
     /// #419: the generated plugin must load under BOTH OpenCode plugin
     /// contracts.
     ///
-    /// v1 reads the named `DcgGuard` export and calls
+    /// v1 up to 1.3.3 calls the named `DcgGuard` export, v1 from 1.3.4 calls
+    /// the default export's `server()` (#516), and both then call
     /// `tool.execute.before(input, output)`; v2 requires a default export
     /// `{ id, setup(ctx) }` and registers through
     /// `ctx.tool.hook("execute.before", cb)`. A v1-only file fails v2's loader
@@ -24010,6 +24247,13 @@ if ($errors.Count -ne 0) {
         assert!(
             source.contains("\"tool.execute.before\""),
             "v1 registers a tool.execute.before hook map"
+        );
+        // #516: OpenCode v1 from 1.3.4 treats a default export with an `id`
+        // as a plugin module and rejects it without `server()`, so the v2
+        // shape alone made v1 refuse the whole file.
+        assert!(
+            source.contains("server: async () => v1Hooks()"),
+            "v1 (>= 1.3.4) needs the default export's server() to return the hook map"
         );
 
         // v2 contract.
@@ -24186,7 +24430,7 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("\"--robot\", \"test\", \"--stdin\""));
         assert!(source.contains("\"--agent\", \"omp\""));
         assert!(
-            source.contains("\"--format\", \"json\",\n        \"--omp-bridge-output\","),
+            source.contains("\"--format\", \"json\",\n      \"--omp-bridge-output\","),
             "the private robot bridge must pin compact JSON before Clap reads ambient DCG_FORMAT"
         );
         assert!(source.contains("\"deny\", \"ask\", \"indeterminate\""));
@@ -24221,9 +24465,20 @@ if ($errors.Count -ne 0) {
             "each effective bash cwd must be resolved against the callback's session cwd"
         );
         assert!(
-            source.contains("cwd: commandCwd,"),
-            "dcg must run in the same effective cwd as the guarded bash call"
+            source.contains(
+                "let spawnCwd = commandCwd;\n    if (!isExistingDirectory(commandCwd)) {"
+            ),
+            "dcg must run in the same effective cwd as the guarded bash call whenever it exists"
         );
+        assert!(
+            source.contains("spawnCwd = dcgSpawnDirectory(commandCwd) ?? path.dirname(DCG_BIN);"),
+            "a missing cwd must still reach dcg from an existing directory (#504)"
+        );
+        assert!(
+            source.contains("dcgArgv.push(`--command-cwd=${commandCwd}`);"),
+            "the real cwd must reach dcg as data, in a single argv word that cannot pose as an option"
+        );
+        assert!(source.contains("cwd: spawnCwd,"));
 
         let line = source
             .lines()
@@ -24246,7 +24501,8 @@ if ($errors.Count -ne 0) {
             "the generated artifact must not overstate pathname authority as byte identity"
         );
         assert!(
-            source.contains("proc = Bun.spawn([\n        DCG_BIN,"),
+            source.contains("const dcgArgv = [\n      DCG_BIN,")
+                && source.contains("proc = Bun.spawn(dcgArgv, {"),
             "the installed absolute executable must be the direct child capability"
         );
         assert!(
@@ -24357,7 +24613,7 @@ if ($errors.Count -ne 0) {
             !has_bounded_compact_contract(&unbounded_collector_mutant),
             "the source contract must reject the former unbounded `.text()` collectors"
         );
-        let full_envelope_mutant = source.replacen("        \"--omp-bridge-output\",\n", "", 1);
+        let full_envelope_mutant = source.replacen("      \"--omp-bridge-output\",\n", "", 1);
         assert!(
             !has_bounded_compact_contract(&full_envelope_mutant),
             "the source contract must reject restoring the command-echoing general robot envelope"
@@ -24400,9 +24656,9 @@ if ($errors.Count -ne 0) {
         assert!(source.contains(
             "if (!cancellationRequested) readFailure = describeChildCollectionFailure(reason);"
         ));
-        assert!(
-            source.contains("OMP guard could not run dcg: ${describeChildCollectionFailure(err)}")
-        );
+        assert!(source.contains(
+            "`could not start ${DCG_BIN} ${location}: ${describeChildCollectionFailure(err)}`"
+        ));
         assert_eq!(
             source
                 .matches("${describeChildCollectionFailure(err)}")
@@ -24670,8 +24926,8 @@ if ($errors.Count -ne 0) {
             r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
             r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#,
             r#""exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
-            r#""exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
-            r#""signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
+            r#""exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
+            r#""signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
         ] {
             assert!(
                 source.contains(row),
@@ -24898,6 +25154,10 @@ function equal(actual: unknown, expected: unknown, caseId: string): void {
   check(left === right, `${caseId}: expected ${right}, received ${left}`);
 }
 
+// The unverified posture is ambient configuration; the corpus sets it
+// explicitly where it matters and must not inherit an operator's value.
+delete process.env.DCG_UNVERIFIED_DECISION;
+
 const toolCaseIds: string[] = [];
 const toolCases: Array<[string, unknown, string, string?]> = [
   ["tool/null-event", null, "other-tool"],
@@ -24940,8 +25200,8 @@ const expectedActions = {
   "exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
   "exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" },
   "exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
-  "exit-other": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
-  "signal": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
+  "exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
+  "signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
 } as const;
 const transitionCaseIds: string[] = [];
 for (const outcome of outcomes) {
@@ -25409,6 +25669,12 @@ try {
     };
   };
 
+  // A dcg that started and died without a blocking verdict blocks by default.
+  const crashBlock = (terminationDetail: string) => ({
+    block: true,
+    reason: `Blocked by dcg: dcg ended without a verdict${terminationDetail}, so the command could not be verified. Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`,
+  });
+
   let replay = await invoke("callback/other-tool", { toolName: "read", input: {} });
   equal(replay.result, undefined, "callback/other-tool/result");
   equal(replay.spawns.length, 0, "callback/other-tool/spawn-count");
@@ -25638,7 +25904,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitError: "synthetic exit status failure" },
   );
-  equal(replay.result, undefined, "callback/exit-reject-no-verdict/result");
+  equal(replay.result, crashBlock(" (exit status unavailable)"), "callback/exit-reject-no-verdict/result");
   equal(replay.spawns[0]!.killCalls, 1, "callback/exit-reject-no-verdict/direct-child-kill");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable): exit status failed: Error: synthetic exit status failure"], "callback/exit-reject-no-verdict/diagnostics-without-unobserved-signal");
 
@@ -25671,7 +25937,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { stdout: "", stderr: "child crash", exitCode: 9 },
   );
-  equal(replay.result, undefined, "callback/infrastructure-exit/result");
+  equal(replay.result, crashBlock(" (exit 9)"), "callback/infrastructure-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9): child crash"], "callback/infrastructure-exit/diagnostics");
 
   replay = await invoke(
@@ -25687,7 +25953,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: null },
   );
-  equal(replay.result, undefined, "callback/normal-exit-137/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/normal-exit-137/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137)"], "callback/normal-exit-137/diagnostics");
 
   replay = await invoke(
@@ -25703,7 +25969,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "SIGKILL" },
   );
-  equal(replay.result, undefined, "callback/sigkill-no-verdict/result");
+  equal(replay.result, crashBlock(" (signal SIGKILL)"), "callback/sigkill-no-verdict/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/sigkill-no-verdict/diagnostics");
 
   replay = await invoke(
@@ -25732,7 +25998,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: undefined },
   );
-  equal(replay.result, undefined, "callback/undefined-exit/result");
+  equal(replay.result, crashBlock(" (exit status unavailable)"), "callback/undefined-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status unavailable)"], "callback/undefined-exit/diagnostics");
 
   replay = await invoke(
@@ -25740,7 +26006,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: null },
   );
-  equal(replay.result, undefined, "callback/null-exit/result");
+  equal(replay.result, crashBlock(" (exit status null)"), "callback/null-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status null)"], "callback/null-exit/diagnostics");
 
   replay = await invoke(
@@ -25748,7 +26014,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: "137\n\u001b[31mFORGED" },
   );
-  equal(replay.result, undefined, "callback/control-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: string)"), "callback/control-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/control-exit/diagnostics");
 
   replay = await invoke(
@@ -25756,7 +26022,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: "7".repeat(DCG_STDERR_MAX_BYTES + 1) },
   );
-  equal(replay.result, undefined, "callback/oversized-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: string)"), "callback/oversized-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: string)"], "callback/oversized-exit/diagnostics");
 
   replay = await invoke(
@@ -25764,7 +26030,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: { toString(): string { throw new Error("invalid exit status must not be coerced"); } } },
   );
-  equal(replay.result, undefined, "callback/hostile-object-exit/result");
+  equal(replay.result, crashBlock(" (exit status invalid: object)"), "callback/hostile-object-exit/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit status invalid: object)"], "callback/hostile-object-exit/diagnostics");
 
   replay = await invoke(
@@ -25772,7 +26038,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: { signal: "SIGKILL" } },
   );
-  equal(replay.result, undefined, "callback/invalid-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/invalid-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: object"], "callback/invalid-signal/diagnostics");
 
   replay = await invoke(
@@ -25780,7 +26046,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "SIGKILL\n\u001b[31mFORGED" },
   );
-  equal(replay.result, undefined, "callback/control-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/control-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/control-signal/diagnostics");
 
   replay = await invoke(
@@ -25788,7 +26054,7 @@ try {
     { toolName: "bash", input: { command: "echo safe" } },
     { exitCode: 137, signalCode: "S".repeat(DCG_STDERR_MAX_BYTES + 1) },
   );
-  equal(replay.result, undefined, "callback/oversized-signal/result");
+  equal(replay.result, crashBlock(" (exit 137)"), "callback/oversized-signal/result");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 137): signal status invalid: string"], "callback/oversized-signal/diagnostics");
 
   replay = await invoke(
@@ -25973,7 +26239,7 @@ try {
     { stuckUntilTimeout: true },
   );
   check(replay.elapsedMs < 1_000, "callback/timeout-no-verdict/remained-bounded");
-  equal(replay.result, undefined, "callback/timeout-no-verdict/result");
+  equal(replay.result, crashBlock(" (signal SIGKILL)"), "callback/timeout-no-verdict/result");
   equal(replay.spawns.length, 1, "callback/timeout-no-verdict/spawn-count");
   equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/timeout-no-verdict/diagnostics");
 
@@ -25996,7 +26262,119 @@ try {
   equal(replay.result, undefined, "callback/spawn-throw/result");
   equal(replay.spawns.length, 0, "callback/spawn-throw/spawn-count");
   equal(replay.watchdogSchedules, 0, "callback/spawn-throw/no-watchdog-before-successful-spawn");
-  equal(replay.errors, ["[dcg] OMP guard could not run dcg: Error: synthetic spawn failure"], "callback/spawn-throw/diagnostics");
+  equal(replay.errors, [
+    `[dcg] OMP guard infrastructure failure (dcg did not start): could not start ${observedExecutable} in ${JSON.stringify(process.cwd())}: Error: synthetic spawn failure`,
+  ], "callback/spawn-throw/diagnostics");
+
+  // #504: a cwd that does not exist must not cost the command its verdict.
+  const missingCwd = `${process.cwd()}/dcg-missing-cwd-504/nested`;
+  replay = await invoke(
+    "callback/missing-cwd-deny",
+    { toolName: "bash", input: { command: "git reset --hard", cwd: missingCwd } },
+    { stdout: JSON.stringify({ decision: "deny", reason: "judged from an ancestor", rule_id: "core.git:reset-hard" }), exitCode: 1 },
+  );
+  equal(replay.result, { block: true, reason: "judged from an ancestor\n\nRule: core.git:reset-hard" }, "callback/missing-cwd-deny/result");
+  equal(replay.spawns.length, 1, "callback/missing-cwd-deny/spawn-count");
+  equal(replay.spawns[0]!.cwd, process.cwd(), "callback/missing-cwd-deny/nearest-existing-ancestor");
+  equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix", "--format", "json", "--omp-bridge-output", `--command-cwd=${missingCwd}`], "callback/missing-cwd-deny/argv");
+  equal(replay.errors, [], "callback/missing-cwd-deny/diagnostics");
+
+  replay = await invoke(
+    "callback/existing-cwd-unchanged-argv",
+    { toolName: "bash", input: { command: "echo ok", cwd: process.cwd() } },
+    { stdout: JSON.stringify({ decision: "allow" }), exitCode: 0 },
+  );
+  equal(replay.result, undefined, "callback/existing-cwd-unchanged-argv/result");
+  equal(replay.spawns[0]!.cwd, process.cwd(), "callback/existing-cwd-unchanged-argv/cwd");
+  equal(replay.spawns[0]!.argv.some(arg => arg.startsWith("--command-cwd")), false, "callback/existing-cwd-unchanged-argv/argv");
+
+  replay = await invoke(
+    "callback/missing-cwd-spawn-throw",
+    { toolName: "bash", input: { command: "echo safe", cwd: missingCwd } },
+    { spawnError: "synthetic spawn failure" },
+  );
+  equal(replay.result, undefined, "callback/missing-cwd-spawn-throw/result");
+  equal(replay.errors, [
+    `[dcg] OMP guard infrastructure failure (dcg did not start): could not start ${observedExecutable} in ${JSON.stringify(process.cwd())} (command cwd ${JSON.stringify(missingCwd)} does not exist): Error: synthetic spawn failure`,
+  ], "callback/missing-cwd-spawn-throw/diagnostics");
+
+  // #338 posture: DCG_UNVERIFIED_DECISION=deny turns every verdict-less
+  // infrastructure outcome into a block; `ask` keeps the #346 fail-open.
+  process.env.DCG_UNVERIFIED_DECISION = " Deny ";
+  try {
+    replay = await invoke(
+      "callback/spawn-throw-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { spawnError: "synthetic spawn failure" },
+    );
+    equal(replay.result, {
+      block: true,
+      reason: "Blocked by dcg: the command could not be verified (dcg did not start) and DCG_UNVERIFIED_DECISION=deny",
+    }, "callback/spawn-throw-unverified-deny/result");
+    equal(replay.errors.length, 1, "callback/spawn-throw-unverified-deny/diagnostics");
+
+    replay = await invoke(
+      "callback/infrastructure-exit-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { exitCode: 9 },
+    );
+    equal(replay.result, {
+      block: true,
+      reason: "Blocked by dcg: the command could not be verified (dcg infrastructure failure (exit 9)) and DCG_UNVERIFIED_DECISION=deny",
+    }, "callback/infrastructure-exit-unverified-deny/result");
+    equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 9)"], "callback/infrastructure-exit-unverified-deny/diagnostics");
+
+    replay = await invoke(
+      "callback/allow-unaffected-by-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { stdout: JSON.stringify({ decision: "allow" }), exitCode: 0 },
+    );
+    equal(replay.result, undefined, "callback/allow-unaffected-by-unverified-deny/result");
+
+    process.env.DCG_UNVERIFIED_DECISION = "ask";
+    replay = await invoke(
+      "callback/spawn-throw-unverified-ask",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { spawnError: "synthetic spawn failure" },
+    );
+    equal(replay.result, undefined, "callback/spawn-throw-unverified-ask/result");
+  } finally {
+    delete process.env.DCG_UNVERIFIED_DECISION;
+  }
+
+  // DCG_BRIDGE_CRASH_DECISION=allow restores fail-open for a crash only: a
+  // deny written before the crash, and DCG_UNVERIFIED_DECISION=deny, still win.
+  process.env.DCG_BRIDGE_CRASH_DECISION = " Allow ";
+  try {
+    replay = await invoke(
+      "callback/crash-opt-out-allows",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { exitCode: 137, signalCode: "SIGKILL" },
+    );
+    equal(replay.result, undefined, "callback/crash-opt-out-allows/result");
+    equal(replay.errors, ["[dcg] OMP guard infrastructure failure (signal SIGKILL)"], "callback/crash-opt-out-allows/diagnostics");
+
+    replay = await invoke(
+      "callback/crash-opt-out-keeps-deny",
+      { toolName: "bash", input: { command: "danger" } },
+      { stdout: JSON.stringify({ decision: "deny", reason: "deny survives the opt-out" }), exitCode: 9 },
+    );
+    equal(replay.result, { block: true, reason: "deny survives the opt-out" }, "callback/crash-opt-out-keeps-deny/result");
+
+    process.env.DCG_UNVERIFIED_DECISION = "deny";
+    replay = await invoke(
+      "callback/crash-opt-out-loses-to-unverified-deny",
+      { toolName: "bash", input: { command: "echo safe" } },
+      { exitCode: 9 },
+    );
+    equal(replay.result, {
+      block: true,
+      reason: "Blocked by dcg: the command could not be verified (dcg infrastructure failure (exit 9)) and DCG_UNVERIFIED_DECISION=deny",
+    }, "callback/crash-opt-out-loses-to-unverified-deny/result");
+  } finally {
+    delete process.env.DCG_BRIDGE_CRASH_DECISION;
+    delete process.env.DCG_UNVERIFIED_DECISION;
+  }
 } finally {
   (Bun as unknown as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
   console.error = originalConsoleError;
@@ -26048,6 +26426,8 @@ console.log(JSON.stringify({
             .current_dir(root)
             .env("DCG_BIN", root.join("ambient-decoy-dcg"))
             .env_remove("PI_NO_PTY")
+            .env_remove("DCG_UNVERIFIED_DECISION")
+            .env_remove("DCG_BRIDGE_CRASH_DECISION")
             .output()
             .expect("launch Bun OMP bridge replay")
     }
@@ -26330,6 +26710,16 @@ console.log(JSON.stringify({
                 "callback/timeout-no-verdict",
                 "callback/timeout-after-deny",
                 "callback/spawn-throw",
+                "callback/missing-cwd-deny",
+                "callback/existing-cwd-unchanged-argv",
+                "callback/missing-cwd-spawn-throw",
+                "callback/spawn-throw-unverified-deny",
+                "callback/infrastructure-exit-unverified-deny",
+                "callback/allow-unaffected-by-unverified-deny",
+                "callback/spawn-throw-unverified-ask",
+                "callback/crash-opt-out-allows",
+                "callback/crash-opt-out-keeps-deny",
+                "callback/crash-opt-out-loses-to-unverified-deny",
             ]
             .map(str::to_string)
         );
@@ -26467,9 +26857,11 @@ console.log(JSON.stringify({
             "the executable corpus vacuously accepted echoing hostile exit-status bytes\nstdout:\n{}",
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stdout)
         );
+        // The crash block reason carries the same termination detail, so the
+        // forged bytes are caught at the case's result or its diagnostics.
         assert!(
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
-                .contains("callback/control-exit/diagnostics"),
+                .contains("callback/control-exit/"),
             "unsafe invalid-exit mutant red must identify the control-injection callback\nstderr:\n{}",
             String::from_utf8_lossy(&unsafe_exit_mutant_output.stderr)
         );
@@ -30443,26 +30835,42 @@ exclude = ["target/**"]
     fn self_heal_repair_carries_timeout_from_legacy_matcher() {
         // A hook migrating off the legacy matcher keeps its host-owned fields.
         let desired = claude_dcg_hook().unwrap();
-        let mut settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
-                    "hooks": [dcg_hook_with_timeout("/stale/path/to/dcg", 7)]
-                }]
-            }
-        });
+        for legacy_matcher in LEGACY_CLAUDE_SHELL_MATCHERS {
+            let dir = tempfile::tempdir().unwrap();
+            let settings_path = dir.path().join("settings.json");
+            let lock_path = dir.path().join("selfheal.lock");
+            let settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": legacy_matcher,
+                        "hooks": [dcg_hook_with_timeout(desired["command"].as_str().unwrap(), 7)]
+                    }]
+                }
+            });
+            assert!(!settings_has_exact_dcg_hook(&settings, &desired));
+            std::fs::write(
+                &settings_path,
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
 
-        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
-        assert!(changed);
-        let hook = canonical_dcg_hook(&settings);
-        assert_eq!(hook["command"], desired["command"]);
-        assert_eq!(hook["timeout"], 7);
-        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert!(
-            pre.iter()
-                .all(|entry| entry["matcher"] != LEGACY_CLAUDE_SHELL_MATCHER),
-            "emptied legacy entry is dropped"
-        );
+            ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+            let content = std::fs::read(&settings_path).unwrap();
+            let healed: serde_json::Value = serde_json::from_slice(&content).unwrap();
+            let hook = canonical_dcg_hook(&healed);
+            assert_eq!(hook["command"], desired["command"]);
+            assert_eq!(hook["timeout"], 7);
+            assert!(settings_has_exact_dcg_hook(&healed, &desired));
+            let pre = healed["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(pre.len(), 1, "emptied {legacy_matcher} entry is dropped");
+
+            ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+            assert_eq!(
+                std::fs::read(&settings_path).unwrap(),
+                content,
+                "self-heal is idempotent"
+            );
+        }
     }
 
     #[cfg(not(windows))]

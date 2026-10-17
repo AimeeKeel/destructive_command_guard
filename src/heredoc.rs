@@ -44,10 +44,23 @@
 
 use memchr::memchr;
 use regex::RegexSet;
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace, warn};
+
+/// Options a POSIX shell accepts after `-c` and before the command string:
+/// `bash -c -e '<cmd>'`, `sh -c -- '<cmd>'`, `sh -c - '<cmd>'`,
+/// `bash -c -o errexit '<cmd>'`, `bash -c +e '<cmd>'`. The first operand is
+/// the command string, not the first word after the flag. Quoting an option or
+/// its name does not change the argv (`bash -c -o 'errexit' '<cmd>'`,
+/// `sh -c '-e' '<cmd>'`), so each may carry quotes.
+macro_rules! shell_option_after_c_re {
+    () => {
+        r#"(?:['"]?[-+][oO]['"]?\s+(?:[A-Za-z_]|'[A-Za-z_]*'|"[A-Za-z_]*")+|['"]?(?:[-+][A-Za-z]+|--?)['"]?)"#
+    };
+}
 
 /// Tier 1 trigger patterns for heredoc and inline script detection.
 ///
@@ -78,18 +91,18 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // superset invariant.  False positives are acceptable for Tier 1.
     r"<<<",
     // Python inline execution (matches python, python3, python3.11, python.exe, python3.11.exe, etc.)
-    r#"\bpython[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ce][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bpython[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ce][A-Za-z]*(?:\s|['"]|$)"#,
     // Ruby inline execution (matches ruby, ruby3, ruby3.0, ruby.exe, etc.)
-    r#"\bruby[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
-    r#"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bruby[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Perl inline execution (matches perl, perl5, perl5.36, perl.exe, etc.)
-    r#"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
     // Node.js inline execution (matches node, node18, nodejs, node.exe, etc.)
-    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // Bun and Deno inline execution (issue #397). Bun runs `-e`/`-p` exactly as
     // Node does, so the identical payload must reach the identical rules; before
     // this, swapping `node` for `bun` was a one-word bypass of a live deny.
-    r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // Bun's `exec` subcommand hands its argument to a shell, so it is an inline
     // shell payload under a subcommand rather than a flag (issue #397).
     // The optional quote matches `subcommand_inline_payload`, which dequotes the
@@ -120,14 +133,15 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     r"\$\.system\s*\(",
     r"\.doShellScript\s*\(",
     // PHP inline execution
-    r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
-    r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.).
     // dash/ksh/mksh are ordinary POSIX shells: without them `dash -c "git
     // reset --hard"` was never unwrapped, and command-position rules such as
-    // core.git never saw the payload.
-    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
+    // core.git never saw the payload. An option or its value may be quoted
+    // (`bash -o 'errexit' -c`, `bash '-e' -c`); the argv is the same.
+    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
     // PowerShell inline execution (powershell -Command '...', pwsh -c "...",
     // and Windows full-path forms like
     //   "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '...'
@@ -182,7 +196,10 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // so Tier 2 only needs to run when quoting or expansion is present).
     // `[\s;|&(/]` before `ssh` keeps `ssh-keygen`/`ssh-add`/`autossh` from
     // triggering while still matching path-qualified `/usr/bin/ssh`.
-    r#"(?i)(?:^|[\s;|&(/])ssh(?:\.exe)?\s[^\n;|&]*['"$]"#,
+    //
+    // A quoted or escaped name (`\ssh`, `'ssh'`) is the same program, and a
+    // descriptor duplication (`2>&1`) does not end the segment.
+    r#"(?i)(?:^|[\s;|&(/\\'"])ssh(?:\.exe)?['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
     // `watch '<cmd>'`, `parallel ::: '<cmd>'` / `parallel '<cmd>' ::: …`,
     // `env -S'<cmd>'`, `su -c '<cmd>'` and the other runners in
     // `COMMAND_STRING_RUNNERS` hand a command STRING to a shell (or, for
@@ -190,7 +207,8 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // `sh -c`. Superset of `command_string_runner_payloads`, which validates;
     // as for ssh, only a quote or `$` makes the payload invisible to raw
     // matching.
-    r#"(?:^|[\s;|&(/])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)\s[^\n;|&]*['"$]"#,
+    // A name split by quoting (`w\atch`) is `names_a_runner_through_quoting`.
+    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -508,7 +526,12 @@ pub enum TriggerResult {
 #[must_use]
 #[instrument(skip(command), fields(cmd_len = command.len()))]
 pub fn check_triggers(command: &str) -> TriggerResult {
-    if contains_active_heredoc_operator(command) || HEREDOC_TRIGGERS.is_match(command) {
+    if contains_active_heredoc_operator(command)
+        || HEREDOC_TRIGGERS.is_match(command)
+        || names_a_runner_through_quoting(command)
+        || blank_local_redirects(command).is_some_and(|view| HEREDOC_TRIGGERS.is_match(&view))
+        || respelled_command_may_be_present(command)
+    {
         debug!("tier1_trigger: heredoc/inline script indicator detected");
         TriggerResult::Triggered
     } else {
@@ -523,10 +546,255 @@ pub fn check_triggers(command: &str) -> TriggerResult {
 #[must_use]
 pub fn matched_triggers(command: &str) -> Vec<usize> {
     let mut matches: Vec<usize> = HEREDOC_TRIGGERS.matches(command).into_iter().collect();
-    if contains_active_heredoc_operator(command) {
+    if let Some(view) = blank_local_redirects(command) {
+        for index in &HEREDOC_TRIGGERS.matches(&view) {
+            if !matches.contains(&index) {
+                matches.push(index);
+            }
+        }
+        matches.sort_unstable();
+    }
+    if contains_active_heredoc_operator(command)
+        || names_a_runner_through_quoting(command)
+        || respelled_command_may_be_present(command)
+    {
         matches.push(MANUAL_HEREDOC_TRIGGER_INDEX);
     }
     matches
+}
+
+/// The manual tier-1 triggers for command words the tier-2 readers re-spell:
+/// a run-time command word (`w${x}atch '…'`, `$(echo git reset --hard)`), a
+/// dashed Git built-in behind a wrapper (`xargs git-reset --hard`), and a
+/// quoted `find` action (`find . '-delete'`). Cheap byte tests first.
+fn respelled_command_may_be_present(command: &str) -> bool {
+    may_wrap_dashed_git(command)
+        || may_quote_a_find_action(command)
+        || may_run_through_dynamic_command_word(command)
+}
+
+/// `command` with each unquoted local redirect word blank-filled, or `None`
+/// when it has none. The shell removes a redirect from the argv wherever it
+/// stands, so `sh 2>/dev/null -c '<cmd>'`, `sh -c 2>/dev/null '<cmd>'` and
+/// `python3 &>log -c '<cmd>'` run `<cmd>`, while the inline-interpreter
+/// patterns expect options and the flag to follow one another. They also
+/// read this view (sixth review of GH #498); repeating a redirect fragment in
+/// each pattern instead made the tier-1 set, which every hook call compiles,
+/// about a millisecond slower to build.
+///
+/// A redirect word starts a word (or follows one directly, operator first):
+/// optional descriptor digits or `{name}`, then `>`, `<`, `>>`, `<>`, `>|`,
+/// `>&`, `<&`, `&>` or `&>>`, then its target, glued or after blanks
+/// (`2> /dev/null`, `2>& 1`). A here-string (`<<<word`) is a redirect too
+/// (`sh <<<x -c '<cmd>'` runs `<cmd>`); a heredoc (`<<`), a process
+/// substitution (`<(`) and a word without a target are left alone. A target's
+/// `$(…)`, `${…}` and backquoted parts belong to it (`2>$(mktemp) -c`). Text
+/// inside quotes is never taken for a redirect, so a quoted payload reads the
+/// same in both. Length
+/// preserving (every blanked byte becomes a space, so the view stays UTF-8
+/// and every range in it is the same range in `command`); linear.
+fn blank_local_redirects(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    memchr::memchr2(b'<', b'>', bytes)?;
+    let len = bytes.len();
+    let mut view: Option<Vec<u8>> = None;
+    let mut index = 0usize;
+    let mut word_start = true;
+    while index < len {
+        let byte = bytes[index];
+        if matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'(' | b')'
+        ) || (byte == b'&' && bytes.get(index + 1) != Some(&b'>'))
+        {
+            word_start = true;
+            index += 1;
+            continue;
+        }
+        // A redirect may also follow a word directly (`sh>/dev/null -c …`
+        // is `sh` and `>/dev/null`); its operator then starts it.
+        if (word_start || matches!(byte, b'<' | b'>' | b'&'))
+            && let Some(end) = local_redirect_word_end(bytes, index)
+        {
+            view.get_or_insert_with(|| bytes.to_vec())[index..end].fill(b' ');
+            index = end;
+            continue;
+        }
+        word_start = false;
+        index = match byte {
+            b'\\' => (index + 2).min(len),
+            // `<<`, `<<-`, `<<<`: a heredoc or here-string operator, whose
+            // second `<` must not be read as a redirect of the delimiter.
+            b'<' => index + bytes[index..].iter().take_while(|&&b| b == b'<').count(),
+            // `$'…'` takes backslash escapes, so `\'` does not close it.
+            b'$' if bytes.get(index + 1) == Some(&b'\'') => {
+                let mut at = index + 2;
+                while at < len && bytes[at] != b'\'' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                (at + 1).min(len)
+            }
+            b'\'' => memchr(b'\'', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'"' => skip_double_quoted(bytes, index + 1),
+            _ => index + 1,
+        };
+    }
+    view.map(|view| String::from_utf8(view).expect("blank-filling whole characters keeps UTF-8"))
+}
+
+/// End of the local redirect word starting at `start` (see
+/// [`blank_local_redirects`]), target included, or `None`.
+fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut index = start;
+    if bytes[index] == b'{' {
+        // `{name}`: stop at the first byte that is not part of a name, so a
+        // run of `{` is not rescanned to its end at each one.
+        let name = bytes[index + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+            .count();
+        let close = index + 1 + name;
+        if name == 0 || bytes[index + 1].is_ascii_digit() || bytes.get(close) != Some(&b'}') {
+            return None;
+        }
+        index = close + 1;
+    } else {
+        while index < len && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    let rest = &bytes[index..];
+    let operator = if rest.starts_with(b"&>>") || rest.starts_with(b"<<<") {
+        3
+    } else if rest.starts_with(b"&>")
+        || rest.starts_with(b">>")
+        || rest.starts_with(b"<>")
+        || rest.starts_with(b">|")
+        || rest.starts_with(b">&")
+        || rest.starts_with(b"<&")
+    {
+        2
+    } else if matches!(rest.first(), Some(b'>' | b'<')) {
+        1
+    } else {
+        return None;
+    };
+    if matches!(rest.get(operator), Some(b'(' | b'<')) {
+        // `<(…)`/`>(…)`, `<<`, `<<<<`, `>>(…)`: not a plain redirect.
+        return None;
+    }
+    index += operator;
+    while index < len && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    let target_start = index;
+    while index < len {
+        index = match bytes[index] {
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' => break,
+            b'\\' => (index + 2).min(len),
+            b'\'' => memchr(b'\'', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'"' => skip_double_quoted(bytes, index + 1),
+            b'`' => memchr(b'`', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                crate::normalize::consume_shell_paren_construct(bytes, index + 2, len)
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                memchr(b'}', &bytes[index + 2..]).map_or(len, |at| index + 3 + at)
+            }
+            _ => index + 1,
+        };
+    }
+    (index > target_start).then_some(index)
+}
+
+/// Index just past the double-quoted string whose body starts at `start`.
+fn skip_double_quoted(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return index + 1,
+            b'\\' => index += 2,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Whether quoting inside a word hides a command-string runner's or `ssh`'s
+/// name from the trigger patterns: `w\atch '<cmd>'`, `wat$'c'h '<cmd>'` and
+/// `s'sh' h '<cmd>'` run `watch` and `ssh`, but no pattern sees the name.
+/// Superset of what Tier 2 validates; linear.
+fn names_a_runner_through_quoting(command: &str) -> bool {
+    if !command
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'\'' | b'"'))
+    {
+        return false;
+    }
+    // Dequoting never removes an occurrence (no name holds a quote), so a
+    // name the quoting hid shows as one more occurrence, even when the same
+    // name also stands plainly elsewhere (`echo watch; w\atch '<cmd>'`). A
+    // `$'…'` escape can spell one too (`$'\x77atch'`).
+    let hidden = |text: &str| {
+        let unquoted: String = text
+            .chars()
+            .filter(|ch| !matches!(ch, '\\' | '\'' | '"' | '$'))
+            .collect();
+        COMMAND_STRING_RUNNERS
+            .iter()
+            .copied()
+            .chain(["ssh"])
+            .any(|name| unquoted.matches(name).count() > command.matches(name).count())
+    };
+    hidden(command) || decode_ansi_c_strings(command).is_some_and(|decoded| hidden(&decoded))
+}
+
+/// `command` with the body of each Bash `$'…'` string decoded, or `None` when
+/// no such string holds an escape. The name prefilters read it as well as the
+/// raw text, since an escape can spell a program: `$'\x77atch'` is `watch`.
+/// Double quotes are not tracked, so `"$'…'"` is decoded too; that only
+/// widens a prefilter. Linear.
+fn decode_ansi_c_strings(command: &str) -> Option<String> {
+    let opens = command.find("$'")?;
+    if !command[opens..].contains('\\') {
+        return None;
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    let mut decoded_any = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                let mut body = String::new();
+                let closed = crate::normalize::decode_ansi_c_quoted(&mut chars, &mut body).is_ok();
+                out.push('\'');
+                out.push_str(&body);
+                out.push('\'');
+                decoded_any = true;
+                if !closed {
+                    break;
+                }
+            }
+            '\'' => {
+                out.push(ch);
+                for inner in chars.by_ref() {
+                    out.push(inner);
+                    if inner == '\'' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                out.push(ch);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    decoded_any.then_some(out)
 }
 
 // ============================================================================
@@ -1149,7 +1417,7 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
     // `["']?` after the interpreter swallows the closing quote of a quoted full
     // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*)['\x22]?\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
@@ -1161,7 +1429,7 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // PowerShell host + quoted-path closing quote handled as in the single-quote
     // variant above (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*[ceECpr][A-Za-z]*)['\x22]?\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
 
@@ -1173,8 +1441,37 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
 /// dynamic, so the evaluator fails it closed like the quoted forms (bd-vweh).
 /// Groups match the quoted patterns: (1) shell, (2) unused, (3) flag, (4) operand.
 static INLINE_SCRIPT_UNQUOTED_DYNAMIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*c[A-Za-z]*)\s+(\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`)(?:\s|$|[;&|)])")
+    Regex::new(concat!(r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?(-[A-Za-z]*c[A-Za-z]*)['\x22]?(?:\s+", shell_option_after_c_re!(), r")*\s+(\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`)(?:\s|$|[;&|)])"))
         .expect("inline script unquoted-dynamic regex compiles")
+});
+
+/// A POSIX shell whose `-c` is followed by options before the quoted command
+/// string: `sh -c -- '<cmd>'`, `sh -c - '<cmd>'`, `bash -c -e '<cmd>'`,
+/// `bash -c -o errexit '<cmd>'`. The shell takes its first operand as the
+/// command string, so the payload is that quoted word; the quoted patterns
+/// above expect it right after the flag, so at least one option is required
+/// here and a command both read is not read twice. Groups match the quoted
+/// patterns: (1) shell, (2) unused, (3) flag, (4) content.
+static INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b['\x22]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*",
+        r"\s+['\x22]?(-[A-Za-z]*c[A-Za-z]*)['\x22]?(?:\s+",
+        shell_option_after_c_re!(),
+        r")+\s+'([^']*)'"
+    ))
+    .expect("inline shell options-after-c single-quote regex compiles")
+});
+
+/// [`INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE`] for a double-quoted command
+/// string.
+static INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b['\x22]?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*",
+        r"\s+['\x22]?(-[A-Za-z]*c[A-Za-z]*)['\x22]?(?:\s+",
+        shell_option_after_c_re!(),
+        r")+\s+\x22([^\x22]*)\x22"
+    ))
+    .expect("inline shell options-after-c double-quote regex compiles")
 });
 
 /// Regex for `cmd /c "..."` / `cmd /k ...` inline execution (the Windows analog of
@@ -1578,6 +1875,15 @@ fn extract_content_with_scan_view(
         &mut extracted,
         &mut skip_reasons,
     );
+    // `xargs git-reset --hard`, `find . '-delete'`
+    extract_respelled_commands(
+        scan_view,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
         return if extracted.is_empty() {
             ExtractionResult::Skipped(skip_reasons)
@@ -1699,10 +2005,18 @@ fn extract_inline_scripts(
         return;
     }
 
-    // Helper to extract from a given regex pattern
+    // Helper to extract from a given regex pattern. The patterns read the
+    // command and then its redirect view (`sh 2>/dev/null -c '…'`); the view
+    // is length preserving, so a payload found in both is the same range and
+    // is read once.
+    let redirect_view = blank_local_redirects(command);
+    let option_after_c_flag = std::iter::once(command)
+        .chain(redirect_view.as_deref())
+        .any(may_have_option_after_c_flag);
     let mut hit_limit = false;
     let mut extract_from_pattern = |pattern: &Regex| {
-        for cap in pattern.captures_iter(command) {
+        let views = std::iter::once(command).chain(redirect_view.as_deref());
+        for cap in views.flat_map(|view| pattern.captures_iter(view)) {
             if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
                 return;
             }
@@ -1715,7 +2029,10 @@ fn extract_inline_scripts(
             let flag = cap.get(3).map_or("", |m| m.as_str());
             // Content is in group 4: (1) interpreter, (2) optional "js", (3) flag, (4) content
             let content_match = cap.get(4);
-            let content = content_match.map_or("", |m| m.as_str());
+            // From `command`, not the view the match came from (same range).
+            let content = content_match
+                .and_then(|m| command.get(m.start()..m.end()))
+                .unwrap_or("");
 
             // The regex covers multiple interpreters; validate that the matched flag actually
             // implies inline code for this interpreter (e.g. bash needs -c, perl needs -e/-E).
@@ -1754,6 +2071,15 @@ fn extract_inline_scripts(
                 continue;
             }
 
+            // A launcher spelled inside another command's quoted argument,
+            // behind prose, is not one the shell runs (#510).
+            if cap
+                .get(1)
+                .is_some_and(|name| inline_launcher_is_quoted_prose(command, name.start()))
+            {
+                continue;
+            }
+
             // Enforce content size limit
             if content.len() > limits.max_body_bytes {
                 // Skip but don't add to skip_reasons (would be too noisy)
@@ -1761,12 +2087,20 @@ fn extract_inline_scripts(
             }
 
             let full_match = cap.get(0).unwrap();
+            let content_range = content_match.map(|m| m.start()..m.end());
+            if content_range.is_some()
+                && extracted
+                    .iter()
+                    .any(|seen| seen.content_range == content_range)
+            {
+                continue;
+            }
             extracted.push(ExtractedContent {
                 content: content.to_string(),
                 language: ScriptLanguage::from_command(cmd_name),
                 delimiter: None,
                 byte_range: full_match.start()..full_match.end(),
-                content_range: content_match.map(|m| m.start()..m.end()),
+                content_range,
                 quoted: true, // -c/-e content is always in quotes
                 heredoc_type: None,
                 target_command: Some(cmd_name.to_string()), // -c/-e content is executed by the interpreter
@@ -1778,12 +2112,312 @@ fn extract_inline_scripts(
     extract_from_pattern(&INLINE_SCRIPT_SINGLE_QUOTE);
     extract_from_pattern(&INLINE_SCRIPT_DOUBLE_QUOTE);
     extract_from_pattern(&INLINE_SCRIPT_UNQUOTED_DYNAMIC);
+    // Built and run only when some flag ending in `c` is followed by an
+    // option, which few commands have; building them costs every other one
+    // about a millisecond.
+    if option_after_c_flag {
+        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE);
+        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE);
+    }
 
     if hit_limit {
         skip_reasons.push(SkipReason::ExceededHeredocLimit {
             limit: limits.max_heredocs,
         });
     }
+}
+
+/// Whether the inline launcher whose interpreter word starts at
+/// `launcher_start` is prose inside another command's quoted argument rather
+/// than a command any shell runs (#510).
+///
+/// The inline-script patterns match a launcher anywhere in the text, so
+/// `tracker comment 1 "example: bash -c 'git reset --hard' is refused"` was
+/// denied as if it ran `git reset --hard`. It does not, under either reading
+/// of that quoted word:
+///
+/// - as data (what dcg already assumes for an unknown program's operands:
+///   `tracker comment 1 "git reset --hard"` is allowed), nothing runs it;
+/// - as a shell string some program hands to `sh -c`, its command word is
+///   `example:`, and `bash` is an operand of that program, not a launcher.
+///
+/// So a launcher is dropped only when BOTH hold: it sits inside single or
+/// double quotes (not inside a `$(…)` or backquote substitution, which run
+/// whatever their quoting), and inside that quoted text the simple command
+/// it belongs to starts with a plain word that is not a shell, interpreter,
+/// wrapper, command runner or reserved word. A launcher that opens the
+/// quoted text (`tmux new "bash -c '…'"`, `"bash" -c '…'`), follows a
+/// separator inside it (`"x; bash -c '…'"`), or follows a wrapper
+/// (`"sudo bash -c '…'"`) is kept, because a program that runs its operand
+/// as a shell string would run that launcher.
+///
+/// Anything this walk cannot follow keeps the launcher: a heredoc (its body
+/// is not shell-quoted, so one apostrophe in it would flip the quote state),
+/// a comment, a `${…}` expansion, an ANSI-C `$'…'` string, or an escaped
+/// interpreter word.
+fn inline_launcher_is_quoted_prose(command: &str, launcher_start: usize) -> bool {
+    if command.contains("<<") {
+        return false;
+    }
+    let Some(quote_open) = innermost_shell_quote_at(command, launcher_start) else {
+        return false;
+    };
+    command
+        .get(quote_open + 1..launcher_start)
+        .is_some_and(quoted_launcher_prefix_is_prose)
+}
+
+/// The byte offset of the quote that opens the innermost single- or
+/// double-quoted string containing `position`, when that string is the
+/// innermost shell context there. `None` when `position` is unquoted, sits
+/// inside a `$(…)`/backquote substitution, or the text before it uses a
+/// construct this walk does not model (see [`inline_launcher_is_quoted_prose`]).
+fn innermost_shell_quote_at(command: &str, position: usize) -> Option<usize> {
+    #[derive(Clone, Copy)]
+    enum Context {
+        Single(usize),
+        Double(usize),
+        Substitution(usize),
+        Backquote,
+    }
+    let bytes = command.as_bytes();
+    if position > bytes.len() {
+        return None;
+    }
+    let mut stack: Vec<Context> = Vec::new();
+    let mut index = 0usize;
+    while index < position {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match stack.last().copied() {
+            Some(Context::Single(_)) => {
+                if byte == b'\'' {
+                    stack.pop();
+                }
+                index += 1;
+            }
+            Some(Context::Double(_)) => match byte {
+                b'\\' => index += 2,
+                b'"' => {
+                    stack.pop();
+                    index += 1;
+                }
+                b'$' if next == Some(b'(') => {
+                    stack.push(Context::Substitution(1));
+                    index += 2;
+                }
+                b'$' if next == Some(b'{') => return None,
+                b'`' => {
+                    stack.push(Context::Backquote);
+                    index += 1;
+                }
+                _ => index += 1,
+            },
+            top => match byte {
+                b'\\' => index += 2,
+                b'\'' => {
+                    if index > 0 && bytes[index - 1] == b'$' {
+                        return None;
+                    }
+                    stack.push(Context::Single(index));
+                    index += 1;
+                }
+                b'"' => {
+                    stack.push(Context::Double(index));
+                    index += 1;
+                }
+                b'`' => {
+                    if matches!(top, Some(Context::Backquote)) {
+                        stack.pop();
+                    } else {
+                        stack.push(Context::Backquote);
+                    }
+                    index += 1;
+                }
+                b'$' if next == Some(b'(') => {
+                    stack.push(Context::Substitution(1));
+                    index += 2;
+                }
+                b'$' if next == Some(b'{') => return None,
+                b'(' => {
+                    if let Some(Context::Substitution(depth)) = stack.last_mut() {
+                        *depth += 1;
+                    }
+                    index += 1;
+                }
+                b')' => {
+                    if let Some(Context::Substitution(depth)) = stack.last_mut() {
+                        *depth -= 1;
+                        if *depth == 0 {
+                            stack.pop();
+                        }
+                    }
+                    index += 1;
+                }
+                b'#' if index == 0
+                    || matches!(
+                        bytes[index - 1],
+                        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'`'
+                    ) =>
+                {
+                    return None;
+                }
+                _ => index += 1,
+            },
+        }
+    }
+    // An escape that swallowed the interpreter's first byte: not a plain word.
+    if index != position {
+        return None;
+    }
+    match stack.last() {
+        Some(Context::Single(open) | Context::Double(open)) => Some(*open),
+        _ => None,
+    }
+}
+
+/// Whether, in the quoted text before a launcher, the simple command the
+/// launcher belongs to starts with a plain prose word that runs nothing (see
+/// [`inline_launcher_is_quoted_prose`]).
+///
+/// The simple command is found by cutting at the LAST separator byte, quoted
+/// or not. Over-cutting can only shorten the prefix and so make the launcher
+/// look like a command word, which keeps it: the conservative direction.
+fn quoted_launcher_prefix_is_prose(prefix: &str) -> bool {
+    let segment_start = prefix
+        .rfind(|c: char| {
+            matches!(
+                c,
+                ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '{' | '}' | '`'
+            )
+        })
+        .map_or(0, |at| at + 1);
+    let segment = &prefix[segment_start..];
+    let mut words: Vec<&str> = segment.split_ascii_whitespace().collect();
+    // Text glued to the interpreter word (`/usr/bin/` of `/usr/bin/bash`, an
+    // opening quote) is part of the launcher's own word.
+    if !segment.ends_with(|c: char| c.is_ascii_whitespace()) {
+        words.pop();
+    }
+    let Some(first) = words
+        .into_iter()
+        .find(|word| !crate::normalize::is_env_assignment(word))
+    else {
+        // Nothing but assignments before it: the launcher is the command word.
+        return false;
+    };
+    let plain = !first.starts_with('-')
+        && first.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && first.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'-' | b'.' | b',' | b':' | b'/' | b'+' | b'@' | b'?'
+                )
+        });
+    if !plain {
+        return false;
+    }
+    let basename = first
+        .rsplit('/')
+        .next()
+        .unwrap_or(first)
+        .to_ascii_lowercase();
+    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
+    !word_may_run_its_operands(basename)
+}
+
+/// Whether a command word names something that may run another command among
+/// its operands: a shell, an interpreter, a wrapper, a command runner, a
+/// remote or sandboxed executor, a build or package runner, or a shell
+/// reserved word. Deliberately broad; see [`inline_launcher_is_quoted_prose`].
+fn word_may_run_its_operands(name: &str) -> bool {
+    is_code_runner_name(name)
+        || COMMAND_WRAPPERS.contains(&name)
+        || PRIMARY_COMMAND_WRAPPERS.contains(&name)
+        || matches!(
+            name,
+            "if" | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "do"
+                | "done"
+                | "while"
+                | "until"
+                | "case"
+                | "esac"
+                | "for"
+                | "in"
+                | "select"
+                | "function"
+                | "coproc"
+                | "find"
+                | "fd"
+                | "git"
+                | "make"
+                | "gmake"
+                | "just"
+                | "task"
+                | "npm"
+                | "npx"
+                | "pnpm"
+                | "yarn"
+                | "bunx"
+                | "uv"
+                | "uvx"
+                | "poetry"
+                | "pipx"
+                | "cargo"
+                | "direnv"
+                | "nix"
+                | "nix-shell"
+                | "devbox"
+                | "firejail"
+                | "bwrap"
+                | "unshare"
+                | "proot"
+                | "fakeroot"
+                | "strace"
+                | "ltrace"
+                | "valgrind"
+                | "perf"
+                | "hyperfine"
+                | "entr"
+                | "runuser"
+                | "sg"
+                | "newgrp"
+                | "pkexec"
+                | "gosu"
+                | "su-exec"
+                | "setpriv"
+                | "sshpass"
+                | "xvfb-run"
+                | "dbus-run-session"
+                | "vagrant"
+                | "ansible"
+                | "pdsh"
+                | "clush"
+                | "pssh"
+                | "parallel-ssh"
+                | "winpty"
+                | "wsl"
+        )
+}
+
+/// Whether a `c` is followed by blanks and then `-` or `+`, optionally behind
+/// a quote: a superset of a shell's `-c` followed by an option
+/// (`sh -c -- '…'`, `sh -c '-e' '…'`), the only commands
+/// [`INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE`] and its double-quote twin
+/// can match. Linear: each blank run follows one `c`.
+fn may_have_option_after_c_flag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    memchr::memchr_iter(b'c', bytes).any(|at| {
+        let rest = &bytes[at + 1..];
+        let blanks = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        let quote = usize::from(matches!(rest.get(blanks), Some(b'\'' | b'"')));
+        blanks > 0 && matches!(rest.get(blanks + quote), Some(b'-' | b'+'))
+    })
 }
 
 /// Push one extracted Windows inner command (re-evaluated as a shell command).
@@ -1844,8 +2478,18 @@ fn extract_windows_inline_scripts(
         return;
     }
 
+    // Each pattern also reads the redirect view (`pwsh 2>$null -enc …`,
+    // `cmd 2>nul /c …`; see `blank_local_redirects`). The view is length
+    // preserving, so payload text is taken from `command` by range and a
+    // payload both readings find is read once.
+    let redirect_view = blank_local_redirects(command);
+    let views: Vec<&str> = std::iter::once(command)
+        .chain(redirect_view.as_deref())
+        .collect();
+    let text = |m: regex::Match<'_>| command.get(m.start()..m.end()).unwrap_or("");
+
     // cmd /c | /k  (double-quoted, single-quoted, or unquoted rest-of-line)
-    for cap in CMD_INLINE_SCRIPT.captures_iter(command) {
+    for cap in windows_view_captures(&CMD_INLINE_SCRIPT, &views, &[1, 2, 3]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -1855,7 +2499,7 @@ fn extract_windows_inline_scripts(
                 extracted,
                 skip_reasons,
                 limits,
-                m.as_str(),
+                text(m),
                 full.start()..full.end(),
                 Some(m.start()..m.end()),
                 "cmd",
@@ -1866,7 +2510,7 @@ fn extract_windows_inline_scripts(
     }
 
     // iex / Invoke-Expression "<code>"
-    for cap in IEX_INLINE_SCRIPT.captures_iter(command) {
+    for cap in windows_view_captures(&IEX_INLINE_SCRIPT, &views, &[1, 2]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -1876,7 +2520,7 @@ fn extract_windows_inline_scripts(
                 extracted,
                 skip_reasons,
                 limits,
-                m.as_str(),
+                text(m),
                 full.start()..full.end(),
                 Some(m.start()..m.end()),
                 "iex",
@@ -1890,7 +2534,7 @@ fn extract_windows_inline_scripts(
     // <args>`, so `Start-Process cmd -ArgumentList '/c rd /s /q C:\src'` is the
     // same deletion as the denied `cmd /c rd /s /q C:\src`. The reconstructed
     // line is not a substring of the command, so there is no content_range.
-    for cap in START_PROCESS_INLINE.captures_iter(command) {
+    for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2, 3]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -1898,7 +2542,7 @@ fn extract_windows_inline_scripts(
             continue;
         };
         let full = cap.get(0).expect("group 0 always present");
-        let line = format!("{} {}", file.as_str(), args.as_str());
+        let line = format!("{} {}", text(file), text(args));
         if !push_windows_inner(
             extracted,
             skip_reasons,
@@ -1913,12 +2557,12 @@ fn extract_windows_inline_scripts(
     }
 
     // powershell -EncodedCommand <base64>  (decode base64 UTF-16LE, then re-evaluate)
-    for cap in POWERSHELL_ENCODED_COMMAND.captures_iter(command) {
+    for cap in windows_view_captures(&POWERSHELL_ENCODED_COMMAND, &views, &[1]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
         let Some(b64) = cap.get(1) else { continue };
-        let Some(decoded) = decode_powershell_encoded_command(b64.as_str()) else {
+        let Some(decoded) = decode_powershell_encoded_command(text(b64)) else {
             continue; // fail-open on invalid base64
         };
         let full = cap.get(0).expect("group 0 always present");
@@ -1936,6 +2580,28 @@ fn extract_windows_inline_scripts(
             return;
         }
     }
+}
+
+/// `pattern`'s captures in each of `views` (the command, then its redirect
+/// view), dropping a capture whose payload (the first of `payload_groups`
+/// that matched) was already captured at the same range: the views are the
+/// same length, so that is the same payload read twice. Lazy, so a caller
+/// that stops at the extraction limit stops the scan too.
+fn windows_view_captures<'a>(
+    pattern: &'a Regex,
+    views: &'a [&'a str],
+    payload_groups: &'a [usize],
+) -> impl Iterator<Item = regex::Captures<'a>> + 'a {
+    let mut seen = std::collections::HashSet::new();
+    views
+        .iter()
+        .flat_map(move |view| pattern.captures_iter(view))
+        .filter(move |cap| {
+            payload_groups
+                .iter()
+                .find_map(|&group| cap.get(group))
+                .is_none_or(|m| seen.insert((m.start(), m.end())))
+        })
 }
 
 /// Byte spans of one `mise exec -c/--command` inline shell payload.
@@ -2254,6 +2920,12 @@ fn dequoted_executable_word(word: &str) -> std::borrow::Cow<'_, str> {
     {
         return std::borrow::Cow::Borrowed(word);
     }
+    // The shell's own quote removal when the word has no expansion, which
+    // also decodes `$'…'` escapes: `$'\x77atch'` runs `watch`. A word it
+    // cannot decode keeps the looser reading below.
+    if let std::borrow::Cow::Owned(decoded) = crate::normalize::decode_posix_syntax_token(word) {
+        return std::borrow::Cow::Owned(decoded);
+    }
     let bytes = word.as_bytes();
     let mut out = String::with_capacity(word.len());
     let mut index = 0usize;
@@ -2324,6 +2996,12 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 /// cheaper one. The quoting-aware walk runs only when that fails, and is bounded
 /// by `general.max_command_bytes` times the single-digit needle length.
 fn names_interpreter(command: &str, needle: &str) -> bool {
+    names_interpreter_as_written(command, needle)
+        || decode_ansi_c_strings(command)
+            .is_some_and(|decoded| names_interpreter_as_written(&decoded, needle))
+}
+
+fn names_interpreter_as_written(command: &str, needle: &str) -> bool {
     if contains_ascii_case_insensitive(command, needle) {
         return true;
     }
@@ -2362,9 +3040,11 @@ fn names_interpreter(command: &str, needle: &str) -> bool {
 /// means the glyph is data, not syntax, so only a bare operator counts.
 fn word_token_starts_local_redirect(text: &str) -> bool {
     let bytes = text.as_bytes();
-    let mut index = 0usize;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
+    let mut index = redirect_descriptor_prefix_len(text);
+    if index == 0 {
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
     }
     match bytes.get(index) {
         Some(b'>' | b'<') => true,
@@ -2372,6 +3052,31 @@ fn word_token_starts_local_redirect(text: &str) -> bool {
         // and never reaches this function as part of a Word.
         Some(b'&') if index == 0 => bytes.get(1) == Some(&b'>'),
         _ => false,
+    }
+}
+
+/// Length of a `{name}` descriptor-variable prefix (`{fd}>file`, bash 4.1+),
+/// or 0. It allocates a descriptor and stores its number in `name`; like a
+/// numbered descriptor it belongs to the redirect, not to the argv.
+fn redirect_descriptor_prefix_len(text: &str) -> usize {
+    let Some(rest) = text.strip_prefix('{') else {
+        return 0;
+    };
+    let Some(close) = rest.find('}') else {
+        return 0;
+    };
+    let name = &rest[..close];
+    let valid = name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid && matches!(rest.as_bytes().get(close + 1), Some(b'>' | b'<')) {
+        close + 2
+    } else {
+        0
     }
 }
 
@@ -2778,7 +3483,8 @@ fn extract_awk_inline_scripts(
             let Some(program_text) = command.get(program.clone()) else {
                 continue;
             };
-            for payload in awk_shell_payload_ranges(program_text, program.start) {
+            let payloads = awk_shell_payload_ranges(program_text, program.start);
+            for payload in payloads.commands {
                 let Some(content) = command.get(payload.clone()) else {
                     continue;
                 };
@@ -2789,6 +3495,37 @@ fn extract_awk_inline_scripts(
                     content,
                     program.clone(),
                     Some(payload),
+                    "awk",
+                ) {
+                    return;
+                }
+            }
+            for printed in payloads.printed {
+                // A variable the command line can reassign (`-v cmd=…`, a
+                // `cmd=…` operand) is not the literal the program assigns.
+                let reassignable = printed.variable.as_deref().is_some_and(|name| {
+                    let assignment = format!("{name}=");
+                    command
+                        .get(..program.start)
+                        .is_some_and(|head| head.contains(&assignment))
+                        || command
+                            .get(program.end..)
+                            .is_some_and(|tail| tail.contains(&assignment))
+                });
+                let script = match printed.script {
+                    Some(script) if !reassignable => script,
+                    // Computed at run time: a script whose whole source is an
+                    // expansion, which the evaluator fails closed exactly as it
+                    // does `bash -c "$X"`.
+                    _ => AWK_COMPUTED_PRINT_SCRIPT.to_string(),
+                };
+                if !push_windows_inner(
+                    extracted,
+                    skip_reasons,
+                    limits,
+                    &script,
+                    program.clone(),
+                    Some(printed.range),
                     "awk",
                 ) {
                     return;
@@ -3006,6 +3743,324 @@ fn awk_program_tokens(
     programs
 }
 
+/// The script extracted for a computed `print … | "sh"`: a single expansion,
+/// so it is code chosen at run time. The evaluator recognises it and denies it
+/// under `heredoc.posix:pipeline-consumer`, the rule the shell-level
+/// `awk '{print "mv " $1}' f | sh` already gets.
+pub(crate) const AWK_COMPUTED_PRINT_SCRIPT: &str = "$dcg_awk_printed_value";
+
+/// What an awk program hands to a shell.
+struct AwkShellPayloads {
+    /// Byte ranges (whole-command coordinates) of the literal commands the
+    /// program runs: `system("…")`, `… | "…"`, `"…" | getline`.
+    commands: Vec<Range<usize>>,
+    /// Text printed into a shell that runs its stdin as a script.
+    printed: Vec<AwkPrintedScript>,
+}
+
+/// The expression a `print`/`printf` writes into a shell that runs its stdin
+/// (`print "git reset --hard" | "sh"`), which that shell executes (#511).
+#[derive(Debug, PartialEq, Eq)]
+struct AwkPrintedScript {
+    /// Byte range of the printed expression, in whole-command coordinates.
+    range: Range<usize>,
+    /// The script the shell receives, when the expression is literal strings
+    /// (or one variable assigned exactly one literal). `None` when it is
+    /// computed: a field, a concatenation with a variable, a format.
+    script: Option<String>,
+    /// The awk variable the script was read through, if any. An assignment to
+    /// it on awk's command line (`-v name=…`, a `name=…` operand) would replace
+    /// the value, so the caller must check the rest of the command.
+    variable: Option<String>,
+}
+
+/// Whether an awk pipe's command string is a shell that reads its script from
+/// standard input: `sh`, `bash -e`, `/bin/sh -s arg`, `sudo sh`, `bash -`.
+/// Not one given `-c` (`sh -c cat` just runs `cat`) or a script operand
+/// (`sh run.sh`), whose stdin is only data.
+fn awk_pipe_target_runs_stdin_as_script(target: &str) -> bool {
+    let normalized = crate::normalize::strip_wrapper_prefixes(target);
+    let mut words = normalized.normalized.split_ascii_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    let basename = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
+    if !SHELL_PROGRAMS.contains(&basename) {
+        return false;
+    }
+    while let Some(word) = words.next() {
+        match word {
+            // `-s`: the script is stdin, the rest are positional parameters.
+            // `-`: the same, POSIX spelling.
+            "-s" | "-" => return true,
+            // After `--` the next operand is a script file.
+            "--" => return words.next().is_none(),
+            "-o" | "+o" | "--rcfile" | "--init-file" => {
+                words.next();
+            }
+            _ if word.starts_with("--") => {}
+            _ if word.starts_with(['-', '+']) => {
+                if word.contains('c') {
+                    return false;
+                }
+                if word[1..].contains('s') {
+                    return true;
+                }
+            }
+            // A script file operand: stdin is that script's input, not code.
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The expression printed by the `print`/`printf` statement that occupies
+/// `program[statement_start..pipe_at]`, read as the script a stdin shell runs.
+fn awk_printed_script(
+    program: &str,
+    statement_start: usize,
+    pipe_at: usize,
+    offset: usize,
+) -> AwkPrintedScript {
+    let computed = |range: Range<usize>| AwkPrintedScript {
+        range: offset + range.start..offset + range.end,
+        script: None,
+        variable: None,
+    };
+    let Some(statement) = program.get(statement_start..pipe_at) else {
+        return computed(statement_start.min(pipe_at)..pipe_at);
+    };
+    let Some((keyword_end, is_printf)) = awk_print_keyword_end(statement) else {
+        // No print keyword found: nothing provable about what is written.
+        return computed(statement_start..pipe_at);
+    };
+    let expression_start = statement_start + keyword_end;
+    let raw = &program[expression_start..pipe_at];
+    let lead = raw.len() - raw.trim_start().len();
+    let range = expression_start + lead..expression_start + raw.trim_end().len();
+    let mut expression = raw.trim();
+    if expression.starts_with('(') && expression.ends_with(')') && expression.len() >= 2 {
+        expression = expression[1..expression.len() - 1].trim();
+    }
+
+    if let Some(items) = awk_literal_list(expression) {
+        let script = if is_printf {
+            items
+                .first()
+                .and_then(|(format, _)| awk_static_printf(format))
+        } else {
+            let mut joined = String::new();
+            for (text, comma_before) in &items {
+                if *comma_before {
+                    // print's default output field separator.
+                    joined.push(' ');
+                }
+                joined.push_str(text);
+            }
+            Some(joined)
+        };
+        return AwkPrintedScript {
+            range: offset + range.start..offset + range.end,
+            script,
+            variable: None,
+        };
+    }
+
+    let is_identifier = !expression.is_empty()
+        && expression
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && expression
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if is_identifier && !is_printf {
+        if let Some(value) = awk_single_literal_assignment(program, expression) {
+            return AwkPrintedScript {
+                range: offset + range.start..offset + range.end,
+                script: Some(value),
+                variable: Some(expression.to_string()),
+            };
+        }
+    }
+    computed(range)
+}
+
+/// The end of the `print`/`printf` keyword in `statement` (outside string
+/// literals), and whether it is `printf`.
+fn awk_print_keyword_end(statement: &str) -> Option<(usize, bool)> {
+    let bytes = statement.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index = awk_string_literal_end(statement, index).map_or(bytes.len(), |end| end + 1);
+            }
+            b'\\' if bytes.get(index + 1) == Some(&b'"') => {
+                index = escaped_string_literal_end(statement, index + 2)
+                    .map_or(bytes.len(), |end| end + 2);
+            }
+            b'p' if statement[index..].starts_with("print")
+                && (index == 0 || !is_awk_identifier_byte(bytes[index - 1])) =>
+            {
+                let is_printf = statement[index..].starts_with("printf");
+                let end = index + if is_printf { 6 } else { 5 };
+                if bytes.get(end).is_none_or(|b| !is_awk_identifier_byte(*b)) {
+                    return Some((end, is_printf));
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+const fn is_awk_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// A list of awk string literals joined by commas or by juxtaposition
+/// (concatenation), decoded, each with whether a comma preceded it. `None`
+/// when anything else appears (a variable, a field, an operator).
+fn awk_literal_list(expression: &str) -> Option<Vec<(String, bool)>> {
+    let bytes = expression.as_bytes();
+    let mut items = Vec::new();
+    let mut index = 0usize;
+    let mut comma_before = false;
+    loop {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        if bytes[index] == b',' {
+            if items.is_empty() || comma_before {
+                return None;
+            }
+            comma_before = true;
+            index += 1;
+            continue;
+        }
+        let literal = inline_string_literal_at(expression, index)?;
+        if literal.start != index + 1 && literal.start != index + 2 {
+            return None;
+        }
+        let escaped = literal.start == index + 2;
+        items.push((
+            decode_awk_string(&expression[literal.clone()]),
+            std::mem::take(&mut comma_before),
+        ));
+        index = literal.end + if escaped { 2 } else { 1 };
+    }
+    (!items.is_empty() && !comma_before).then_some(items)
+}
+
+/// An awk string literal's value: its escape sequences decoded.
+fn decode_awk_string(literal: &str) -> String {
+    let mut out = String::with_capacity(literal.len());
+    let mut chars = literal.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// A `printf` format that prints itself: no conversion other than `%%`.
+fn awk_static_printf(format: &str) -> Option<String> {
+    let mut out = String::with_capacity(format.len());
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if chars.next() != Some('%') {
+                return None;
+            }
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// The value of awk variable `name` when the program assigns it exactly once,
+/// a single string literal, and otherwise only prints it into a pipe. Any
+/// other use (another assignment, `name = name "x"`, `getline name`,
+/// `sub(…, name)`, `split(…, name)`, a field) answers `None`.
+fn awk_single_literal_assignment(program: &str, name: &str) -> Option<String> {
+    let bytes = program.as_bytes();
+    let mut value: Option<String> = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index = awk_string_literal_end(program, index).map_or(bytes.len(), |end| end + 1);
+                continue;
+            }
+            b'\\' if bytes.get(index + 1) == Some(&b'"') => {
+                index = escaped_string_literal_end(program, index + 2)
+                    .map_or(bytes.len(), |end| end + 2);
+                continue;
+            }
+            _ => {}
+        }
+        // Bytes, not `str` slicing: `index` may sit inside a multi-byte
+        // character, and a match of the ASCII name starts on a boundary.
+        let at_word = bytes[index..].starts_with(name.as_bytes())
+            && (index == 0
+                || !(is_awk_identifier_byte(bytes[index - 1]) || bytes[index - 1] == b'$'))
+            && bytes
+                .get(index + name.len())
+                .is_none_or(|b| !is_awk_identifier_byte(*b));
+        if !at_word {
+            index += 1;
+            continue;
+        }
+        let after = index + name.len();
+        let rest = program[after..].trim_start();
+        let before = program[..index].trim_end();
+        if rest.starts_with('=') && !rest.starts_with("==") {
+            if value.is_some() {
+                return None;
+            }
+            let rhs_at = program.len() - rest.len() + 1;
+            let literal = inline_string_literal_at(program, rhs_at)?;
+            let escaped = program.as_bytes().get(literal.start - 1) == Some(&b'"')
+                && program.as_bytes().get(literal.start.wrapping_sub(2)) == Some(&b'\\');
+            let close_end = literal.end + if escaped { 2 } else { 1 };
+            let tail = program[close_end..].trim_start_matches([' ', '\t']);
+            if !(tail.is_empty() || tail.starts_with([';', '}', '\n'])) {
+                return None;
+            }
+            value = Some(decode_awk_string(&program[literal]));
+            index = close_end;
+            continue;
+        }
+        let printed = (before.ends_with("print") || before.ends_with("printf"))
+            && rest.starts_with('|')
+            && !rest.starts_with("||");
+        if !printed {
+            return None;
+        }
+        index = after;
+    }
+    value
+}
+
 /// Byte ranges (in whole-command coordinates) of every shell command an awk
 /// program hands to `/bin/sh`.
 ///
@@ -3013,10 +4068,19 @@ fn awk_program_tokens(
 /// command), and `<string> | getline`. Only a literal awk string supplies a
 /// payload: a concatenation or a variable is not statically known, and guessing
 /// at one would evaluate text that never reaches a shell.
-fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
+///
+/// When a print pipe's command is a shell reading its script from stdin
+/// (`| "sh"`), the printed expression is reported too, in
+/// [`AwkShellPayloads::printed`] (#511).
+fn awk_shell_payload_ranges(program: &str, offset: usize) -> AwkShellPayloads {
     let bytes = program.as_bytes();
     let mut payloads = Vec::new();
+    let mut printed = Vec::new();
     let mut index = 0usize;
+    // Where the statement the scan is in began: just past the last `;`, `{`,
+    // `}` or newline outside a string, regex or comment. A `print … | "sh"`
+    // reads its printed expression from here (#511).
+    let mut statement_start = 0usize;
     // Byte offset of the `/` that closed the most recently skipped regex
     // literal. `awk_slash_opens_regex` needs it to tell a regex CLOSE (a value,
     // so the next `/` divides) from the division OPERATOR (after which a regex
@@ -3037,6 +4101,7 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
                 index = program[index..]
                     .find('\n')
                     .map_or(bytes.len(), |newline| index + newline + 1);
+                statement_start = index;
             }
             b'"' => {
                 let Some(end) = awk_string_literal_end(program, index) else {
@@ -3121,12 +4186,25 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
                 };
                 if let Some(literal) = awk_leading_string_literal(program, after) {
                     payloads.push(offset + literal.start..offset + literal.end);
+                    // `print "git reset --hard" | "sh"` writes the printed text
+                    // to a shell that runs its stdin as a script, exactly as
+                    // `echo "…" | sh` does, so the printed text is a payload as
+                    // well as the pipe target (#511).
+                    if program
+                        .get(literal.clone())
+                        .is_some_and(awk_pipe_target_runs_stdin_as_script)
+                    {
+                        printed.push(awk_printed_script(program, statement_start, index, offset));
+                    }
                     index = literal.end + 1;
                 } else {
                     index = after;
                 }
             }
             _ => {
+                if matches!(bytes[index], b';' | b'{' | b'}' | b'\n') {
+                    statement_start = index + 1;
+                }
                 if let Some(rest) = program.get(index..)
                     && rest.starts_with("system")
                     && !index
@@ -3151,7 +4229,10 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> Vec<Range<usize>> {
             }
         }
     }
-    payloads
+    AwkShellPayloads {
+        commands: payloads,
+        printed,
+    }
 }
 
 /// Whether the `/` at `index` opens an awk regex literal rather than being the
@@ -3630,37 +4711,49 @@ fn extract_ssh_inline_scripts(
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
         return;
     }
-    if !command.contains("ssh") && !command.contains("SSH") {
+    if !may_name_a_command(command, &["ssh", "SSH"]) {
         return;
     }
 
-    let tokens = crate::normalize::tokenize_for_normalization(command);
-    for index in 0..tokens.len() {
-        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
-            return;
-        }
-        let token = &tokens[index];
-        if token.kind != crate::normalize::NormalizeTokenKind::Word {
-            continue;
-        }
-        let Some(word) = token.text(command) else {
-            continue;
-        };
-        // Path-qualified spellings (`/usr/bin/ssh`, `C:\…\ssh.exe`) are the
-        // same program; `ssh-keygen`/`ssh-add`/`autossh` are not.
-        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
-        let basename = basename
-            .strip_suffix(".exe")
-            .or_else(|| basename.strip_suffix(".EXE"))
-            .unwrap_or(basename);
-        if !basename.eq_ignore_ascii_case("ssh") {
-            continue;
-        }
-        let Some(payload) = ssh_remote_payload(command, &tokens, index) else {
-            continue;
-        };
-        if !push_joined_payload(command, payload, limits, extracted, skip_reasons, "ssh") {
-            return;
+    // Process substitution bodies too: `cat <(ssh h '<cmd>')`.
+    let (views, complete) = command_token_views(command, MAX_COMMAND_STRING_RUNNERS);
+    if !complete {
+        skip_reasons.push(SkipReason::ExceededHeredocLimit {
+            limit: MAX_COMMAND_STRING_RUNNERS,
+        });
+    }
+    for tokens in &views {
+        for index in 0..tokens.len() {
+            if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+                return;
+            }
+            let token = &tokens[index];
+            if token.kind != crate::normalize::NormalizeTokenKind::Word {
+                continue;
+            }
+            let Some(word) = token.text(command) else {
+                continue;
+            };
+            // Path-qualified spellings (`/usr/bin/ssh`, `C:\…\ssh.exe`) are
+            // the same program, and so are quoted ones (`\ssh`, `"ssh"`);
+            // `ssh-keygen`/`ssh-add`/`autossh` are not.
+            let names_ssh = |word: &str| {
+                let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+                basename
+                    .strip_suffix(".exe")
+                    .or_else(|| basename.strip_suffix(".EXE"))
+                    .unwrap_or(basename)
+                    .eq_ignore_ascii_case("ssh")
+            };
+            if !names_ssh(word) && !names_ssh(&dequoted_executable_word(word)) {
+                continue;
+            }
+            let Some(payload) = ssh_remote_payload(command, tokens, index) else {
+                continue;
+            };
+            if !push_joined_payload(command, payload, limits, extracted, skip_reasons, "ssh") {
+                return;
+            }
         }
     }
 }
@@ -3685,41 +4778,572 @@ fn extract_command_string_runner_scripts(
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
         return;
     }
-    if !COMMAND_STRING_RUNNERS
-        .iter()
-        .any(|name| command.contains(name))
+    if !may_name_a_command(command, COMMAND_STRING_RUNNERS)
+        && !may_run_through_dynamic_command_word(command)
     {
+        return;
+    }
+    let (views, complete) = command_token_views(command, MAX_COMMAND_STRING_RUNNERS);
+    if !complete {
+        skip_reasons.push(SkipReason::ExceededHeredocLimit {
+            limit: MAX_COMMAND_STRING_RUNNERS,
+        });
+    }
+    let mut runners = 0usize;
+    for tokens in &views {
+        let positions = command_word_positions(command, tokens);
+        let primary = primary_command_positions(command, tokens, &positions);
+        for index in 0..tokens.len() {
+            if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+                return;
+            }
+            if !positions[index] {
+                continue;
+            }
+            let dynamic_word = primary[index]
+                .then(|| tokens[index].text(command))
+                .flatten()
+                .filter(|word| word.contains(['$', '`']));
+            if let Some(word) = dynamic_word
+                && let Some(output) = substitution_command_line(command, tokens, index, word)
+            {
+                // `$(echo git reset --hard)`: the command is what the
+                // substitution prints, read here as what an echo would.
+                let full = tokens[index].byte_range.start..segment_end(tokens, index);
+                if !push_windows_inner(
+                    extracted,
+                    skip_reasons,
+                    limits,
+                    &output,
+                    full,
+                    None,
+                    DYNAMIC_RUNNER,
+                ) {
+                    return;
+                }
+            }
+            let name = command_string_runner_name(command, &tokens[index]).or_else(|| {
+                (dynamic_word.is_some_and(dynamic_word_may_name_runner)
+                    && !assigns_like_powershell(command, tokens, index))
+                .then_some(DYNAMIC_RUNNER)
+            });
+            let Some(name) = name else {
+                continue;
+            };
+            // Each runner reads the rest of its segment; a command that is
+            // nothing but runners is not read runner by runner (quadratic), it
+            // is an incomplete reading the caller judges by the bounded
+            // fallback.
+            runners += 1;
+            if runners > MAX_COMMAND_STRING_RUNNERS {
+                skip_reasons.push(SkipReason::ExceededHeredocLimit {
+                    limit: MAX_COMMAND_STRING_RUNNERS,
+                });
+                return;
+            }
+            for payload in command_string_runner_payloads(command, tokens, index, name) {
+                if !push_joined_payload(command, payload, limits, extracted, skip_reasons, name) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Re-spell two command shapes whose rules are anchored to a spelling a
+/// wrapper or quoting hides, and hand each on for re-evaluation.
+///
+/// A dashed Git built-in behind a wrapper this file treats as running its
+/// operands (`xargs git-reset --hard`, `sudo -u bob git-clean -fdx`): the
+/// `core.git` rules accept `git-<sub>` only where a command starts, and these
+/// wrappers are not stripped from the text they read. The payload is the
+/// built-in and the rest of its segment.
+///
+/// A `find` action or option spelled through quoting (`find . '-delete'`,
+/// `find . -de''lete`, `find . -de\lete`): find receives `-delete` either way,
+/// but the find rules read the words as written. The payload is the segment
+/// with such words dequoted — except a word that is the value of the option
+/// before it (`-name '-delete'`) or an argument of an `-exec` command, which
+/// stay as written.
+fn extract_respelled_commands(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    use crate::normalize::NormalizeTokenKind;
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+    let dashed_git = may_wrap_dashed_git(command);
+    let find_action = may_quote_a_find_action(command);
+    if !dashed_git && !find_action {
         return;
     }
     let tokens = crate::normalize::tokenize_for_normalization(command);
     let positions = command_word_positions(command, &tokens);
-    let mut runners = 0usize;
-    for index in 0..tokens.len() {
+    // Each re-spelling reads the rest of its segment, so a segment of nothing
+    // but candidates (`xargs find find find …`) is not read candidate by
+    // candidate; past the cap the reading is partial and the caller judges it
+    // by the bounded fallback.
+    let mut respelled = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
-        if !positions[index] {
+        if !positions[index] || token.kind != NormalizeTokenKind::Word {
             continue;
         }
-        let Some(name) = command_string_runner_name(command, &tokens[index]) else {
+        let Some(text) = token.text(command) else {
             continue;
         };
-        // Each runner reads the rest of its segment; a command that is
-        // nothing but runners is not read runner by runner (quadratic), it is
-        // an incomplete reading the caller judges by the bounded fallback.
-        runners += 1;
-        if runners > MAX_COMMAND_STRING_RUNNERS {
+        let executable = dequoted_executable_word(text);
+        let basename = executable.rsplit('/').next().unwrap_or(&executable);
+        let behind_a_word = index > 0 && tokens[index - 1].kind == NormalizeTokenKind::Word;
+        let dashed = dashed_git && behind_a_word && basename.starts_with("git-");
+        let find = matches!(basename, "find" | "gfind") && (dashed_git || find_action);
+        if !dashed && !find {
+            continue;
+        }
+        respelled += 1;
+        if respelled > MAX_COMMAND_STRING_RUNNERS {
             skip_reasons.push(SkipReason::ExceededHeredocLimit {
                 limit: MAX_COMMAND_STRING_RUNNERS,
             });
             return;
         }
-        for payload in command_string_runner_payloads(command, &tokens, index, name) {
-            if !push_joined_payload(command, payload, limits, extracted, skip_reasons, name) {
+        let start = token.byte_range.start;
+        let end = segment_end(&tokens, index);
+        if dashed {
+            if !push_windows_inner(
+                extracted,
+                skip_reasons,
+                limits,
+                &command[start..end],
+                start..end,
+                Some(start..end),
+                "git",
+            ) {
+                return;
+            }
+            continue;
+        }
+        if dashed_git && find {
+            // `find . -exec git-clean -fdx \;`: the `-exec` command starts a
+            // command of its own, through its `;` or `+`.
+            let words = tokens[index + 1..]
+                .iter()
+                .take_while(|token| token.kind == NormalizeTokenKind::Word);
+            let mut after_exec = false;
+            let mut exec_start = None;
+            for word_token in words {
+                let Some(word) = word_token.text(command) else {
+                    break;
+                };
+                let decoded = crate::normalize::decode_posix_syntax_token(word);
+                if let Some(from) = exec_start {
+                    if matches!(decoded.as_ref(), ";" | "+") {
+                        exec_start = None;
+                        if !push_windows_inner(
+                            extracted,
+                            skip_reasons,
+                            limits,
+                            &command[from..word_token.byte_range.start],
+                            from..word_token.byte_range.start,
+                            Some(from..word_token.byte_range.start),
+                            "git",
+                        ) {
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                if std::mem::take(&mut after_exec) {
+                    let executable = dequoted_executable_word(word);
+                    if executable
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| name.starts_with("git-"))
+                    {
+                        exec_start = Some(word_token.byte_range.start);
+                    }
+                    continue;
+                }
+                after_exec = matches!(decoded.as_ref(), "-exec" | "-execdir" | "-ok" | "-okdir");
+            }
+            if let Some(from) = exec_start
+                && !push_windows_inner(
+                    extracted,
+                    skip_reasons,
+                    limits,
+                    &command[from..end],
+                    from..end,
+                    Some(from..end),
+                    "git",
+                )
+            {
                 return;
             }
         }
+        if find_action
+            && find
+            && let Some(dequoted) = find_with_dequoted_actions(command, &tokens, index)
+            && !push_windows_inner(
+                extracted,
+                skip_reasons,
+                limits,
+                &dequoted,
+                start..end,
+                None,
+                "find",
+            )
+        {
+            return;
+        }
     }
+}
+
+/// `segment` (one simple command) with its brace lists expanded as bash
+/// expands them, when that changes the program or its options (bd-2bm3):
+/// the command word is a list (`{rm,-rf,~}` runs `rm -rf ~`,
+/// `sudo {git,reset,--hard}`), or a list's alternatives are options
+/// (`rm {-rf,~}`). Lists that only name files (`mkdir -p src/{a,b}`,
+/// `cp f{,.bak}`) change neither and give `None`, as does anything
+/// [`crate::packs::core::filesystem::literal_brace_expansions`] declines
+/// (quotes, escapes, `$`, backquotes, ranges).
+pub(crate) fn brace_expanded_command(segment: &str) -> Option<String> {
+    use crate::normalize::NormalizeTokenKind;
+    let tokens = crate::normalize::tokenize_for_normalization(segment);
+    let positions = command_word_positions(segment, &tokens);
+    let primary = primary_command_positions(segment, &tokens, &positions);
+    let at = (0..tokens.len()).find(|&index| primary[index])?;
+    if !tokens[at..]
+        .iter()
+        .take_while(|token| token.kind == NormalizeTokenKind::Word)
+        .any(|token| token.text(segment).is_some_and(|word| word.contains('{')))
+    {
+        return None;
+    }
+    let mut out = segment[..tokens[at].byte_range.start].to_string();
+    let mut changed = false;
+    for (offset, token) in tokens[at..]
+        .iter()
+        .take_while(|token| token.kind == NormalizeTokenKind::Word)
+        .enumerate()
+    {
+        let text = token.text(segment)?;
+        if offset > 0 {
+            out.push(' ');
+        }
+        match crate::packs::core::filesystem::literal_brace_expansions(text) {
+            Some(words)
+                if primary[at + offset] || words.iter().any(|word| word.starts_with('-')) =>
+            {
+                out.push_str(&words.join(" "));
+                changed = true;
+            }
+            _ => out.push_str(text),
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Whether a brace list starts a word (`{rm,-rf,~}`, `rm {-rf,~}`): the cheap
+/// superset of what [`brace_expanded_command`] reads. Each list is scanned a
+/// bounded distance, so a run of `{` stays linear.
+pub(crate) fn may_brace_expand_a_command(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    memchr::memchr_iter(b'{', bytes).any(|at| {
+        let starts_word = at == 0
+            || matches!(
+                bytes[at - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'('
+            );
+        if !starts_word {
+            return false;
+        }
+        let rest = &bytes[at + 1..bytes.len().min(at + 1 + 256)];
+        rest.iter()
+            .position(|byte| matches!(byte, b'}' | b' ' | b'\t' | b'\n'))
+            .is_some_and(|close| rest[close] == b'}' && rest[..close].contains(&b','))
+    })
+}
+
+/// find primaries that take no value, so the word after one is a primary of
+/// its own rather than that primary's argument.
+const FIND_VALUELESS_PRIMARIES: &[&str] = &[
+    "-delete",
+    "-print",
+    "-print0",
+    "-ls",
+    "-prune",
+    "-quit",
+    "-depth",
+    "-d",
+    "-xdev",
+    "-mount",
+    "-empty",
+    "-true",
+    "-false",
+    "-readable",
+    "-writable",
+    "-executable",
+    "-nouser",
+    "-nogroup",
+    "-follow",
+    "-noleaf",
+    "-ignore_readdir_race",
+    "-noignore_readdir_race",
+    "-daystart",
+    "-not",
+    "-a",
+    "-o",
+    "-and",
+    "-or",
+    "-H",
+    "-L",
+    "-P",
+    "-E",
+    "-X",
+    "-x",
+    "-s",
+];
+
+/// The `find` segment starting at token `index`, its option and action words
+/// spelled through quoting (`'-delete'`, `-de''lete`) replaced by what find
+/// receives, or `None` when there is none. A word that is the value of the
+/// primary before it (`-name '-delete'`) or an argument of an `-exec`-family
+/// command stays as written.
+fn find_with_dequoted_actions(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> Option<String> {
+    // The program as find is run, quoting removed (`f'ind'` is `find`).
+    let program = tokens[index].text(command)?;
+    let dequoted_program = dequoted_executable_word(program);
+    let mut out = dequoted_program.to_string();
+    let mut cursor = tokens[index].byte_range.end;
+    let mut in_exec = false;
+    let mut pending_value = false;
+    let mut changed = dequoted_program.as_ref() != program;
+    for token in tokens[index + 1..]
+        .iter()
+        .take_while(|token| token.kind == crate::normalize::NormalizeTokenKind::Word)
+    {
+        let text = token.text(command)?;
+        let decoded = crate::normalize::decode_posix_syntax_token(text);
+        let decoded = decoded.as_ref();
+        if in_exec {
+            // An `-exec` command's own words, through its `;` or `+`.
+            in_exec = !matches!(decoded, ";" | "+");
+            continue;
+        }
+        if std::mem::take(&mut pending_value) {
+            // The value of the primary before it: `-name '-delete'`,
+            // `-perm -u+x`.
+            continue;
+        }
+        let option = decoded.len() > 1
+            && decoded.starts_with('-')
+            && decoded[1..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if option && decoded != text {
+            out.push_str(&command[cursor..token.byte_range.start]);
+            out.push_str(decoded);
+            cursor = token.byte_range.end;
+            changed = true;
+        }
+        in_exec = matches!(decoded, "-exec" | "-execdir" | "-ok" | "-okdir");
+        pending_value = !in_exec
+            && decoded.len() > 1
+            && decoded.starts_with('-')
+            && !FIND_VALUELESS_PRIMARIES.contains(&decoded);
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&command[cursor..segment_end(tokens, index)]);
+    Some(out)
+}
+
+/// Whether some word-initial `git-` stands behind another word: the tier-1
+/// superset of the dashed built-ins [`extract_respelled_commands`] re-reads.
+fn may_wrap_dashed_git(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    command.match_indices("git-").any(|(at, _)| {
+        at > 0
+            && matches!(bytes[at - 1], b' ' | b'\t' | b'/' | b'\'' | b'"' | b'\\')
+            && bytes[..at]
+                .iter()
+                .rev()
+                .take_while(|byte| !matches!(byte, b'\n' | b';' | b'|' | b'&' | b'('))
+                .any(|byte| !byte.is_ascii_whitespace())
+    })
+}
+
+/// Whether `command` names `find` and holds an option-shaped word spelled
+/// through quoting (`'-delete'`, `"-exec"`, `-de''lete`, `-de\lete`): the
+/// tier-1 superset of what [`find_with_dequoted_actions`] re-spells. Linear.
+fn may_quote_a_find_action(command: &str) -> bool {
+    if !may_name_a_command(command, &["find"]) {
+        return false;
+    }
+    let bytes = command.as_bytes();
+    let quoting = |byte: u8| matches!(byte, b'\'' | b'"' | b'\\');
+    memchr::memchr_iter(b'-', bytes).any(|at| {
+        if (at > 0 && quoting(bytes[at - 1]))
+            || bytes.get(at + 1).is_some_and(|byte| quoting(*byte))
+        {
+            return true;
+        }
+        let letters = bytes[at + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+            .count();
+        letters > 0
+            && bytes
+                .get(at + 1 + letters)
+                .is_some_and(|byte| quoting(*byte))
+    })
+}
+
+/// Whether `command` may name one of `names` as a program: a plain substring
+/// test, or the same test with shell quoting removed when the command has any
+/// (`\watch`, `w\atch`, `"watch"`, `w'at'ch` all run `watch`). Linear.
+fn may_name_a_command(command: &str, names: &[&str]) -> bool {
+    if names.iter().any(|name| command.contains(name)) {
+        return true;
+    }
+    if !command
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'\'' | b'"'))
+    {
+        return false;
+    }
+    let names_one = |text: &str| {
+        let unquoted: String = text
+            .chars()
+            .filter(|ch| !matches!(ch, '\\' | '\'' | '"' | '$'))
+            .collect();
+        names.iter().any(|name| unquoted.contains(name))
+    };
+    names_one(command) || decode_ansi_c_strings(command).is_some_and(|decoded| names_one(&decoded))
+}
+
+/// The command's word tokens, then those of each process substitution body
+/// (`<(…)`, `>(…)`, nested ones too): each body is a command line of its own
+/// whose first word is a command, while the outer tokenizer keeps the whole
+/// substitution as one word (`cat <(watch '…')`, `cat --x=<(watch '…')`).
+/// Token ranges index `command`. `false` when more than `limit` bodies were
+/// found, the rest unread.
+fn command_token_views(
+    command: &str,
+    limit: usize,
+) -> (Vec<crate::normalize::NormalizeTokens>, bool) {
+    let mut views = vec![crate::normalize::tokenize_for_normalization(command)];
+    let mut next = 0usize;
+    while next < views.len() {
+        let mut bodies = Vec::new();
+        for token in &views[next] {
+            if token.kind != crate::normalize::NormalizeTokenKind::Word {
+                continue;
+            }
+            let Some(text) = token.text(command) else {
+                continue;
+            };
+            let offset = token.byte_range.start;
+            bodies.extend(
+                process_substitution_bodies(text)
+                    .into_iter()
+                    .map(|body| body.start + offset..body.end + offset),
+            );
+        }
+        for body in bodies {
+            if views.len() > limit {
+                return (views, false);
+            }
+            let Some(text) = command.get(body.clone()) else {
+                continue;
+            };
+            let mut tokens = crate::normalize::tokenize_for_normalization(text);
+            for token in &mut tokens {
+                token.byte_range =
+                    token.byte_range.start + body.start..token.byte_range.end + body.start;
+            }
+            views.push(tokens);
+        }
+        next += 1;
+    }
+    (views, true)
+}
+
+/// Byte ranges, within `word`, of the bodies of the process substitutions the
+/// word holds: bash expands an unquoted `<(…)`/`>(…)` wherever it stands in a
+/// word, so `--file=<(…)` and `a<(…)` run their bodies like `<(…)` does.
+/// Quoted text is literal, and a `$(…)` body is the command-substitution
+/// reader's, so both are skipped whole. Nested substitutions are the bodies'
+/// own. Linear.
+fn process_substitution_bodies(word: &str) -> Vec<Range<usize>> {
+    let bytes = word.as_bytes();
+    let len = bytes.len();
+    let mut bodies = Vec::new();
+    let mut index = 0usize;
+    while index < len {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(len),
+            // `$'…'` takes backslash escapes, so `\'` does not close it.
+            b'$' if bytes.get(index + 1) == Some(&b'\'') => {
+                index += 2;
+                while index < len && bytes[index] != b'\'' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index = (index + 1).min(len);
+            }
+            b'\'' => {
+                index += 1;
+                while index < len && bytes[index] != b'\'' {
+                    index += 1;
+                }
+                index = (index + 1).min(len);
+            }
+            b'"' => {
+                index += 1;
+                while index < len {
+                    match bytes[index] {
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        b'\\' => index = (index + 2).min(len),
+                        b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                            index = crate::normalize::consume_shell_paren_construct(
+                                bytes,
+                                index + 2,
+                                len,
+                            );
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                index = crate::normalize::consume_shell_paren_construct(bytes, index + 2, len);
+            }
+            b'<' | b'>' if bytes.get(index + 1) == Some(&b'(') => {
+                let end = crate::normalize::consume_shell_paren_construct(bytes, index + 2, len);
+                if end > index + 3 && bytes[end - 1] == b')' {
+                    bodies.push(index + 2..end - 1);
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    bodies
 }
 
 /// Runner occurrences one command is read for before the reading is partial.
@@ -3733,8 +5357,8 @@ fn command_string_runner_name(
     if token.kind != crate::normalize::NormalizeTokenKind::Word {
         return None;
     }
-    let word = token.text(command)?;
-    let basename = word.rsplit('/').next().unwrap_or(word);
+    let word = dequoted_executable_word(token.text(command)?);
+    let basename = word.rsplit('/').next().unwrap_or(&word);
     COMMAND_STRING_RUNNERS
         .iter()
         .find(|runner| **runner == basename)
@@ -3743,22 +5367,31 @@ fn command_string_runner_name(
 
 /// For each token, whether a runner there would run: it is the command word
 /// of its segment (after assignments, redirects and the reserved words `{`,
-/// `!`, `if`, `then`, `do`, …), or any later word behind a command that runs
-/// its arguments (`sudo -u bob watch …`, `timeout 5s watch …`,
-/// `taskset -c 0 watch …`), whose options and their values this does not
-/// model. A runner among another command's arguments (`echo watch 'x'`) is
-/// data. One pass, so the check is linear in the command.
+/// `!`, `if`, `then`, `do`, …, and the name `function NAME` / `coproc NAME`
+/// give a body), or any later word behind a command that runs its arguments
+/// (`sudo -u bob watch …`, `timeout 5s watch …`, `taskset -c 0 watch …`),
+/// whose options and their values this does not model. A runner among another
+/// command's arguments (`echo watch 'x'`) is data. One pass, so the check is
+/// linear in the command.
 fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeToken]) -> Vec<bool> {
     use crate::normalize::NormalizeTokenKind;
     let mut positions = vec![false; tokens.len()];
     let mut expect_command = true;
     let mut wrapped = false;
     let mut redirect_target = false;
+    let mut body_name = false;
     for (index, token) in tokens.iter().enumerate() {
         if token.kind != NormalizeTokenKind::Word {
+            if splits_fd_duplication(command, tokens, index) {
+                // `2>&1`: the `&` and the descriptor after it are the
+                // redirect's, not a background separator and a command.
+                redirect_target = true;
+                continue;
+            }
             expect_command = true;
             wrapped = false;
             redirect_target = false;
+            body_name = false;
             continue;
         }
         let Some(text) = token.text(command) else {
@@ -3769,10 +5402,13 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
             continue;
         }
         if word_token_starts_local_redirect(text) {
-            // `2> /dev/null`: a bare operator takes the next word as target.
-            redirect_target = text
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'>' | b'<' | b'&' | b'|'));
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
+        }
+        if body_name {
+            // `function f { …; }`, `coproc NAME { …; }`: the name, then a
+            // body whose first word is a command.
+            body_name = false;
             continue;
         }
         positions[index] = expect_command || wrapped;
@@ -3784,10 +5420,28 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
             "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "coproc"
         ) || crate::normalize::is_env_assignment(text)
         {
+            // bash takes `coproc WORD` as a name only when a compound command
+            // follows it (`coproc NAME { …; }`); otherwise WORD is the command.
+            body_name = text == "coproc"
+                && tokens
+                    .get(index + 2)
+                    .filter(|body| body.kind == NormalizeTokenKind::Word)
+                    .and_then(|body| body.text(command))
+                    .is_some_and(|body| {
+                        matches!(
+                            body,
+                            "{" | "while" | "until" | "if" | "for" | "case" | "select"
+                        )
+                    });
+            continue;
+        }
+        if text == "function" {
+            body_name = true;
             continue;
         }
         expect_command = false;
-        let basename = text.rsplit('/').next().unwrap_or(text);
+        let executable = dequoted_executable_word(text);
+        let basename = executable.rsplit('/').next().unwrap_or(&executable);
         let next = tokens
             .get(index + 1)
             .filter(|next| next.kind == NormalizeTokenKind::Word)
@@ -3808,11 +5462,59 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
                 | "setsid"
                 | "stdbuf"
                 | "ionice"
+                | "chrt"
+                | "busybox"
                 | "chronic"
                 | "env"
         ) || crate::packs::core::git::unmodeled_exec_wrapper(basename, next);
     }
     positions
+}
+
+/// Whether a bare redirect operator word takes the following word as its
+/// target: `2>` and `>&` do, while `2>&1`, `>&-` and `<&0` carry their target
+/// already, so the word after them is the command (`2>&1 watch '…'`).
+fn redirect_operator_takes_next_word(text: &str) -> bool {
+    let named = redirect_descriptor_prefix_len(text);
+    let operator = if named > 0 {
+        &text[named..]
+    } else {
+        text.trim_start_matches(|ch: char| ch.is_ascii_digit())
+    };
+    !operator.is_empty()
+        && operator
+            .bytes()
+            .all(|byte| matches!(byte, b'>' | b'<' | b'&' | b'|'))
+}
+
+/// Whether the separator token at `index` is the `&` of a descriptor
+/// duplication (`2>&1`, `>&2`, `<&0`, `>& file`) or the `|` of a clobbering
+/// redirect (`>|file`). The tokenizer ends a word at `&` and `|`, so `2>&1`
+/// arrives as the word `2>`, a `&` separator and the word `1`; read as a
+/// background `&`, the `1` became the command and the word after it
+/// (`2>&1 watch '…'`) an argument. `>|f` read as a pipe into `f` ended the
+/// runner's words the same way (`watch >|f '…'`).
+fn splits_fd_duplication(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> bool {
+    let Some(separator) = tokens.get(index) else {
+        return false;
+    };
+    let Some(before) = index.checked_sub(1).and_then(|at| tokens.get(at)) else {
+        return false;
+    };
+    before.kind == crate::normalize::NormalizeTokenKind::Word
+        && before.byte_range.end == separator.byte_range.start
+        && before.text(command).is_some_and(|text| {
+            word_token_starts_local_redirect(text)
+                && match separator.text(command) {
+                    Some("&") => text.ends_with(['>', '<']),
+                    Some("|") => text.ends_with('>') && !text.ends_with("&>"),
+                    _ => false,
+                }
+        })
 }
 
 /// The command-string payloads of the runner whose name token is at `start`.
@@ -3825,18 +5527,29 @@ fn command_string_runner_payloads(
 ) -> Vec<SshRemotePayload> {
     use crate::normalize::NormalizeTokenKind;
     let full_start = tokens[start].byte_range.start;
-    // The word tokens of this segment after the runner, up to a separator or
-    // a local redirect.
+    // The word tokens of this segment after the runner, up to a separator.
+    // A local redirect (and a bare operator's target) is the local shell's,
+    // wherever it stands: `watch 2>/dev/null '<cmd>'` runs `<cmd>`. The
+    // payload spans below still start and end at argv words.
     let mut words: Vec<(&str, Range<usize>)> = Vec::new();
-    for token in &tokens[start + 1..] {
+    let mut redirect_target = false;
+    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
         if token.kind != NormalizeTokenKind::Word {
+            if splits_fd_duplication(command, tokens, index) {
+                redirect_target = true;
+                continue;
+            }
             break;
         }
         let Some(text) = token.text(command) else {
             break;
         };
+        if std::mem::take(&mut redirect_target) {
+            continue;
+        }
         if word_token_starts_local_redirect(text) {
-            break;
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
         }
         words.push((text, token.byte_range.clone()));
     }
@@ -3876,6 +5589,53 @@ fn command_string_runner_payloads(
     };
     let mut payloads = Vec::new();
     match name {
+        DYNAMIC_RUNNER => {
+            // A program the shell names at run time may be any runner, so
+            // every quoted operand may be its command string, and so may the
+            // operands joined (`w${x}atch 'git reset' --hard`). Words shown
+            // unquoted are judged where they stand already. An operand that
+            // is itself run-time text with no blank (`"$ARG"`, `"$DIR/f"`)
+            // cannot be judged either way and is left to the program: a
+            // dynamic program with dynamic arguments (`"$X" "$Y"`) stays
+            // allowed (#273).
+            let quoted = |word: &str| word.contains(['\'', '"', '$', '\\']);
+            let spaced = |word: &str| {
+                crate::normalize::decode_posix_syntax_token(word).contains(char::is_whitespace)
+            };
+            let judgeable = |word: &str| {
+                let decoded = crate::normalize::decode_posix_syntax_token(word);
+                decoded.contains(char::is_whitespace) || !decoded.contains(['$', '`'])
+            };
+            let first_operand = words.iter().position(|(word, _)| !option(word));
+            for (at, (word, range)) in words.iter().enumerate() {
+                if !quoted(word) {
+                    continue;
+                }
+                if !option(word) {
+                    if judgeable(word) {
+                        payloads.extend(span(at, at + 1));
+                    }
+                } else if let Some(value) = word.find(['=', '\'', '"']).filter(|at| *at > 1) {
+                    // `-c'<cmd>'`, `--command=<cmd>`
+                    let value_start = value + usize::from(word.as_bytes()[value] == b'=');
+                    if value_start < word.len() && judgeable(&word[value_start..]) {
+                        payloads.push(attached(
+                            &word[value_start..],
+                            range.start + value_start,
+                            range.end,
+                        ));
+                    }
+                }
+            }
+            if let Some(first) = first_operand
+                && words.len() - first > 1
+                && words[first..]
+                    .iter()
+                    .any(|(word, _)| quoted(word) && spaced(word))
+            {
+                payloads.extend(span(first, words.len()));
+            }
+        }
         "watch" => {
             // procps `watch` stops at its first operand (`+` getopt), so only
             // the options before it decide `-x`; `-n`/`-q` take a value,
@@ -4124,6 +5884,431 @@ fn command_string_runner_payloads(
     payloads
 }
 
+/// The runner label of a command word the shell assembles at run time
+/// (`w${x}atch`, `$RUNNER`), which may name any of the runners.
+const DYNAMIC_RUNNER: &str = "<dynamic command word>";
+
+/// Wrappers after which the next word is still the command a segment runs,
+/// for [`primary_command_positions`].
+const PRIMARY_COMMAND_WRAPPERS: &[&str] = &[
+    "sudo", "doas", "nohup", "exec", "command", "builtin", "nice", "time", "env", "xargs",
+    "setsid", "chronic", "timeout", "gtimeout",
+];
+
+/// For each token, whether it is the command word a segment actually runs:
+/// its first command position after assignments and reserved words, or the
+/// first word after one of the [`PRIMARY_COMMAND_WRAPPERS`] and its option
+/// flags (`sudo $RUNNER '…'`, `nice -n5 $RUNNER '…'` is not modeled, but
+/// `timeout 5 $RUNNER '…'` is). The run-time command handling reads only
+/// these, not every word behind a wrapper that [`command_word_positions`]
+/// admits, so a variable among `sudo -u "$USER"`'s options does not turn a
+/// later quoted argument into a command. Linear.
+fn primary_command_positions(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    positions: &[bool],
+) -> Vec<bool> {
+    let mut primary = vec![false; tokens.len()];
+    let mut seen = false;
+    // Inside a wrapper's prefix: its flags, an option's value, and
+    // `timeout`'s duration.
+    let mut after_wrapper: Option<&str> = None;
+    let mut value_next = false;
+    let mut duration_next = false;
+    for (index, token) in tokens.iter().enumerate() {
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            if !splits_fd_duplication(command, tokens, index) {
+                seen = false;
+                after_wrapper = None;
+                value_next = false;
+                duration_next = false;
+            }
+            continue;
+        }
+        let Some(word) = token.text(command) else {
+            continue;
+        };
+        if !positions[index] {
+            after_wrapper = None;
+            continue;
+        }
+        if !seen
+            && (crate::normalize::is_env_assignment(word)
+                || matches!(
+                    word,
+                    "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until"
+                ))
+        {
+            continue;
+        }
+        if std::mem::take(&mut value_next) {
+            continue;
+        }
+        if let Some(wrapper) = after_wrapper
+            && word.len() > 1
+            && word.starts_with('-')
+        {
+            // `sudo -u "$USER" git …`: `-u` takes the next word.
+            value_next = wrapper_option_takes_value(wrapper, word);
+            continue;
+        }
+        if std::mem::take(&mut duration_next)
+            && word.bytes().all(|byte| {
+                byte.is_ascii_digit() || matches!(byte, b'.' | b's' | b'm' | b'h' | b'd')
+            })
+        {
+            continue;
+        }
+        primary[index] = !seen || after_wrapper.is_some();
+        seen = true;
+        let executable = dequoted_executable_word(word);
+        let basename = executable.rsplit('/').next().unwrap_or(&executable);
+        after_wrapper = PRIMARY_COMMAND_WRAPPERS
+            .iter()
+            .find(|wrapper| **wrapper == basename)
+            .copied();
+        duration_next = matches!(after_wrapper, Some("timeout" | "gtimeout"));
+    }
+    primary
+}
+
+/// Whether a [`PRIMARY_COMMAND_WRAPPERS`] option takes the next word as its
+/// value. Unknown options are taken to stand alone, so a value they carry
+/// may be read as the command: a missed run-time command word, never a
+/// quoted argument read as one.
+fn wrapper_option_takes_value(wrapper: &str, option: &str) -> bool {
+    let options: &[&str] = match wrapper {
+        "sudo" | "doas" => &[
+            "-u",
+            "-g",
+            "-h",
+            "-p",
+            "-C",
+            "-D",
+            "-r",
+            "-t",
+            "-U",
+            "-T",
+            "--user",
+            "--group",
+            "--host",
+            "--prompt",
+            "--chdir",
+            "--role",
+            "--type",
+            "--other-user",
+            "--command-timeout",
+            "--close-from",
+        ],
+        "env" => &["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
+        "nice" => &["-n", "--adjustment"],
+        "timeout" | "gtimeout" => &["-s", "-k", "--signal", "--kill-after"],
+        "xargs" => &[
+            "-a",
+            "-d",
+            "-E",
+            "-I",
+            "-J",
+            "-L",
+            "-n",
+            "-P",
+            "-R",
+            "-s",
+            "-S",
+            "--arg-file",
+            "--delimiter",
+            "--max-args",
+            "--max-procs",
+            "--max-chars",
+            "--max-lines",
+            "--process-slot-var",
+        ],
+        _ => &[],
+    };
+    options.contains(&option)
+}
+
+/// Whether the word after token `index` is an assignment operator (`$x = …`,
+/// `$x += …`): PowerShell's assignment, which dcg also reads under the
+/// POSIX rules when the dialect is not proven. POSIX would run `$x` with an
+/// argument `=`, which no one writes on purpose.
+fn assigns_like_powershell(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> bool {
+    tokens
+        .get(index + 1)
+        .filter(|token| token.kind == crate::normalize::NormalizeTokenKind::Word)
+        .and_then(|token| token.text(command))
+        .is_some_and(|word| {
+            word.starts_with('=')
+                || ["+=", "-=", "*=", "/=", "%=", "??="]
+                    .iter()
+                    .any(|operator| word.starts_with(operator))
+        })
+}
+
+/// Index just past the last word token of the segment holding `index`.
+fn segment_end(tokens: &[crate::normalize::NormalizeToken], index: usize) -> usize {
+    tokens[index..]
+        .iter()
+        .take_while(|token| token.kind == crate::normalize::NormalizeTokenKind::Word)
+        .last()
+        .map_or(tokens[index].byte_range.end, |token| token.byte_range.end)
+}
+
+/// Whether some command word of `command` is assembled at run time in a way
+/// the runner and substitution readers act on: a whole `$(…)`/backquote
+/// substitution, or an expansion that may complete a runner's name, with a
+/// quoted operand. The tier-1 superset of what
+/// [`extract_command_string_runner_scripts`] reads for such words.
+fn may_run_through_dynamic_command_word(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let substitution = command.contains("$(") || bytes.contains(&b'`');
+    let quoted = bytes.iter().any(|byte| matches!(byte, b'\'' | b'"'));
+    if !(substitution || (quoted && bytes.contains(&b'$'))) {
+        return false;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    let positions = command_word_positions(command, &tokens);
+    let primary = primary_command_positions(command, &tokens, &positions);
+    tokens.iter().enumerate().any(|(index, token)| {
+        primary[index]
+            && token.text(command).is_some_and(|word| {
+                whole_substitution_body(word).is_some()
+                    || (quoted && dynamic_word_may_name_runner(word))
+            })
+    })
+}
+
+/// The body of a word that is exactly one command substitution:
+/// `$(…)`, `` `…` ``, or either inside double quotes.
+fn whole_substitution_body(word: &str) -> Option<&str> {
+    let word = word
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(word);
+    let bytes = word.as_bytes();
+    if let Some(inner) = word.strip_prefix("$(") {
+        let end = crate::normalize::consume_shell_paren_construct(bytes, 2, bytes.len());
+        return (end == bytes.len() && word.ends_with(')')).then(|| &inner[..inner.len() - 1]);
+    }
+    let inner = word.strip_prefix('`')?.strip_suffix('`')?;
+    (!inner.is_empty() && !inner.contains('`')).then_some(inner)
+}
+
+/// The command line a command word that is one whole substitution runs,
+/// read as if the substitution echoed its arguments: each segment's words
+/// after its first, then the outer segment's remaining words, all with their
+/// quoting removed. `$(echo git reset --hard)` and
+/// `$(printf 'git reset') --hard` run `git reset --hard`; `$(which cargo)
+/// build` runs `cargo build`. `None` when the word is not a substitution or
+/// nothing would be printed.
+fn substitution_command_line(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+    word: &str,
+) -> Option<String> {
+    let body = whole_substitution_body(word)?;
+    let mut words = echoed_words(body);
+    if words.is_empty() {
+        return None;
+    }
+    // The outer words keep their quoting: the line is parsed again as shell.
+    for token in tokens[index + 1..]
+        .iter()
+        .take_while(|token| token.kind == crate::normalize::NormalizeTokenKind::Word)
+    {
+        if let Some(text) = token.text(command) {
+            words.push(text.to_string());
+        }
+    }
+    Some(words.join(" "))
+}
+
+/// What a command line prints, read as if each of its commands echoed its
+/// arguments: every segment's words after its program, quoting removed,
+/// without `echo`'s leading options or a `printf` format holding a directive.
+/// The model behind [`substitution_command_line`] and the evaluator's
+/// `BASH_ENV=<(…)` view: `echo git reset --hard` and
+/// `printf '%s' 'git reset --hard'` print `git reset --hard`.
+pub(crate) fn echoed_words(body: &str) -> Vec<String> {
+    let body_tokens = crate::normalize::tokenize_for_normalization(body);
+    let mut words: Vec<String> = Vec::new();
+    // The current body segment's program, and whether its leading options
+    // (`echo -n`) or `printf`'s format are still to come.
+    let mut program: Option<String> = None;
+    let mut leading = true;
+    for token in &body_tokens {
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            program = None;
+            continue;
+        }
+        let Some(text) = token.text(body) else {
+            continue;
+        };
+        let decoded = crate::normalize::decode_posix_syntax_token(text).into_owned();
+        let Some(name) = program.as_deref() else {
+            program = Some(decoded.rsplit('/').next().unwrap_or(&decoded).to_string());
+            leading = true;
+            continue;
+        };
+        if leading {
+            if name == "echo" && matches!(decoded.as_str(), "-n" | "-e" | "-E" | "-ne" | "-en") {
+                continue;
+            }
+            leading = false;
+            // printf's format prints itself only when it has no directive.
+            if name == "printf" && decoded.contains('%') {
+                continue;
+            }
+        }
+        words.push(decoded);
+    }
+    words
+}
+
+/// Whether a command word holding a run-time expansion may name one of the
+/// runners (or `ssh`) once expanded: its last path component, read with each
+/// expansion as a wildcard, matches the name (`w${x}atch`, `${W}atch`, `$W`,
+/// `"$RUNNER"`). A word whose last component is literal (`$HOME/bin/tool`)
+/// names that literal program, and one whose literal parts fit no runner
+/// (`$X-build`) names none of them. `$'…'` counts as an expansion here: a
+/// wholly literal `$'…'` word is decoded by [`dequoted_executable_word`]
+/// instead. Linear in the word.
+fn dynamic_word_may_name_runner(word: &str) -> bool {
+    #[derive(PartialEq)]
+    enum Piece {
+        Literal(Vec<u8>),
+        Any,
+    }
+    let bytes = word.as_bytes();
+    let len = bytes.len();
+    let mut pieces: Vec<Piece> = Vec::new();
+    let literal = |pieces: &mut Vec<Piece>, byte: u8| match pieces.last_mut() {
+        Some(Piece::Literal(text)) => text.push(byte),
+        _ => pieces.push(Piece::Literal(vec![byte])),
+    };
+    let any = |pieces: &mut Vec<Piece>| {
+        if pieces.last() != Some(&Piece::Any) {
+            pieces.push(Piece::Any);
+        }
+    };
+    let mut double = false;
+    // A `$'…'` string is quoting, not an expansion: a word with no other
+    // `$`/backquote names a literal program, which the ordinary readers see.
+    let mut run_time = false;
+    let mut index = 0usize;
+    while index < len {
+        let byte = bytes[index];
+        if byte == b'`' || (byte == b'$' && bytes.get(index + 1) != Some(&b'\'')) {
+            run_time = true;
+        }
+        match byte {
+            b'/' => {
+                pieces.clear();
+                index += 1;
+            }
+            b'"' => {
+                double = !double;
+                index += 1;
+            }
+            b'\'' if !double => {
+                let end = memchr(b'\'', &bytes[index + 1..]).map_or(len, |at| index + 1 + at);
+                for &inner in &bytes[index + 1..end] {
+                    if inner == b'/' {
+                        pieces.clear();
+                    } else {
+                        literal(&mut pieces, inner);
+                    }
+                }
+                index = end + 1;
+            }
+            b'\\' => {
+                if let Some(&next) = bytes.get(index + 1) {
+                    literal(&mut pieces, next);
+                }
+                index += 2;
+            }
+            b'`' => {
+                any(&mut pieces);
+                let mut at = index + 1;
+                while at < len && bytes[at] != b'`' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                index = at + 1;
+            }
+            b'$' => match bytes.get(index + 1) {
+                Some(b'(') => {
+                    any(&mut pieces);
+                    index = crate::normalize::consume_shell_paren_construct(bytes, index + 2, len);
+                }
+                Some(b'{') => {
+                    any(&mut pieces);
+                    index = memchr(b'}', &bytes[index + 2..]).map_or(len, |at| index + 3 + at);
+                }
+                Some(b'\'') if !double => {
+                    any(&mut pieces);
+                    let mut at = index + 2;
+                    while at < len && bytes[at] != b'\'' {
+                        at += if bytes[at] == b'\\' { 2 } else { 1 };
+                    }
+                    index = at + 1;
+                }
+                Some(next) if next.is_ascii_alphabetic() || *next == b'_' => {
+                    any(&mut pieces);
+                    index += 1;
+                    while index < len
+                        && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                    {
+                        index += 1;
+                    }
+                }
+                Some(next) if next.is_ascii_digit() || b"@*#?!$-".contains(next) => {
+                    any(&mut pieces);
+                    index += 2;
+                }
+                _ => {
+                    literal(&mut pieces, byte);
+                    index += 1;
+                }
+            },
+            _ => {
+                literal(&mut pieces, byte);
+                index += 1;
+            }
+        }
+    }
+    if !run_time || !pieces.contains(&Piece::Any) {
+        return false;
+    }
+    // Wildcard match of the pieces against a name; the literal pieces are few
+    // and short once they must fit a runner name, so backtracking is bounded.
+    fn fits(pieces: &[Piece], name: &[u8]) -> bool {
+        match pieces.split_first() {
+            None => name.is_empty(),
+            Some((Piece::Literal(text), rest)) => {
+                name.starts_with(text) && fits(rest, &name[text.len()..])
+            }
+            Some((Piece::Any, rest)) => (0..=name.len()).any(|skip| fits(rest, &name[skip..])),
+        }
+    }
+    let literal_len: usize = pieces
+        .iter()
+        .map(|piece| match piece {
+            Piece::Literal(text) => text.len(),
+            Piece::Any => 0,
+        })
+        .sum();
+    COMMAND_STRING_RUNNERS
+        .iter()
+        .copied()
+        .chain(["ssh"])
+        .any(|name| literal_len <= name.len() && fits(&pieces, name.as_bytes()))
+}
+
 /// Programs that run a command string (see
 /// [`extract_command_string_runner_scripts`]).
 const COMMAND_STRING_RUNNERS: &[&str] = &[
@@ -4210,22 +6395,52 @@ fn ssh_remote_payload(
     use crate::normalize::NormalizeTokenKind;
 
     let full_start = tokens.get(start)?.byte_range.start;
-    let mut index = start + 1;
-    let mut options_ended = false;
-
-    // Phase 1: options, then the destination.
-    loop {
-        let token = tokens.get(index)?;
+    // ssh's argv: the words up to the next shell separator (which belongs to
+    // the LOCAL shell), without local redirects and a bare operator's target,
+    // which the local shell also removes wherever they stand — a redirect
+    // applies to the `ssh` process, never to the remote command
+    // (`ssh h 2>/dev/null '<cmd>'` runs `<cmd>`). Dropping a trailing one is
+    // what keeps the payload a single token in `ssh h "a 2>/dev/null" 2>&1`,
+    // so the quote-stripping branch below still fires: when the run swallowed
+    // the local `2>`, the retained closing quote glued itself onto the remote
+    // target, producing `/dev/null"` and a `redirect-truncate-dynamic-path`
+    // deny for an unchanged, harmless inner redirect (issue #404).
+    let mut argv: Vec<&crate::normalize::NormalizeToken> = Vec::new();
+    let mut redirect_target = false;
+    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
         if token.kind != NormalizeTokenKind::Word {
-            // Separator before any destination: an interactive `ssh host` in
-            // an earlier segment shape, or plain `ssh` — no payload.
-            return None;
+            if splits_fd_duplication(command, tokens, index) {
+                redirect_target = true;
+                continue;
+            }
+            break;
         }
+        let text = token.text(command)?;
+        if std::mem::take(&mut redirect_target) {
+            continue;
+        }
+        if word_token_starts_local_redirect(text) {
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
+        }
+        argv.push(token);
+    }
+    let word_at = |index: usize| -> Option<&str> {
+        let token = argv.get(index)?;
         let (word, _, _) = dequoted_flag_word(
             token.text(command)?,
             token.byte_range.start,
             token.byte_range.end,
         );
+        Some(word)
+    };
+    let mut index = 0usize;
+    let mut options_ended = false;
+
+    // Phase 1: options, then the destination.
+    loop {
+        // No destination: plain `ssh` — no payload.
+        let word = word_at(index)?;
         if !options_ended && word == "--" {
             options_ended = true;
             index += 1;
@@ -4253,15 +6468,7 @@ fn ssh_remote_payload(
     // leaves the words to the payload, as before.
     if !options_ended {
         let mut again = index;
-        while let Some(token) = tokens.get(again) {
-            if token.kind != NormalizeTokenKind::Word {
-                break;
-            }
-            let (word, _, _) = dequoted_flag_word(
-                token.text(command)?,
-                token.byte_range.start,
-                token.byte_range.end,
-            );
+        while let Some(word) = word_at(again) {
             if word == "--" {
                 again += 1;
                 index = again;
@@ -4280,38 +6487,10 @@ fn ssh_remote_payload(
         }
     }
 
-    // Phase 2: the payload is the run of Word tokens after the destination,
-    // up to the next shell separator (which belongs to the LOCAL shell) or the
-    // first redirect operator (which also belongs to the LOCAL shell — a
-    // redirect always applies to the `ssh` process, never to the remote
-    // command). Stopping at the redirect is what keeps the payload a single
-    // token in `ssh h "a 2>/dev/null" 2>&1`, so the quote-stripping branch
-    // below still fires: without it the run swallowed the local `2>` and the
-    // retained closing quote glued itself onto the remote target, producing
-    // `/dev/null"` and a `redirect-truncate-dynamic-path` deny for an
-    // unchanged, harmless inner redirect (issue #404).
-    let payload_start = index;
-    let mut payload_end = index;
-    while let Some(token) = tokens.get(payload_end) {
-        if token.kind != NormalizeTokenKind::Word {
-            break;
-        }
-        if token
-            .text(command)
-            .is_some_and(word_token_starts_local_redirect)
-        {
-            break;
-        }
-        payload_end += 1;
-    }
-    if payload_end == payload_start {
-        // Interactive session: no remote command.
-        return None;
-    }
-
-    let first = tokens.get(payload_start)?;
-    let last = tokens.get(payload_end - 1)?;
-    if payload_end - payload_start == 1 {
+    // Phase 2: the payload is the rest of the argv.
+    let payload = argv.get(index..).unwrap_or_default();
+    let (first, last) = (payload.first()?, payload.last()?);
+    if payload.len() == 1 {
         // Single payload word: strip one layer of quotes so the recursive
         // evaluation sees the remote command line itself, exactly as the
         // remote shell will.
@@ -4586,7 +6765,8 @@ fn quoted_non_shell_heredoc_ranges(command: &str, limit: usize) -> Vec<Range<usi
     let ast = AstGrep::new(command, SupportLang::Bash);
     let mut heredocs = Vec::new();
     let mut parse_error = false;
-    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error);
+    // Only the bodies are wanted here, not where their command's output goes.
+    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error, true);
     if parse_error {
         return Vec::new();
     }
@@ -5181,30 +7361,51 @@ fn is_trusted_os_data_sink_path(lexical_target: &str, basename: &str) -> bool {
 
 #[allow(clippy::needless_pass_by_value)]
 fn find_visible_shell_name_override<D: ast_grep_core::Doc>(
-    node: ast_grep_core::Node<'_, D>,
+    root: ast_grep_core::Node<'_, D>,
     target: &str,
     overridden: &mut bool,
     parse_error: &mut bool,
 ) {
-    if *overridden || *parse_error {
-        return;
+    // An explicit stack, not recursion (see [`collect_active_heredocs`]):
+    // a list nests one level per `&&`, and this walks the whole command.
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if *overridden || *parse_error {
+            return;
+        }
+        if shell_name_override_node(&node, target, overridden, parse_error) {
+            // Children reversed onto the stack, so they pop in order.
+            let first_child = pending.len();
+            pending.extend(node.children());
+            pending[first_child..].reverse();
+        }
     }
+}
+
+/// [`find_visible_shell_name_override`] for one node: set the flags it
+/// proves, and answer whether to descend into its children.
+fn shell_name_override_node<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    target: &str,
+    overridden: &mut bool,
+    parse_error: &mut bool,
+) -> bool {
     match node.kind().as_ref() {
         "ERROR" => {
             *parse_error = true;
-            return;
+            return false;
         }
         "function_definition" => {
             let Some(name) = node.field("name") else {
                 // A function definition whose binding cannot be resolved is
                 // exactly the case where proving a later bare sink is unsafe.
                 *overridden = true;
-                return;
+                return false;
             };
             let name = name.text();
             if name.as_ref() == target || !is_static_shell_name(name.as_ref()) {
                 *overridden = true;
-                return;
+                return false;
             }
             // Keep descending into a differently named function body. A later
             // invocation can make an `eval`/`source` inside it mutate the
@@ -5215,7 +7416,7 @@ fn find_visible_shell_name_override<D: ast_grep_core::Doc>(
             let text = node.text();
             if shell_assignment_name(text.as_ref()) == Some("PATH") {
                 *overridden = true;
-                return;
+                return false;
             }
         }
         "command" => {
@@ -5224,28 +7425,26 @@ fn find_visible_shell_name_override<D: ast_grep_core::Doc>(
                 Ok(tokens) => {
                     if shell_command_may_override_name(&tokens, target) {
                         *overridden = true;
-                        return;
+                        return false;
                     }
                     // The complete simple command was resolved above. Its
                     // assignment children are temporary environment state
                     // unless the command itself is a modeled mutator; do not
                     // reclassify `PATH=/tmp printf ...` as persistent state.
-                    return;
+                    return false;
                 }
                 Err(_) => {
                     // AST-valid shell that the secondary word splitter cannot
                     // resolve must never establish a data-only proof.
                     *parse_error = true;
                     *overridden = true;
-                    return;
+                    return false;
                 }
             }
         }
         _ => {}
     }
-    for child in node.children() {
-        find_visible_shell_name_override(child, target, overridden, parse_error);
-    }
+    true
 }
 
 #[must_use]
@@ -5603,24 +7802,192 @@ pub(crate) fn range_is_inert_interpreter_stdin(command: &str, range: &Range<usiz
         return false;
     };
     heredocs.iter().any(|heredoc| {
-        let ActiveHeredocBody::Heredoc {
-            body_start,
-            body_end,
-            delimiter_quoted,
-        } = heredoc.body
-        else {
-            return false;
-        };
-        if !delimiter_quoted || range.start < body_start || range.end > body_end {
-            return false;
+        matches!(
+            heredoc.body,
+            ActiveHeredocBody::Heredoc { body_start, body_end, .. }
+                if range.start >= body_start && range.end <= body_end
+        ) && inert_interpreter_stdin_body(command, heredoc).is_some()
+    })
+}
+
+fn inert_interpreter_stdin_body(command: &str, heredoc: &ActiveHeredoc) -> Option<Range<usize>> {
+    let ActiveHeredocBody::Heredoc {
+        body_start,
+        body_end,
+        delimiter_quoted: true,
+    } = heredoc.body
+    else {
+        return None;
+    };
+    let target = extract_heredoc_target_command(command, heredoc.operator_start)?;
+    (is_non_shell_interpreter_stdin_command(&target)
+        && !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target))
+    .then_some(body_start..body_end)
+}
+
+/// A view for consumers asking only about OUTER shell syntax. A proven,
+/// quoted non-shell interpreter body cannot contribute a shell substitution
+/// or contradict the hook's shell label (#520, #523). Keep its byte offsets
+/// and newlines so findings outside the body still refer to the original.
+///
+/// This is deliberately separate from the pattern-matching view: interpreter
+/// source must still reach both the language-specific analysis and the raw
+/// destructive-pattern scan, including opaque or aliased execution sinks.
+#[must_use]
+pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
+    if !command.contains("<<") {
+        return Cow::Borrowed(command);
+    }
+    let Some(heredocs) = active_heredocs(command) else {
+        return Cow::Borrowed(command);
+    };
+    // Each proof inspects the owning command and visible executable lookup.
+    // Bound their count before those scans, just as extraction bounds bodies;
+    // exceeding the bound keeps all source visible to the conservative path.
+    if heredocs.len() > ExtractionLimits::default().max_heredocs {
+        return Cow::Borrowed(command);
+    }
+    let bodies: Vec<_> = heredocs
+        .iter()
+        .filter(|heredoc| {
+            let Some(owner) = plain_heredoc_command_at(command, heredoc.operator_start) else {
+                return false;
+            };
+            let Ok(words) = shell_words::split(&owner) else {
+                return false;
+            };
+            let Some((program, arguments)) = words.split_first() else {
+                return false;
+            };
+            let name = program.rsplit('/').next().unwrap_or(program);
+            matches!(
+                ScriptLanguage::from_command(name),
+                ScriptLanguage::Python
+                    | ScriptLanguage::JavaScript
+                    | ScriptLanguage::Ruby
+                    | ScriptLanguage::Perl
+                    | ScriptLanguage::Php
+            ) && (arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
+        })
+        .filter_map(|heredoc| inert_interpreter_stdin_body(command, heredoc))
+        .collect();
+    if bodies.is_empty() {
+        Cow::Borrowed(command)
+    } else {
+        Cow::Owned(blank_ranges(command, &bodies))
+    }
+}
+
+/// The plain command owning one heredoc, with no other redirection, pipeline
+/// or trailing argument hidden under the redirection node. Callers use this
+/// narrow shape to prove how stdin is consumed; an interpreter running `-c`
+/// or a script file can hand stdin to a shell and is not such a proof.
+pub(crate) fn plain_heredoc_command_at(command: &str, operator_start: usize) -> Option<String> {
+    if command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+        || longest_pipeline_stages(command) > MAX_PARSED_PIPELINE_STAGES
+    {
+        return None;
+    }
+    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    if ast.root().get_inner_node().has_error() {
+        return None;
+    }
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() == "heredoc_redirect"
+            && node
+                .text()
+                .find("<<")
+                .map(|offset| node.range().start + offset)
+                == Some(operator_start)
+        {
+            if node
+                .children()
+                .filter(ast_grep_core::Node::is_named)
+                .any(|child| {
+                    !matches!(
+                        child.kind().as_ref(),
+                        "heredoc_start" | "heredoc_body" | "heredoc_end"
+                    )
+                })
+            {
+                return None;
+            }
+            let statement = node.parent()?;
+            if statement.kind().as_ref() != "redirected_statement"
+                || statement
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .any(|child| !matches!(child.kind().as_ref(), "command" | "heredoc_redirect"))
+                || statement
+                    .children()
+                    .filter(|child| child.kind().as_ref() == "heredoc_redirect")
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            return statement
+                .children()
+                .find(|child| child.kind().as_ref() == "command")
+                .map(|owner| owner.text().to_string());
         }
-        let Some(target) = extract_heredoc_target_command(command, heredoc.operator_start) else {
-            return false;
-        };
-        if !is_non_shell_interpreter_stdin_command(&target) {
-            return false;
+        pending.extend(node.children());
+    }
+    None
+}
+
+/// Whether the command owning the heredoc or here-string at `heredoc_start`
+/// reads its PROGRAM from stdin: `awk -f -`, `sed -f /dev/stdin`,
+/// `gawk --file=-`. awk and sed are data sinks for their input, but a program
+/// read from stdin runs — awk's `system()` and sed's `e` start shell
+/// commands — so such a body is code, quoted delimiter or not. Scoped to the
+/// operator's own line, like [`is_git_stdin_data_sink`].
+fn stdin_is_the_program(command: &str, heredoc_start: usize) -> bool {
+    let prefix = &command[..heredoc_start.min(command.len())];
+    let line_start = prefix.rfind(['\n', '\r']).map_or(0, |i| i + 1);
+    let before = prefix[line_start..].trim_end();
+    if before.is_empty() || !before.contains('f') {
+        return false;
+    }
+    let mut tokens = tokenize_backwards(before);
+    tokens.reverse();
+    let mut idx = 0;
+    while tokens.get(idx).is_some_and(|token| {
+        is_shell_env_assignment(token) || SHELL_WRAPPER_COMMANDS.contains(&token.as_str())
+    }) {
+        idx += 1;
+    }
+    let Some(program) = tokens.get(idx) else {
+        return false;
+    };
+    let program = dequoted_executable_word(program);
+    let program = program.rsplit('/').next().unwrap_or(&program);
+    if !matches!(
+        program,
+        "awk" | "gawk" | "mawk" | "nawk" | "busybox" | "sed" | "gsed"
+    ) {
+        return false;
+    }
+    let stdin = |path: &str| matches!(path, "-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0");
+    let args: Vec<std::borrow::Cow<'_, str>> = tokens[idx + 1..]
+        .iter()
+        .map(|token| crate::normalize::decode_posix_syntax_token(token))
+        .collect();
+    args.iter().enumerate().any(|(at, arg)| {
+        let arg = arg.as_ref();
+        if matches!(arg, "-f" | "--file") {
+            return args.get(at + 1).is_some_and(|next| stdin(next));
         }
-        !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target)
+        arg.strip_prefix("--file=")
+            .or_else(|| arg.strip_prefix("-f"))
+            .is_some_and(stdin)
+            // A short-option cluster ending in `f` takes the next word.
+            || (arg.len() > 2
+                && arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg.ends_with('f')
+                && args.get(at + 1).is_some_and(|next| stdin(next)))
     })
 }
 
@@ -5999,14 +8366,22 @@ pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
     mask_non_executing_heredocs_with_policy(command, false)
 }
 
-/// Mask quoted heredoc bodies only when their target consumes stdin as data.
+/// Mask the data of heredoc bodies whose target consumes stdin as data,
+/// keeping every byte the outer shell itself executes.
 ///
 /// A quoted POSIX heredoc delimiter suppresses expansion in the outer shell,
 /// so command-substitution analysis must not treat literal `$()` text passed
-/// to `cat`, `tee`, or another data sink as executable. Unquoted heredocs are
-/// deliberately left intact because the outer shell expands them before the
-/// data sink runs. Shell/interpreter targets are likewise left intact because
-/// they may execute the body after receiving it.
+/// to `cat`, `tee`, or another data sink as executable; such a body is masked
+/// whole. An unquoted delimiter makes the shell expand the body before the
+/// data sink runs, so its `$(…)`, backquoted and arithmetic spans stay
+/// verbatim; the text around them is masked only when the sink's output
+/// provably stays put (the terminal, a plain file, read-only text tools), and
+/// is then as inert as a quoted body's (`cat <<EOF > notes.md` documenting
+/// `watch '…'` runs no `watch`). Any other unquoted body, and one whose
+/// substitutions cannot be bounded, stays whole. Shell/interpreter targets
+/// are left intact because they may execute the body after receiving it; a
+/// data body whose output reaches one is judged separately
+/// (`data_heredoc_bodies_whose_output_may_run`).
 #[must_use]
 pub fn mask_non_expanding_data_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
     mask_non_executing_heredocs_with_policy(command, true)
@@ -6029,6 +8404,35 @@ fn mask_non_executing_heredocs_with_policy(
     // false positive instead of masking uncertain source.
     let Some(active_heredocs) = active_heredocs(command) else {
         return Cow::Borrowed(command);
+    };
+
+    // A body written to a file that the same command then runs is code, not
+    // data: `tee x.sh <<EOF … EOF` followed by `sh x.sh`.
+    let mut output_executed: Option<bool> = None;
+    let bodies: Vec<Range<usize>> = active_heredocs
+        .iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                ..
+            } => Some(body_start..body_end),
+            ActiveHeredocBody::HereString => None,
+        })
+        .collect();
+    // Where each command's output goes, when the parse tree did not prove
+    // it: decided once, from the text outside every body.
+    let mut unproven_output: Option<HeredocOutput> = None;
+    let mut output_of = |heredoc: &ActiveHeredoc| -> HeredocOutput {
+        heredoc.output.unwrap_or_else(|| {
+            *unproven_output.get_or_insert_with(|| {
+                if command_may_run_heredoc_output(&blank_ranges(command, &bodies)) {
+                    HeredocOutput::Executes
+                } else {
+                    HeredocOutput::Escapes
+                }
+            })
+        })
     };
 
     let mut result = String::new();
@@ -6057,6 +8461,7 @@ fn mask_non_executing_heredocs_with_policy(
             });
             let should_mask_herestring = !require_quoted_delimiter
                 && !target_may_be_overridden
+                && !stdin_is_the_program(command, heredoc_start)
                 && (target_cmd.as_ref().is_some_and(|cmd| {
                     is_non_executing_heredoc_command(cmd)
                         || is_interpreter_source_heredoc_command(cmd)
@@ -6100,6 +8505,29 @@ fn mask_non_executing_heredocs_with_policy(
             // turning an advisory false-positive filter into a hook panic.
             continue;
         };
+        // For the expansion-aware view, the spans of an unquoted body the shell
+        // runs while reading it stay verbatim (`None`: they cannot be bounded,
+        // so the body stays whole). The full mask erases them too; its callers
+        // judge substitutions from the expansion-aware view instead.
+        //
+        // The prose around those spans is only data when the target's output
+        // provably stays put: the terminal, a plain file, read-only text
+        // tools. Any other unquoted body stays whole in this view, as in
+        // v0.15.1: `cat <<EOF 2>&1 | sh`, `(cat <<EOF) | sh`, `cat <<EOF | ssh
+        // h` and `x=$(cat <<EOF …)` run or may run the text. (A body whose
+        // output reaches a program that runs it is also judged as commands,
+        // quoted or not, through [`data_heredoc_bodies_whose_output_may_run`];
+        // the views keep their masks so its quotes cannot regroup the text
+        // around it.)
+        let keep_spans = if require_quoted_delimiter && !delimiter_quoted {
+            if output_of(&active_heredoc) == HeredocOutput::Contained {
+                active_heredoc.live_spans.clone()
+            } else {
+                None
+            }
+        } else {
+            Some(Vec::new())
+        };
         let target_may_be_overridden = target_cmd.as_deref().is_some_and(|target| {
             stdin_data_sink_may_be_overridden(command, heredoc_start, target)
         });
@@ -6111,14 +8539,16 @@ fn mask_non_executing_heredocs_with_policy(
         //     already analyzed authoritatively (#136). Shell interpreters are
         //     excluded so real `bash <<SH … rm -rf … SH` still blocks.
         let target_is_data_sink = !target_may_be_overridden
+            && !stdin_is_the_program(command, heredoc_start)
             && (target_cmd.as_ref().is_some_and(|cmd| {
                 is_non_executing_heredoc_command(cmd) || is_interpreter_source_heredoc_command(cmd)
             }) || is_structured_stdin_data_sink(command, heredoc_start)
                 || (delimiter_quoted
                     && target_cmd
                         .as_deref()
-                        .is_some_and(is_noop_stdin_discarding_command)));
-        let should_mask = target_is_data_sink && (!require_quoted_delimiter || delimiter_quoted);
+                        .is_some_and(is_noop_stdin_discarding_command)))
+            && !*output_executed.get_or_insert_with(|| written_file_is_executed(command, &bodies));
+        let should_mask = target_is_data_sink && keep_spans.is_some();
 
         if should_mask {
             // Tree-sitter's body span is authoritative for delimiter quote
@@ -6130,7 +8560,26 @@ fn mask_non_executing_heredocs_with_policy(
             } else {
                 result.push_str(&command[pos..body_start]);
             }
-            result.push_str(&mask_preserve_newlines(&command[body_start..body_end]));
+            let mut cursor = body_start;
+            // Spans are sorted and disjoint; clamping keeps every kept byte
+            // verbatim even if that ever stopped holding. Around kept spans
+            // the data is filled with `_` rather than blanks, so a
+            // substitution in the middle of a line of prose is not moved to
+            // the start of a word, where it would read as a command name.
+            let spans = keep_spans.as_deref().unwrap_or_default();
+            let fill: fn(&str) -> String = if spans.is_empty() {
+                mask_preserve_newlines
+            } else {
+                mask_preserve_whitespace
+            };
+            for span in spans {
+                let start = span.start.clamp(cursor, body_end);
+                let end = span.end.clamp(start, body_end);
+                result.push_str(&fill(&command[cursor..start]));
+                result.push_str(&command[start..end]);
+                cursor = end;
+            }
+            result.push_str(&fill(&command[cursor..body_end]));
             pos = body_end;
             continue;
         }
@@ -6151,6 +8600,302 @@ fn mask_non_executing_heredocs_with_policy(
     }
 }
 
+/// The bodies of data-sink heredocs (`cat`, `tee`, `grep`, … — targets the
+/// masks treat as data) whose command's output reaches a program that may
+/// run it: `cat <<'EOF' | ssh host`, `cat <<EOF 2>&1 | sh`, `(cat <<'EOF') |
+/// sh`, `tee >(sh) <<'EOF'`, `eval "$(cat <<'EOF' …)"`. The caller judges each
+/// one as commands, whatever its delimiter's quoting. Interpreter targets
+/// (`python3 - <<'EOF' | sh`) are left out: their output is not their body.
+pub(crate) fn data_heredoc_bodies_whose_output_may_run(command: &str) -> Vec<Range<usize>> {
+    if !command.contains("<<") {
+        return Vec::new();
+    }
+    let Some(heredocs) = active_heredocs(command) else {
+        return Vec::new();
+    };
+    let bodies: Vec<Range<usize>> = heredocs
+        .iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                ..
+            } => Some(body_start..body_end),
+            ActiveHeredocBody::HereString => None,
+        })
+        .collect();
+    let mut unproven_runs: Option<bool> = None;
+    let mut found = Vec::new();
+    for heredoc in &heredocs {
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            ..
+        } = heredoc.body
+        else {
+            continue;
+        };
+        if body_start >= body_end
+            || !extract_heredoc_target_command(command, heredoc.operator_start)
+                .as_deref()
+                .is_some_and(is_non_executing_heredoc_command)
+        {
+            continue;
+        }
+        let runs = match heredoc.output {
+            Some(output) => output == HeredocOutput::Executes,
+            None => *unproven_runs.get_or_insert_with(|| {
+                command_may_run_heredoc_output(&blank_ranges(command, &bodies))
+            }),
+        };
+        if runs {
+            found.push(body_start..body_end);
+        }
+    }
+    found
+}
+
+/// Preserve the association between a body and its input operator. The
+/// evaluator needs the operator's owning command to distinguish a remote
+/// script from a local command that happens to follow an ssh invocation.
+pub(crate) fn heredoc_bodies_with_operators(command: &str) -> Vec<(Range<usize>, usize)> {
+    active_heredocs(command)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|heredoc| {
+            let body = match heredoc.body {
+                ActiveHeredocBody::Heredoc {
+                    body_start,
+                    body_end,
+                    ..
+                } => body_start..body_end,
+                ActiveHeredocBody::HereString => {
+                    let (start, end) =
+                        find_herestring_content_bounds(command, heredoc.operator_start + 3)?;
+                    start..end
+                }
+            };
+            Some((body, heredoc.operator_start))
+        })
+        .collect()
+}
+
+/// The quoted body belonging to this exact operator. This retains source
+/// identity when a pipeline consumer supplies the body's interpreter language;
+/// identical text in another heredoc cannot establish that relationship.
+pub(crate) fn quoted_heredoc_body_at(command: &str, operator_start: usize) -> Option<Range<usize>> {
+    active_heredocs(command)?
+        .into_iter()
+        .find_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                delimiter_quoted: true,
+            } if heredoc.operator_start == operator_start => Some(body_start..body_end),
+            ActiveHeredocBody::HereString | ActiveHeredocBody::Heredoc { .. } => None,
+        })
+}
+
+/// `command` with every byte inside `ranges` (other than newlines) blanked.
+fn blank_ranges(command: &str, ranges: &[Range<usize>]) -> String {
+    let mut outside = command.as_bytes().to_vec();
+    for range in ranges {
+        if let Some(bytes) = outside.get_mut(range.clone()) {
+            for byte in bytes.iter_mut().filter(|byte| **byte != b'\n') {
+                *byte = b' ';
+            }
+        }
+    }
+    // A body range holds whole UTF-8 sequences, so blanking it byte by byte
+    // leaves valid UTF-8; keep the raw text if that ever stopped holding.
+    String::from_utf8(outside).unwrap_or_else(|_| command.to_string())
+}
+
+/// A program that runs its operands or its standard input as code: a shell,
+/// `source`/`.`/`eval`/`exec`, `xargs`, or a script interpreter.
+fn runs_its_input_as_code(program: &str) -> bool {
+    matches!(
+        program,
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "mksh"
+            | "fish"
+            | "source"
+            | "."
+            | "eval"
+            | "exec"
+            | "xargs"
+            | "busybox"
+    ) || ["python", "perl", "ruby", "node", "php", "lua"]
+        .iter()
+        .any(|prefix| program.starts_with(prefix))
+}
+
+/// Whether `command`, read with its heredoc `bodies` blanked, writes a file
+/// (`> f`, `>> f`, `>| f`, `tee f`) and names that file again anywhere a
+/// program may run or read it as code: `sh x.sh`, `./x.sh`, `. x.sh`,
+/// `sh -c "$(cat x.sh)"`, `cat x.sh | sh`, `bash < x.sh`. A mention by a
+/// program that only reads or files the text away (`git add notes.md`,
+/// `cat notes.md`) is not one, unless that segment pipes into another. Names
+/// are compared by basename at word boundaries. Coarse on purpose — it only
+/// ever keeps a body visible. Linear in the command times the (few) files.
+fn written_file_is_executed(command: &str, bodies: &[Range<usize>]) -> bool {
+    use crate::normalize::NormalizeTokenKind;
+    /// Programs whose mention of a file neither runs it nor hands it on.
+    const READERS: &[&str] = &[
+        "git", "cat", "head", "tail", "less", "more", "wc", "grep", "rg", "diff", "ls", "stat",
+        "file", "echo", "printf", "rm", "chmod", "touch", "open", "code", "vim", "vi", "nano",
+        "gh", "jq", "yq", "sort", "uniq", "cut", "test", "[", "mkdir", "tee",
+    ];
+    if !command.contains('>') && !command.contains("tee") && !command.contains("of=") {
+        return false;
+    }
+    let mut outside = command.as_bytes().to_vec();
+    for body in bodies {
+        if let Some(bytes) = outside.get_mut(body.clone()) {
+            for byte in bytes.iter_mut().filter(|byte| **byte != b'\n') {
+                *byte = b' ';
+            }
+        }
+    }
+    let Ok(outside) = String::from_utf8(outside) else {
+        return true;
+    };
+    let tokens = crate::normalize::tokenize_for_normalization(&outside);
+    let name_of = |word: &str| -> String {
+        let word = dequoted_executable_word(word);
+        word.rsplit('/').next().unwrap_or(&word).to_string()
+    };
+
+    // Per token: the written file it names as a write target, and the
+    // command word of its segment plus whether that segment pipes into a
+    // shell or interpreter (`cat x.sh | bash`, not `… | wc -c`).
+    let mut written: Vec<String> = Vec::new();
+    let mut write_targets = vec![false; tokens.len()];
+    let mut segment_command: Vec<Option<String>> = vec![None; tokens.len()];
+    let mut piped = vec![false; tokens.len()];
+    // (first token, end token, program, pipes on) of each segment.
+    let mut segments: Vec<(usize, usize, Option<String>, bool)> = Vec::new();
+    let mut segment_start = 0usize;
+    let mut command_word: Option<String> = None;
+    let mut pending_target = false;
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(text) = token.text(&outside) else {
+            continue;
+        };
+        if token.kind != NormalizeTokenKind::Word {
+            // `>|` and `>&` arrive split at the separator byte.
+            if pending_target && matches!(text, "|" | "&") {
+                continue;
+            }
+            pending_target = false;
+            segments.push((segment_start, index, command_word.take(), text == "|"));
+            segment_start = index + 1;
+            continue;
+        }
+        if std::mem::take(&mut pending_target) {
+            written.push(name_of(text));
+            write_targets[index] = true;
+            continue;
+        }
+        if let Some(at) = text.find('>') {
+            let target = text[at..].trim_start_matches(['>', '|', '&']);
+            if target.is_empty() {
+                pending_target = true;
+            } else {
+                written.push(name_of(target));
+                write_targets[index] = true;
+            }
+            continue;
+        }
+        if command_word.as_deref() == Some("dd")
+            && let Some(target) = text.strip_prefix("of=")
+        {
+            written.push(name_of(target));
+            write_targets[index] = true;
+            continue;
+        }
+        match command_word.as_deref() {
+            None => {
+                if !is_shell_env_assignment(text)
+                    && !matches!(
+                        text,
+                        "sudo" | "env" | "nohup" | "exec" | "command" | "time" | "nice" | "builtin"
+                    )
+                {
+                    command_word = Some(name_of(text));
+                }
+            }
+            Some("tee") if !text.starts_with('-') => {
+                written.push(name_of(text));
+                write_targets[index] = true;
+            }
+            Some(_) => {}
+        }
+    }
+    segments.push((segment_start, tokens.len(), command_word, false));
+    for (at, (start, end, program, pipes_on)) in segments.iter().enumerate() {
+        let feeds_interpreter = *pipes_on
+            && segments
+                .get(at + 1)
+                .and_then(|next| next.2.as_deref())
+                .is_some_and(runs_its_input_as_code);
+        for index in *start..*end {
+            segment_command[index].clone_from(program);
+            piped[index] = feeds_interpreter;
+        }
+    }
+    written.retain(|name| !name.is_empty() && name != "-");
+    written.sort_unstable();
+    written.dedup();
+    if written.is_empty() {
+        return false;
+    }
+    // Each name is searched in every word; past a handful of distinct files
+    // that would grow with the square of the command, so stay visible.
+    if written.len() > 32 {
+        return true;
+    }
+    let boundary = |byte: Option<&u8>| {
+        byte.is_none_or(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'@'))
+        })
+    };
+    tokens.iter().enumerate().any(|(index, token)| {
+        if write_targets[index] || token.kind != NormalizeTokenKind::Word {
+            return false;
+        }
+        let Some(text) = token.text(&outside) else {
+            return false;
+        };
+        // A name the shell computes may be the file: any such word run by a
+        // shell or interpreter (`sh $(ls *.sh)`, `bash ./*.sh`), and a
+        // command word computed the same way (`$f`, `./*.sh`).
+        let computed = text.contains(['$', '`', '*', '?', '[']);
+        let program = segment_command[index].as_deref();
+        let command_word = program.is_some_and(|word| word == name_of(text));
+        let interpreted = program.is_some_and(runs_its_input_as_code);
+        if computed && !is_shell_env_assignment(text) && (command_word || interpreted) {
+            return true;
+        }
+        let mentions = written.iter().any(|name| {
+            text.match_indices(name.as_str()).any(|(at, _)| {
+                boundary(
+                    at.checked_sub(1)
+                        .and_then(|before| text.as_bytes().get(before)),
+                ) && boundary(text.as_bytes().get(at + name.len()))
+            })
+        });
+        mentions
+            && (piped[index]
+                || !segment_command[index]
+                    .as_deref()
+                    .is_some_and(|word| READERS.contains(&word)))
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveHeredocBody {
     HereString,
@@ -6161,10 +8906,38 @@ enum ActiveHeredocBody {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveHeredoc {
     operator_start: usize,
     body: ActiveHeredocBody,
+    /// The parts of the body the shell executes while reading it, as absolute
+    /// byte ranges: `Some(vec![])` for a quoted delimiter or an expanding body
+    /// without substitutions, the substitution spans for an expanding body
+    /// (see [`expanding_body_live_spans`]), and `None` when those cannot be
+    /// bounded — such a body must stay whole in any view that judges it.
+    live_spans: Option<Vec<Range<usize>>>,
+    /// Where the output of the command reading the body goes, when the parse
+    /// tree proves it; `None` when it does not, and the masker falls back to
+    /// [`command_may_run_heredoc_output`] over the text outside the bodies.
+    output: Option<HeredocOutput>,
+}
+
+/// Where the standard output of the command that reads a heredoc goes.
+///
+/// A data sink such as `cat` or `tee` copies its body to standard output, so
+/// the body is only as inert as the place that output ends up: `cat <<EOF >
+/// notes.md` files it away, `cat <<EOF | sh` runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeredocOutput {
+    /// Provably contained: the terminal, a plain file, or through read-only
+    /// text tools ([`READ_ONLY_PIPE_STAGES`]) into one of those.
+    Contained,
+    /// Not provably contained, and nothing seen that runs it: an unknown
+    /// pipeline stage, a descriptor duplication, a command substitution.
+    Escapes,
+    /// Into something that may run it as code: a shell, an interpreter, a
+    /// remote or privileged shell, `xargs`, a process substitution, `eval`.
+    Executes,
 }
 
 fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
@@ -6176,7 +8949,8 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
     let ast = AstGrep::new(command, SupportLang::Bash);
     let mut heredocs = Vec::new();
     let mut parse_error = false;
-    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error);
+    let plumbed = output_may_be_replumbed(&ast.root());
+    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error, plumbed);
     if parse_error {
         return active_single_heredoc_fallback(command);
     }
@@ -6287,6 +9061,11 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
     {
         return None;
     }
+    // Without a parse tree the substitutions of an expanding body cannot be
+    // bounded, so such a body is only maskable when it has none to hide.
+    let live_spans = (candidate.quoted
+        || !expanding_body_may_execute(&command[body_range.clone()]))
+    .then(Vec::new);
     Some(vec![ActiveHeredoc {
         operator_start,
         body: ActiveHeredocBody::Heredoc {
@@ -6294,19 +9073,48 @@ fn active_single_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
             body_end: body_range.end,
             delimiter_quoted: candidate.quoted,
         },
+        live_spans,
+        // No parse tree, so nothing about the output is proven.
+        output: None,
     }])
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn collect_active_heredocs<D: ast_grep_core::Doc>(
-    node: ast_grep_core::Node<'_, D>,
+    root: ast_grep_core::Node<'_, D>,
     heredocs: &mut Vec<ActiveHeredoc>,
     parse_error: &mut bool,
+    plumbed: bool,
 ) {
+    // An explicit stack, not recursion: this runs on every hook payload
+    // before the size gate (dialect refinement masks the command first), and
+    // a list of some ten thousand `true &&` nests that deep in the parse
+    // tree. Recursing overflowed the stack and aborted the hook, which the
+    // agent treats as a non-blocking error and runs the command.
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if collect_active_heredoc_node(&node, heredocs, parse_error, plumbed) {
+            // Children reversed onto the stack, so they pop in order.
+            let first_child = pending.len();
+            pending.extend(node.children());
+            pending[first_child..].reverse();
+        }
+    }
+}
+
+/// [`collect_active_heredocs`] for one node: record it if it is a heredoc or
+/// here-string (or flag a parse error), and answer whether to descend into
+/// its children.
+fn collect_active_heredoc_node<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    heredocs: &mut Vec<ActiveHeredoc>,
+    parse_error: &mut bool,
+    plumbed: bool,
+) -> bool {
     let kind = node.kind();
     if kind == "ERROR" {
         *parse_error = true;
-        return;
+        return false;
     }
     if kind == "herestring_redirect" {
         let text = node.text();
@@ -6314,24 +9122,30 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
             heredocs.push(ActiveHeredoc {
                 operator_start: node.range().start + offset,
                 body: ActiveHeredocBody::HereString,
+                live_spans: None,
+                output: (!plumbed).then(|| heredoc_output(node)).flatten(),
             });
         } else {
             *parse_error = true;
         }
-        return;
+        return false;
     }
     if kind == "heredoc_redirect" {
         let text = node.text();
         let Some(offset) = text.find("<<") else {
             *parse_error = true;
-            return;
+            return false;
         };
         let mut body_range = None;
+        let mut body_node = None;
         let mut end_start = None;
         let mut delimiter_quoted = false;
         for child in node.children() {
             match child.kind().as_ref() {
-                "heredoc_body" => body_range = Some(child.range()),
+                "heredoc_body" => {
+                    body_range = Some(child.range());
+                    body_node = Some(child);
+                }
                 "heredoc_end" => end_start = Some(child.range().start),
                 "heredoc_start" => {
                     delimiter_quoted |= heredoc_delimiter_is_quoted(
@@ -6348,12 +9162,18 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
             body_range.or_else(|| end_start.map(|start| std::ops::Range { start, end: start }));
         let Some(body_range) = body_range else {
             *parse_error = true;
-            return;
+            return false;
         };
         if body_range.start > body_range.end || body_range.end > node.range().end {
             *parse_error = true;
-            return;
+            return false;
         }
+        let live_spans = if delimiter_quoted {
+            Some(Vec::new())
+        } else {
+            // An empty body has no `heredoc_body` node and nothing to run.
+            body_node.map_or_else(|| Some(Vec::new()), expanding_body_live_spans)
+        };
         heredocs.push(ActiveHeredoc {
             operator_start: node.range().start + offset,
             body: ActiveHeredocBody::Heredoc {
@@ -6361,11 +9181,1233 @@ fn collect_active_heredocs<D: ast_grep_core::Doc>(
                 body_end: body_range.end,
                 delimiter_quoted,
             },
+            live_spans,
+            output: (!plumbed).then(|| heredoc_output(node)).flatten(),
         });
-        return;
+        return false;
     }
-    for child in node.children() {
-        collect_active_heredocs(child, heredocs, parse_error);
+    true
+}
+
+/// Pipeline stages that only read, count, filter or file text and pass it on
+/// as text: a body piped through them is as contained as their own output.
+/// `sed` and `awk` are absent on purpose (`e`, `system()`), as are pagers
+/// (`!` runs a shell).
+const READ_ONLY_PIPE_STAGES: &[&str] = &[
+    "cat",
+    "tac",
+    "nl",
+    "wc",
+    "head",
+    "tail",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "fold",
+    "fmt",
+    "column",
+    "paste",
+    "expand",
+    "unexpand",
+    "rev",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "tee",
+    "md5sum",
+    "sha1sum",
+    "sha224sum",
+    "sha256sum",
+    "sha384sum",
+    "sha512sum",
+    "shasum",
+    "b2sum",
+    "cksum",
+    "base64",
+    "base32",
+    "od",
+    "xxd",
+    "hexdump",
+    "strings",
+    "comm",
+    "pr",
+    "jq",
+];
+
+/// Shells: they run their standard input unless given a script file or a
+/// literal `-c` string.
+const SHELL_PROGRAMS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "ash", "yash", "posh",
+    "rbash",
+];
+
+/// Programs that run what they read on standard input, or turn it into
+/// commands, whatever their operands: `xargs`, `at`, `su`, `ed`, `gdb`, ….
+const STDIN_COMMAND_RUNNERS: &[&str] = &[
+    "source", ".", "eval", "xargs", "parallel", "at", "batch", "crontab", "su", "ed", "ex", "gdb",
+    "lldb",
+];
+
+/// Script interpreters: like shells, they run standard input unless given a
+/// script file, a literal code string, or a module.
+fn is_interpreter_program(name: &str) -> bool {
+    matches!(
+        name,
+        "deno" | "bun" | "tclsh" | "wish" | "expect" | "julia" | "Rscript" | "osascript" | "cmd"
+    ) || [
+        "python",
+        "perl",
+        "ruby",
+        "node",
+        "php",
+        "lua",
+        "pwsh",
+        "powershell",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+/// Programs that run another program named among their operands
+/// (`sudo -u x sh`, `timeout 5 bash`, `docker exec -i c sh`,
+/// `kubectl exec -i p -- sh`). What such a stage does with its input is
+/// what that program does.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "sudo",
+    "doas",
+    "env",
+    "nohup",
+    "timeout",
+    "nice",
+    "ionice",
+    "stdbuf",
+    "setsid",
+    "time",
+    "command",
+    "builtin",
+    "chrt",
+    "taskset",
+    "unbuffer",
+    "flock",
+    "caffeinate",
+    "exec",
+    "busybox",
+    "toybox",
+    "watch",
+    "docker",
+    "podman",
+    "kubectl",
+    "oc",
+    "lxc",
+    "incus",
+    "nsenter",
+    "chroot",
+    "systemd-run",
+    "machinectl",
+    "tmux",
+    "screen",
+    "script",
+];
+
+/// Whether `name` is a program [`stage_runs_received_text`] judges by its
+/// operands rather than dismissing: a shell, an interpreter, a remote shell,
+/// or a program that runs its standard input.
+fn is_code_runner_name(name: &str) -> bool {
+    SHELL_PROGRAMS.contains(&name)
+        || STDIN_COMMAND_RUNNERS.contains(&name)
+        || is_interpreter_program(name)
+        || matches!(name, "ssh" | "mosh")
+}
+
+/// Whether a command word is a literal name rather than one the shell
+/// computes, and the basename it names.
+fn literal_program_name(word: &str) -> Option<&str> {
+    if word.is_empty()
+        || !word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'+')
+        })
+    {
+        return None;
+    }
+    Some(word.rsplit('/').next().unwrap_or(word))
+}
+
+/// A word the shell computes at run time.
+fn is_computed_word(word: &str) -> bool {
+    word.contains(['$', '`'])
+}
+
+/// A word with one layer of surrounding quotes removed (coarse: enough to
+/// read an option, a program name or a script operand).
+fn unquoted_word(word: &str) -> &str {
+    word.trim_matches(['\'', '"'])
+}
+
+/// An operand that names standard input as a file.
+fn names_stdin(word: &str) -> bool {
+    matches!(
+        unquoted_word(word),
+        "-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
+    )
+}
+
+/// Whether a stage named `program` with operands `operands` runs the text it
+/// receives on standard input (or a substitution that reads it). A computed
+/// name (`$SHELL`, `$(…)`) may be anything, so it does.
+fn stage_runs_received_text(program: &str, operands: &[String]) -> bool {
+    let Some(name) = literal_program_name(program) else {
+        return true;
+    };
+    if SHELL_PROGRAMS.contains(&name) {
+        return shell_reads_its_input(operands);
+    }
+    if is_interpreter_program(name) {
+        return interpreter_reads_its_input(operands);
+    }
+    if STDIN_COMMAND_RUNNERS.contains(&name) {
+        // `su -c 'cmd' user` runs its literal command, not its input.
+        return !(name == "su"
+            && operands.iter().enumerate().any(|(at, operand)| {
+                matches!(operand.as_str(), "-c" | "--command")
+                    && operands
+                        .get(at + 1)
+                        .is_some_and(|code| !is_computed_word(code))
+            }));
+    }
+    if matches!(name, "ssh" | "mosh") {
+        return remote_shell_reads_its_input(operands);
+    }
+    if !COMMAND_WRAPPERS.contains(&name) {
+        return false;
+    }
+    // `sudo -s`, `sudo -i`, a bare `sudo`: a root shell reading the text.
+    if matches!(name, "sudo" | "doas")
+        && (operands.iter().all(|operand| operand.starts_with('-'))
+            || operands
+                .iter()
+                .any(|operand| matches!(operand.as_str(), "-s" | "-i" | "--shell" | "--login")))
+    {
+        return true;
+    }
+    // The first operand that names a code runner (or a piece of a
+    // split-string operand, `env -S 'sh -e'`) is the program run, with the
+    // operands after it; one computed at run time may be anything.
+    for (at, operand) in operands.iter().enumerate() {
+        if is_computed_word(operand) && !is_shell_env_assignment(operand) {
+            return true;
+        }
+        let pieces: Vec<&str> = unquoted_word(operand).split_whitespace().collect();
+        if let Some((first, rest)) = pieces.split_first()
+            && literal_program_name(first).is_some_and(is_code_runner_name)
+        {
+            let mut tail: Vec<String> = rest.iter().map(ToString::to_string).collect();
+            tail.extend(operands[at + 1..].iter().cloned());
+            return stage_runs_received_text(first, &tail);
+        }
+    }
+    false
+}
+
+/// A shell's operands: does it read its program from standard input? It
+/// does with no script operand, with `-s`, or with `-`; a script file or a
+/// literal `-c` string leaves the input as data, a computed one may not.
+fn shell_reads_its_input(operands: &[String]) -> bool {
+    let mut at = 0;
+    while let Some(operand) = operands.get(at) {
+        if is_computed_word(operand) || names_stdin(operand) {
+            return true;
+        }
+        let word = unquoted_word(operand);
+        if word == "--" {
+            return operands
+                .get(at + 1)
+                .is_none_or(|next| is_computed_word(next) || names_stdin(next));
+        }
+        if word.starts_with("--") {
+            at += if matches!(word, "--rcfile" | "--init-file") {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if let Some(letters) = word.strip_prefix(['-', '+']) {
+            if letters.contains('s') {
+                return true;
+            }
+            if letters.contains('c') {
+                return operands
+                    .get(at + 1)
+                    .is_none_or(|code| is_computed_word(code));
+            }
+            at += if letters.ends_with(['o', 'O']) { 2 } else { 1 };
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// An interpreter's operands: does it read its program from standard input?
+/// It does with no script operand or with `-`; a script file, a literal code
+/// string (`-c`, `-e`, `--eval`, …) or a module that is not a console leaves
+/// the input as data.
+fn interpreter_reads_its_input(operands: &[String]) -> bool {
+    let mut at = 0;
+    while let Some(operand) = operands.get(at) {
+        if is_computed_word(operand) || names_stdin(operand) {
+            return true;
+        }
+        let word = unquoted_word(operand);
+        if word == "--" {
+            at += 1;
+            continue;
+        }
+        let Some(rest) = word.strip_prefix('-') else {
+            return false;
+        };
+        let code = matches!(
+            word,
+            "--eval" | "--print" | "-Command" | "-command" | "-c" | "-e" | "-E" | "-r" | "-p"
+        ) || (!rest.starts_with('-')
+            && rest.len() <= 3
+            && rest.bytes().all(|byte| byte.is_ascii_alphabetic())
+            && rest.contains(['c', 'e', 'E']));
+        if code || matches!(word, "-File" | "-file") {
+            return operands
+                .get(at + 1)
+                .is_none_or(|value| is_computed_word(value) || names_stdin(value));
+        }
+        if word == "-m" {
+            return operands.get(at + 1).is_none_or(|module| {
+                matches!(
+                    unquoted_word(module),
+                    "code" | "pdb" | "ipdb" | "IPython" | "asyncio" | "idlelib"
+                )
+            });
+        }
+        at += 1;
+    }
+    true
+}
+
+/// `ssh`'s operands: with no remote command the remote login shell runs the
+/// input; otherwise the remote command decides, read like a stage.
+fn remote_shell_reads_its_input(operands: &[String]) -> bool {
+    let mut at = 0;
+    while let Some(operand) = operands.get(at) {
+        if !operand.starts_with('-') {
+            break;
+        }
+        at += match classify_ssh_option(operand) {
+            SshOptionShape::TakesSeparateValue => 2,
+            SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached => 1,
+            SshOptionShape::Unknown => return true,
+        };
+    }
+    // `operands[at]` is the host; the rest is the remote command line.
+    let remote = operands.get(at + 1..).unwrap_or_default();
+    let remote = match remote.first() {
+        Some(first) if first == "--" => &remote[1..],
+        _ => remote,
+    };
+    let words: Vec<String> = remote
+        .iter()
+        .flat_map(|operand| {
+            unquoted_word(operand)
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let Some((first, rest)) = words.split_first() else {
+        return true;
+    };
+    stage_runs_received_text(first, rest)
+}
+
+/// Whether anything in the parse tree can send a command's standard output
+/// somewhere the tree does not show at that command: a process substitution
+/// (`exec > >(sh)`, `tee >(sh)`), an `exec` that rewires descriptors, a
+/// function whose output goes where it is called, or an alias that renames a
+/// pipeline stage. Any of them leaves every heredoc's output unproven.
+fn output_may_be_replumbed<D: ast_grep_core::Doc>(root: &ast_grep_core::Node<'_, D>) -> bool {
+    root.dfs().any(|node| match node.kind().as_ref() {
+        "process_substitution" | "function_definition" => true,
+        "command_name" => matches!(
+            node.text().as_ref(),
+            "exec" | "alias" | "enable" | "hash" | "coproc"
+        ),
+        _ => false,
+    })
+}
+
+/// Where a `file_redirect` sends standard output, if it redirects it.
+enum StdoutRedirect {
+    /// It does not touch standard output.
+    Untouched,
+    /// To a plain, literal file (or `/dev/null`).
+    File,
+    /// Anywhere else: another descriptor, a device, a computed name.
+    Elsewhere,
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn stdout_redirect<D: ast_grep_core::Doc>(redirect: ast_grep_core::Node<'_, D>) -> StdoutRedirect {
+    stdout_redirect_parts(redirect.children())
+}
+
+/// [`stdout_redirect`] over a redirect's children (or a prefix of them).
+fn stdout_redirect_parts<'r, D: ast_grep_core::Doc + 'r>(
+    children: impl Iterator<Item = ast_grep_core::Node<'r, D>>,
+) -> StdoutRedirect {
+    let mut descriptor: Option<String> = None;
+    let mut operator: Option<String> = None;
+    let mut destinations = Vec::new();
+    for child in children {
+        let kind = child.kind();
+        match kind.as_ref() {
+            "file_descriptor" => descriptor = Some(child.text().to_string()),
+            ">" | ">>" | ">|" | "&>" | "&>>" | ">&" | "<" | "<&" | "<>" | ">&-" | "<&-" => {
+                operator = Some(kind.to_string());
+            }
+            _ => destinations.push(child),
+        }
+    }
+    let Some(operator) = operator else {
+        return StdoutRedirect::Elsewhere;
+    };
+    let to_stdout = match operator.as_str() {
+        ">" | ">>" | ">|" | ">&" | ">&-" => descriptor.as_deref().is_none_or(|fd| fd == "1"),
+        "&>" | "&>>" => true,
+        // An input redirect only matters when it names descriptor 1.
+        _ => descriptor.as_deref() == Some("1"),
+    };
+    if !to_stdout {
+        return StdoutRedirect::Untouched;
+    }
+    if !matches!(operator.as_str(), ">" | ">>" | ">|" | "&>" | "&>>" | ">&") {
+        return StdoutRedirect::Elsewhere;
+    }
+    let [destination] = destinations.as_slice() else {
+        return StdoutRedirect::Elsewhere;
+    };
+    let text = destination.text();
+    let path = match destination.kind().as_ref() {
+        "word" => text.as_ref(),
+        "raw_string" => text.trim_matches('\''),
+        "string"
+            if destination
+                .children()
+                .all(|part| part.kind() == "string_content" || !part.is_named()) =>
+        {
+            text.trim_matches('"')
+        }
+        _ => return StdoutRedirect::Elsewhere,
+    };
+    if is_plain_file_path(path) {
+        StdoutRedirect::File
+    } else {
+        StdoutRedirect::Elsewhere
+    }
+}
+
+/// A literal path naming a plain file (or `/dev/null`): nothing the shell
+/// computes, no descriptor number, and no device or descriptor path
+/// (`/dev/stdout`, `/dev/fd/1`, `/proc/self/fd/1`, or one reached through
+/// `..`).
+fn is_plain_file_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['$', '`', '\\', '*', '?', '[', '{', '~'])
+        && !path.starts_with(['-', '&'])
+        && !path.bytes().all(|byte| byte.is_ascii_digit())
+        && (path == "/dev/null" || !(path.contains("dev/") || path.contains("proc/")))
+}
+
+/// Whether leading assignments leave the named program the one it names:
+/// `PATH=…`, `LD_PRELOAD=…` and their kin load other code, and
+/// `RIPGREP_CONFIG_PATH=…` or `GREP_OPTIONS=…` add options.
+fn assignments_keep_program(assignments: &[String]) -> bool {
+    assignments.iter().all(|assignment| {
+        shell_assignment_name(assignment).is_some_and(|var| {
+            !(var.starts_with("LD_")
+                || var.starts_with("DYLD_")
+                || matches!(
+                    var,
+                    "PATH"
+                        | "RIPGREP_CONFIG_PATH"
+                        | "GREP_OPTIONS"
+                        | "GCONV_PATH"
+                        | "BASH_ENV"
+                        | "ENV"
+                ))
+        })
+    })
+}
+
+/// Whether a [`READ_ONLY_PIPE_STAGES`] program run with these operands and
+/// leading assignments really only passes its input on as text, to standard
+/// output or to plain files. `sort --compress-program=sh` and `rg --pre sh`
+/// hand it to a program; `tee /dev/stderr`, `sort -o /dev/fd/3`, `uniq -
+/// /dev/stderr` and `xxd - /dev/stderr` write it to a descriptor that a
+/// redirect can point anywhere (`2>&1 >/dev/null | sh`); an assignment such
+/// as `RIPGREP_CONFIG_PATH=…` or `LD_PRELOAD=…` changes what the program does
+/// ([`assignments_keep_program`]).
+fn read_only_stage_is_inert(name: &str, operands: &[String], assignments: &[String]) -> bool {
+    if !READ_ONLY_PIPE_STAGES.contains(&name) {
+        return false;
+    }
+    if !assignments_keep_program(assignments) {
+        return false;
+    }
+    // Only these write their input anywhere but standard output: `tee` to
+    // every file operand, `sort` to its `-o` value, `uniq` and `xxd` to the
+    // file operand after their input. `rg` hands a file it searches to a
+    // `--pre` program (perhaps one named in its config file).
+    let mut options_ended = false;
+    let mut output_value_next = false;
+    let mut files = 0usize;
+    for operand in operands {
+        let word = unquoted_word(operand);
+        // A computed word may be any option or path; single quotes keep a
+        // `$` literal.
+        let single_quoted = operand.len() >= 2
+            && operand.starts_with('\'')
+            && operand.ends_with('\'')
+            && operand.matches('\'').count() == 2;
+        if is_computed_word(operand) && !single_quoted {
+            if matches!(name, "tee" | "sort" | "uniq" | "xxd" | "rg") {
+                return false;
+            }
+            continue;
+        }
+        if std::mem::take(&mut output_value_next) {
+            if !is_plain_file_path(word) {
+                return false;
+            }
+            continue;
+        }
+        if !options_ended && word == "--" {
+            options_ended = true;
+            continue;
+        }
+        if !options_ended && word.len() > 1 && word.starts_with('-') {
+            match name {
+                // GNU getopt takes any unambiguous prefix of a long option:
+                // `--co` is `--compress-program`, `--o` is `--output`.
+                "sort" if word.starts_with("--co") => return false,
+                "sort" if word.starts_with("--o") => match word.split_once('=') {
+                    Some((_, path)) if !is_plain_file_path(path) => return false,
+                    Some(_) => {}
+                    None => output_value_next = true,
+                },
+                // A short-option cluster holding `o`: the rest of the word,
+                // or the next one, is the output file.
+                "sort" if !word.starts_with("--") && word.contains('o') => {
+                    let after = word.split_once('o').map_or("", |(_, after)| after);
+                    if after.is_empty() {
+                        output_value_next = true;
+                    } else if !is_plain_file_path(after) {
+                        return false;
+                    }
+                }
+                "rg" if word.starts_with("--pre") && word != "--pretty" => return false,
+                _ => {}
+            }
+            continue;
+        }
+        files += 1;
+        let written = match name {
+            "tee" => true,
+            "uniq" | "xxd" => files >= 2,
+            _ => false,
+        };
+        if written && !is_plain_file_path(word) {
+            return false;
+        }
+        if name == "rg" && (word.contains("dev/") || word.contains("proc/")) {
+            return false;
+        }
+    }
+    !output_value_next
+}
+
+/// What one pipeline stage after a heredoc's command does with the text.
+enum PipeStage {
+    /// Reads and passes it on ([`READ_ONLY_PIPE_STAGES`]).
+    PassesOn,
+    /// Reads it and files its own output in a plain file.
+    Files,
+    /// May run it ([`stage_runs_received_text`], or a compound stage).
+    Runs,
+    /// Consumes it some other way, or sends it somewhere unproven.
+    Other,
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn classify_pipe_stage<D: ast_grep_core::Doc>(stage: ast_grep_core::Node<'_, D>) -> PipeStage {
+    let (command, mut redirects): (_, Vec<_>) = match stage.kind().as_ref() {
+        "command" => (stage.clone(), Vec::new()),
+        "redirected_statement" => {
+            let mut children = stage.children();
+            let Some(first) = children.next() else {
+                return PipeStage::Runs;
+            };
+            let mut redirects = Vec::new();
+            for child in children {
+                if child.kind() != "file_redirect" {
+                    // A heredoc or here-string of its own replaces the text.
+                    return PipeStage::Other;
+                }
+                redirects.push(child);
+            }
+            match first.kind().as_ref() {
+                "command" => (first, redirects),
+                // `| grep x | sort > out` parses as the rest of the pipeline
+                // under one redirect: follow its stages, then the redirect.
+                "pipeline" => {
+                    let mut stages = Vec::new();
+                    pipeline_stages_after(&first, 0, &mut stages);
+                    return match follow_pipe_stages(stages) {
+                        Some(HeredocOutput::Executes) => PipeStage::Runs,
+                        Some(HeredocOutput::Escapes) => PipeStage::Other,
+                        Some(HeredocOutput::Contained) => PipeStage::Files,
+                        None => stage_redirects_outcome(redirects),
+                    };
+                }
+                _ => return PipeStage::Runs,
+            }
+        }
+        // `| while read l; do eval "$l"; done`, `| (sh)`, `| { …; }`: a
+        // compound stage may run anything it reads.
+        _ => return PipeStage::Runs,
+    };
+    let mut program = None;
+    let mut operands = Vec::new();
+    let mut assignments = Vec::new();
+    for child in command.children() {
+        match child.kind().as_ref() {
+            "command_name" => program = Some(child.text().to_string()),
+            "variable_assignment" => assignments.push(child.text().to_string()),
+            "file_redirect" => redirects.push(child),
+            _ if program.is_some() => operands.push(child.text().to_string()),
+            _ => {}
+        }
+    }
+    let Some(program) = program else {
+        return PipeStage::Runs;
+    };
+    if stage_runs_received_text(&program, &operands) {
+        return PipeStage::Runs;
+    }
+    if !literal_program_name(&program)
+        .is_some_and(|name| read_only_stage_is_inert(name, &operands, &assignments))
+    {
+        return PipeStage::Other;
+    }
+    stage_redirects_outcome(redirects)
+}
+
+/// Whether the command that owns a heredoc only passes its body on as text
+/// (or ignores it), so that the body is as contained as that command's
+/// output: a [`READ_ONLY_PIPE_STAGES`] program with inert operands, `echo`
+/// or `printf` (which never read it), or `git`, `gh` and `spx`, whose
+/// structured-stdin data contract the masker proves separately. `read c`
+/// keeps the body for a later `$c`, sed's `e` and awk's `system()` run it,
+/// `nc` and `curl` send it to a peer, and `tee /dev/stderr` writes it where
+/// `2>&1 >/dev/null | sh` points.
+#[allow(clippy::needless_pass_by_value)]
+fn owner_passes_body_through<D: ast_grep_core::Doc>(command: ast_grep_core::Node<'_, D>) -> bool {
+    let mut program = None;
+    let mut operands = Vec::new();
+    let mut assignments = Vec::new();
+    for child in command.children() {
+        match child.kind().as_ref() {
+            "command_name" => program = Some(child.text().to_string()),
+            "variable_assignment" if program.is_none() => {
+                assignments.push(child.text().to_string());
+            }
+            "file_redirect" => {}
+            _ if program.is_some() => operands.push(child.text().to_string()),
+            _ => {}
+        }
+    }
+    let Some(name) = program.as_deref().and_then(literal_program_name) else {
+        return false;
+    };
+    if matches!(name, "echo" | "printf" | "git" | "gh" | "spx") {
+        return assignments_keep_program(&assignments);
+    }
+    read_only_stage_is_inert(name, &operands, &assignments)
+}
+
+/// What a read-only stage's own redirects make of the text it passes on.
+fn stage_redirects_outcome<D: ast_grep_core::Doc>(
+    redirects: Vec<ast_grep_core::Node<'_, D>>,
+) -> PipeStage {
+    let mut filed = false;
+    for redirect in redirects {
+        match stdout_redirect(redirect) {
+            StdoutRedirect::Untouched => {}
+            StdoutRedirect::File => filed = true,
+            StdoutRedirect::Elsewhere => return PipeStage::Other,
+        }
+    }
+    if filed {
+        PipeStage::Files
+    } else {
+        PipeStage::PassesOn
+    }
+}
+
+/// The stages of `pipeline` (nested pipelines flattened) that start at or
+/// after `from`.
+fn pipeline_stages_after<'r, D: ast_grep_core::Doc>(
+    pipeline: &ast_grep_core::Node<'r, D>,
+    from: usize,
+    stages: &mut Vec<ast_grep_core::Node<'r, D>>,
+) {
+    for child in pipeline.children() {
+        if !child.is_named() || child.range().start < from {
+            continue;
+        }
+        if child.kind() == "pipeline" {
+            pipeline_stages_after(&child, from, stages);
+        } else {
+            stages.push(child);
+        }
+    }
+}
+
+/// Where the text reaching `stages` in order ends up: `None` when it passes
+/// through all of them still contained (it continues to whatever receives
+/// the pipeline's output), otherwise the answer.
+fn follow_pipe_stages<D: ast_grep_core::Doc>(
+    stages: Vec<ast_grep_core::Node<'_, D>>,
+) -> Option<HeredocOutput> {
+    let mut escapes = false;
+    for stage in stages {
+        match classify_pipe_stage(stage) {
+            PipeStage::PassesOn => {}
+            PipeStage::Files if !escapes => return Some(HeredocOutput::Contained),
+            PipeStage::Files | PipeStage::Other => escapes = true,
+            PipeStage::Runs => return Some(HeredocOutput::Executes),
+        }
+    }
+    escapes.then_some(HeredocOutput::Escapes)
+}
+
+/// Where the standard output of the command that owns `redirect` (a
+/// `heredoc_redirect` or `herestring_redirect`) goes, when the parse tree
+/// proves it. `None` whenever it does not — an unexpected node, a parse
+/// recovery in the operator's line, a delimiter the grammar read past a
+/// metacharacter, a descriptor duplication, a substitution — and the caller
+/// then decides from the text instead.
+///
+/// tree-sitter-bash hangs the rest of the heredoc's line under the
+/// `heredoc_redirect` node (`<<EOF > notes.md`, `<<EOF | sh`, `<<EOF && x`),
+/// so those children are read as the owning command's redirects and pipe up
+/// to the first list operator.
+fn heredoc_output<D: ast_grep_core::Doc>(
+    redirect: &ast_grep_core::Node<'_, D>,
+) -> Option<HeredocOutput> {
+    let statement = redirect.parent()?;
+    if statement.kind() != "redirected_statement" {
+        return None;
+    }
+    let mut children = statement.children();
+    let first = children.next()?;
+    // `cd d && cat <<EOF > f` and `x | cat <<EOF` parse as a list or pipeline
+    // whose LAST command owns the heredoc and the redirects after it.
+    let command = match first.kind().as_ref() {
+        "command" => first,
+        "list" | "pipeline" => {
+            let last = first
+                .children()
+                .filter(ast_grep_core::Node::is_named)
+                .last()?;
+            if last.kind() != "command" {
+                return None;
+            }
+            last
+        }
+        _ => return None,
+    };
+    // The body is only as contained as the output when its owner passes it
+    // through untouched; otherwise nothing about it is proven here.
+    if !owner_passes_body_through(command.clone()) {
+        return None;
+    }
+    let mut filed = false;
+    let mut account = |stdout: StdoutRedirect| -> Option<()> {
+        match stdout {
+            StdoutRedirect::Untouched => Some(()),
+            StdoutRedirect::File => {
+                filed = true;
+                Some(())
+            }
+            StdoutRedirect::Elsewhere => None,
+        }
+    };
+    for child in command.children() {
+        if child.kind() == "file_redirect" {
+            account(stdout_redirect(child))?;
+        }
+    }
+    let mut redirects_seen = 0usize;
+    for child in children {
+        match child.kind().as_ref() {
+            "file_redirect" => account(stdout_redirect(child))?,
+            "heredoc_redirect" | "herestring_redirect" => redirects_seen += 1,
+            _ => return None,
+        }
+    }
+    // Two heredocs on one command share a header the grammar splits
+    // arbitrarily between them.
+    if redirects_seen != 1 {
+        return None;
+    }
+
+    let mut piped_into = None;
+    // The words of a pipeline stage the grammar swallowed into a redirect.
+    let mut swallowed_stage: Option<Vec<String>> = None;
+    if redirect.kind() == "heredoc_redirect" {
+        let line_end = redirect_line_end(redirect);
+        let mut list_ended = false;
+        for child in redirect.children() {
+            let kind = child.kind();
+            if matches!(kind.as_ref(), "<<" | "<<-" | "heredoc_body" | "heredoc_end") {
+                continue;
+            }
+            // The header is the operator's own line. A child reaching past it
+            // means the grammar mis-split the line (`cat <<EOF |` continues
+            // after the body, but parses as a pipe into the body's first
+            // line), and a recovery anywhere in it means the same — except the
+            // one the grammar makes of `cat <<EOF >log | sh` and `<<EOF 2>&1 |
+            // sh`, a redirect that swallowed the pipe and the next stage.
+            if child.range().end > line_end {
+                return None;
+            }
+            if child.dfs().any(|node| node.is_error()) {
+                if kind != "file_redirect"
+                    || list_ended
+                    || piped_into.is_some()
+                    || swallowed_stage.is_some()
+                {
+                    return None;
+                }
+                let (stdout, stage) = redirect_with_swallowed_pipe(&child)?;
+                account(stdout)?;
+                swallowed_stage = Some(stage);
+                continue;
+            }
+            if kind == "heredoc_start" {
+                // `<<A; sh <<B` parses with `A;` as the delimiter.
+                if child
+                    .text()
+                    .contains([';', '&', '|', '<', '>', '(', ')', ' ', '\t'])
+                {
+                    return None;
+                }
+                continue;
+            }
+            if list_ended {
+                continue;
+            }
+            match kind.as_ref() {
+                "file_redirect" if piped_into.is_none() && swallowed_stage.is_none() => {
+                    account(stdout_redirect(child))?;
+                }
+                "pipeline"
+                    if piped_into.is_none()
+                        && swallowed_stage.is_none()
+                        && child
+                            .children()
+                            .next()
+                            .is_some_and(|first| matches!(first.kind().as_ref(), "|" | "|&")) =>
+                {
+                    piped_into = Some(child);
+                }
+                "&&" | "||" | ";" | "&" => list_ended = true,
+                _ => return None,
+            }
+        }
+    }
+    if filed {
+        return Some(HeredocOutput::Contained);
+    }
+    if let Some(stage) = swallowed_stage {
+        // Only the stage's own words survived the recovery: answer when it
+        // runs the text, and leave anything else to the text-level check.
+        let (program, operands) = stage.split_first()?;
+        return stage_runs_received_text(program, operands).then_some(HeredocOutput::Executes);
+    }
+    if let Some(pipeline) = piped_into {
+        let mut stages = Vec::new();
+        pipeline_stages_after(&pipeline, 0, &mut stages);
+        if let Some(answer) = follow_pipe_stages(stages) {
+            return Some(answer);
+        }
+    }
+
+    // The statement's output is its enclosing construct's.
+    let mut node = statement;
+    loop {
+        let parent = node.parent()?;
+        match parent.kind().as_ref() {
+            "program" => return Some(HeredocOutput::Contained),
+            "list"
+            | "subshell"
+            | "compound_statement"
+            | "if_statement"
+            | "elif_clause"
+            | "else_clause"
+            | "while_statement"
+            | "for_statement"
+            | "c_style_for_statement"
+            | "do_group"
+            | "case_statement"
+            | "case_item"
+            | "negated_command" => {}
+            "pipeline" => {
+                let mut stages = Vec::new();
+                pipeline_stages_after(&parent, node.range().end, &mut stages);
+                if let Some(answer) = follow_pipe_stages(stages) {
+                    return Some(answer);
+                }
+            }
+            "redirected_statement" => {
+                let mut filed = false;
+                for child in parent.children() {
+                    if child.range() == node.range() {
+                        continue;
+                    }
+                    if child.kind() != "file_redirect" {
+                        return None;
+                    }
+                    match stdout_redirect(child) {
+                        StdoutRedirect::Untouched => {}
+                        StdoutRedirect::File => filed = true,
+                        StdoutRedirect::Elsewhere => return None,
+                    }
+                }
+                if filed {
+                    return Some(HeredocOutput::Contained);
+                }
+            }
+            _ => return None,
+        }
+        node = parent;
+    }
+}
+
+/// Split the redirect tree-sitter-bash makes of `>log | sh` (or `2>&1 |
+/// sh`): the redirect proper, then an `ERROR` holding the pipe, then the next
+/// stage's words. `None` for any other recovery.
+fn redirect_with_swallowed_pipe<D: ast_grep_core::Doc>(
+    redirect: &ast_grep_core::Node<'_, D>,
+) -> Option<(StdoutRedirect, Vec<String>)> {
+    let children: Vec<_> = redirect.children().collect();
+    let error_at = children.iter().position(|child| child.kind() == "ERROR")?;
+    let error = &children[error_at];
+    if !matches!(error.text().trim(), "|" | "|&")
+        || error.dfs().filter(ast_grep_core::Node::is_error).count() != 1
+    {
+        return None;
+    }
+    let mut stage = Vec::new();
+    for child in &children[error_at + 1..] {
+        if !matches!(
+            child.kind().as_ref(),
+            "word"
+                | "string"
+                | "raw_string"
+                | "number"
+                | "simple_expansion"
+                | "expansion"
+                | "concatenation"
+        ) || child.dfs().any(|node| node.is_error())
+        {
+            return None;
+        }
+        stage.push(child.text().to_string());
+    }
+    if stage.is_empty() {
+        return None;
+    }
+    Some((
+        stdout_redirect_parts(children[..error_at].iter().cloned()),
+        stage,
+    ))
+}
+
+/// The end of the line holding the start of `node`.
+fn redirect_line_end<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> usize {
+    let start = node.range().start;
+    let text = node.text();
+    text.find(['\n', '\r'])
+        .map_or(start + text.len(), |at| start + at)
+}
+
+/// Whether `outside` — the command with its heredoc bodies blanked — may run
+/// the output of a heredoc's command, for when the parse tree could not show
+/// where that output goes. Coarse in the strict direction: a pipe into a
+/// program that runs what it receives ([`stage_runs_received_text`]), a line
+/// that ends in a pipe (the pipeline continues past the body), a process
+/// substitution, `eval`/`source`/`.`/`exec`/`xargs`/…, or such a program fed
+/// a computed operand (`sh -c "$x"`, `bash "$(cat <<EOF …)"`) or a redirect.
+fn command_may_run_heredoc_output(outside: &str) -> bool {
+    use crate::normalize::NormalizeTokenKind;
+    if outside.contains(">(") || outside.contains("<(") {
+        return true;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(outside);
+    let mut trailing_pipe = false;
+    let mut previous_separator: Option<&str> = None;
+    let mut words: Vec<&str> = Vec::new();
+    let segment_runs = |separator: Option<&str>, words: &[&str], trailing_pipe: bool| -> bool {
+        // Redirect words are neither the program nor operands (`sh < x` reads
+        // `x`, and a stdin redirect on a runner is input it may run); a group
+        // brace, an assignment or a reserved word before the program is not
+        // the program either.
+        let mut program = None;
+        let mut operands: Vec<String> = Vec::new();
+        let mut redirected_input = false;
+        let mut redirect_target = false;
+        for word in words.iter().copied() {
+            if std::mem::take(&mut redirect_target) {
+                continue;
+            }
+            let operator = word.trim_start_matches(|c: char| c.is_ascii_digit());
+            if operator.starts_with(['<', '>']) || operator.starts_with("&>") {
+                redirected_input |= operator.starts_with('<');
+                redirect_target = operator.trim_start_matches(['<', '>', '&', '|']).is_empty();
+                continue;
+            }
+            if program.is_some() {
+                operands.push(word.to_string());
+            } else if !is_shell_env_assignment(word)
+                && !matches!(
+                    word,
+                    "{" | "}"
+                        | "!"
+                        | "if"
+                        | "then"
+                        | "do"
+                        | "else"
+                        | "elif"
+                        | "while"
+                        | "until"
+                        | "fi"
+                        | "done"
+                        | "esac"
+                )
+            {
+                program = Some(dequoted_executable_word(word));
+            }
+        }
+        let Some(program) = program else {
+            return false;
+        };
+        if !stage_runs_received_text(&program, &operands) {
+            return false;
+        }
+        let name = literal_program_name(&program).unwrap_or("");
+        let piped = matches!(separator, Some("|" | "|&")) || trailing_pipe;
+        piped
+            || matches!(
+                name,
+                "eval" | "source" | "." | "exec" | "xargs" | "parallel" | "watch" | "at" | "batch"
+            )
+            || literal_program_name(&program).is_none()
+            || redirected_input
+            || operands.iter().any(|operand| is_computed_word(operand))
+    };
+    for token in &tokens {
+        let Some(text) = token.text(outside) else {
+            continue;
+        };
+        if token.kind == NormalizeTokenKind::Word {
+            words.push(text);
+            continue;
+        }
+        if segment_runs(previous_separator, &words, trailing_pipe) {
+            return true;
+        }
+        // A line that ends in a pipe continues on a later one — after the
+        // heredoc's body, in `cat <<EOF |` — so from there on every program
+        // may be the one it feeds.
+        if text == "\n" && words.is_empty() && matches!(previous_separator, Some("|" | "|&")) {
+            trailing_pipe = true;
+        }
+        words.clear();
+        previous_separator = Some(text);
+    }
+    segment_runs(previous_separator, &words, trailing_pipe)
+}
+
+/// Whether an expanding (unquoted-delimiter) heredoc body holds syntax the
+/// shell may execute while reading it: `$(…)`, backquotes, or bash 5.3's
+/// `${ cmd; }` / `${| cmd; }` in-shell substitutions. A body without any of
+/// them only undergoes parameter and arithmetic expansion, which run nothing.
+fn expanding_body_may_execute(body: &str) -> bool {
+    body.contains("$(")
+        || body.contains('`')
+        || contains_bash_funsub(body)
+        || continuation_forms_substitution(body)
+}
+
+/// Whether removing the body's line continuations creates a substitution:
+/// an expanding here-document joins `\<newline>` like the shell does
+/// elsewhere, so `$\` at the end of one line and `(cmd)` on the next is
+/// `$(cmd)`. A backslash that is itself escaped (`\\<newline>`) does not
+/// continue the line. Linear.
+fn continuation_forms_substitution(body: &str) -> bool {
+    if !body.contains("\\\n") && !body.contains("\\\r\n") {
+        return false;
+    }
+    let bytes = body.as_bytes();
+    let mut joined = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            match bytes.get(index + 1) {
+                Some(b'\n') => {
+                    index += 2;
+                    continue;
+                }
+                Some(b'\r') if bytes.get(index + 2) == Some(&b'\n') => {
+                    index += 3;
+                    continue;
+                }
+                Some(&escaped) => {
+                    joined.extend_from_slice(&[b'\\', escaped]);
+                    index += 2;
+                    continue;
+                }
+                None => {}
+            }
+        }
+        joined.push(bytes[index]);
+        index += 1;
+    }
+    let joined = String::from_utf8_lossy(&joined);
+    joined.matches("$(").count() > body.matches("$(").count()
+        || (contains_bash_funsub(&joined) && !contains_bash_funsub(body))
+}
+
+/// Bash 5.3 runs `${ cmd; }` and `${| cmd; }` in the current shell. The
+/// grammar does not model them, so their presence makes a body unmaskable.
+fn contains_bash_funsub(text: &str) -> bool {
+    text.match_indices("${").any(|(at, _)| {
+        matches!(
+            text.as_bytes().get(at + 2),
+            Some(b' ' | b'\t' | b'\n' | b'\r' | b'|')
+        )
+    })
+}
+
+/// The spans of an expanding heredoc body that the shell executes while
+/// reading it, as absolute byte ranges.
+///
+/// An unquoted delimiter (`cat <<EOF > notes.md`) expands the body before the
+/// target reads it, so its `$(…)` and backquoted substitutions run even when
+/// the target only stores the text. Everything else in the body — the prose
+/// of a note or a commit message — is data for a data sink, exactly as a
+/// quoted body is. The spans returned are the outermost `command_substitution`
+/// and `arithmetic_expansion` nodes the grammar parsed in the body (all
+/// arithmetic is kept visible: bash re-reads some `$((…))` as a command
+/// substitution holding a subshell) plus the backquoted substitutions the
+/// grammar leaves as plain text, found with the here-document escape rules.
+///
+/// `None` — the body must stay whole — when the grammar recovered from an
+/// error inside the body, a backquote is unterminated, a live `$(` lies
+/// outside every span, or the body holds a bash 5.3 `${ …; }` substitution.
+#[allow(clippy::needless_pass_by_value)]
+fn expanding_body_live_spans<D: ast_grep_core::Doc>(
+    body: ast_grep_core::Node<'_, D>,
+) -> Option<Vec<Range<usize>>> {
+    let text = body.text();
+    let text = text.as_ref();
+    if !expanding_body_may_execute(text) {
+        return Some(Vec::new());
+    }
+    if contains_bash_funsub(text) || continuation_forms_substitution(text) {
+        return None;
+    }
+    let base = body.range().start;
+    let bytes = text.as_bytes();
+    // A backslash quotes `$` in a here-document (POSIX 2.7.4), so `\$(…)` is
+    // text; `\\$(…)` is an escaped backslash before a live substitution.
+    let escaped = |at: usize| {
+        bytes[..at]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count()
+            % 2
+            == 1
+    };
+    let mut spans: Vec<Range<usize>> = Vec::new();
+    let mut recovered = false;
+    collect_body_expansion_spans(body.clone(), &mut spans, &mut recovered);
+    if recovered
+        || spans
+            .iter()
+            .any(|span| span.start < base || span.end > base + text.len())
+    {
+        return None;
+    }
+    // Relative to the body from here on. Every arithmetic expansion is kept,
+    // even one that looks numeric: what bash makes of an unparsable `$((…))`
+    // (a subshell, or an error) is not decided here, and v0.15.1 judged a
+    // multi-line one as a command.
+    let mut spans: Vec<Range<usize>> = spans
+        .into_iter()
+        .map(|span| span.start - base..span.end - base)
+        .filter(|span| !escaped(span.start))
+        .collect();
+    spans.sort_by_key(|span| span.start);
+    let opaque: Vec<(usize, usize)> = spans.iter().map(|span| (span.start, span.end)).collect();
+    let backquoted = scan_backquoted_substitutions(text, 0, &opaque).ok()?;
+    spans.extend(backquoted.into_iter().map(|found| found.start..found.end));
+    spans.sort_by_key(|span| span.start);
+    // Every live `$(` must sit inside a kept span; the list is sorted, so one
+    // forward pass checks them all.
+    let mut next = 0usize;
+    for (at, _) in text.match_indices("$(") {
+        while spans.get(next).is_some_and(|span| span.end <= at) {
+            next += 1;
+        }
+        let covered = spans.get(next).is_some_and(|span| span.start <= at);
+        if !covered && !escaped(at) {
+            return None;
+        }
+    }
+    Some(
+        spans
+            .into_iter()
+            .map(|span| span.start + base..span.end + base)
+            .collect(),
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn collect_body_expansion_spans<D: ast_grep_core::Doc>(
+    node: ast_grep_core::Node<'_, D>,
+    spans: &mut Vec<Range<usize>>,
+    recovered: &mut bool,
+) {
+    match node.kind().as_ref() {
+        "ERROR" => *recovered = true,
+        "command_substitution" | "arithmetic_expansion" => spans.push(node.range()),
+        _ => {
+            for child in node.children() {
+                collect_body_expansion_spans(child, spans, recovered);
+            }
+        }
     }
 }
 
@@ -6396,6 +10438,21 @@ fn heredoc_delimiter_is_quoted(
     // whereas the normalized delimiter text below still catches real quotes.
     let delimiter_word = redirect_text.get(word_start..delimiter_end).unwrap_or("");
     delimiter_word.contains(QUOTING_BYTES) || delimiter_text.contains(QUOTING_BYTES)
+}
+
+/// Every non-whitespace byte of `input` replaced with `_`, whitespace kept:
+/// word boundaries survive, the text does not, and the length is unchanged.
+fn mask_preserve_whitespace(input: &str) -> String {
+    input
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_whitespace() {
+                char::from(byte)
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn mask_preserve_newlines(input: &str) -> String {
@@ -6658,6 +10715,44 @@ pub struct PosixCommandSubstitutionParseError;
 /// input is refused for its size rather than its syntax.
 pub(crate) const MAX_SUBSTITUTION_SOURCE_BYTES: usize = 256 * 1024;
 
+/// Stages one pipeline may have before a command is not handed to the bash
+/// parser. tree-sitter-bash parses a single long pipeline in superlinear
+/// time: `x | cat | … | sh -c ls` with 6,000 stages held one parse ~0.7 s in
+/// an optimized build and the shipped hook 2.5–9 s, past its own deadline.
+/// No real command comes near this; past it the reading is refused.
+pub(crate) const MAX_PARSED_PIPELINE_STAGES: usize = 1024;
+
+/// Stages in the command's longest pipeline, by the tokenizer: `|` (and
+/// `|&`) joins two stages; any other separator (`;`, `&&`, `||`, `&`, a
+/// newline, a parenthesis) starts a new pipeline. Linear.
+pub(crate) fn longest_pipeline_stages(command: &str) -> usize {
+    if !command.contains('|') {
+        return 1;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    let mut longest = 1usize;
+    let mut stages = 1usize;
+    let mut previous_pipe_end = None;
+    for token in &tokens {
+        if token.kind != crate::normalize::NormalizeTokenKind::Separator {
+            continue;
+        }
+        match token.text(command) {
+            Some("|") => {
+                stages += 1;
+                longest = longest.max(stages);
+                previous_pipe_end = Some(token.byte_range.end);
+                continue;
+            }
+            // `|&` arrives as `|` then `&`.
+            Some("&") if previous_pipe_end == Some(token.byte_range.start) => {}
+            _ => stages = 1,
+        }
+        previous_pipe_end = None;
+    }
+    longest
+}
+
 pub fn extract_posix_command_substitutions(
     content: &str,
 ) -> Result<Vec<PosixCommandSubstitution>, PosixCommandSubstitutionParseError> {
@@ -6665,10 +10760,23 @@ pub fn extract_posix_command_substitutions(
     // and `$(` are the only POSIX command-substitution introducers; arithmetic
     // expansion may pass this prefilter, but the AST will not classify it as a
     // command substitution.
-    if content.trim().is_empty() || (!content.contains("$(") && !content.contains('`')) {
+    // A line continuation can join `$` and `(` (`$\<newline>(cmd)`); such
+    // input goes to the parse, where an expanding heredoc body holding one
+    // fails closed.
+    if content.trim().is_empty()
+        || (!content.contains("$(")
+            && !content.contains('`')
+            && !content.contains("$\\\n")
+            && !content.contains("$\\\r\n"))
+    {
         return Ok(Vec::new());
     }
-    if content.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
+    if content.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+        || longest_pipeline_stages(content) > MAX_PARSED_PIPELINE_STAGES
+        // `$\<newline>(cmd)` is `$(cmd)` once the shell joins the line, but
+        // the grammar reads `$` and `(cmd)` apart and reports no substitution.
+        || continuation_forms_substitution(content)
+    {
         return Err(PosixCommandSubstitutionParseError);
     }
 
@@ -6865,7 +10973,6 @@ fn collect_heredoc_redirect_substitutions<D: ast_grep_core::Doc>(
     };
     let body_range = body.range();
     let body_text = body.text();
-
     // Everything the walk above found under this redirect, in source order.
     let mut parsed = substitutions.split_off(first_child_index);
     parsed.sort_by(|left, right| {
@@ -7147,6 +11254,624 @@ mod tests {
     #[allow(unused_imports)]
     use proptest::prelude::*;
 
+    /// Eighth review: an expanding data body keeps exactly what the shell
+    /// runs while reading it — `$(…)`, backquotes, arithmetic that may be a
+    /// subshell — and masks the prose around it, with `_` so a substitution
+    /// is not moved to a word start. Bodies whose substitutions cannot be
+    /// bounded stay whole.
+    #[test]
+    fn expanding_data_bodies_keep_only_their_substitutions() {
+        let prose = "cat <<EOF > notes.md\nwatch 'git reset --hard'\nEOF";
+        let masked = mask_non_expanding_data_heredocs(prose);
+        assert!(!masked.contains("watch"), "{masked:?}");
+        assert_eq!(masked.len(), prose.len());
+
+        for (command, kept) in [
+            ("cat <<EOF > n\nrun $(date) now\nEOF", "$(date)"),
+            ("cat <<EOF > n\nrun `date` now\nEOF", "`date`"),
+            ("cat <<EOF > n\n${x:-$(rm -rf ~/a)}\nEOF", "$(rm -rf ~/a)"),
+            (
+                "cat <<EOF > n\n$(( a[$(rm -rf ~/a)] ))\nEOF",
+                "$(rm -rf ~/a)",
+            ),
+            ("cat <<EOF > n\n\\\\$(rm -rf ~/a)\nEOF", "$(rm -rf ~/a)"),
+            (
+                "cat <<EOF > n\n$(cat <<X\nrm -rf ~/a\nX\n)\nEOF",
+                "rm -rf ~/a",
+            ),
+        ] {
+            let masked = mask_non_expanding_data_heredocs(command);
+            assert!(masked.contains(kept), "{command:?} -> {masked:?}");
+            assert!(!masked.contains("run "), "{command:?} -> {masked:?}");
+            assert_eq!(masked.len(), command.len());
+        }
+        let around = mask_non_expanding_data_heredocs("cat <<EOF > n\nrun ($(date)) x\nEOF");
+        assert!(around.contains("___ _$(date)_ _"), "{around:?}");
+
+        // Arithmetic is kept, numeric or not, and the prose around it is
+        // still masked. (An escaped `\$(…)` defeats the grammar, and the
+        // recovery path keeps such a body whole.)
+        let numeric = "cat <<EOF > n\n$((1+2)) git reset --hard\nEOF";
+        let masked = mask_non_expanding_data_heredocs(numeric);
+        assert!(masked.contains("$((1+2))"), "{masked:?}");
+        assert!(!masked.contains("git reset"), "{masked:?}");
+        let multiline = "cat <<EOF > n\n$((\nrm -rf ~/a\n))\nEOF";
+        let masked = mask_non_expanding_data_heredocs(multiline);
+        assert!(masked.contains("rm -rf ~/a"), "{masked:?}");
+
+        // Unbounded: a continuation that forms `$(`, a bash 5.3 `${ …; }`,
+        // an unterminated backquote. The whole body stays.
+        for command in [
+            "cat <<EOF > n\n$\\\n(rm -rf ~/a)\nEOF",
+            "cat <<EOF > n\n${ rm -rf ~/a; }\nEOF",
+            "cat <<EOF > n\nx `rm -rf ~/a\nEOF",
+        ] {
+            let masked = mask_non_expanding_data_heredocs(command);
+            assert!(masked.contains("rm -rf ~/a"), "{command:?} -> {masked:?}");
+        }
+        // A continuation that forms a substitution also fails the
+        // substitution reader closed.
+        assert!(
+            extract_posix_command_substitutions("cat <<EOF > n\n$\\\n(rm -rf ~/a)\nEOF").is_err()
+        );
+        assert!(extract_posix_command_substitutions("cat <<EOF > n\na \\\nb\nEOF").is_ok());
+
+        // An executing target keeps the whole body, quoted or not, and so
+        // does an unquoted data sink whose output is not contained
+        // (`cat <<EOF | sh`; its body is also judged as commands, see
+        // `data_heredoc_bodies_are_masked_only_where_their_output_stays`).
+        for executed in [
+            "bash <<EOF\nwatch 'git reset --hard'\nEOF",
+            "bash <<'EOF'\nwatch 'git reset --hard'\nEOF",
+            "cat <<EOF | sh\nwatch 'git reset --hard'\nEOF",
+        ] {
+            let masked = mask_non_expanding_data_heredocs(executed);
+            assert!(masked.contains("git reset --hard"), "{masked:?}");
+        }
+    }
+
+    /// The output of each heredoc's command, as the parse tree proves it.
+    fn heredoc_outputs(command: &str) -> Vec<Option<HeredocOutput>> {
+        active_heredocs(command)
+            .expect("parses")
+            .into_iter()
+            .map(|heredoc| heredoc.output)
+            .collect()
+    }
+
+    /// Where a data sink's output goes decides whether its body is data.
+    /// The parse tree proves containment only for the terminal, a plain file
+    /// and read-only text tools; it proves execution for a pipe into a
+    /// program that runs text; anything it cannot follow is `None`.
+    #[test]
+    fn heredoc_output_is_proven_from_the_parse_tree() {
+        use HeredocOutput::{Contained, Escapes, Executes};
+        for (command, expected) in [
+            // Contained.
+            ("cat <<EOF\nx\nEOF", Some(Contained)),
+            ("cat <<EOF > notes.md\nx\nEOF", Some(Contained)),
+            ("cat > notes.md <<EOF\nx\nEOF", Some(Contained)),
+            ("FOO=1 cat <<EOF >> log.txt\nx\nEOF", Some(Contained)),
+            ("cat <<EOF > 'my notes.md'\nx\nEOF", Some(Contained)),
+            ("cat <<EOF >/dev/null\nx\nEOF", Some(Contained)),
+            ("cat <<EOF 2>/dev/null > n\nx\nEOF", Some(Contained)),
+            ("cat <<EOF 2>&1\nx\nEOF", Some(Contained)),
+            ("cat <<EOF | wc -l\nx\nEOF", Some(Contained)),
+            (
+                "cat <<EOF | grep -v x | sort > out.txt\nx\nEOF",
+                Some(Contained),
+            ),
+            ("cat <<EOF | tee a.txt | wc\nx\nEOF", Some(Contained)),
+            (
+                "cd d && cat <<EOF > n.md && git add n.md\nx\nEOF",
+                Some(Contained),
+            ),
+            ("git commit -F - <<EOF\nx\nEOF", Some(Contained)),
+            ("if true; then\ncat <<EOF\nx\nEOF\nfi", Some(Contained)),
+            // The grammar swallows `| bash` into the redirect; stdout is filed.
+            ("cat <<'EOF' >log | bash\nx\nEOF", Some(Contained)),
+            // Into a program that runs text.
+            ("cat <<EOF | sh\nx\nEOF", Some(Executes)),
+            ("cat <<'EOF' | bash -s -- a\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | grep x | sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | tee x | python3\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | ssh host\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | ssh -T host -- bash -s\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | docker exec -i c sh\nx\nEOF", Some(Executes)),
+            (
+                "cat <<EOF | kubectl exec -i p -- sh\nx\nEOF",
+                Some(Executes),
+            ),
+            ("cat <<EOF | sudo -u root sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | sudo\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | sudo -s\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | timeout 5 sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | env -i sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | su\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | at now\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | xargs -0 sh -c\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | $SHELL\nx\nEOF", Some(Executes)),
+            (
+                "cat <<EOF | while read -r l; do eval \"$l\"; done\nx\nEOF",
+                Some(Executes),
+            ),
+            ("cat <<EOF 2>&1 | sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF 2>/dev/null | sh\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | sh -c \"$(cat)\"\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | python3 -\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | ssh host 'bash -s'\nx\nEOF", Some(Executes)),
+            ("cat <<EOF | sudo env sh\nx\nEOF", Some(Executes)),
+            // Not contained, nothing seen that runs it.
+            ("cat <<EOF | git commit -F -\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | kubectl apply -f -\nx\nEOF", Some(Escapes)),
+            (
+                "cat <<EOF | sudo tee /etc/x >/dev/null\nx\nEOF",
+                Some(Escapes),
+            ),
+            ("cat <<EOF | sed s/a/b/\nx\nEOF", Some(Escapes)),
+            // A script file or a literal `-c` string reads the text as data.
+            ("cat <<EOF | bash deploy.sh\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | sh -c 'cat > out'\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | python3 -m json.tool\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | ssh host 'cat > f'\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | docker exec -i c tee /f\nx\nEOF", Some(Escapes)),
+            ("cat <<EOF | su -c 'cat > f' u\nx\nEOF", Some(Escapes)),
+            // Unproven: the tree cannot follow the output.
+            ("cat <<EOF >&2\nx\nEOF", None),
+            ("cat <<EOF >/dev/stdout\nx\nEOF", None),
+            ("cat <<EOF >/dev/stdout | sh\nx\nEOF", None),
+            ("cat <<EOF >&2 | sh\nx\nEOF", None),
+            ("cat <<EOF > ../../dev/fd/1\nx\nEOF", None),
+            ("cat <<EOF > \"$f\"\nx\nEOF", None),
+            ("cat <<EOF |\nx\nEOF\nsh", None),
+            ("x=$(cat <<EOF\nx\nEOF\n)", None),
+            ("tee >(sh) <<EOF\nx\nEOF", None),
+            ("cat <<EOF > >(sh)\nx\nEOF", None),
+            ("exec 3>&1; cat <<EOF\nx\nEOF", None),
+            ("f() { cat <<EOF\nx\nEOF\n}; f | sh", None),
+            ("cat <<A; sh <<B\nhi\nA\nx\nB", None),
+        ] {
+            let outputs = heredoc_outputs(command);
+            assert_eq!(outputs.first().copied().flatten(), expected, "{command:?}");
+        }
+    }
+
+    /// Without a proof from the tree, the text outside the bodies decides,
+    /// in the strict direction.
+    #[test]
+    fn unproven_heredoc_output_is_judged_from_the_text() {
+        for command in [
+            "cat <<EOF 2>&1 | sh\n\nEOF",
+            "(cat <<EOF) | sh\n\nEOF",
+            "{ cat <<EOF; } | sh\n\nEOF",
+            "cat <<EOF |\n\nEOF\nsh",
+            "x=$(cat <<EOF\n\nEOF\n); eval \"$x\"",
+            "x=$(cat <<EOF\n\nEOF\n)\nsh -c \"$x\"",
+            "eval \"$(cat <<EOF\n\nEOF\n)\"",
+            "bash -c \"$(cat <<EOF\n\nEOF\n)\"",
+            "tee >(sh) <<EOF\n\nEOF",
+            "f() { cat <<EOF\n\nEOF\n}; f | sh",
+            "cat <<A; sh <<B\nhi\nA\n\nB",
+            "cat <<EOF | $SHELL\n\nEOF",
+            "exec 3> >(sh)\ncat <<EOF >&3\n\nEOF",
+            "cat <<EOF > x\n\nEOF\nexec sh < x",
+        ] {
+            assert!(command_may_run_heredoc_output(command), "{command:?}");
+        }
+        for command in [
+            "cat <<EOF >&2\n\nEOF\nexit 1",
+            "git commit -m \"$(cat <<EOF\n\nEOF\n)\"",
+            "x=$(cat <<EOF\n\nEOF\n)\ngit commit -m \"$x\"",
+            "cat <<EOF > \"$f\"\n\nEOF\nbash build.sh",
+            "cat <<EOF | sudo tee /etc/x\n\nEOF",
+            "exec 2>&1\ncat <<EOF > n\n\nEOF",
+            "{ cat <<EOF; } > n\n\nEOF",
+            "if true; then cat <<EOF > n\n\nEOF\nfi",
+        ] {
+            assert!(!command_may_run_heredoc_output(command), "{command:?}");
+        }
+    }
+
+    /// A body is only as contained as its owner's output when the owner
+    /// passes it through untouched; a program that runs, stores, sends or
+    /// re-files it leaves the output unproven, and the unquoted body whole.
+    #[test]
+    fn owners_and_stages_that_use_the_body_prove_nothing() {
+        let body = "watch 'git reset --hard'";
+        for template in [
+            "read -r c <<EOF\n{b}\nEOF\n$c",
+            "sed e <<EOF\n{b}\nEOF",
+            "awk '{system($0)}' <<EOF\n{b}\nEOF",
+            "nc h 4444 <<EOF\n{b}\nEOF",
+            "curl --data-binary @- http://h <<EOF\n{b}\nEOF",
+            "dd of=out <<EOF\n{b}\nEOF",
+            "sort --compress-program=sh <<EOF\n{b}\nEOF",
+            "sort --co=sh <<EOF\n{b}\nEOF",
+            "sort -o /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+            "sort -o/dev/fd/3 <<EOF\n{b}\nEOF",
+            "sort --output=/dev/stderr <<EOF\n{b}\nEOF",
+            "sort -o <<EOF\n{b}\nEOF",
+            "sort $opt <<EOF\n{b}\nEOF",
+            "tee /dev/stderr <<EOF 2>&1 >/dev/null | sh\n{b}\nEOF",
+            "tee \"$f\" <<EOF\n{b}\nEOF",
+            "tee 'a'$f <<EOF\n{b}\nEOF",
+            "uniq - /dev/stderr <<EOF\n{b}\nEOF",
+            "xxd - /proc/self/fd/2 <<EOF\n{b}\nEOF",
+            "PATH=/tmp/x cat <<EOF\n{b}\nEOF",
+            "LD_PRELOAD=x.so cat <<EOF\n{b}\nEOF",
+            "cat <<EOF | sort --compress-program=sh\n{b}\nEOF",
+            "cat <<EOF | rg --pre=sh x /dev/stdin\n{b}\nEOF",
+            "cat <<EOF | tee /dev/stderr 2>&1 >/dev/null | sh\n{b}\nEOF",
+            "cat <<EOF | RIPGREP_CONFIG_PATH=x rg y\n{b}\nEOF",
+        ] {
+            let command = template.replace("{b}", body);
+            assert!(
+                heredoc_outputs(&command)
+                    .first()
+                    .is_some_and(|output| *output != Some(HeredocOutput::Contained)),
+                "{command:?}"
+            );
+            let view = mask_non_expanding_data_heredocs(&command);
+            assert!(view.contains("git reset"), "{command:?} -> {view:?}");
+        }
+        for template in [
+            "LC_ALL=C sort -u <<EOF > out\n{b}\nEOF",
+            "sort -o sorted.txt <<EOF\n{b}\nEOF",
+            "sort -ro sorted.txt <<EOF\n{b}\nEOF",
+            "tee -a notes.md log.txt <<EOF >/dev/null\n{b}\nEOF",
+            "uniq -c in.txt out.txt <<EOF\n{b}\nEOF",
+            "echo hi <<EOF\n{b}\nEOF",
+            "cat <<EOF | rg -n 'reset$' --pretty | sort -o s.txt\n{b}\nEOF",
+        ] {
+            let command = template.replace("{b}", body);
+            assert_eq!(
+                heredoc_outputs(&command).first().copied().flatten(),
+                Some(HeredocOutput::Contained),
+                "{command:?}"
+            );
+            let view = mask_non_expanding_data_heredocs(&command);
+            assert!(!view.contains("git reset"), "{command:?} -> {view:?}");
+        }
+    }
+
+    /// An unquoted data body keeps only its substitutions in the
+    /// expansion-aware view when its output is provably contained; any other
+    /// unquoted body stays whole there, as in v0.15.1, and quoted bodies keep
+    /// their v0.15.1 mask. A body whose output reaches a program that runs it
+    /// is handed to the caller to judge as commands, quoted or not.
+    #[test]
+    fn data_heredoc_bodies_are_masked_only_where_their_output_stays() {
+        let body = "watch 'git reset --hard'";
+        let contained = [
+            "cat <<{d} > notes.md\n{b}\nEOF",
+            "cat <<{d}\n{b}\nEOF",
+            "cat <<{d} | wc -l\n{b}\nEOF",
+            "cd d && cat <<{d} > n.md\n{b}\nEOF",
+        ];
+        let escapes = [
+            "cat <<{d} >&2\n{b}\nEOF",
+            "cat <<{d} | git commit -F -\n{b}\nEOF",
+            "cat <<{d} | sudo tee /etc/x\n{b}\nEOF",
+            "git commit -m \"$(cat <<{d}\n{b}\nEOF\n)\"",
+        ];
+        let executes = [
+            "cat <<{d} | sh\n{b}\nEOF",
+            "cat <<{d} 2>&1 | sh\n{b}\nEOF",
+            "cat <<{d} 2>/dev/null | sh\n{b}\nEOF",
+            "cat <<{d} >&2 | sh\n{b}\nEOF",
+            "(cat <<{d}) | sh\n{b}\nEOF",
+            "cat <<{d} | ssh host\n{b}\nEOF",
+            "cat <<{d} | ssh host bash\n{b}\nEOF",
+            "cat <<{d} | docker exec -i c sh\n{b}\nEOF",
+            "cat <<{d} | kubectl exec -i p -- sh\n{b}\nEOF",
+            "cat <<{d} | sudo sh\n{b}\nEOF",
+            "cat <<{d} | at now\n{b}\nEOF",
+            "cat <<{d} | su\n{b}\nEOF",
+            "cat <<{d} | $SHELL\n{b}\nEOF",
+            "cat <<{d} | tee /dev/null | sh\n{b}\nEOF",
+            "cat <<{d} |\n{b}\nEOF\nsh",
+            "cat <<{d} > >(sh)\n{b}\nEOF",
+            "tee >(sh) <<{d}\n{b}\nEOF",
+            "eval \"$(cat <<{d}\n{b}\nEOF\n)\"",
+            "x=$(cat <<{d}\n{b}\nEOF\n); eval \"$x\"",
+        ];
+        for delimiter in ["EOF", "'EOF'"] {
+            let quoted = delimiter.starts_with('\'');
+            let render = |template: &str| template.replace("{d}", delimiter).replace("{b}", body);
+            let judged = |command: &str| -> Vec<String> {
+                data_heredoc_bodies_whose_output_may_run(command)
+                    .into_iter()
+                    .map(|body| command[body].to_string())
+                    .collect()
+            };
+            for template in contained {
+                let command = render(template);
+                let view = mask_non_expanding_data_heredocs(&command);
+                assert!(!view.contains("git reset"), "{command:?} -> {view:?}");
+                let full = mask_non_executing_heredocs(&command);
+                assert!(!full.contains("git reset"), "{command:?} -> {full:?}");
+                assert!(judged(&command).is_empty(), "{command:?}");
+            }
+            for template in escapes {
+                let command = render(template);
+                let view = mask_non_expanding_data_heredocs(&command);
+                // v0.15.1: a quoted body masked, an unquoted one whole.
+                assert_eq!(
+                    view.contains("git reset"),
+                    !quoted,
+                    "{command:?} -> {view:?}"
+                );
+                let full = mask_non_executing_heredocs(&command);
+                assert!(!full.contains("git reset"), "{command:?} -> {full:?}");
+                assert!(judged(&command).is_empty(), "{command:?}");
+            }
+            for template in executes {
+                let command = render(template);
+                if !quoted {
+                    let view = mask_non_expanding_data_heredocs(&command);
+                    assert!(view.contains("git reset"), "{command:?} -> {view:?}");
+                }
+                // Judged as commands — or, where the grammar mis-splits the
+                // line (`cat <<EOF |` continued after the body), never masked.
+                let bodies = judged(&command);
+                assert!(
+                    bodies.iter().any(|judged| judged.contains(body))
+                        || mask_non_executing_heredocs(&command).contains(body),
+                    "{command:?} -> {bodies:?}"
+                );
+            }
+        }
+    }
+
+    /// A body written to a file the same command then runs is code.
+    #[test]
+    fn a_body_written_to_a_file_the_command_runs_stays_visible() {
+        for command in [
+            "tee x.sh <<EOF\nrm -rf ~/a\nEOF\nsh x.sh",
+            "cat > x.sh <<'EOF'\nrm -rf ~/a\nEOF\nbash x.sh",
+            "cat <<EOF > x.sh && ./x.sh\nrm -rf ~/a\nEOF",
+            "cat <<EOF > x.sh; . ./x.sh\nrm -rf ~/a\nEOF",
+            "cat <<EOF > x.sh\nrm -rf ~/a\nEOF\nsh -c \"$(cat x.sh)\"",
+            "cat <<EOF > x.sh\nrm -rf ~/a\nEOF\ncat x.sh | bash",
+            "cat <<EOF > x.sh\nrm -rf ~/a\nEOF\nbash < x.sh",
+            "cat <<EOF | tee a b.sh\nrm -rf ~/a\nEOF\nsh b.sh",
+            "cat >| /tmp/d/x.sh <<'EOF'\nrm -rf ~/a\nEOF\nsudo bash -e /tmp/d/x.sh",
+            "dd of=x.sh <<'EOF'\nrm -rf ~/a\nEOF\nsh x.sh",
+            "cat > x.sh <<'EOF'\nrm -rf ~/a\nEOF\nsh $(ls *.sh)",
+            "cat > x.sh <<'EOF'\nrm -rf ~/a\nEOF\nbash ./*.sh",
+            "cat > \"$f\" <<'EOF'\nrm -rf ~/a\nEOF\n\"$f\"",
+        ] {
+            assert!(
+                mask_non_expanding_data_heredocs(command).contains("rm -rf ~/a"),
+                "{command:?}"
+            );
+            assert!(
+                mask_non_executing_heredocs(command).contains("rm -rf ~/a"),
+                "{command:?}"
+            );
+        }
+        for command in [
+            "cat > notes.md <<'EOF'\nrm -rf ~/a\nEOF\ngit add notes.md && git commit -m n",
+            "cat > notes.md <<'EOF'\nrm -rf ~/a\nEOF\nwc -l notes.md",
+            "cat > notes.md <<'EOF'\nrm -rf ~/a\nEOF\nsh other.sh",
+            "cat > a.sh <<'EOF'\nrm -rf ~/a\nEOF\nsh ba.sh",
+            "cat > notes.md <<'EOF'\nrm -rf ~/a\nEOF\nX=$(date)",
+            "cat > notes.md <<'EOF'\nrm -rf ~/a\nEOF\nmake -j$(nproc)",
+            "cat > notes.md <<'EOF'\nrm -rf ~/a\nEOF\ngit add *.md",
+        ] {
+            assert!(
+                !mask_non_executing_heredocs(command).contains("rm -rf ~/a"),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_time_command_words_that_may_name_a_runner() {
+        for word in [
+            "w${x}atch",
+            "${W}atch",
+            "$W",
+            "\"$RUN\"",
+            "w$x'atch'",
+            "$(echo watch)",
+            "`echo ssh`",
+            "s${x}sh",
+            "/usr/bin/$W",
+            "w$1atch",
+            "w$@atch",
+            "$'\\x77'$x",
+        ] {
+            assert!(dynamic_word_may_name_runner(word), "{word:?}");
+        }
+        for word in [
+            "watch",
+            "$HOME/bin/tool",
+            "${X}-build",
+            "$X.sh",
+            "'$W'",
+            "w\\$xatch",
+            "tool$X",
+        ] {
+            assert!(!dynamic_word_may_name_runner(word), "{word:?}");
+        }
+    }
+
+    #[test]
+    fn substitution_command_words_read_as_their_output() {
+        let line = |command: &str| {
+            let tokens = crate::normalize::tokenize_for_normalization(command);
+            let word = tokens[0].text(command).unwrap();
+            substitution_command_line(command, &tokens, 0, word)
+        };
+        assert_eq!(
+            line("$(echo git reset --hard)").as_deref(),
+            Some("git reset --hard")
+        );
+        assert_eq!(
+            line("$(printf 'git reset') --hard").as_deref(),
+            Some("git reset --hard")
+        );
+        assert_eq!(
+            line("\"$(echo git)\" reset --hard").as_deref(),
+            Some("git reset --hard")
+        );
+        // The tokenizer splits a backquoted word at its blanks, so only a
+        // blank-free one reaches the reader whole.
+        assert_eq!(
+            whole_substitution_body("`echo git reset --hard`"),
+            Some("echo git reset --hard")
+        );
+        assert_eq!(line("`pwd`"), None);
+        assert_eq!(
+            line("$(echo git; echo reset)").as_deref(),
+            Some("git reset")
+        );
+        assert_eq!(line("$(pwd)"), None);
+        assert_eq!(line("$(echo a)b"), None);
+    }
+
+    #[test]
+    fn find_options_spelled_through_quoting_are_respelled() {
+        let respell = |command: &str| {
+            let tokens = crate::normalize::tokenize_for_normalization(command);
+            find_with_dequoted_actions(command, &tokens, 0)
+        };
+        assert_eq!(
+            respell("find . '-delete'").as_deref(),
+            Some("find . -delete")
+        );
+        assert_eq!(
+            respell("find . -de''lete").as_deref(),
+            Some("find . -delete")
+        );
+        assert_eq!(
+            respell("find . -de\\lete").as_deref(),
+            Some("find . -delete")
+        );
+        assert_eq!(
+            respell("find . -perm -u+x \"-delete\" -print").as_deref(),
+            Some("find . -perm -u+x -delete -print")
+        );
+        assert_eq!(respell("find . -name '-delete'"), None);
+        assert_eq!(respell("find . -exec grep '-delete' {} \\;"), None);
+        assert_eq!(respell("find . -name x -print"), None);
+    }
+
+    #[test]
+    fn primary_command_words_skip_wrapper_options_and_their_values() {
+        let primary = |command: &str| {
+            let tokens = crate::normalize::tokenize_for_normalization(command);
+            let positions = command_word_positions(command, &tokens);
+            primary_command_positions(command, &tokens, &positions)
+                .iter()
+                .zip(tokens.iter())
+                .filter(|(primary, _)| **primary)
+                .filter_map(|(_, token)| token.text(command).map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            primary("sudo -u \"$USER\" git commit -m 'x'"),
+            ["sudo", "git"]
+        );
+        assert_eq!(primary("x=1 w${x}atch 'y'"), ["w${x}atch"]);
+        assert_eq!(primary("if true; then $W 'y'; fi"), ["true", "$W", "fi"]);
+        assert_eq!(primary("timeout 5 $W 'y'"), ["timeout", "$W"]);
+        assert_eq!(primary("nohup -- $W 'y'"), ["nohup", "$W"]);
+        assert_eq!(primary("echo $W 'y'"), ["echo"]);
+    }
+
+    #[test]
+    fn stdin_programs_of_awk_and_sed_are_not_data() {
+        for command in [
+            "awk -f - <<EOF\nx\nEOF",
+            "gawk --file=/dev/stdin <<EOF\nx\nEOF",
+            "sed -nf - x <<EOF\nx\nEOF",
+            "sudo awk -f /dev/fd/0 <<EOF\nx\nEOF",
+        ] {
+            let at = command.find("<<").unwrap();
+            assert!(stdin_is_the_program(command, at), "{command:?}");
+        }
+        for command in [
+            "awk -f prog.awk <<EOF\nx\nEOF",
+            "awk '{print}' <<EOF\nx\nEOF",
+            "cat -f - <<EOF\nx\nEOF",
+            "awk -f - x; cat <<EOF\nx\nEOF",
+        ] {
+            let at = command.find("<<").unwrap();
+            assert!(!stdin_is_the_program(command, at), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn brace_lists_that_make_the_command_are_expanded() {
+        assert_eq!(
+            brace_expanded_command("{rm,-rf,~}").as_deref(),
+            Some("rm -rf ~")
+        );
+        assert_eq!(
+            brace_expanded_command("{git,reset} --hard x").as_deref(),
+            Some("git reset --hard x")
+        );
+        assert_eq!(
+            brace_expanded_command("sudo {git,reset,--hard}").as_deref(),
+            Some("sudo git reset --hard")
+        );
+        assert_eq!(
+            brace_expanded_command("rm {-rf,~/a}").as_deref(),
+            Some("rm -rf ~/a")
+        );
+        assert_eq!(brace_expanded_command("mkdir -p src/{a,b}"), None);
+        assert_eq!(brace_expanded_command("cp f{,.bak}"), None);
+        assert_eq!(brace_expanded_command("echo {a,b}"), None);
+        assert_eq!(brace_expanded_command("{a}"), None);
+        assert_eq!(brace_expanded_command("{ ls; }"), None);
+
+        for command in ["{rm,-rf,~}", "x; {a,b}", "rm {-rf,~}"] {
+            assert!(may_brace_expand_a_command(command), "{command:?}");
+        }
+        for command in [
+            "mkdir -p src/{a,b}",
+            "cp f{,.bak}",
+            "{ ls; }",
+            "awk '{print}'",
+        ] {
+            assert!(!may_brace_expand_a_command(command), "{command:?}");
+        }
+        // A run of `{` is scanned a bounded distance per brace.
+        let long = "{".repeat(200_000);
+        let started = Instant::now();
+        assert!(!may_brace_expand_a_command(&long));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn eighth_review_tier1_triggers() {
+        for command in [
+            "w${x}atch 'git reset --hard'",
+            "$(echo git reset --hard)",
+            "xargs git-reset --hard",
+            "find . '-delete'",
+            "find . -\\delete",
+            "f'ind' . \"-delete\"",
+            "$'\\x77atch' 'git reset --hard'",
+        ] {
+            assert_eq!(
+                check_triggers(command),
+                TriggerResult::Triggered,
+                "{command:?}"
+            );
+        }
+        for command in [
+            "git-reset --hard",
+            "echo $HOME 'x'",
+            "find . -name x -delete",
+            "ls",
+        ] {
+            assert!(!respelled_command_may_be_present(command), "{command:?}");
+        }
+    }
+
     /// Issue #440: a nested heredoc operator inside a quoted body is data.
     ///
     /// Writing a Ruby script with `cat > x.rb <<'OUTER'` whose body uses
@@ -7168,16 +11893,21 @@ mod tests {
         assert_eq!(masked.len(), command.len());
     }
 
-    /// The same shape with an UNQUOTED outer delimiter stays visible: the
-    /// shell expands that body before `cat` sees it, so it is not inert.
+    /// The same shape with an UNQUOTED outer delimiter: the shell expands the
+    /// body before `cat` sees it, but expansion runs only the body's
+    /// substitutions. Without one the body is as inert as a quoted one; a
+    /// `$(…)` in it stays, and so does a body the recovery path cannot bound
+    /// the substitutions of.
     #[test]
-    fn nested_heredoc_operator_inside_an_unquoted_body_stays_visible_issue_440() {
+    fn nested_heredoc_operator_inside_an_unquoted_body_keeps_only_substitutions_issue_440() {
         let command = "cat > /tmp/x.rb <<OUTER\neval <<~'SCRIPT'\n  puts 1\nSCRIPT\nOUTER";
         let masked = mask_non_expanding_data_heredocs(command);
-        assert!(
-            masked.contains("eval"),
-            "an unquoted body expands before the data sink runs and must not be masked"
-        );
+        assert!(!masked.contains("eval"), "{masked:?}");
+        assert_eq!(masked.len(), command.len());
+
+        let live = "cat > /tmp/x.rb <<OUTER\neval <<~'SCRIPT'\n  $(rm -rf ~/x)\nSCRIPT\nOUTER";
+        let masked = mask_non_expanding_data_heredocs(live);
+        assert!(masked.contains("rm -rf ~/x"), "{masked:?}");
     }
 
     /// Proves the recovery path itself, not just the AST path: `cat <<'EOF';
@@ -11077,6 +15807,66 @@ EOF";
     mod inert_interpreter_stdin {
         use super::*;
 
+        #[test]
+        fn syntax_view_preserves_outer_source_and_raw_interpreter_analysis() {
+            let command = "echo before\npython3 - <<'PY'\na = 'it\\'s'\nb = '#'\nc = re.compile(r\"^\")\nlabel = 'café'\nrun('rm -rf ~')\nPY\ngit reset --hard";
+            let masked = mask_inert_interpreter_stdin(command);
+            assert!(!masked.contains("re.compile"));
+            assert!(!masked.contains("run("));
+            assert_eq!(masked.len(), command.len());
+            assert_eq!(masked.lines().count(), command.lines().count());
+            assert!(masked.starts_with("echo before\npython3 - <<'PY'\n"));
+            assert!(masked.ends_with("PY\ngit reset --hard"));
+            assert_eq!(
+                masked.find("git reset --hard"),
+                command.find("git reset --hard")
+            );
+            assert!(mask_non_expanding_data_heredocs(command).contains("run('rm -rf ~')"));
+        }
+
+        #[test]
+        fn syntax_view_requires_a_proven_program_from_stdin() {
+            for header in [
+                "python3 -",
+                "/usr/bin/python3 -",
+                "node -",
+                "ruby",
+                "perl -",
+                "php",
+            ] {
+                let command = format!("{header} <<'EOF'\ncopy nul .git\\config\nEOF");
+                assert!(
+                    !mask_inert_interpreter_stdin(&command).contains("copy nul"),
+                    "{command}"
+                );
+            }
+            for command in [
+                "python3 -c 'import os,sys; os.system(sys.stdin.read())' <<'PY'\ncopy nul .git\\config\nPY",
+                "python3 script.py <<'PY'\ncopy nul .git\\config\nPY",
+                "python3 <<'PY' script.py\ncopy nul .git\\config\nPY",
+                "node -e 'eval(require(\"fs\").readFileSync(0,\"utf8\"))' <<'JS'\ncopy nul .git\\config\nJS",
+                "python3 - <<PY\n$(git reset --hard)\nPY",
+                "bash <<'SH'\ncopy nul .git\\config\nSH",
+                "env python3 - <<'PY'\ncopy nul .git\\config\nPY",
+                "python3() { bash -s; }; python3 - <<'PY'\ncopy nul .git\\config\nPY",
+                "PATH=/tmp python3 - <<'PY'\ncopy nul .git\\config\nPY",
+                "/tmp/python3 - <<'PY'\ncopy nul .git\\config\nPY",
+            ] {
+                assert_eq!(mask_inert_interpreter_stdin(command), command, "{command}");
+            }
+        }
+
+        #[test]
+        fn quoted_body_lookup_keeps_operator_identity() {
+            let command = "cat <<'A'\nsame text\nA\ncat <<B\nsame text\nB";
+            let quoted = command.find("<<'A'").unwrap();
+            let expanding = command.find("<<B").unwrap();
+            let body = quoted_heredoc_body_at(command, quoted).expect("quoted body");
+            assert!(command[body].contains("same text"));
+            assert!(quoted_heredoc_body_at(command, expanding).is_none());
+            assert!(quoted_heredoc_body_at(command, quoted + 1).is_none());
+        }
+
         /// Ask the predicate about the span of `needle` inside `command`.
         fn needle_is_inert(command: &str, needle: &str) -> bool {
             let start = command
@@ -11234,6 +16024,386 @@ EOF";
                     "{name} must not be classified as a proven non-shell interpreter"
                 );
             }
+        }
+    }
+
+    /// Fifth review: stages of the longest pipeline, the bound that keeps a
+    /// many-thousand-stage pipeline away from the bash parser.
+    #[test]
+    fn longest_pipeline_stages_counts_one_pipeline_at_a_time() {
+        for (command, stages) in [
+            ("ls", 1),
+            ("a | b", 2),
+            ("a | b | c; d | e", 3),
+            ("a | b && c | d | e | f", 4),
+            ("a |& b |& c", 3),
+            ("a || b || c", 1),
+            ("a & b | c", 2),
+            ("echo 'a|b|c|d' | wc", 2),
+            ("a | b\nc | d", 2),
+        ] {
+            assert_eq!(longest_pipeline_stages(command), stages, "{command:?}");
+        }
+        assert_eq!(
+            longest_pipeline_stages(&format!("x{}", " | cat".repeat(5000))),
+            5001
+        );
+    }
+
+    /// Sixth review: a redirect before or after an interpreter's inline flag,
+    /// and a shell's options between `-c` and its command string, hid the
+    /// payload from tier 1 and tier 2. Each payload is read exactly once.
+    #[test]
+    fn inline_flag_behind_redirects_and_shell_options_extracts_the_payload() {
+        for (command, payload) in [
+            ("sh 2>/dev/null -c 'git reset --hard'", "git reset --hard"),
+            ("sh 2>&1 -c 'x'", "x"),
+            ("sh 2> /dev/null -c 'x'", "x"),
+            ("sh 2>& 1 -c 'x'", "x"),
+            ("bash &>/dev/null -c 'x'", "x"),
+            ("bash &>>log -c 'x'", "x"),
+            ("zsh >|/tmp/o -c 'x'", "x"),
+            ("dash {fd}>/dev/null -c 'x'", "x"),
+            ("sh <>/tmp/o -c 'x'", "x"),
+            ("sh 3<&0- -c 'x'", "x"),
+            ("sh 2>\"/tmp/a b\" -c 'x'", "x"),
+            ("sh -e 2>/dev/null -c \"x\"", "x"),
+            ("sh -c 2>/dev/null 'x'", "x"),
+            ("sh -c -- 'x'", "x"),
+            ("sh -c - \"x\"", "x"),
+            ("bash -c -e 'x'", "x"),
+            ("bash -c -o errexit 'x'", "x"),
+            ("bash -c +e -- 'x'", "x"),
+            ("bash -c 2>&1 -x 2>/dev/null 'x'", "x"),
+            ("bash +e -c 'x'", "x"),
+            ("sh -c -- $CMD", "$CMD"),
+            ("sh 2>/dev/null -c $CMD", "$CMD"),
+            ("python3 2>/dev/null -c 'x'", "x"),
+            ("python3 -c 2>/dev/null 'x'", "x"),
+            ("sh>/dev/null -c 'x'", "x"),
+            ("sh -c 'x'>/dev/null", "x"),
+            ("sh -c 2>/dev/null 'echo a >/tmp/b'", "echo a >/tmp/b"),
+            // Seventh review: a here-string, and a redirect target holding
+            // a command substitution, backquotes or a `${…}` with blanks.
+            ("sh <<<y -c 'x'", "x"),
+            ("bash <<<'a b' -c 'x'", "x"),
+            ("sh 2>$(mktemp -u) -c 'x'", "x"),
+            ("sh 2>`mktemp -u` -c 'x'", "x"),
+            ("sh 2>${d:-a b}/f -c 'x'", "x"),
+        ] {
+            assert!(
+                matches!(check_triggers(command), TriggerResult::Triggered),
+                "{command:?} must trigger"
+            );
+            let contents = match extract_content(command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{command:?}: {other:?}"),
+            };
+            let reads = contents.iter().filter(|c| c.content == payload).count();
+            assert_eq!(reads, 1, "{command:?}: {contents:?}");
+        }
+        // A redirect's target is not a flag: `sh 2> -c 'x'` writes to a file
+        // named `-c` and runs the script file `x`. A quoted word after the
+        // command string is an argument (`$0`), not a second command string.
+        for (command, not_payload) in [("sh 2> -c 'x'", "x"), ("sh -c 'x' 2>/dev/null -e 'y'", "y")]
+        {
+            let contents = match extract_content(command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                ExtractionResult::NoContent => Vec::new(),
+                other => panic!("{command:?}: {other:?}"),
+            };
+            assert!(
+                !contents.iter().any(|c| c.content == not_payload),
+                "{command:?}: {contents:?}"
+            );
+        }
+    }
+
+    /// Sixth review: the redirect view blanks exactly the local redirects,
+    /// never text inside quotes, a heredoc or a process substitution.
+    #[test]
+    fn blank_local_redirects_blanks_only_redirect_words() {
+        for (command, expected) in [
+            ("sh 2>/dev/null -c 'x'", Some("sh             -c 'x'")),
+            ("sh 2> /dev/null -c 'x'", Some("sh              -c 'x'")),
+            ("a 2>&1 >&- 3<&0- b", Some("a                b")),
+            ("a &>l &>>l >|l <>l b", Some("a                  b")),
+            ("a {fd}>l {9x}>l b", Some("a        {9x}   b")),
+            ("a>l b", Some("a   b")),
+            ("a 2>\"x y\" b", Some("a         b")),
+            ("echo 'x > y' \"a <b\"", None),
+            ("cat <<EOF", None),
+            // Seventh review: a here-string is a redirect, and a target's
+            // `$(…)`, backquotes and `${…}` belong to it, blanks and all.
+            ("cat 2<<-EOF <<<x", Some("cat 2<<-EOF     ")),
+            ("a <<<'x y' b", Some("a          b")),
+            ("a 2>$(mktemp -u) b", Some("a                b")),
+            ("a 2>`mktemp -u` b", Some("a               b")),
+            ("a 2>${d:-x y}/f b", Some("a               b")),
+            ("cat <<<", None),
+            ("cat <(ls) >(wc)", None),
+            ("a 2>", None),
+            ("ls", None),
+        ] {
+            assert_eq!(
+                blank_local_redirects(command).as_deref(),
+                expected,
+                "{command:?}"
+            );
+        }
+    }
+
+    /// Sixth review: bash expands a process substitution anywhere in an
+    /// unquoted word (`--x=<(…)`), not only at its start.
+    #[test]
+    fn process_substitution_bodies_are_found_anywhere_in_a_word() {
+        for (word, expected) in [
+            ("<(a)", vec!["a"]),
+            ("--x=<(a b)", vec!["a b"]),
+            ("a<(b)>(c)", vec!["b", "c"]),
+            ("<(a <(b))", vec!["a <(b)"]),
+            ("$'\\''<(a)", vec!["a"]),
+            ("'<(a)'", vec![]),
+            ("\"<(a)\"", vec![]),
+            ("\\<(a)", vec![]),
+            ("$(<(a))", vec![]),
+            ("$'\\'<(a)'", vec![]),
+            ("<()", vec![]),
+            ("<(a", vec![]),
+        ] {
+            let bodies: Vec<&str> = process_substitution_bodies(word)
+                .into_iter()
+                .map(|body| &word[body])
+                .collect();
+            assert_eq!(bodies, expected, "{word:?}");
+        }
+    }
+
+    /// Seventh review: the Windows wrappers (`cmd /c`, `-EncodedCommand`,
+    /// `iex`, `Start-Process`) did not read the redirect view, so a redirect
+    /// between the program and its flag hid the payload
+    /// (`pwsh 2>$null -EncodedCommand …`, `cmd 2>nul /c …`). Each payload is
+    /// read once, from the command's own text.
+    #[test]
+    fn windows_wrappers_behind_redirects_extract_the_payload_once() {
+        // "git reset --hard" as base64 UTF-16LE.
+        let encoded = "ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=";
+        let reset = "git reset --hard";
+        for (command, payload) in [
+            (format!("pwsh 2>$null -EncodedCommand {encoded}"), reset),
+            (format!("powershell 2>&1 -enc {encoded}"), reset),
+            (format!("pwsh -EncodedCommand {encoded} 2>$null"), reset),
+            (format!("cmd 2>nul /c \"{reset}\""), reset),
+            (format!("cmd >nul /c {reset}"), reset),
+            (format!("iex 2>$null '{reset}'"), reset),
+            ("cmd /c dir 2>nul".to_string(), "dir 2>nul"),
+        ] {
+            let contents = match extract_content(&command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{command:?}: {other:?}"),
+            };
+            let reads = contents.iter().filter(|c| c.content == payload).count();
+            assert_eq!(reads, 1, "{command:?}: {contents:?}");
+        }
+    }
+
+    /// #510: a launcher quoted as prose in another command's argument.
+    mod quoted_launcher_prose {
+        use super::*;
+
+        /// Ask the predicate about the first `bash`/`sh`/`python3` word.
+        fn prose(command: &str) -> bool {
+            let start = ["bash", "sh ", "python3"]
+                .iter()
+                .filter_map(|needle| command.find(needle))
+                .min()
+                .unwrap_or_else(|| panic!("no launcher in {command:?}"));
+            inline_launcher_is_quoted_prose(command, start)
+        }
+
+        #[test]
+        fn prose_inside_a_quoted_argument_is_not_a_launcher() {
+            for command in [
+                "t c 1 \"example: bash -c 'git reset --hard' is refused\"",
+                "t c 1 'example: bash -c \"git reset --hard\"'",
+                "t c 1 \"run /usr/bin/bash -c 'x'\"",
+                "t c 1 \"note, python3 -c 'import os'\"",
+                "t --body=\"the hook blocks bash -c 'x'\"",
+                "t \"a 'b' bash -c 'x'\"",
+                "t \"$(echo 'note: bash -c x')\"",
+            ] {
+                assert!(prose(command), "{command}");
+            }
+        }
+
+        #[test]
+        #[allow(clippy::literal_string_with_formatting_args)] // shell `${…}`, not a format
+        fn launchers_that_may_run_are_kept() {
+            for command in [
+                // Unquoted, or the quoted text opens with the launcher.
+                "bash -c 'x'",
+                "t bash -c 'x'",
+                "\"bash\" -c 'x'",
+                "t \"bash -c 'x'\"",
+                "t \"  bash -c 'x'\"",
+                "t \"FOO=1 bash -c 'x'\"",
+                // A separator, wrapper, runner or reserved word before it.
+                "t \"x; bash -c 'x'\"",
+                "t \"x && bash -c 'x'\"",
+                "t \"x\nbash -c 'x'\"",
+                "t \"sudo bash -c 'x'\"",
+                "t \"timeout 5 bash -c 'x'\"",
+                "t \"xargs bash -c 'x'\"",
+                "t \"ssh host bash -c 'x'\"",
+                "t \"then bash -c 'x'\"",
+                "t \"/usr/bin/env bash -c 'x'\"",
+                // Inside a substitution, whatever the quoting.
+                "t \"note $(bash -c 'x')\"",
+                "t \"note `bash -c 'x'`\"",
+                "t 'x' $(bash -c 'y')",
+                // A first word that is not plain prose.
+                "t \"$X bash -c 'x'\"",
+                "t \"-v bash -c 'x'\"",
+                // Constructs the walk does not follow.
+                "cat <<EOF\nnote: bash -c 'x'\nEOF",
+                "t \"${A:-note} bash -c 'x'\"",
+                "t $'note bash -c x'",
+                "# note \"x bash -c 'y'\"",
+                "t \\\"note bash -c 'x'",
+            ] {
+                assert!(!prose(command), "{command}");
+            }
+        }
+
+        #[test]
+        fn extraction_skips_only_the_prose_launcher() {
+            let limits = ExtractionLimits::default();
+            let contents = |command: &str| match extract_content(command, &limits) {
+                ExtractionResult::Extracted(contents) => contents,
+                ExtractionResult::NoContent => Vec::new(),
+                other => panic!("{command:?}: {other:?}"),
+            };
+            assert!(contents("t c \"example: bash -c 'git reset --hard'\"").is_empty());
+            let live = contents("t c \"example\" && bash -c 'git reset --hard'");
+            assert_eq!(live.len(), 1, "{live:?}");
+            assert_eq!(live[0].content, "git reset --hard");
+        }
+    }
+
+    /// #511: what an awk program prints into a shell that runs its stdin.
+    mod awk_printed_into_shell {
+        use super::*;
+
+        fn printed(program: &str) -> Vec<AwkPrintedScript> {
+            awk_shell_payload_ranges(program, 0).printed
+        }
+
+        fn script(program: &str) -> Option<String> {
+            let found = printed(program);
+            assert_eq!(found.len(), 1, "{program:?}: {found:?}");
+            found.into_iter().next().and_then(|p| p.script)
+        }
+
+        #[test]
+        fn stdin_shells_are_recognised() {
+            for target in [
+                "sh",
+                "bash",
+                "/bin/sh",
+                "dash",
+                "zsh",
+                "bash -e",
+                "sh -s",
+                "sh -s arg",
+                "bash -",
+                "bash -o pipefail",
+                "sudo sh",
+                "env bash",
+                "bash --norc",
+            ] {
+                assert!(awk_pipe_target_runs_stdin_as_script(target), "{target}");
+            }
+            for target in [
+                "cat",
+                "sort -u",
+                "sh -c cat",
+                "bash -ec 'x'",
+                "sh run.sh",
+                "sh -- run.sh",
+                "python3",
+                "",
+            ] {
+                assert!(!awk_pipe_target_runs_stdin_as_script(target), "{target}");
+            }
+        }
+
+        #[test]
+        fn literal_prints_become_the_script() {
+            assert_eq!(
+                script("BEGIN{print \"git reset --hard\" | \"sh\"}").as_deref(),
+                Some("git reset --hard")
+            );
+            assert_eq!(
+                script("BEGIN{print(\"a\", \"b\") | \"sh\"}").as_deref(),
+                Some("a b")
+            );
+            assert_eq!(
+                script("BEGIN{print \"a\" \"b\" | \"sh\"}").as_deref(),
+                Some("ab")
+            );
+            assert_eq!(
+                script("BEGIN{printf \"rm x\\n100%%\" | \"sh\"}").as_deref(),
+                Some("rm x\n100%")
+            );
+            assert_eq!(
+                script("BEGIN{x=1; print \"q;}\" | \"sh\"}").as_deref(),
+                Some("q;}")
+            );
+            assert_eq!(
+                script("BEGIN{print \\\"git reset --hard\\\" | \\\"sh\\\"}").as_deref(),
+                Some("git reset --hard")
+            );
+        }
+
+        #[test]
+        fn a_variable_assigned_one_literal_is_resolved() {
+            let found = printed("BEGIN{cmd=\"git reset --hard\"; print cmd | \"sh\"}");
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].script.as_deref(), Some("git reset --hard"));
+            assert_eq!(found[0].variable.as_deref(), Some("cmd"));
+        }
+
+        #[test]
+        fn computed_prints_are_reported_without_a_script() {
+            for program in [
+                "{print \"rm \" $1 | \"sh\"}",
+                "{print $0 | \"sh\"}",
+                "BEGIN{c=\"ls\"; c=c \" -l\"; print c | \"sh\"}",
+                "BEGIN{c=\"ls\"; c=\"rm\"; print c | \"sh\"}",
+                "{getline c; print c | \"sh\"}",
+                "BEGIN{printf \"%s\\n\", \"ls\" | \"sh\"}",
+                "BEGIN{print toupper(\"ls\") | \"sh\"}",
+            ] {
+                assert_eq!(script(program), None, "{program}");
+            }
+        }
+
+        #[test]
+        fn pipes_into_non_shells_report_nothing_printed() {
+            for program in [
+                "{print $1 | \"sort\"}",
+                "BEGIN{print \"x\" | \"sh -c cat\"}",
+                "BEGIN{print \"x\" > \"out\"}",
+                "BEGIN{if (a || b) print \"x\"}",
+            ] {
+                assert!(printed(program).is_empty(), "{program}");
+            }
+        }
+
+        #[test]
+        fn non_ascii_programs_do_not_panic() {
+            let _ = printed("BEGIN{é=\"ü\"; cmd=\"ls\"; print cmd | \"sh\"} # ß");
+            let _ = printed("BEGIN{print \"日本\" | \"sh\"}");
         }
     }
 }

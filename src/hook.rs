@@ -145,6 +145,17 @@ pub struct HookInput {
     )]
     pub tool_calls: Option<Vec<ToolCall>>,
 
+    /// Sent only by dcg's own generated OpenCode plugin: `true` asks for an
+    /// explicit allow line ([`EXPLICIT_ALLOW_VERDICT`]) instead of the
+    /// protocol's silent allow.
+    ///
+    /// With silence meaning allow, a caller cannot tell an allowed command
+    /// from a dcg that died before answering. The plugin sets this so that an
+    /// empty stdout means "no verdict" and blocks. No host sends the field, so
+    /// every hook protocol keeps its own allow encoding. Raw JSON value for
+    /// the same parse-robustness reason as `permission_mode`.
+    pub dcg_explicit_verdict: Option<serde_json::Value>,
+
     /// Command strings displaced by a *conflicting* snake_case/camelCase alias
     /// pair in the raw envelope (issue #410).
     ///
@@ -779,10 +790,50 @@ impl HookProtocol {
 /// [`HookProtocol::undeliverable_block_exit_code`] for blocking verdicts and
 /// ignores it for warnings, whose command was going to proceed anyway.
 fn deliver_verdict(payload: &[u8]) -> io::Result<()> {
+    if !claim_verdict_output() {
+        // The panic backstop already owns stdout and is about to exit with
+        // its own fail-closed verdict; a second document would corrupt it.
+        return Ok(());
+    }
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     handle.write_all(payload)?;
     handle.flush()
+}
+
+/// The explicit allow line written for a caller that sent
+/// `"dcg_explicit_verdict": true` (dcg's OpenCode plugin).
+///
+/// Deliberately not any host's allow shape: in Claude Code a
+/// `permissionDecision` of `allow` skips the user's own permission prompt, so
+/// this line uses a dcg-only key that no host acts on.
+pub const EXPLICIT_ALLOW_VERDICT: &[u8] = b"{\"dcg_verdict\":\"allow\"}\n";
+
+/// Write [`EXPLICIT_ALLOW_VERDICT`] unless a verdict document has already
+/// claimed stdout (a deny, ask, or warning was written for this request).
+///
+/// # Errors
+///
+/// The stdout write or flush failed.
+pub fn output_explicit_allow() -> io::Result<()> {
+    deliver_verdict(EXPLICIT_ALLOW_VERDICT)
+}
+
+/// Set once something has begun writing this process's single verdict
+/// document to stdout.
+static VERDICT_OUTPUT_CLAIMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim the right to write this process's verdict document to stdout.
+///
+/// Hook protocols read one JSON document. The normal publication path and the
+/// hook binary's panic backstop both claim before writing, and only the first
+/// claim succeeds, so a panic can never append a second document to (or
+/// interleave with) a verdict already on its way out. Returns `true` exactly
+/// once per process.
+#[must_use]
+pub fn claim_verdict_output() -> bool {
+    !VERDICT_OUTPUT_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
 /// A shell command extracted from a hook request together with its execution
@@ -1563,9 +1614,12 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // classify Codex separately because its JSON parser is strict
     // (`deny_unknown_fields`) and would silently drop dcg's standard deny
     // payload, letting the destructive command through.
+    // `shell` is Cursor's name for Claude Code's `Bash` when Cursor runs the
+    // `PreToolUse` hooks from `~/.claude/settings.json`; it reads the
+    // Claude-shaped answer (#518).
     let is_claude_compatible_shell_tool = matches!(
         tool_name.as_str(),
-        "bash" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe"
+        "bash" | "monitor" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe" | "shell"
     ) || is_vscode_terminal_tool(&tool_name);
     let has_codex_turn_id = input
         .turn_id
@@ -1625,7 +1679,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         "powershell" | "pwsh" | "cmd" | "cmd.exe"
     );
     // Claude Code on Windows DOES send `PowerShell` (dcg's own installer
-    // registers its Claude hook for `Bash|PowerShell`), and classifying those
+    // registers its Claude hook for `Bash|PowerShell|Monitor`), and classifying those
     // payloads as Codex answered every deny in the minimal shape — no ruleId,
     // packId, severity, allow-once code or remediation. An Anthropic tool-use
     // id (`toolu_…`) is the precise wire marker: Codex never emits one. The
@@ -1642,7 +1696,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     }
 
     // --- Claude-compatible indicators ---
-    // Claude Code uses tool_name="Bash" or "launch-process"; Codex-style
+    // Claude Code uses tool_name="Bash", "Monitor" or "launch-process"; Codex-style
     // shell payloads can also use PowerShell names. These tool names are not
     // Gemini's shell tool names, so check them before Gemini envelope fields.
     // Claude Code payloads also include session_id/cwd/transcript_path, which
@@ -1724,6 +1778,9 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
         || matches!(
             normalized.as_str(),
             "bash"
+            // Claude Code's Monitor command is a POSIX shell script. Its
+            // commandless WebSocket form is ignored during extraction (#529).
+            | "monitor"
             | "launch-process"
             | "powershell"
             | "pwsh"
@@ -1731,6 +1788,12 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             | "cmd.exe"
             | "run_shell_command"
             | "run-shell-command"
+            // Cursor's shell tool. Cursor runs Claude Code's `PreToolUse`
+            // hooks from `~/.claude/settings.json` and renames `Bash` to
+            // `Shell` on the way (its "third-party hooks" mapping), so a dcg
+            // installed for Claude Code that did not know the name let every
+            // Cursor command through unjudged (#518).
+            | "shell"
             // Hermes Agent shell tool. Distinct from Cursor's "terminal"
             // wrapper script which translates upstream to "Bash" before
             // invoking dcg, so the only path here is genuine Hermes input.
@@ -1747,6 +1810,16 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
 }
 
 impl HookInput {
+    /// Whether the caller asked for an explicit allow line (see
+    /// [`Self::dcg_explicit_verdict`]). Only a JSON `true` counts.
+    #[must_use]
+    pub fn requests_explicit_verdict(&self) -> bool {
+        matches!(
+            self.dcg_explicit_verdict,
+            Some(serde_json::Value::Bool(true))
+        )
+    }
+
     /// Whether the payload declares a permission mode in which no human is
     /// guaranteed to answer a prompt (`bypassPermissions`, `dontAsk`).
     ///
@@ -1781,7 +1854,7 @@ pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDiale
     };
 
     match tool_name.to_ascii_lowercase().as_str() {
-        "bash" => ShellDialect::Posix,
+        "bash" | "monitor" => ShellDialect::Posix,
         "powershell" | "pwsh" => ShellDialect::PowerShell,
         "cmd" | "cmd.exe" => ShellDialect::Cmd,
         _ => ShellDialect::Unknown,
@@ -1842,7 +1915,8 @@ pub(crate) fn codex_host_shell_dialect(
     }
     // The same masked view the POSIX evaluation path parses, so the verdict
     // here matches the one that path would reach.
-    let posix_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let posix_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
     match crate::heredoc::extract_posix_command_substitutions(posix_view.as_ref()) {
         Ok(_) => ShellDialect::Unknown,
         Err(crate::heredoc::PosixCommandSubstitutionParseError) => ShellDialect::PowerShell,
@@ -2188,7 +2262,24 @@ fn segment_command_word_is_cmd_assembled(segment: &str) -> bool {
     if first.starts_with(['"', '\'']) {
         return false;
     }
-    first.contains('^') || is_percent_expansion(first)
+    // A quote can begin inside a word: Python's r"^" is one such token
+    // when the conservative heredoc scan encounters re.compile(r"^").
+    // Only an unquoted caret can assemble a cmd executable; a quoted caret
+    // is literal text. Keep real g^it / doc^ker evidence, including inside
+    // interpreter strings passed through an opaque shell sink.
+    let mut quote = None;
+    for byte in first.bytes() {
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        } else if byte == b'^' {
+            return true;
+        }
+    }
+    is_percent_expansion(first)
 }
 
 fn is_windows_path_token(token: &str) -> bool {
@@ -2312,20 +2403,62 @@ fn segment_is_format_drive_invocation(segment: &str) -> bool {
 /// argument (`rm -Recurse -Force …`, `del /s /q …`), or a cmd writer carrying a
 /// Windows path (`copy nul .git\config`).
 fn command_has_powershell_shape(command: &str) -> bool {
-    command
-        .split(['|', ';', '&', '\n', '\r', '(', '{'])
-        .any(|segment| {
-            segment
-                .split_whitespace()
-                .next()
-                .is_some_and(is_powershell_cmdlet_token)
-                || segment_is_windows_alias_invocation(segment)
-                || segment_is_cmd_writer_invocation(segment)
-                || segment_is_windows_file_delete_invocation(segment)
-                || segment_is_windows_only_executable(segment)
-                || segment_command_word_is_cmd_assembled(segment)
-                || segment_is_format_drive_invocation(segment)
-        })
+    use ast_grep_core::AstGrep;
+    use ast_grep_language::SupportLang;
+
+    let has_candidate = |source: &str| {
+        source
+            .split(['|', ';', '&', '\n', '\r', '(', '{'])
+            .any(segment_has_windows_shape)
+    };
+    if !has_candidate(command) {
+        return false;
+    }
+    // The cheap scan sees separators inside quoted arguments too: sed's
+    // 's|^\./||' appeared to start a command with a cmd caret (#524). Only
+    // withdraw that evidence when a complete, bounded Bash parse establishes
+    // the actual command positions. Real substitutions, process substitutions,
+    // groups and control-flow bodies are all visited, including inside quotes.
+    // An invalid or oversized parse retains the conservative candidate.
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
+        || crate::heredoc::longest_pipeline_stages(command)
+            > crate::heredoc::MAX_PARSED_PIPELINE_STAGES
+    {
+        return true;
+    }
+    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+        return true;
+    };
+    if ast.root().get_inner_node().has_error() {
+        return true;
+    }
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        match node.kind().as_ref() {
+            "ERROR" => return true,
+            "command" if segment_has_windows_shape(node.text().as_ref()) => return true,
+            // Interpreter source retains conservative Windows evidence:
+            // an opaque or aliased sink can pass these strings to a shell.
+            // Only the separately proven data bodies have been masked.
+            "heredoc_body" if has_candidate(node.text().as_ref()) => return true,
+            _ => {}
+        }
+        pending.extend(node.children());
+    }
+    false
+}
+
+fn segment_has_windows_shape(segment: &str) -> bool {
+    segment
+        .split_whitespace()
+        .next()
+        .is_some_and(is_powershell_cmdlet_token)
+        || segment_is_windows_alias_invocation(segment)
+        || segment_is_cmd_writer_invocation(segment)
+        || segment_is_windows_file_delete_invocation(segment)
+        || segment_is_windows_only_executable(segment)
+        || segment_command_word_is_cmd_assembled(segment)
+        || segment_is_format_drive_invocation(segment)
 }
 
 /// Down-trust a `Bash`-labeled dialect when the command itself is
@@ -3161,23 +3294,12 @@ pub fn write_denial_to(
         warning_audience,
     );
 
-    // GH#332: name the allow-once remedy in the reason text for protocols
-    // whose JSON already carries the code. Codex is excluded on purpose — its
-    // output deliberately strips all allow-once metadata (see the Codex arm
-    // below and `WarningAudience::CodexModel`), and the reason string must
-    // not reintroduce what the protocol's design withholds.
-    let reason_allow_once_code = match protocol {
-        HookProtocol::Codex => None,
-        _ => allow_once_code,
-    };
-    let message = format_denial_message(
-        command,
-        reason,
-        explanation,
-        pack,
-        pattern,
-        reason_allow_once_code,
-    );
+    // GH#332/#537: expose a successfully minted review identifier through the
+    // supported reason text, including Codex's strict three-field contract.
+    // This remains a denial; only explicit human redemption grants an exception.
+    // If persistence failed (including lock timeout), there is no code to expose.
+    let message =
+        format_denial_message(command, reason, explanation, pack, pattern, allow_once_code);
     let rule_id = build_rule_id(pack, pattern);
     let remediation = allow_once.map(|info| {
         let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
@@ -3211,8 +3333,10 @@ pub fn write_denial_to(
         HookProtocol::Codex => {
             // Codex 0.144.x: emit only the documented PreToolUse fields.
             // Extra dcg metadata is intentionally omitted because Codex's
-            // parser is stricter than Claude's.  Exit remains 0; some current
-            // Codex builds classify exit 2 as hook failure and then fail open.
+            // parser is stricter than Claude's. An allow-once review code can
+            // appear in the supported reason string without adding fields.
+            // Exit remains 0; some current Codex builds classify exit 2 as
+            // hook failure and then fail open.
             let output = HookOutput {
                 hook_specific_output: HookSpecificOutput {
                     hook_event_name: "PreToolUse",
@@ -3762,6 +3886,29 @@ pub fn write_indeterminate_to(
     let _ = stderr.flush();
 }
 
+/// Emit the indeterminate response from the hook binary's panic backstop.
+///
+/// Same document as [`output_indeterminate_for_protocol`], but it takes the
+/// stdout claim itself: `None` means a verdict was already being written when
+/// the panic struck, so nothing is written and the caller must fall back to
+/// the protocol's blocking exit status.
+#[cold]
+#[inline(never)]
+pub fn output_indeterminate_from_panic(
+    protocol: HookProtocol,
+    reason: &str,
+    deny: bool,
+) -> Option<io::Result<()>> {
+    if !claim_verdict_output() {
+        return None;
+    }
+    let mut verdict = Vec::new();
+    write_indeterminate_to(&mut verdict, &mut io::stderr(), protocol, reason, deny);
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    Some(handle.write_all(&verdict).and_then(|()| handle.flush()))
+}
+
 /// Emit a safety-evaluation indeterminate response on process stdout/stderr.
 #[cold]
 #[inline(never)]
@@ -4148,8 +4295,51 @@ mod tests {
     }
 
     #[test]
+    fn test_monitor_command_uses_claude_protocol_and_posix_dialect() {
+        for tool_name in ["Monitor", "monitor", "MONITOR"] {
+            let input: HookInput = serde_json::from_value(serde_json::json!({
+                "tool_name": tool_name,
+                "tool_input": { "command": "until git reset --hard HEAD; do sleep 1; done" },
+                "hook_event_name": "PreToolUse",
+                "session_id": "monitor-529",
+                "tool_use_id": "toolu_monitor_529",
+                "cwd": "/tmp",
+            }))
+            .unwrap();
+
+            assert!(is_supported_shell_tool(input.tool_name.as_deref()));
+            let extracted = extract_command_with_context(&input).expect("Monitor shell script");
+            assert_eq!(
+                extracted.command,
+                "until git reset --hard HEAD; do sleep 1; done"
+            );
+            assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
+            assert_eq!(extracted.dialect, ShellDialect::Posix);
+        }
+    }
+
+    #[test]
+    fn test_monitor_websocket_without_command_is_not_evaluated() {
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "tool_name": "Monitor",
+            "tool_input": { "ws": { "url": "wss://example.com/stream" } },
+            "hook_event_name": "PreToolUse",
+            "session_id": "monitor-529",
+            "tool_use_id": "toolu_monitor_529",
+            "cwd": "/tmp",
+        }))
+        .unwrap();
+
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+        assert!(extract_command_with_context(&input).is_none());
+        for tool_name in ["MonitorStatus", "MCP:monitor"] {
+            assert!(!is_supported_shell_tool(Some(tool_name)));
+        }
+    }
+
+    #[test]
     fn test_shell_dialect_inference_requires_explicit_shell_tool_name() {
-        for tool_name in ["bash", "Bash", "BASH"] {
+        for tool_name in ["bash", "Bash", "BASH", "monitor", "Monitor", "MONITOR"] {
             assert_eq!(
                 shell_dialect_for_tool_name(Some(tool_name)),
                 ShellDialect::Posix
@@ -4425,10 +4615,13 @@ mod tests {
         // commit message must not down-trust real Bash (issue #412). Bodies the
         // masker cannot delimit — an unbalanced quote inside `"$(…)"` defeats
         // the trigger scanner — still widen; that residue is tracked in #412.
+        // An unquoted body that feeds a data sink is data too, except for its
+        // substitutions, which the shell runs.
         for command in [
             "git commit -q -F - <<'EOF'\na \" b\nRead-only\nEOF",
             "cat > msg.txt <<'EOF'\nRemove-Item -Recurse -Force C:\\x\nEOF",
             "git commit -q -m \"$(cat <<'EOF'\nRead-only\nEOF\n)\"",
+            "cat <<EOF\nRemove-Item -Recurse -Force C:\\x\nEOF",
         ] {
             assert_eq!(
                 refine_shell_dialect(command, ShellDialect::Posix),
@@ -4437,10 +4630,10 @@ mod tests {
             );
         }
 
-        // An UNquoted heredoc expands, and anything outside any heredoc body is
-        // still command text, so both still widen.
+        // A substitution in an UNquoted heredoc runs, and anything outside
+        // any heredoc body is still command text, so both still widen.
         for command in [
-            "cat <<EOF\nRemove-Item -Recurse -Force C:\\x\nEOF",
+            "cat <<EOF\n$(Remove-Item -Recurse -Force C:\\x)\nEOF",
             "Remove-Item -Recurse -Force C:\\x; cat <<'EOF'\nRead-only\nEOF",
         ] {
             assert_eq!(
@@ -4637,6 +4830,44 @@ mod tests {
                 ShellDialect::Posix,
                 "a caret outside the command word must not widen: {command:?}"
             );
+        }
+    }
+
+    #[test]
+    fn windows_shape_requires_executable_command_positions() {
+        for command in [
+            "for x in a b; do\nls | sed 's|^\\./||'\ndone",
+            "printf '%s\\n' 'text; Remove-Item -Recurse -Force C:\\x'",
+            "echo \"text|g^it reset --hard\"",
+            "echo foo\\;^bar",
+            "python3 - <<'PY'\na = 'it\\'s'\nb = '#'\nc = re.compile(r\"^\")\nPY",
+            "python3 -c 'print(\"text|^prefix\")'",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix,
+                "{command}"
+            );
+            assert!(!command_is_windows_shell_payload(command), "{command}");
+        }
+        for command in [
+            "g^it reset --hard",
+            "g\"\"^it reset --hard",
+            "echo \"$(Remove-Item -Recurse -Force C:\\x)\"",
+            "cat <(Remove-Item -Recurse -Force C:\\x)",
+            "{ Remove-Item -Recurse -Force C:\\x; }",
+            "bash <<'SH'\nRemove-Item -Recurse -Force C:\\x\nSH",
+            "python3 - <<PY\n$(Remove-Item -Recurse -Force C:\\x)\nPY",
+            "python3 script.py <<'PY'\ncopy nul .git\\config\nPY",
+            // A missing closing token cannot certify quoted data boundaries.
+            "echo \"$(true; g^it reset --hard)",
+        ] {
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "{command}"
+            );
+            assert!(command_is_windows_shell_payload(command), "{command}");
         }
     }
 
@@ -5957,6 +6188,39 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_shell_tool_from_claude_hooks_is_judged_518() {
+        // Cursor runs `~/.claude/settings.json` PreToolUse hooks and renames
+        // `Bash` to `Shell`; it reads the Claude-shaped answer. The tool
+        // could be bash, zsh or PowerShell, so the dialect stays the
+        // fail-closed union.
+        let json = r#"{
+            "conversation_id":"c-518","generation_id":"g-518",
+            "hook_event_name":"PreToolUse","cursor_version":"2026.09.28",
+            "workspace_roots":["/repo"],"transcript_path":null,
+            "tool_name":"Shell",
+            "tool_input":{"command":"git stash clear","cwd":"/repo"},
+            "tool_use_id":"call_1","cwd":"/repo"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert!(is_supported_shell_tool(input.tool_name.as_deref()));
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+        let extracted = extract_command_with_context(&input).expect("shell command");
+        assert_eq!(extracted.command, "git stash clear");
+        assert_eq!(extracted.protocol, HookProtocol::ClaudeCompatible);
+        assert_eq!(
+            shell_dialect_for_tool_name(Some("Shell")),
+            ShellDialect::Unknown
+        );
+
+        for name in ["shell", "SHELL"] {
+            assert!(is_supported_shell_tool(Some(name)), "{name}");
+        }
+        // Cursor's MCP tools are named `MCP:<tool>`; one called `shell` is
+        // not Cursor's shell tool.
+        assert!(!is_supported_shell_tool(Some("MCP:shell")));
+    }
+
+    #[test]
     fn test_grok_run_terminal_command_full_spelling_is_supported() {
         // Grok Build's own hooks guide documents the shell tool as
         // `run_terminal_command` (full spelling), not the abbreviated
@@ -7239,6 +7503,16 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("git reset --hard HEAD~1"))
         );
+        let reason = specific["permissionDecisionReason"].as_str().unwrap();
+        assert!(
+            reason.contains("the user can approve it with: dcg allow-once abc123"),
+            "Codex must expose the persisted review code in its supported reason: {reason}"
+        );
+        assert!(
+            !reason.contains("--yes") && !reason.contains("dcg allowlist add"),
+            "the review hint must retain explicit user approval and exact-command scope: {reason}"
+        );
+        assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
         assert_eq!(
             specific.as_object().map(serde_json::Map::len),
             Some(3),
@@ -7273,6 +7547,79 @@ mod tests {
             stderr_str.contains("Do not retry it, create a bypass, or change dcg policy yourself"),
             "Codex stderr should give an explicit no-bypass instruction; got: {stderr_str}"
         );
+    }
+
+    /// GH#537: store contention or failed persistence must not fabricate a
+    /// review identifier or change Codex's parser-compatible denial.
+    #[test]
+    fn test_write_denial_codex_without_code_still_denies() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Codex,
+            "git reset --hard HEAD~1",
+            "destroys uncommitted changes",
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+            None,
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let specific = &json["hookSpecificOutput"];
+        assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
+        assert_eq!(specific.as_object().map(serde_json::Map::len), Some(3));
+        assert_eq!(specific["hookEventName"], "PreToolUse");
+        assert_eq!(specific["permissionDecision"], "deny");
+        let reason = specific["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.starts_with("BLOCKED by dcg"), "{reason}");
+        assert!(reason.contains("Rule: core.git:reset-hard"), "{reason}");
+        assert!(
+            !reason.contains("allow-once"),
+            "a code-less denial must not advertise an unredeemable code: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_write_denial_codex_review_code_without_rule_metadata() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let allow = test_allow_once();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Codex,
+            "unverified-command",
+            "cannot statically verify the command",
+            None,
+            None,
+            None,
+            Some(&allow),
+            None,
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let specific = &json["hookSpecificOutput"];
+        assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
+        assert_eq!(specific.as_object().map(serde_json::Map::len), Some(3));
+        assert_eq!(specific["hookEventName"], "PreToolUse");
+        assert_eq!(specific["permissionDecision"], "deny");
+        let reason = specific["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("dcg allow-once abc123"), "{reason}");
+        assert!(!reason.contains("Rule:"), "{reason}");
     }
 
     #[test]
@@ -7645,6 +7992,19 @@ mod tests {
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
             assert_ne!(decision, Some("allow"), "payload: {json}");
+            if protocol == HookProtocol::Codex {
+                assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
+                assert_eq!(
+                    json["hookSpecificOutput"]
+                        .as_object()
+                        .map(serde_json::Map::len),
+                    Some(3)
+                );
+                assert!(
+                    reason.is_some_and(|text| text.contains("dcg allow-once abc123")),
+                    "Codex review must remain a denial with a user-review code: {json}"
+                );
+            }
             if matches!(
                 protocol,
                 HookProtocol::ClaudeCompatible | HookProtocol::Copilot
