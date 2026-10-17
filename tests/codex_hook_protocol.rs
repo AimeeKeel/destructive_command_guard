@@ -2206,13 +2206,13 @@ fn disable_core_filesystem_still_blocks_git_claude() {
 // ===========================================================================
 // P2.11 — Allow-once round-trip under Codex
 //
-// Under Codex, the model-visible stderr denial must not expose allow-once
-// tokens. The pending store still records the generated code so a human or
-// harness can redeem it explicitly, then retry — the command must pass.
+// Codex's strict parser accepts only three hookSpecificOutput fields. The
+// review identifier must therefore be usable from permissionDecisionReason,
+// without consulting the private pending store or adding JSON fields (#537).
+// The terse model-facing stderr warning continues to omit review identifiers.
+// The user redeems it explicitly; only the exact command may then pass once.
 // ===========================================================================
 
-/// Extract the allow-once short_code from the pending_exceptions.jsonl
-/// in the hermetic HOME directory.
 /// Where these tests pin the pending-exception store.
 ///
 /// `src/pending_exceptions.rs` prefers `$HOME/.config/dcg/` only when that
@@ -2235,7 +2235,8 @@ fn allow_once_path(home: &std::path::Path) -> std::path::PathBuf {
 /// Apply both store overrides to a spawned dcg invocation.
 fn pin_exception_stores(cmd: &mut Command, home: &std::path::Path) {
     cmd.env("DCG_PENDING_EXCEPTIONS_PATH", pending_exceptions_path(home))
-        .env("DCG_ALLOW_ONCE_PATH", allow_once_path(home));
+        .env("DCG_ALLOW_ONCE_PATH", allow_once_path(home))
+        .env("DCG_SELF_HEAL_HOOK", "0");
 }
 
 fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<String> {
@@ -2257,122 +2258,126 @@ fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<
     None
 }
 
-#[test]
-fn codex_deny_creates_pending_exception_with_code() {
-    // Use a persistent HOME (not run_codex_hook, which cleans up its tempdir)
-    let home = tempfile::tempdir().expect("tempdir");
-    let home_path = home.path().to_path_buf();
-    let system_path = std::env::var("PATH").unwrap_or_default();
+/// Keep the hook and the human's CLI review in the same isolated directory.
+fn codex_review_test_command(home: &std::path::Path) -> Command {
+    let tmp = home.join("tmp");
+    std::fs::create_dir_all(&tmp).expect("create isolated temp directory");
+    let config_path = home.join("config.toml");
+    std::fs::write(&config_path, "").expect("write isolated config");
 
-    let payload = build_codex_payload("git reset --hard HEAD~1");
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
-        .env("PATH", &system_path)
-        .env("HOME", &home_path)
-        .env("USERPROFILE", &home_path)
-        .env("TMPDIR", home_path.join("tmp"))
-        .env("TEMP", home_path.join("tmp"))
-        .env("TMP", home_path.join("tmp"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("TMPDIR", &tmp)
+        .env("TEMP", &tmp)
+        .env("TMP", &tmp)
         .env("NO_COLOR", "1")
+        .env("DCG_CONFIG", &config_path)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_SELF_HEAL_HOOK", "0")
         .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .env("DCG_AST_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .current_dir(home);
+    pin_exception_stores(&mut cmd, home);
+    cmd
+}
+
+/// Feed a Codex payload to dcg; never execute its command text.
+fn run_codex_in_home(command: &str, home: &std::path::Path, hook_args: &[&str]) -> HookOutcome {
+    run_codex_tool_in_home("Bash", command, home, hook_args)
+}
+
+fn run_codex_tool_in_home(
+    tool_name: &str,
+    command: &str,
+    home: &std::path::Path,
+    hook_args: &[&str],
+) -> HookOutcome {
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&build_codex_payload(command)).expect("Codex payload");
+    payload["cwd"] = serde_json::json!(home);
+    payload["tool_name"] = serde_json::json!(tool_name);
+    let payload = payload.to_string();
+
+    let mut child = codex_review_test_command(home)
+        .args(hook_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    pin_exception_stores(&mut cmd, &home_path);
-
-    let mut child = cmd.spawn().expect("spawn");
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(payload.as_bytes()).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    let outcome = HookOutcome {
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Codex hook");
+    child
+        .stdin
+        .as_mut()
+        .expect("hook stdin")
+        .write_all(payload.as_bytes())
+        .expect("write Codex payload");
+    let output = child.wait_with_output().expect("wait for Codex hook");
+    HookOutcome {
         stdout: output.stdout,
         stderr: output.stderr,
         exit_code: output.status.code().unwrap_or(-1),
         stdin_sent: payload.into_bytes(),
-        home_dir: home_path.clone(),
-    };
+        home_dir: home.to_path_buf(),
+    }
+}
 
-    assert!(outcome.is_codex_block_shape(), "block expected\n{outcome}");
-
-    let code = extract_allow_once_code_from_pending_store(&home_path);
-    assert!(
-        code.is_some(),
-        "Codex deny must create a pending exception with short_code\n{outcome}"
-    );
-    assert!(
-        code.as_ref().unwrap().len() >= 5,
-        "short_code must be >= 5 chars, got {:?}\n{outcome}",
-        code
-    );
+/// Read the supported review instruction, not dcg's private store or stderr.
+fn codex_reason_allow_once_code(outcome: &HookOutcome) -> Option<String> {
+    let json = outcome.stdout_json();
+    let reason = json["hookSpecificOutput"]["permissionDecisionReason"].as_str()?;
+    let (_, instruction) = reason.split_once("the user can approve it with: dcg allow-once ")?;
+    let code = instruction.split_whitespace().next()?;
+    (code.len() >= 5 && code.bytes().all(|byte| byte.is_ascii_digit())).then(|| code.to_string())
 }
 
 #[test]
-fn codex_allow_once_round_trip() {
+fn codex_deny_creates_pending_exception_with_code() {
     let home = tempfile::tempdir().expect("tempdir");
-    let home_path = home.path().to_path_buf();
-    let system_path = std::env::var("PATH").unwrap_or_default();
+    let outcome = run_codex_in_home("git reset --hard HEAD~1", home.path(), &[]);
 
-    // Step 1: Codex deny — creates pending exception in hermetic HOME
-    let deny_payload = build_codex_payload("git reset --hard HEAD~1");
-    let mut cmd = Command::new(dcg_binary());
-    cmd.env_clear()
-        .env("PATH", &system_path)
-        .env("HOME", &home_path)
-        .env("USERPROFILE", &home_path)
-        .env("TMPDIR", home_path.join("tmp"))
-        .env("TEMP", home_path.join("tmp"))
-        .env("TMP", home_path.join("tmp"))
-        .env("NO_COLOR", "1")
-        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    pin_exception_stores(&mut cmd, &home_path);
+    assert!(outcome.is_codex_block_shape(), "block expected\n{outcome}");
 
-    let mut child = cmd.spawn().expect("spawn deny");
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(deny_payload.as_bytes()).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    let deny_outcome = HookOutcome {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code().unwrap_or(-1),
-        stdin_sent: deny_payload.into_bytes(),
-        home_dir: home_path.clone(),
-    };
+    let code = codex_reason_allow_once_code(&outcome)
+        .unwrap_or_else(|| panic!("Codex reason must expose the review code\n{outcome}"));
+    assert_eq!(
+        extract_allow_once_code_from_pending_store(home.path()).as_deref(),
+        Some(code.as_str()),
+        "Codex reason must expose the persisted identifier\n{outcome}"
+    );
+}
+
+fn assert_codex_allow_once_round_trip(
+    tool_name: &str,
+    command: &str,
+    changed_commands: &[&str],
+    hook_args: &[&str],
+    redeem_args: &[&str],
+) {
+    let home = tempfile::tempdir().expect("tempdir");
+    let deny_outcome = run_codex_tool_in_home(tool_name, command, home.path(), hook_args);
 
     assert!(
         deny_outcome.is_codex_block_shape(),
         "initial Codex deny expected\n{deny_outcome}"
     );
+    let allow_code = codex_reason_allow_once_code(&deny_outcome)
+        .unwrap_or_else(|| panic!("Codex reason must expose the review code\n{deny_outcome}"));
+    assert_eq!(
+        extract_allow_once_code_from_pending_store(home.path()).as_deref(),
+        Some(allow_code.as_str()),
+        "surfaced identifier must refer to the persisted exact-command denial\n{deny_outcome}"
+    );
 
-    // Extract the allow-once code from the pending store
-    let allow_code = extract_allow_once_code_from_pending_store(&home_path)
-        .unwrap_or_else(|| panic!("pending store must contain short_code\n{deny_outcome}"));
-
-    // Step 2: Redeem the allow-once code
-    let mut redeem_cmd = Command::new(dcg_binary());
-    redeem_cmd
-        .arg("allow-once")
-        .arg(&allow_code)
-        .arg("--yes")
-        .env_clear()
-        .env("PATH", &system_path)
-        .env("HOME", &home_path)
-        .env("USERPROFILE", &home_path)
-        .env("TMPDIR", home_path.join("tmp"))
-        .env("TEMP", home_path.join("tmp"))
-        .env("TMP", home_path.join("tmp"))
-        .env("NO_COLOR", "1");
-    pin_exception_stores(&mut redeem_cmd, &home_path);
-    let redeem_output = redeem_cmd
+    // --yes stands in for the user's interactive confirmation in this test.
+    let redeem_output = codex_review_test_command(home.path())
+        .args(["allow-once", &allow_code, "--yes"])
+        .args(redeem_args)
         .output()
         .expect("failed to run allow-once redeem");
-
     assert!(
         redeem_output.status.success(),
         "allow-once redeem must succeed (exit 0), got exit {}\nstdout: {}\nstderr: {}",
@@ -2381,40 +2386,151 @@ fn codex_allow_once_round_trip() {
         String::from_utf8_lossy(&redeem_output.stderr),
     );
 
-    // Step 3: Retry under Codex — must now be allowed (exit 0)
-    let retry_payload = build_codex_payload("git reset --hard HEAD~1");
-    let mut cmd = Command::new(dcg_binary());
-    cmd.env_clear()
-        .env("PATH", &system_path)
-        .env("HOME", &home_path)
-        .env("USERPROFILE", &home_path)
-        .env("TMPDIR", home_path.join("tmp"))
-        .env("TEMP", home_path.join("tmp"))
-        .env("TMP", home_path.join("tmp"))
-        .env("NO_COLOR", "1")
-        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    pin_exception_stores(&mut cmd, &home_path);
-
-    let mut child = cmd.spawn().expect("spawn retry");
+    // Altered targets and wrappers, even ones containing the original command,
+    // must not borrow or consume its grant. Trailing whitespace also differs
+    // in raw bytes despite being semantically equivalent.
+    let whitespace_variant = format!("{command} ");
+    for changed in changed_commands
+        .iter()
+        .copied()
+        .chain(std::iter::once(whitespace_variant.as_str()))
     {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(retry_payload.as_bytes()).unwrap();
+        let outcome = run_codex_tool_in_home(tool_name, changed, home.path(), hook_args);
+        assert!(
+            outcome.is_codex_block_shape(),
+            "an altered command must remain denied after redemption\n{outcome}"
+        );
     }
-    let output = child.wait_with_output().unwrap();
-    let retry_outcome = HookOutcome {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code().unwrap_or(-1),
-        stdin_sent: retry_payload.into_bytes(),
-        home_dir: home_path.clone(),
-    };
 
+    let retry_outcome = run_codex_tool_in_home(tool_name, command, home.path(), hook_args);
     assert!(
         retry_outcome.is_allow_shape(),
-        "after allow-once redeem, Codex retry must be allowed (exit 0)\n{retry_outcome}"
+        "after redemption, the exact Codex command must be allowed once\n{retry_outcome}"
+    );
+
+    let consumed_outcome = run_codex_tool_in_home(tool_name, command, home.path(), hook_args);
+    assert!(
+        consumed_outcome.is_codex_block_shape(),
+        "the exact command must be denied again after consuming its single use\n{consumed_outcome}"
+    );
+}
+
+#[test]
+fn codex_allow_once_round_trip() {
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        "git reset --hard HEAD~1",
+        &[
+            "git reset --hard HEAD~2",
+            "bash -c 'git reset --hard HEAD~1'",
+            "echo \"$(git reset --hard HEAD~1)\"",
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
+fn codex_allow_once_powershell_wrapped_round_trip() {
+    // Windows Codex command text is data: the test needs no PowerShell
+    // executable and never runs either destructive operation.
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        r#""C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command 'git reset --hard HEAD~1'"#,
+        &[
+            r#""C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command 'git reset --hard HEAD~2'"#,
+            "git reset --hard HEAD~1",
+        ],
+        &["hook"],
+        // The documented command is also single-use when the flag is omitted.
+        &[],
+    );
+}
+
+#[test]
+fn codex_allow_once_unknown_dialect_round_trip() {
+    // launch-process leaves the dialect Unknown on every host, while turn_id
+    // still identifies Codex. The PowerShell replay sees the executable sink;
+    // it must not lose a grant consumed by the primary dialect's evaluation.
+    assert_codex_allow_once_round_trip(
+        "launch-process",
+        "'git reset --hard HEAD~1' | iex",
+        &["'git reset --hard HEAD~2' | iex"],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
+fn codex_allow_once_preserves_raw_diagnostic_prefix() {
+    // Diagnostic text is masked during rule matching. The grant still binds
+    // to the entire raw input, including the inert diagnostic arguments.
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        "dcg test 'git reset --hard HEAD~2' && git reset --hard HEAD~1",
+        &[
+            "dcg test 'git reset --hard HEAD~3' && git reset --hard HEAD~1",
+            "git reset --hard HEAD~1",
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+fn assert_codex_denial_without_review_code(outcome: &HookOutcome) {
+    assert!(
+        outcome.is_codex_block_shape(),
+        "failure to issue a review code must preserve the minimal Codex denial\n{outcome}"
+    );
+    let json = outcome.stdout_json();
+    let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("denial reason");
+    assert!(
+        !reason.contains("dcg allow-once"),
+        "a code-less denial must not advertise a redeemable instruction\n{outcome}"
+    );
+}
+
+#[test]
+fn codex_contended_pending_store_denies_without_review_code() {
+    let home = make_hermetic_home();
+    let pending = pending_exceptions_path(home.path());
+    std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&pending)
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let outcome = run_codex_in_home("git reset --hard HEAD~1", home.path(), &[]);
+    fs2::FileExt::unlock(&lock).unwrap();
+    assert!(
+        outcome.is_codex_block_shape(),
+        "fallback must deny\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout_str().contains("dcg allow-once"),
+        "failed persistence must not advertise redemption\n{outcome}"
+    );
+    assert!(std::fs::read_to_string(pending).unwrap().trim().is_empty());
+}
+
+#[test]
+fn codex_pending_store_error_preserves_codeless_denial() {
+    let home = tempfile::tempdir().expect("tempdir");
+    // A directory at the store's file path fails even with elevated test
+    // privileges, unlike a platform-dependent read-only permissions fixture.
+    std::fs::create_dir_all(pending_exceptions_path(home.path()))
+        .expect("create unusable store path");
+
+    let outcome = run_codex_in_home("git reset --hard HEAD~1", home.path(), &["hook"]);
+    assert_codex_denial_without_review_code(&outcome);
+    assert!(
+        outcome.stderr_contains("could not record an allow-once code"),
+        "store failure must leave a diagnostic while the command stays blocked\n{outcome}"
     );
 }
 
