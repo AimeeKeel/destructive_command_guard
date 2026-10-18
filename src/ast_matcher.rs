@@ -9,6 +9,8 @@
 mod source_analysis;
 #[path = "ast_matcher/tempfile_provenance.rs"]
 mod tempfile_provenance;
+#[path = "ast_matcher/bash_temp_policy.rs"]
+mod bash_temp_policy;
 
 pub use source_analysis::*;
 
@@ -47,6 +49,12 @@ impl DefaultPolicyMatcher {
         language: ScriptLanguage,
     ) -> Result<Vec<PatternMatch>, MatchError> {
         let matches = source_analysis::DEFAULT_MATCHER.find_matches(code, language)?;
+        let matches = bash_temp_policy::refine(
+            code,
+            language,
+            matches,
+            source_analysis::protected_scan_budget(),
+        );
         complete_python_deletion_matches(
             code,
             language,
@@ -70,6 +78,12 @@ impl DefaultPolicyMatcher {
         let started = Instant::now();
         let matches = source_analysis::DEFAULT_MATCHER
             .find_matches_with_timeout(code, language, timeout)?;
+        let matches = bash_temp_policy::refine(
+            code,
+            language,
+            matches,
+            timeout.saturating_sub(started.elapsed()),
+        );
         complete_python_deletion_matches(
             code,
             language,
