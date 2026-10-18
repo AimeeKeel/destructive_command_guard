@@ -406,13 +406,13 @@ GROK_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
 assert_case grok deny "$GROK_DENY" deny '.decision' deny
 assert_case grok allow "$GROK_ALLOW" allow '.' ''
 
-# --- Antigravity CLI (agy): nested toolCall envelope, decision:"block" -----
+# --- Antigravity CLI (agy): strict decision:"deny" + reason only (#573) -----
 $JSON_OUTPUT || echo "Antigravity CLI (agy)"
 AGY_DENY=$(jq -nc --arg c "$DENY_CMD" \
   '{toolCall:{name:"run_command",args:{CommandLine:$c}},conversationId:"conv_e2e",stepIdx:1}')
 AGY_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
   '{toolCall:{name:"run_command",args:{CommandLine:$c}},conversationId:"conv_e2e",stepIdx:2}')
-assert_case agy deny "$AGY_DENY" deny '.decision' block
+assert_case agy deny "$AGY_DENY" deny '.decision' deny
 assert_case agy allow "$AGY_ALLOW" allow '.' ''
 
 # --- Crush (Charm): flat event/tool_name/tool_input envelope, decision:"deny"

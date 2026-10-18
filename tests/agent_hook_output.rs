@@ -586,14 +586,10 @@ fn test_hook_output_remediation_safe_alternative() {
 // Antigravity CLI (`agy`) end-to-end hook integration.
 //
 // Feeds the dcg binary the exact stdin envelope that `agy` passes to a
-// PreToolUse hook (captured empirically in a sandboxed $HOME) and asserts dcg
-// emits the block decision that `agy` honors. This is the live wire-format
-// contract: `agy` reads {"decision":"block","reason":...} from stdout (exit 0)
-// and aborts its `run_command` tool. A fully-interactive live-fire block (the
-// model actually being prevented from running the command) was verified
-// manually against the real `agy` binary in a sandbox HOME; that path needs an
-// authenticated, interactive `agy` session and is not reproducible in CI, so
-// here we lock down the byte-level request/response contract instead.
+// PreToolUse hook. Issue #573 verified a clean denial with exactly
+// {"decision":"deny","reason":...} on stdout and exit 0. Additional Gemini
+// fields fail Antigravity 1.4.0's strict parser. This subprocess regression
+// passes commands as data; no command is executed.
 // ============================================================================
 
 /// Run dcg in hook mode with a raw JSON envelope (for non-Claude wire shapes).
@@ -625,7 +621,7 @@ fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
 }
 
 #[test]
-fn test_antigravity_envelope_produces_block_decision() {
+fn test_antigravity_envelope_produces_deny_decision() {
     // Exact agy stdin shape captured from a real `agy` PreToolUse hook run.
     let input = r#"{
         "artifactDirectoryPath":"/tmp/.gemini/brain/abc",
@@ -638,7 +634,7 @@ fn test_antigravity_envelope_produces_block_decision() {
 
     let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
 
-    // `agy` only blocks on exit 0 + JSON (a non-zero exit is merely logged).
+    // Deliver a valid JSON denial instead of relying on hook-error handling.
     assert_eq!(
         exit_code, 0,
         "agy hook must exit 0 so the JSON block decision is honored\nstderr: {stderr}"
@@ -649,8 +645,13 @@ fn test_antigravity_envelope_produces_block_decision() {
         serde_json::from_str(stdout.trim()).expect("agy hook output must be valid JSON");
 
     assert_eq!(
-        json["decision"], "block",
-        "agy block decision must use the \"block\" keyword"
+        json["decision"], "deny",
+        "agy denial must use the documented \"deny\" keyword"
+    );
+    assert_eq!(
+        json.as_object().map(serde_json::Map::len),
+        Some(2),
+        "agy denies through decision and reason only; extra fields fail parsing"
     );
     assert!(
         json["reason"].as_str().is_some_and(|r| !r.is_empty()),
@@ -666,8 +667,7 @@ fn test_antigravity_envelope_produces_block_decision() {
 
 #[test]
 fn test_antigravity_envelope_allows_safe_command() {
-    // A benign command must NOT block: agy gets an explicit allow (or no JSON
-    // block), and the tool proceeds.
+    // No permission decision: the host retains its ordinary permission checks.
     let input = r#"{
         "conversationId":"c1",
         "stepIdx":1,
@@ -678,7 +678,7 @@ fn test_antigravity_envelope_allows_safe_command() {
     let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
     assert_eq!(exit_code, 0, "safe command must exit 0\nstderr: {stderr}");
     assert!(
-        stdout.trim().is_empty(),
+        stdout.is_empty(),
         "safe agy hook output must be silent, got: {stdout}"
     );
 }

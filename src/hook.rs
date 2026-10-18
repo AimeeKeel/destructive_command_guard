@@ -451,6 +451,21 @@ pub struct GeminiHookOutput<'a> {
     pub remediation: Option<Remediation>,
 }
 
+/// Antigravity CLI (`agy`) denial output for `PreToolUse` hooks.
+///
+/// `agy` 1.4.0 rejects unknown fields with its strict protojson parser (#573).
+/// Keep this separate from Gemini's output: rule attribution and allow-once
+/// guidance belong in `reason`, never in additional top-level fields. Warnings
+/// emit no stdout so they do not make a permission decision for the host.
+#[derive(Debug, Serialize)]
+pub struct AntigravityHookOutput<'a> {
+    /// Blocking decision (`"deny"`).
+    pub decision: &'static str,
+
+    /// Human-readable explanation of the denial.
+    pub reason: Cow<'a, str>,
+}
+
 /// Hermes Agent denial output for shell `pre_tool_call` hooks.
 ///
 /// Hermes documents two block-decision wire shapes — `{"decision": "block",
@@ -677,14 +692,14 @@ pub enum HookProtocol {
     /// "...", "stepIdx": N, "transcriptPath": "...", "workspacePaths": [...]}`.
     /// The shell command is in `toolCall.args.CommandLine` and the shell tool
     /// name is `run_command`. Block decision is expressed via stdout JSON
-    /// `{"decision": "block", "reason": "..."}` with exit code 0 — verified
-    /// empirically: `agy` honors both `"block"` and `"deny"` decision keywords
-    /// and aborts the `run_command` tool, whereas a non-zero exit code is only
-    /// logged (`pre-tool hook ... failed: ... exit status 2`) and does NOT
-    /// reliably abort the tool. `agy`'s parser does not use
-    /// `deny_unknown_fields`, so dcg's ergonomics fields (`ruleId`, `packId`,
-    /// `severity`, `remediation`, …) pass through unmolested. `agy` reads its
-    /// hook config from `~/.gemini/config/hooks.json` (with
+    /// `{"decision": "deny", "reason": "..."}` with exit code 0. `agy` 1.4.0
+    /// rejects unknown fields with its strict protojson parser (#573), so
+    /// attribution and review guidance are carried only in `reason`. Do not
+    /// rely on a non-zero exit status to deny a command: it has been observed
+    /// to be logged as a hook failure without reliably aborting the tool.
+    /// Warnings leave stdout empty and preserve the host's permission flow;
+    /// the bundled 1.4.0 contract treats `"allow"` as automatic approval.
+    /// `agy` reads its hook config from `~/.gemini/config/hooks.json` (with
     /// `~/.gemini/antigravity-cli/hooks.json` symlinked to it).
     Antigravity,
     /// Charm Crush protocol (#388). Wire shape: stdin carries the flat
@@ -1566,7 +1581,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // {"CommandLine": "..."}}}`). None of the other supported agents emit a
     // `toolCall` field, so its mere presence unambiguously identifies `agy`.
     // We check this before every other protocol so the `agy`-specific deny
-    // shape (stdout `{"decision":"block",...}` + exit 0) is always used.
+    // shape (stdout `{"decision":"deny",...}` + exit 0) is always used.
     if let Some(tool_call) = input.tool_call.as_ref() {
         let tool_call_name = tool_call
             .name
@@ -3521,25 +3536,12 @@ pub fn write_denial_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Antigravity => {
-            // Antigravity CLI (`agy`): stdout `{"decision":"block","reason":...}`
-            // with exit code 0 aborts the `run_command` tool. Verified
-            // empirically that `agy` honors the `"block"` keyword (and `"deny"`
-            // — both block); a non-zero exit code is only logged and does NOT
-            // reliably abort the tool, so we always emit exit 0 + JSON. We
-            // reuse GeminiHookOutput's wire shape (`decision`/`reason` plus
-            // optional `systemMessage` and dcg ergonomics fields); `agy`'s
-            // parser tolerates the extra fields.
-            let output = GeminiHookOutput {
-                decision: "block",
+            // The strict Antigravity parser rejects Gemini's extra fields.
+            // Preserve the full explanation and any minted review code in
+            // the supported reason string; the verdict remains a denial.
+            let output = AntigravityHookOutput {
+                decision: "deny",
                 reason: Cow::Owned(message),
-                system_message: Some(Cow::Owned(format!("BLOCKED by dcg: {reason}"))),
-                allow_once_code: allow_once.map(|info| info.code.clone()),
-                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
-                rule_id,
-                pack_id: pack.map(String::from),
-                severity,
-                confidence,
-                remediation,
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -3819,9 +3821,9 @@ pub fn output_denial(
 ///
 /// An indeterminate result is neither an allow nor a rule-based denial: dcg
 /// did not finish proving the command safe before its evaluation deadline.
-/// Protocols with an explicit review decision receive `ask`; protocols that
-/// cannot represent `ask` receive their documented blocking decision. This
-/// deliberately never emits an explicit allow or an empty response.
+/// Protocols with a supported native-review integration receive `ask`; the
+/// others receive their documented blocking decision. This deliberately
+/// never emits an explicit allow or an empty response.
 #[cold]
 #[inline(never)]
 pub fn write_indeterminate_to(
@@ -3946,17 +3948,11 @@ pub fn write_indeterminate_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Antigravity => {
-            let output = GeminiHookOutput {
-                decision: "block",
+            // Incomplete evaluation must also reach the strict parser as a
+            // valid denial, never as a hook error or a no-op warning.
+            let output = AntigravityHookOutput {
+                decision: "deny",
                 reason: Cow::Borrowed(reason),
-                system_message: Some(Cow::Borrowed(reason)),
-                allow_once_code: None,
-                allow_once_full_hash: None,
-                rule_id: None,
-                pack_id: None,
-                severity: None,
-                confidence: None,
-                remediation: None,
             };
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
@@ -4085,10 +4081,16 @@ pub(crate) fn write_warning_to(
     let warn_reason = format!("DCG warn: {reason}");
 
     match protocol {
-        // Silence means "no blocking opinion" for review-capable clients.
+        // Silence means "no blocking opinion" for these clients.
         // Keeping warn distinct from ask preserves the documented policy:
         // warn proceeds, while ask requires an explicit operator decision.
-        HookProtocol::ClaudeCompatible | HookProtocol::Copilot | HookProtocol::Codex => {}
+        // In particular, agy 1.4.0's bundled contract treats `allow` as
+        // automatic approval. No stdout leaves its ordinary permission
+        // checks in control, while the warning stays on stderr.
+        HookProtocol::ClaudeCompatible
+        | HookProtocol::Copilot
+        | HookProtocol::Codex
+        | HookProtocol::Antigravity => {}
         // The warning above is on stderr; the caller exits 1, which Reasonix
         // shows as a non-blocking warning (exit 0 would hide it).
         HookProtocol::Reasonix => {}
@@ -4153,30 +4155,9 @@ pub(crate) fn write_warning_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
-        HookProtocol::Antigravity => {
-            // Antigravity CLI (`agy`) supports a "block"/"deny" decision but no
-            // documented "ask"/"warn" decision. Preserve dcg warn semantics as
-            // non-blocking by emitting an explicit "allow"; the warning text is
-            // surfaced via `reason`/`systemMessage` for any tooling that shows
-            // hook context.
-            let output = GeminiHookOutput {
-                decision: "allow",
-                reason: Cow::Owned(warn_reason.clone()),
-                system_message: Some(Cow::Owned(warn_reason)),
-                allow_once_code: None,
-                allow_once_full_hash: None,
-                rule_id,
-                pack_id: pack.map(String::from),
-                severity: None,
-                confidence: None,
-                remediation: None,
-            };
-            let _ = serde_json::to_writer(&mut *stdout, &output);
-            let _ = writeln!(stdout);
-        }
         HookProtocol::Crush => {
             // Crush's `"allow"` is an affirmative pre-approval that SKIPS the
-            // user's permission prompt, so unlike Grok/agy a warn must not be
+            // user's permission prompt, so a warn must not be
             // expressed as an explicit allow — dcg would be vouching for a
             // command it only meant to annotate. Omit `decision` ("no
             // opinion": the call proceeds through Crush's ordinary permission
@@ -6818,9 +6799,27 @@ mod tests {
     //   {"toolCall":{"name":"run_command","args":{"CommandLine":"<cmd>",
     //     "Cwd":"<dir>","WaitMsBeforeAsync":500}},"conversationId":"...",
     //     "stepIdx":4,"transcriptPath":"...","workspacePaths":[...]}
-    // The block decision that `agy` honors is stdout {"decision":"block",
-    // "reason":...} with exit code 0.
+    // The strict denial contract is stdout {"decision":"deny","reason":...}
+    // with exit code 0 and no additional fields (#573).
     // =========================================================================
+
+    fn parse_antigravity_denial(stdout: &[u8]) -> String {
+        // Model the host's strict consumer, independently of dcg's output
+        // structs. Any additional field is a protocol failure, even when
+        // serde_json::Value would happily accept the document (#573).
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Denial {
+            decision: String,
+            reason: String,
+        }
+
+        let denial: Denial = serde_json::from_slice(stdout)
+            .expect("Antigravity denial must contain only decision and reason");
+        assert_eq!(denial.decision, "deny");
+        assert!(!denial.reason.trim().is_empty());
+        denial.reason
+    }
 
     #[test]
     fn test_antigravity_detected_via_tool_call_envelope() {
@@ -7247,64 +7246,57 @@ mod tests {
     }
 
     #[test]
-    fn test_antigravity_hook_output_block_decision_json_shape() {
-        // `agy` aborts run_command on {"decision":"block","reason":...}.
-        // Verified empirically that both "block" and "deny" keywords block;
-        // we emit "block".
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+    fn test_antigravity_denial_is_strict_with_rich_metadata() {
+        let allow_once = test_allow_once();
+        let reason = "destroys \"uncommitted\" changes\nincluding C:\\work\\重要";
+        let explanation = "Rewrites the working tree and index.";
 
-        write_denial_to(
-            &mut stdout,
-            &mut stderr,
-            HookProtocol::Antigravity,
-            "rm -rf /",
-            "catastrophic filesystem deletion",
-            Some("core.filesystem"),
-            Some("rm-rf-root"),
-            None,
-            None,
-            None,
-            Some(crate::packs::Severity::Critical),
-            None,
-            &[],
-            None,
-        );
+        // Exercise both ordinary denials and the populated allow-once /
+        // remediation path that previously leaked unsupported fields.
+        for allow_once in [None, Some(&allow_once)] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            write_denial_to(
+                &mut stdout,
+                &mut stderr,
+                HookProtocol::Antigravity,
+                "git reset --hard",
+                reason,
+                Some("core.git"),
+                Some("reset-hard"),
+                Some(explanation),
+                allow_once,
+                None,
+                Some(crate::packs::Severity::Critical),
+                Some(0.99),
+                &[],
+                None,
+            );
 
-        let stdout_str = String::from_utf8_lossy(&stdout);
-        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
-
-        assert_eq!(json["decision"], "block");
-        assert!(
-            json["reason"]
-                .as_str()
-                .unwrap()
-                .contains("catastrophic filesystem deletion"),
-            "reason must surface the explanation, got: {}",
-            json["reason"]
-        );
-        // Must NOT carry other agents' decision keys.
-        assert!(json.get("action").is_none(), "no Hermes 'action'");
-        assert!(
-            json.get("permissionDecision").is_none(),
-            "no Claude 'permissionDecision'"
-        );
-        assert!(
-            json.get("hookSpecificOutput").is_none(),
-            "no Claude 'hookSpecificOutput'"
-        );
-        assert!(json.get("continue").is_none(), "no Copilot 'continue'");
-        assert!(
-            !stderr.is_empty(),
-            "denial must still surface stderr warning text"
-        );
+            let message = parse_antigravity_denial(&stdout);
+            assert!(message.starts_with("BLOCKED by dcg"));
+            assert!(
+                message.contains(reason),
+                "reason must round-trip: {message}"
+            );
+            assert!(message.contains(explanation));
+            assert!(message.contains("Rule: core.git:reset-hard"));
+            assert_eq!(
+                message.contains("the user can approve it with: dcg allow-once abc123"),
+                allow_once.is_some(),
+                "review guidance stays in reason without granting approval: {message}"
+            );
+            assert!(
+                !stderr.is_empty(),
+                "denial must still surface stderr warning text"
+            );
+        }
     }
 
     #[test]
-    fn test_write_warning_antigravity_produces_allow() {
-        // `agy` has no "ask"/"warn" decision; a warn must NOT block, so we
-        // emit an explicit allow.
+    fn test_write_warning_antigravity_preserves_permission_checks() {
+        // A warning is not permission to execute. In agy 1.4.0, an explicit
+        // allow can bypass the host's ordinary permission checks (#573).
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -7316,13 +7308,37 @@ mod tests {
             "force push",
             Some("core.git"),
             Some("force-push"),
-            None,
+            Some("May overwrite remote changes."),
         );
 
-        let stdout_str = String::from_utf8_lossy(&stdout);
-        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
-        assert_eq!(json["decision"], "allow");
+        assert!(stdout.is_empty(), "no JSON, approval, or even newline");
+        let warning = String::from_utf8(stderr).expect("UTF-8 warning");
+        assert!(warning.contains("dcg WARNING:"));
+        assert!(warning.contains("force push"));
+        assert!(warning.contains("May overwrite remote changes."));
+        assert!(warning.contains("core.git:force-push"));
+        assert!(warning.contains("git push --force"));
+    }
+
+    #[test]
+    fn test_antigravity_indeterminate_is_a_strict_flushed_denial() {
+        let reason = "Safety evaluation timed out; command was not verified.";
+        for deny in [false, true] {
+            let mut stdout = FlushProbe::default();
+            let mut stderr = FlushProbe::default();
+            write_indeterminate_to(
+                &mut stdout,
+                &mut stderr,
+                HookProtocol::Antigravity,
+                reason,
+                deny,
+            );
+
+            assert_eq!(parse_antigravity_denial(&stdout.bytes), reason);
+            assert_eq!(stdout.flushes, 1);
+            assert_eq!(stderr.flushes, 1);
+            assert!(String::from_utf8_lossy(&stderr.bytes).contains(reason));
+        }
     }
 
     #[test]
@@ -7851,7 +7867,7 @@ mod tests {
             (HookProtocol::Gemini, "deny"),
             (HookProtocol::Hermes, "block"),
             (HookProtocol::Grok, "deny"),
-            (HookProtocol::Antigravity, "block"),
+            (HookProtocol::Antigravity, "deny"),
             (HookProtocol::Crush, "deny"),
         ];
 
@@ -8029,7 +8045,7 @@ mod tests {
             (HookProtocol::Gemini, "deny", false),
             (HookProtocol::Hermes, "block", false),
             (HookProtocol::Grok, "deny", false),
-            (HookProtocol::Antigravity, "block", false),
+            (HookProtocol::Antigravity, "deny", false),
             (HookProtocol::Crush, "deny", false),
         ];
 
@@ -8082,7 +8098,7 @@ mod tests {
             (HookProtocol::Gemini, "deny"),
             (HookProtocol::Hermes, "block"),
             (HookProtocol::Grok, "deny"),
-            (HookProtocol::Antigravity, "block"),
+            (HookProtocol::Antigravity, "deny"),
             (HookProtocol::Crush, "deny"),
         ];
         let allow = test_allow_once();
@@ -8136,6 +8152,10 @@ mod tests {
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
             assert_ne!(decision, Some("allow"), "payload: {json}");
+            if protocol == HookProtocol::Antigravity {
+                let message = parse_antigravity_denial(&stdout);
+                assert!(message.contains("dcg allow-once abc123"));
+            }
             if protocol == HookProtocol::Codex {
                 assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
                 assert_eq!(
