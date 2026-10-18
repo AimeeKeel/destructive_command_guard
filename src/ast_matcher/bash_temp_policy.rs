@@ -46,9 +46,13 @@ fn literal_temp_rm(command: &str) -> bool {
     let mut options = true;
     let mut recursive = false;
     let mut targets = 0;
+    let mut saw_end_of_options = false;
     for argument in arguments {
         if options && argument == "--" {
+            // A second `--` is a literal operand, not another option marker.
+            // Reject it rather than accidentally treating it as a temp path.
             options = false;
+            saw_end_of_options = true;
             continue;
         }
         if options && argument.starts_with('-') {
@@ -70,6 +74,9 @@ fn literal_temp_rm(command: &str) -> bool {
         // Deliberately do not borrow core's interactive-mode, no-op, or custom
         // non-temp allowances. Options after an operand are outside this proof.
         options = false;
+        if saw_end_of_options && argument.starts_with('-') {
+            return false;
+        }
         if !literal_temp_descendant(argument) {
             return false;
         }
