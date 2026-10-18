@@ -5373,7 +5373,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                `unlink <file>.deleted-...` after a few days.\n\
              - `cp <file> <file>.bak && unlink <file>` to keep an explicit backup.\n\
              - `unlink /tmp/<subdir>/scratch` is allowed (temp dirs).",
-            UNLINK_SUGGESTIONS
+            UNLINK_SUGGESTIONS,
+            executables = ["unlink"]
         ),
         // ----- `unlink <file>` (High: any other target) -----
         //
@@ -5392,7 +5393,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Make a backup: `cp <file> <file>.bak`.\n\
              - For temp scratch: `unlink /tmp/<subdir>/scratch` is allowed.\n\
              - Use `mv <file> /tmp/quarantine-<file>` if you want a delayed delete.",
-            UNLINK_SUGGESTIONS
+            UNLINK_SUGGESTIONS,
+            executables = ["unlink"]
         ),
         // ----- destructive `truncate -s/--size` (Critical: root/home/system) -----
         //
@@ -6688,6 +6690,31 @@ mod tests {
             "unlink ",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn unlink_rules_are_scoped_to_the_executed_command_issue_550() {
+        let pack = create_pack();
+
+        for command in [
+            "ob sync-unlink --path /home/user/vault",
+            "foo --unlink /tmp/x",
+            "cat unlink /tmp/x",
+            "printf '%s' unlink /etc/passwd",
+        ] {
+            assert_no_match(&pack, command);
+        }
+
+        for command in [
+            "'unlink' /home/user/notes.txt",
+            "\"unlink\" /etc/passwd",
+            "/usr/bin/unlink /etc/shadow",
+            "sudo unlink /etc/sudoers",
+            "env FOO=bar unlink /etc/passwd",
+            "command unlink /etc/passwd",
+        ] {
+            assert_blocks(&pack, command, "unlink");
         }
     }
 
