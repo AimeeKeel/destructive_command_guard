@@ -2685,8 +2685,12 @@ fn python_delete_targets_scratch<D: ast_grep_core::Doc>(call: &ast_grep_core::No
     for _ in 0..MAX_EXEC_ARGV_DEPTH {
         if target.kind() != "parenthesized_expression" {
             let text = target.text();
-            return is_temp_scratch_path(&concatenated_operand(&text, ScriptLanguage::Python, 0))
-                || python_tempfile_directory(&target);
+            let value = if target.kind() == "concatenated_string" {
+                Cow::Owned(python_adjacent_literal_value(&target))
+            } else {
+                concatenated_operand(&text, ScriptLanguage::Python, 0)
+            };
+            return is_temp_scratch_path(&value) || python_tempfile_directory(&target);
         }
         target = {
             let mut children = target
@@ -2702,6 +2706,39 @@ fn python_delete_targets_scratch<D: ast_grep_core::Doc>(call: &ast_grep_core::No
         };
     }
     false
+}
+
+/// Python joins adjacent string literals at compile time, so `'/tmp/' 'build'`
+/// is the constant `'/tmp/build'`, exactly like `'/tmp/' + 'build'` (#549).
+/// The shared, language-generic text folder deliberately refuses bare
+/// adjacency (#474). Fold it here, from Python's parsed pieces, and only for
+/// plain literals: each piece is decoded by the same operand reader, so an
+/// f-string, a bytes or other prefixed piece, or an unknown escape keeps the
+/// runtime marker, and the joined value still has to pass the descendant and
+/// traversal check (`'/tmp' '/..'` is `/tmp/..`).
+fn python_adjacent_literal_value<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> String {
+    let mut value = String::new();
+    for (index, piece) in node
+        .children()
+        .filter(|child| child.is_named() && child.kind() != "comment")
+        .enumerate()
+    {
+        if index >= MAX_EXEC_ARGV_OPERANDS
+            || piece.kind() != "string"
+            || piece.is_error()
+            || piece.is_missing()
+        {
+            return RUNTIME_VALUE.to_string();
+        }
+        value.push_str(&concatenated_operand(
+            &piece.text(),
+            ScriptLanguage::Python,
+            0,
+        ));
+    }
+    value
 }
 
 /// Preserve cleanup of a freshly produced directory without treating any
@@ -6335,6 +6372,21 @@ mod tests {
             "shutil.rmtree('/tmp/build', **options)",
             "shutil.rmtree(other.mkdtemp('/srv'))",
             "shutil.rmtree(Path(tf.mkdtemp()).parent)",
+            // Adjacent literals fold to one constant, which must still be a
+            // real descendant; an interpolated, prefixed or unknown piece
+            // keeps the whole value unproven.
+            "shutil.rmtree('/tmp' '/..')",
+            "shutil.rmtree('/tmp/' 'build' '/..')",
+            "shutil.rmtree('/tmp/build' '/../../etc')",
+            "shutil.rmtree('/tmp/' '')",
+            "shutil.rmtree('/tmp' '')",
+            "shutil.rmtree('/home/' 'user')",
+            "shutil.rmtree('/tmp/' f'{name}')",
+            "shutil.rmtree('/tmp/' f'build')",
+            "shutil.rmtree('/tmp/' b'build')",
+            "shutil.rmtree('/tmp/' '\\x2e\\x2e')",
+            "shutil.rmtree('/tmp/' 'build'[:-5])",
+            "shutil.rmtree(('/tmp/' 'build', '/'))",
         ] {
             let code = format!("import os, shutil, tempfile\nfrom pathlib import Path\n{call}");
             let matches = ast_matcher
@@ -6350,6 +6402,11 @@ mod tests {
             "shutil.rmtree(path='/tmp/build')",
             "shutil.rmtree(('/tmp/build'))",
             "shutil.rmtree('/tmp/' + 'build')",
+            "shutil.rmtree('/tmp/' 'build')",
+            "shutil.rmtree(('/tmp/' 'build'))",
+            "shutil.rmtree(path='/var/tmp/' 'build')",
+            "shutil.rmtree('/private' '/tmp/' 'build', ignore_errors=True)",
+            "shutil.rmtree('/tmp/'  # scratch root\n    'build')",
             "shutil.rmtree('/tmp/build', ignore_errors=True)",
             "shutil.rmtree(ignore_errors=True, path='/tmp/build')",
             "shutil.rmtree(tempfile.mkdtemp())",
