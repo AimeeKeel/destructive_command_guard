@@ -1311,12 +1311,12 @@ fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value)
             .and_then(|tool_input| extract_command_from_tool_input(&tool_input))
             .into_iter()
             .collect(),
-        "tool_args" => extract_command_from_tool_args(value).into_iter().collect(),
+        "tool_args" => extract_commands_from_tool_args(value),
         "tool_call" => serde_json::from_value::<ToolCall>(value.clone())
             .ok()
-            .and_then(|tool_call| extract_command_from_tool_call(&tool_call))
-            .into_iter()
-            .collect(),
+            .filter(is_batch_shell_call)
+            .map(|tool_call| extract_commands_from_tool_call(&tool_call))
+            .unwrap_or_default(),
         "tool_calls" => value
             .as_array()
             .map(|entries| {
@@ -1324,7 +1324,7 @@ fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value)
                     .iter()
                     .filter_map(|entry| serde_json::from_value::<ToolCall>(entry.clone()).ok())
                     .filter(is_batch_shell_call)
-                    .filter_map(|call| extract_command_from_tool_call(&call))
+                    .flat_map(|call| extract_commands_from_tool_call(&call))
                     .collect()
             })
             .unwrap_or_default(),
@@ -1356,12 +1356,29 @@ fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value)
 /// whose structure it does not trust — malformed escapes, raw control
 /// characters inside the string, a non-string value — is dropped rather than
 /// guessed at, and an empty result keeps the caller's historic fail-open
-/// behavior. Escaped occurrences of the key inside string values
-/// (`\"command\"`) never match because the scan requires the unescaped
-/// `"command"` byte sequence.
+/// behavior. Native Antigravity envelopes instead recover command fields
+/// from the actual top-level `toolCall` / `tool_call` object. Their
+/// `CommandLine` spelling must survive the same read errors, but unrelated
+/// metadata must not become a command merely because a shell was identified.
 #[must_use]
 pub fn extract_commands_from_truncated_json(prefix: &str) -> Vec<String> {
-    extract_string_values_for_key(prefix, "\"command\"")
+    let Some(native_commands) = native_commands_from_json_prefix(prefix) else {
+        return extract_string_values_for_key(prefix, "\"command\"");
+    };
+    if !extract_tool_names_from_truncated_json(prefix)
+        .iter()
+        .any(|name| is_supported_shell_tool(Some(name)))
+    {
+        return native_commands;
+    }
+
+    // Keep the legacy all-occurrences rule when a mixed envelope also names
+    // a legacy shell tool. Neither spelling may conceal a sibling command.
+    let mut commands = extract_string_values_for_key(prefix, "\"command\"");
+    for command in native_commands {
+        append_recovered_command(&mut commands, command);
+    }
+    commands
 }
 
 /// Best-effort extraction of the hook envelope's tool name(s) from a truncated
@@ -1386,10 +1403,12 @@ pub fn extract_tool_names_from_truncated_json(prefix: &str) -> Vec<String> {
 ///
 /// Returns the recognized shell tool name and the dialect it implies, using
 /// exactly the same recognition and dialect mapping as the normal parsed path
-/// ([`is_supported_shell_tool`] / [`shell_dialect_for_tool_name`]). Returns
-/// `None` when the prefix carries no tool name at all, or only tool names that
-/// are not shell tools — the caller must then fail open rather than deny a
-/// payload it cannot attribute to a shell.
+/// ([`is_supported_shell_tool`] / [`shell_dialect_for_tool_name`]).
+/// Native Antigravity's `toolCall.name = "run_command"` is also recognized,
+/// including the nameless-with-args form accepted by the parsed path. The
+/// native tool name is read only from the real top-level envelope; a `name`
+/// planted in metadata or a string cannot manufacture shell attribution.
+/// Returns `None` when neither envelope can be attributed to a shell.
 ///
 /// The first *recognized* name wins, so a decoy non-shell tool name planted
 /// ahead of the real one cannot suppress evaluation.
@@ -1401,6 +1420,13 @@ pub fn shell_tool_from_truncated_json(prefix: &str) -> Option<(String, ShellDial
         .map(|name| {
             let dialect = shell_dialect_for_tool_name(Some(&name));
             (name, dialect)
+        })
+        .or_else(|| {
+            json_object_prefix_fields(prefix)
+                .filter(|(key, _)| matches!(key.as_str(), "toolCall" | "tool_call"))
+                .filter_map(|(_, value)| truncated_tool_call(value))
+                .any(|call| call.native_shell)
+                .then(|| ("run_command".to_string(), ShellDialect::Unknown))
         })
 }
 
@@ -1415,9 +1441,32 @@ pub fn shell_tool_from_truncated_json(prefix: &str) -> Option<(String, ShellDial
 /// `event`, a `toolArgs` *object*, and no `tool_input` (which would make it
 /// Crush). Reasonix writes those markers before the tool arguments, so they
 /// survive truncation. A command string cannot forge a key: inside a JSON
-/// string its quotes are escaped. Returns `None` for every other shape.
+/// string its quotes are escaped. Native Antigravity's top-level `toolCall`
+/// object is recognized structurally, including escaped JSON key spellings;
+/// a real plural shell batch retains the parsed path's Claude precedence.
+/// Returns `None` when none of these envelope shapes is present.
 #[must_use]
 pub fn protocol_from_truncated_json(prefix: &str) -> Option<HookProtocol> {
+    let mut native = false;
+    for (key, value) in json_object_prefix_fields(prefix) {
+        match key.as_str() {
+            "toolCall" | "tool_call" => {
+                native |= truncated_tool_call(value).is_some_and(|call| call.native_protocol);
+            }
+            "toolCalls" | "tool_calls" | "toolcalls"
+                if json_array_prefix_values(value)
+                    .filter_map(truncated_tool_call)
+                    .any(|call| call.batch_shell) =>
+            {
+                return Some(HookProtocol::ClaudeCompatible);
+            }
+            _ => {}
+        }
+    }
+    if native {
+        return Some(HookProtocol::Antigravity);
+    }
+
     let pre_tool_use_event = extract_string_values_for_key(prefix, "\"event\"")
         .iter()
         .any(|event| event.eq_ignore_ascii_case("PreToolUse"));
@@ -1426,6 +1475,267 @@ pub fn protocol_from_truncated_json(prefix: &str) -> Option<HookProtocol> {
         .any(|key| has_object_value_for_key(prefix, key));
     let tool_input = prefix.contains("\"tool_input\"") || prefix.contains("\"toolInput\"");
     (pre_tool_use_event && object_tool_args && !tool_input).then_some(HookProtocol::Reasonix)
+}
+
+/// Fields recovered from one structurally attributable `toolCall` object.
+/// Keep the protocol and shell gates separate: a nameless object identifies
+/// Antigravity, but needs args before it can justify evaluating a command.
+struct TruncatedToolCall<'a> {
+    native_protocol: bool,
+    native_shell: bool,
+    batch_shell: bool,
+    args: Vec<&'a str>,
+}
+
+fn truncated_tool_call(value: &str) -> Option<TruncatedToolCall<'_>> {
+    if !value.trim_start().starts_with('{') {
+        return None;
+    }
+    let mut saw_name = false;
+    let mut nameless = false;
+    let mut native_name = false;
+    let mut shell_name = false;
+    let mut args = Vec::new();
+    for (key, value) in json_object_prefix_fields(value) {
+        match key.as_str() {
+            "name" => {
+                saw_name = true;
+                match serde_json::from_str::<serde_json::Value>(value) {
+                    Ok(serde_json::Value::String(name)) => {
+                        nameless |= name.is_empty();
+                        native_name |= name.eq_ignore_ascii_case("run_command");
+                        shell_name |= is_supported_shell_tool(Some(&name));
+                    }
+                    // Match ToolCall's tolerant name field: numbers become
+                    // explicit non-shell names; other valid types are absent.
+                    Ok(serde_json::Value::Number(_)) | Err(_) => {}
+                    Ok(_) => nameless = true,
+                }
+            }
+            "args" if value != "null" => args.push(value),
+            _ => {}
+        }
+    }
+    nameless |= !saw_name;
+    let nameless_shell = nameless && !args.is_empty();
+    Some(TruncatedToolCall {
+        native_protocol: native_name || nameless,
+        native_shell: native_name || nameless_shell,
+        batch_shell: native_name || shell_name || nameless_shell,
+        args,
+    })
+}
+
+/// Native recovery follows only command-bearing envelope fields. The legacy
+/// raw `command` scan is retained separately for legacy shell envelopes.
+fn native_commands_from_json_prefix(prefix: &str) -> Option<Vec<String>> {
+    let mut native_shell = false;
+    let mut commands = Vec::new();
+    for (key, value) in json_object_prefix_fields(prefix) {
+        match key.as_str() {
+            "toolCall" | "tool_call" => {
+                if let Some(call) = truncated_tool_call(value).filter(|call| call.native_shell) {
+                    native_shell = true;
+                    for args in call.args {
+                        recover_args_prefix(args, &mut commands);
+                    }
+                }
+            }
+            "toolCalls" | "tool_calls" | "toolcalls" => {
+                for call in json_array_prefix_values(value)
+                    .filter_map(truncated_tool_call)
+                    .filter(|call| call.batch_shell)
+                {
+                    for args in call.args {
+                        recover_args_prefix(args, &mut commands);
+                    }
+                }
+            }
+            "tool_input" | "toolInput" => {
+                recover_command_fields(value, &["command"], &mut commands);
+            }
+            "tool_args" | "toolArgs" => recover_args_prefix(value, &mut commands),
+            _ => {}
+        }
+    }
+    native_shell.then_some(commands)
+}
+
+fn recover_args_prefix(value: &str, commands: &mut Vec<String>) {
+    const COMMAND_KEYS: &[&str] = &["command", "CommandLine", "commandLine", "Command"];
+    if value.starts_with('"') {
+        let Some(decoded) = decode_native_json_string_prefix(value) else {
+            return;
+        };
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&decoded) {
+            for command in extract_commands_from_tool_args(&parsed) {
+                append_recovered_command(commands, command);
+            }
+        } else {
+            // Stringified args can themselves be truncated JSON. If there
+            // are no recoverable fields, preserve the normal bare-string
+            // form (including a shell command beginning with an open brace).
+            let mut recovered = Vec::new();
+            recover_command_fields(&decoded, COMMAND_KEYS, &mut recovered);
+            if recovered.is_empty() {
+                append_recovered_command(commands, decoded);
+            } else {
+                for command in recovered {
+                    append_recovered_command(commands, command);
+                }
+            }
+        }
+    } else {
+        recover_command_fields(value, COMMAND_KEYS, commands);
+    }
+}
+
+fn recover_command_fields(value: &str, keys: &[&str], commands: &mut Vec<String>) {
+    for (key, value) in json_object_prefix_fields(value) {
+        if keys.contains(&key.as_str()) {
+            if let Some(command) = decode_native_json_string_prefix(value) {
+                append_recovered_command(commands, command);
+            }
+        }
+    }
+}
+
+fn decode_native_json_string_prefix(value: &str) -> Option<String> {
+    let body = value.strip_prefix('"')?;
+    serde_json::from_str::<String>(value)
+        .ok()
+        .or_else(|| {
+            // The string itself can be truncated after a complete escape.
+            // Let serde decode valid surrogate pairs before falling back to
+            // the clean prefix of an incomplete escape. Adding only the
+            // missing quote cannot make an invalid escape or control valid.
+            json_string_prefix_end(value)
+                .is_none()
+                .then(|| serde_json::from_str::<String>(&format!("{value}\"")).ok())
+                .flatten()
+        })
+        .or_else(|| decode_json_string_prefix(body))
+}
+
+fn append_recovered_command(commands: &mut Vec<String>, command: String) {
+    if !command.is_empty() && !commands.contains(&command) {
+        commands.push(command);
+    }
+}
+
+/// Visit immediate object fields, retaining the final truncated value. Keys
+/// must be complete, valid JSON strings. Value boundaries are scanned without
+/// entering strings, so nested metadata cannot impersonate envelope fields.
+fn json_object_prefix_fields(prefix: &str) -> impl Iterator<Item = (String, &str)> {
+    let prefix = prefix.trim_start();
+    let prefix = prefix
+        .strip_prefix('\u{feff}')
+        .unwrap_or(prefix)
+        .trim_start();
+    let mut rest = prefix.strip_prefix('{');
+    std::iter::from_fn(move || {
+        let field = rest.take()?.trim_start();
+        let key_end = json_string_prefix_end(field)?;
+        let key = serde_json::from_str::<String>(&field[..key_end]).ok()?;
+        let value = field[key_end..]
+            .trim_start()
+            .strip_prefix(':')?
+            .trim_start();
+        let value_end = json_value_prefix_len(value)?;
+        rest = value[value_end..].trim_start().strip_prefix(',');
+        Some((key, &value[..value_end]))
+    })
+}
+
+fn json_array_prefix_values(prefix: &str) -> impl Iterator<Item = &str> {
+    let mut rest = prefix.trim_start().strip_prefix('[');
+    std::iter::from_fn(move || {
+        let value = rest.take()?.trim_start();
+        let value_end = json_value_prefix_len(value)?;
+        rest = value[value_end..].trim_start().strip_prefix(',');
+        Some(&value[..value_end])
+    })
+}
+
+/// Byte length through a closing quote; `None` means absent or incomplete.
+/// Escapes are validated when decoding a key/name/command, not while finding
+/// boundaries in unrelated values.
+fn json_string_prefix_end(value: &str) -> Option<usize> {
+    if !value.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
+/// Boundaries of one complete or truncated JSON value. The fixed stack keeps
+/// recovery bounded even when an unparseable payload nests containers beyond
+/// `serde_json`'s normal recursion limit. A mismatched delimiter is untrusted.
+fn json_value_prefix_len(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    match *bytes.first()? {
+        b'"' => return Some(json_string_prefix_end(value).unwrap_or(value.len())),
+        b'{' | b'[' => {}
+        _ => {
+            let end = value
+                .find(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | '}' | ']'))
+                .unwrap_or(value.len());
+            return serde_json::from_str::<serde_json::Value>(&value[..end])
+                .ok()
+                .filter(|parsed| {
+                    matches!(
+                        parsed,
+                        serde_json::Value::Null
+                            | serde_json::Value::Bool(_)
+                            | serde_json::Value::Number(_)
+                    )
+                })
+                .map(|_| end);
+        }
+    }
+
+    let mut closing = [0u8; 128];
+    let mut depth = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => match json_string_prefix_end(&value[index..]) {
+                Some(len) => {
+                    index += len;
+                    continue;
+                }
+                None => return Some(value.len()),
+            },
+            b'{' | b'[' => {
+                if depth == closing.len() {
+                    return None;
+                }
+                closing[depth] = if bytes[index] == b'{' { b'}' } else { b']' };
+                depth += 1;
+            }
+            b'}' | b']' => {
+                if closing[depth - 1] != bytes[index] {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Some(value.len())
 }
 
 /// Whether a raw JSON `key` (given with its surrounding quotes) is followed by
@@ -2672,17 +2982,18 @@ fn is_batch_shell_call(call: &ToolCall) -> bool {
     name == "run_command" || is_supported_shell_tool(Some(&name))
 }
 
-/// Extract the shell command from an Antigravity (`agy`) `toolCall` envelope.
+/// Extract every shell command from an Antigravity (`agy`) `toolCall` envelope.
 ///
 /// `agy`'s `run_command` tool carries the command in
 /// `toolCall.args.CommandLine` (PascalCase); the shared args extraction also
 /// accepts the lowercase `command` key used by other agents in case `agy` ever
 /// normalizes.
-fn extract_command_from_tool_call(tool_call: &ToolCall) -> Option<String> {
+fn extract_commands_from_tool_call(tool_call: &ToolCall) -> Vec<String> {
     tool_call
         .args
         .as_ref()
-        .and_then(extract_command_from_tool_args)
+        .map(extract_commands_from_tool_args)
+        .unwrap_or_default()
 }
 
 fn extract_command_from_tool_input(tool_input: &ToolInput) -> Option<String> {
@@ -2692,37 +3003,41 @@ fn extract_command_from_tool_input(tool_input: &ToolInput) -> Option<String> {
     }
 }
 
-/// Extract the shell command from a `toolArgs` / `toolCall.args` /
+/// Extract every shell command from a `toolArgs` / `toolCall.args` /
 /// `toolCalls[].args` value.
 ///
 /// Accepts the dominant lowercase `command` object key (Claude / Copilot / VS
 /// Code Agent Host), the `CommandLine` / `commandLine` / `Command` variants
 /// (agy and Windows-shell payloads), a JSON-encoded string carrying any of
 /// those object forms (the Agent Host stringifies `args`), and a bare
-/// non-empty string as the command itself. `command` is checked first so
-/// precedence is unchanged for payloads that carry several keys.
-fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<String> {
+/// non-empty string as the command itself. Keep the historical primary-key
+/// order, but retain every distinct command for independent evaluation: a
+/// harmless `command` must not hide Antigravity's destructive `CommandLine`.
+/// Joining conflicting values would let one value's unterminated quote or
+/// trailing backslash absorb a sibling command, so the caller receives a list.
+fn extract_commands_from_tool_args(tool_args: &serde_json::Value) -> Vec<String> {
     match tool_args {
         serde_json::Value::Object(map) => {
+            let mut commands = Vec::new();
             for key in ["command", "CommandLine", "commandLine", "Command"] {
                 if let Some(serde_json::Value::String(s)) = map.get(key) {
-                    if !s.is_empty() {
-                        return Some(s.clone());
+                    if !s.is_empty() && !commands.contains(s) {
+                        commands.push(s.clone());
                     }
                 }
             }
-            None
+            commands
         }
         serde_json::Value::String(s) => {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                extract_command_from_tool_args(&parsed)
+                extract_commands_from_tool_args(&parsed)
             } else if s.is_empty() {
-                None
+                Vec::new()
             } else {
-                Some(s.clone())
+                vec![s.clone()]
             }
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -2845,20 +3160,22 @@ fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHook
             if !is_batch_shell_call(call) {
                 continue;
             }
-            if let Some(command) = call.args.as_ref().and_then(extract_command_from_tool_args) {
+            for command in extract_commands_from_tool_call(call) {
                 let entry_dialect =
                     resolve(&command, shell_dialect_for_tool_name(call.name.as_deref()));
                 commands.push((command, entry_dialect));
             }
         }
     }
-    if let Some(command) = input
+    if let Some(call) = input
         .tool_call
         .as_ref()
-        .and_then(extract_command_from_tool_call)
+        .filter(|call| is_batch_shell_call(call))
     {
-        let entry_dialect = resolve(&command, labeled);
-        commands.push((command, entry_dialect));
+        for command in extract_commands_from_tool_call(call) {
+            let entry_dialect = resolve(&command, labeled);
+            commands.push((command, entry_dialect));
+        }
     }
     if let Some(command) = input
         .tool_input
@@ -2868,13 +3185,11 @@ fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHook
         let entry_dialect = resolve(&command, labeled);
         commands.push((command, entry_dialect));
     }
-    if let Some(command) = input
-        .tool_args
-        .as_ref()
-        .and_then(extract_command_from_tool_args)
-    {
-        let entry_dialect = resolve(&command, labeled);
-        commands.push((command, entry_dialect));
+    if let Some(args) = input.tool_args.as_ref() {
+        for command in extract_commands_from_tool_args(args) {
+            let entry_dialect = resolve(&command, labeled);
+            commands.push((command, entry_dialect));
+        }
     }
 
     let mut entries = commands.into_iter();
@@ -6850,6 +7165,134 @@ mod tests {
     }
 
     #[test]
+    fn test_command_key_conflicts_are_independent_for_every_args_envelope() {
+        let args = serde_json::json!({
+            "command": "echo harmless",
+            "CommandLine": "git reset --hard",
+            "commandLine": "echo second",
+            "Command": "echo third"
+        });
+        for json in [
+            serde_json::json!({"toolCall": {"name": "run_command", "args": args}}),
+            serde_json::json!({"toolCalls": [{"name": "bash", "args": args}]}),
+            serde_json::json!({"toolCalls": [{"name": "bash", "args": args.to_string()}]}),
+            serde_json::json!({"tool_name": "Bash", "tool_args": args}),
+            serde_json::json!({"tool_name": "Bash", "tool_args": args.to_string()}),
+        ] {
+            let input = parse_hook_input(&json.to_string()).unwrap();
+            let extracted = extract_command_with_context(&input).unwrap();
+            assert_eq!(extracted.command, "echo harmless", "{json}");
+            let additional: Vec<&str> = extracted
+                .additional_commands
+                .iter()
+                .map(|(command, _)| command.as_str())
+                .collect();
+            assert_eq!(
+                additional,
+                ["git reset --hard", "echo second", "echo third"],
+                "each supported key needs its own evaluation: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_command_key_aliases_preserve_dialects_and_do_not_join_values() {
+        let input = parse_hook_input(
+            &serde_json::json!({
+                "toolCalls": [{
+                    "name": "bash",
+                    "args": {
+                        "command": "echo '\\",
+                        "CommandLine": "git reset --hard",
+                        "Command": "Remove-Item -Recurse -Force C:\\Users\\user\\Documents"
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let extracted = extract_command_with_context(&input).unwrap();
+        assert_eq!(extracted.command, "echo '\\");
+        assert_eq!(extracted.additional_commands.len(), 2);
+        assert_eq!(
+            extracted.additional_commands[0],
+            ("git reset --hard".to_string(), ShellDialect::Posix)
+        );
+        assert_eq!(extracted.additional_commands[1].1, ShellDialect::Unknown);
+    }
+
+    #[test]
+    fn test_equal_command_keys_are_evaluated_once_and_empty_keys_do_not_hide_commands() {
+        let input = parse_hook_input(
+            &serde_json::json!({
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"command": "", "CommandLine": "git status", "commandLine": "git status", "Command": null}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let extracted = extract_command_with_context(&input).unwrap();
+        assert_eq!(extracted.command, "git status");
+        assert!(extracted.additional_commands.is_empty());
+    }
+
+    #[test]
+    fn test_non_shell_sibling_command_keys_remain_data() {
+        let args = serde_json::json!({"command": "git reset --hard", "CommandLine": "rm -rf /"});
+        for json in [
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "toolCall": {"name": "Read", "args": args}
+            }),
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "tool_call": {"name": "Read", "args": {"command": "other data"}},
+                "toolCall": {"name": "Read", "args": args},
+                "toolCalls": [{"name": "Read", "args": args}]
+            }),
+        ] {
+            let input = parse_hook_input(&json.to_string()).unwrap();
+            let extracted = extract_command_with_context(&input).unwrap();
+            assert_eq!(extracted.command, "git status", "{json}");
+            assert!(extracted.additional_commands.is_empty(), "{json}");
+        }
+    }
+
+    #[test]
+    fn test_displaced_envelope_aliases_retain_every_command_key() {
+        let args = serde_json::json!({"command": "echo alias", "CommandLine": "git reset --hard"});
+        for json in [
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_args": {"command": "echo primary"},
+                "toolArgs": args
+            }),
+            serde_json::json!({
+                "tool_call": {"name": "run_command", "args": {"command": "echo primary"}},
+                "toolCall": {"name": "run_command", "args": args}
+            }),
+            serde_json::json!({
+                "tool_calls": [{"name": "bash", "args": {"command": "echo primary"}}],
+                "toolCalls": [{"name": "bash", "args": args.to_string()}]
+            }),
+        ] {
+            let input = parse_hook_input(&json.to_string()).unwrap();
+            let extracted = extract_command_with_context(&input).unwrap();
+            assert_eq!(extracted.command, "echo primary", "{json}");
+            let additional: Vec<&str> = extracted
+                .additional_commands
+                .iter()
+                .map(|(command, _)| command.as_str())
+                .collect();
+            assert_eq!(additional, ["echo alias", "git reset --hard"], "{json}");
+        }
+    }
+
+    #[test]
     fn test_antigravity_is_shell_hook_candidate() {
         let json = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
@@ -8564,6 +9007,237 @@ mod tests {
             shell_tool_from_truncated_json(prefix).expect("real shell tool must still be found");
         assert_eq!(name, "Bash");
         assert_eq!(dialect, ShellDialect::Posix);
+    }
+
+    #[test]
+    fn antigravity_recovery_recognizes_native_command_and_envelope_aliases() {
+        for envelope_key in ["toolCall", "tool_call"] {
+            for command_key in ["CommandLine", "commandLine", "Command", "command"] {
+                let prefix = format!(
+                    r#"{{"{envelope_key}":{{"name":"RUN_COMMAND","args":{{"{command_key}":"git reset --hard"#
+                );
+                for payload in [prefix.clone(), format!("{prefix}\"}}}}}} trailing")] {
+                    assert_eq!(
+                        shell_tool_from_truncated_json(&payload),
+                        Some(("run_command".to_string(), ShellDialect::Unknown)),
+                        "{payload}"
+                    );
+                    assert_eq!(
+                        protocol_from_truncated_json(&payload),
+                        Some(HookProtocol::Antigravity),
+                        "{payload}"
+                    );
+                    assert_eq!(
+                        extract_commands_from_truncated_json(&payload),
+                        vec!["git reset --hard"],
+                        "{payload}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_decodes_escaped_keys_and_native_name() {
+        let prefix = r#"{"tool\u0043all":{"na\u006de":"run_\u0063ommand","ar\u0067s":{"Command\u004cine":"git reset --hard"#;
+        assert_eq!(
+            protocol_from_truncated_json(prefix),
+            Some(HookProtocol::Antigravity)
+        );
+        assert!(shell_tool_from_truncated_json(prefix).is_some());
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["git reset --hard"]
+        );
+        // A complete command value can be decoded exactly even when its
+        // outer envelope is malformed. Stopping at a valid surrogate pair
+        // would drop the destructive command after the emoji.
+        let unicode = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo \ud83e\uddea\ngit reset --hard"}}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(unicode),
+            vec!["echo 🧪\ngit reset --hard"]
+        );
+        let unfinished = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo \ud83e\uddea\ngit reset --hard"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(unfinished),
+            vec!["echo 🧪\ngit reset --hard"]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_preserves_the_nameless_shell_gate() {
+        for name_field in [
+            "",
+            r#""name":"","#,
+            r#""name":null,"#,
+            r#""name":true,"#,
+            r#""name":{},"#,
+        ] {
+            let prefix =
+                format!(r#"{{"toolCall":{{{name_field}"args":{{"CommandLine":"git reset --hard"#);
+            assert!(
+                shell_tool_from_truncated_json(&prefix).is_some(),
+                "{prefix}"
+            );
+            assert_eq!(
+                protocol_from_truncated_json(&prefix),
+                Some(HookProtocol::Antigravity),
+                "{prefix}"
+            );
+            assert_eq!(
+                extract_commands_from_truncated_json(&prefix),
+                vec!["git reset --hard"],
+                "{prefix}"
+            );
+        }
+        for prefix in [r#"{"toolCall":{}"#, r#"{"toolCall":{"args":null}"#] {
+            assert!(shell_tool_from_truncated_json(prefix).is_none(), "{prefix}");
+            assert_eq!(
+                protocol_from_truncated_json(prefix),
+                Some(HookProtocol::Antigravity)
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_retains_every_command_alias_and_duplicate() {
+        let prefix = r#"{"toolCall":{"name":"run_command","args":{"command":"echo '","CommandLine":"echo harmless","CommandLine":"git reset --hard","commandLine":"git clean -fdx","Command":"git reset --hard"}}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec![
+                "echo '",
+                "echo harmless",
+                "git reset --hard",
+                "git clean -fdx"
+            ]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_decodes_stringified_and_bare_args() {
+        for args in [
+            serde_json::json!("git reset --hard"),
+            serde_json::json!(r#"{"CommandLine":"git reset --hard"}"#),
+        ] {
+            let payload = format!(
+                "{} trailing",
+                serde_json::json!({"toolCall": {"name": "run_command", "args": args}})
+            );
+            assert_eq!(
+                extract_commands_from_truncated_json(&payload),
+                vec!["git reset --hard"],
+                "{payload}"
+            );
+        }
+        let prefix =
+            r#"{"toolCall":{"name":"run_command","args":"{\"CommandLine\":\"git reset --hard"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["git reset --hard"]
+        );
+        let brace_command =
+            r#"{"toolCall":{"name":"run_command","args":"{ git reset --hard; }"}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(brace_command),
+            vec!["{ git reset --hard; }"]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_ignores_non_shell_and_planted_envelopes() {
+        for prefix in [
+            r#"{"toolCall":{"name":"readFile","args":{"CommandLine":"git reset --hard"}}} trailing"#,
+            r#"{"toolCall":{"name":42,"args":{"CommandLine":"git reset --hard"}}} trailing"#,
+            r#"{"metadata":{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"}}}} trailing"#,
+            r#"{"toolCall":{"name":"readFile","args":{"CommandLine":"git reset --hard"},"metadata":{"name":"run_command"}}} trailing"#,
+            r#"{"metadata":"\"toolCall\":{\"name\":\"run_command\",\"args\":{\"CommandLine\":\"git reset --hard\"}}"} trailing"#,
+            r#"[{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"}}}] trailing"#,
+        ] {
+            assert!(shell_tool_from_truncated_json(prefix).is_none(), "{prefix}");
+            assert_eq!(protocol_from_truncated_json(prefix), None, "{prefix}");
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_ignores_commands_in_unrelated_metadata() {
+        let prefix = r#"{"metadata":{"command":"git reset --hard","toolCall":{"name":"run_command","args":{"CommandLine":"git clean -fdx"}}},"toolCall":{"name":"run_command","args":{"metadata":{"command":"git reset --hard"},"CommandLine":"echo harmless"}}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["echo harmless"]
+        );
+        assert_eq!(
+            protocol_from_truncated_json(prefix),
+            Some(HookProtocol::Antigravity)
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_preserves_batch_protocol_precedence() {
+        for batch in [
+            r#"[{"name":"bash","args":{"command":"echo harmless"}}]"#,
+            r#"[{"name":"run_command","args":{"CommandLine":"echo harmless"}}]"#,
+            r#"[{"args":{"command":"echo harmless"}}]"#,
+        ] {
+            let prefix = format!(
+                r#"{{"toolCall":{{"name":"run_command","args":{{"CommandLine":"git reset --hard"}}}},"toolCalls":{batch}}} trailing"#
+            );
+            assert_eq!(
+                protocol_from_truncated_json(&prefix),
+                Some(HookProtocol::ClaudeCompatible),
+                "{prefix}"
+            );
+        }
+        for field in [
+            r#""toolCalls":[{"name":"readFile","args":{"command":"git reset --hard"}}]"#,
+            r#""metadata":{"toolCalls":[{"name":"bash","args":{"command":"git reset --hard"}}]}"#,
+        ] {
+            let prefix = format!(
+                r#"{{{field},"toolCall":{{"name":"run_command","args":{{"CommandLine":"echo harmless"}}}}}} trailing"#
+            );
+            assert_eq!(
+                protocol_from_truncated_json(&prefix),
+                Some(HookProtocol::Antigravity),
+                "{prefix}"
+            );
+            assert_eq!(
+                extract_commands_from_truncated_json(&prefix),
+                vec!["echo harmless"],
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_keeps_command_bearing_siblings_separate() {
+        let prefix = r#"{"toolCall":{"args":{"CommandLine":"echo '"}},"toolInput":{"command":"git reset --hard"},"toolArgs":{"Command":"git clean -fdx"}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["echo '", "git reset --hard", "git clean -fdx"]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_rejects_untrusted_strings_and_container_boundaries() {
+        for prefix in [
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard \q"}}} trailing"#,
+            "{\"toolCall\":{\"name\":\"run_command\",\"args\":{\"CommandLine\":\"git reset --hard\n\"}}} trailing",
+        ] {
+            assert!(
+                extract_commands_from_truncated_json(prefix).is_empty(),
+                "{prefix}"
+            );
+        }
+        for prefix in [
+            r#"{"metadata":[},"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"}}}"#.to_string(),
+            format!(
+                r#"{{"metadata":{}0{},"toolCall":{{"name":"run_command","args":{{"CommandLine":"git reset --hard"}}}}}}"#,
+                "[".repeat(256),
+                "]".repeat(256)
+            ),
+        ] {
+            assert!(shell_tool_from_truncated_json(&prefix).is_none(), "{prefix}");
+            assert_eq!(protocol_from_truncated_json(&prefix), None, "{prefix}");
+        }
     }
 
     /// Issue #386: `[general] log_file` takes no redaction config and used to

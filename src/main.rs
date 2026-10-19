@@ -278,7 +278,8 @@ fn blocking_verdict_exit_code(protocol: hook::HookProtocol, delivery: io::Result
 /// back to the Claude shape, which answers with exit 0, and a host that reads
 /// only the exit status takes exit 0 as a pass. That is the ordinary case for
 /// Reasonix (#358): it sets no env marker, and process-ancestry detection is
-/// Unix-only. So when the agent is unknown, the envelope markers still
+/// Unix-only. Antigravity also needs its native JSON response when its env
+/// marker is absent. So when the agent is unknown, the envelope markers still
 /// readable in the raw `prefix` decide instead
 /// ([`hook::protocol_from_truncated_json`]). They never override an
 /// identified agent: a planted marker must not be able to switch, say,
@@ -563,22 +564,26 @@ fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command
 /// Padding a destructive command past `max_hook_input_bytes` used to skip
 /// every pack: the oversized input failed open (by default) without any
 /// evaluation. The JSON prefix that WAS read usually still contains
-/// `tool_input.command`, so extract it leniently and run it through the
-/// normal evaluation pipeline. A proven Deny/Ask publishes the ordinary
-/// protocol response and returns `true`; every other outcome — nothing
-/// extractable, benign command, warn/log match, deadline exhausted — returns
-/// `false` so the caller keeps the historic fail-open warning path.
+/// `tool_input.command` or native Antigravity `toolCall.args.CommandLine`,
+/// so extract commands leniently and run them through the normal evaluation
+/// pipeline. A proven Deny/Ask publishes the ordinary blocking response;
+/// deadline exhaustion publishes an indeterminate response. Both return the
+/// protocol's exit status. Nothing extractable, a benign command, or a
+/// warn/log match returns `None` to keep the historic fail-open warning path.
 ///
 /// Two attribution rules keep this from over-denying and from under-scanning:
-/// - The prefix must name a recognized SHELL tool (`tool_name`/`toolName`).
+/// - The prefix must name a recognized SHELL tool (`tool_name`/`toolName` or
+///   native `toolCall.name`). Antigravity's nameless-with-args form is also
+///   accepted, as on the parsed path.
 ///   An oversized `Write`/`Read` envelope that happens to carry a
 ///   command-shaped field is not a shell request and must fail open; so does
-///   a prefix with no tool name at all — dcg never denies what it cannot
-///   attribute to a shell.
-/// - EVERY `"command"` occurrence in the prefix is evaluated, not just the
-///   first: `serde_json` is last-wins on duplicate keys and an earlier
-///   unrelated object can carry a decoy, so judging one occurrence would let
-///   a benign decoy suppress the real command.
+///   an unattributable prefix — dcg never denies what it cannot attribute to
+///   a shell.
+/// - EVERY recovered command is evaluated independently. Legacy envelopes
+///   retain the all-occurrences `"command"` scan. Native envelopes recover
+///   their accepted command aliases only from command-bearing envelope
+///   fields, keeping unrelated metadata inert. Neither a duplicate key nor
+///   a benign alias may suppress another command.
 ///
 /// Only called under fail-open; fail-closed unparseable input still denies
 /// unconditionally in `handle_unparseable_hook_input` (issue #160).
@@ -2735,6 +2740,32 @@ mod tests {
                 payloadless_hook_protocol(&agent, Some(reasonix_prefix)),
                 protocol,
                 "{agent:?}: planted markers must not override an identified agent"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_protocol_never_overrides_an_identified_agent() {
+        let prefix = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"#;
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Unknown, Some(prefix)),
+            hook::HookProtocol::Antigravity
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Custom("unknown-host".into()), Some(prefix)),
+            hook::HookProtocol::Antigravity
+        );
+        for agent in [
+            Agent::Antigravity,
+            Agent::CodexCli,
+            Agent::ClaudeCode,
+            Agent::GeminiCli,
+            Agent::Reasonix,
+        ] {
+            assert_eq!(
+                payloadless_hook_protocol(&agent, Some(prefix)),
+                hook_protocol_for_agent(&agent),
+                "native markers must preserve explicit agent {agent:?}"
             );
         }
     }

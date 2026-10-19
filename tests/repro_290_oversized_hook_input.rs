@@ -14,7 +14,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 /// Payload size safely past the default 256 KiB `max_hook_input_bytes`.
 const PADDING_BYTES: usize = 300 * 1024;
@@ -514,4 +514,321 @@ fn issue_290_normal_size_deny_unchanged() {
             .unwrap_or_default(),
         "deny"
     );
+}
+
+// Native Antigravity recovery must work before a HookInput exists, including
+// when the host sets its real marker and when only the stdin shape identifies
+// it. Every command below is fixture data sent to dcg, never executed.
+#[derive(Clone, Copy, Debug)]
+enum NativeRecoveryAgent {
+    NoMarker,
+    Environment,
+    Forced(&'static str),
+}
+
+fn run_native_recovery(
+    input: &[u8],
+    home: &Path,
+    agent: NativeRecoveryAgent,
+    fail_closed: bool,
+) -> Output {
+    let config =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fixtures/configs/minimal.toml");
+    let mut command = Command::new(dcg_binary());
+    command.env_clear();
+    // Preserve executable/platform lookup only; no caller agent markers,
+    // allowlists, size limits, or fail-closed overrides enter these cases.
+    for key in ["PATH", "SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("ProgramData", home)
+        .env("TMPDIR", home)
+        .env("TEMP", home)
+        .env("TMP", home)
+        .env("DCG_CONFIG", config)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_ALLOW_ONCE_PATH", home.join("allow-once.jsonl"))
+        .env("DCG_PENDING_EXCEPTIONS_PATH", home.join("pending.jsonl"))
+        .env("DCG_HISTORY_DISABLED", "1")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("DCG_HOOK_TIMEOUT_MS", "30000")
+        .env("NO_COLOR", "1");
+    match agent {
+        NativeRecoveryAgent::NoMarker => {}
+        NativeRecoveryAgent::Environment => {
+            command.env("ANTIGRAVITY_CONVERSATION_ID", "native-recovery-test");
+        }
+        NativeRecoveryAgent::Forced(name) => {
+            command
+                .env("ANTIGRAVITY_CONVERSATION_ID", "native-recovery-test")
+                .args(["--agent", name]);
+        }
+    }
+    if fail_closed {
+        command.env("DCG_FAIL_CLOSED", "1");
+    }
+    let mut child = command.spawn().expect("spawn native recovery hook");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(input)
+        .expect("write native fixture bytes");
+    child.wait_with_output().expect("wait for native recovery")
+}
+
+fn native_recovery_payload(command: &str) -> String {
+    serde_json::json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": {"CommandLine": command, "Cwd": "/repo", "WaitMsBeforeAsync": 500}
+        },
+        "conversationId": "native-recovery-test",
+        "stepIdx": 1
+    })
+    .to_string()
+}
+
+fn malformed_native_payloads(payload: &str) -> Vec<(&'static str, Vec<u8>)> {
+    let mut non_utf8 = payload.as_bytes().to_vec();
+    non_utf8.push(0xff);
+    vec![
+        (
+            "json truncation",
+            payload.as_bytes()[..payload.len() - 1].to_vec(),
+        ),
+        (
+            "malformed suffix",
+            format!("{payload} trailing").into_bytes(),
+        ),
+        ("invalid UTF-8", non_utf8),
+    ]
+}
+
+fn assert_native_recovery_denial(output: &Output, context: &str) -> String {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NativeDenial {
+        decision: String,
+        reason: String,
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{context}: {stderr}");
+    let root: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("{context}: invalid denial ({err}): {output:?}"));
+    assert!(
+        root.is_object(),
+        "{context}: expected JSON object, got {root}"
+    );
+    // Deserialize the original bytes so duplicate keys cannot be hidden by
+    // Value's last-wins map; String rejects structured enum lookalikes.
+    let denial: NativeDenial = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("{context}: native protocol rejected denial ({err}): {root}"));
+    assert_eq!(denial.decision, "deny", "{context}: {root}");
+    assert!(!denial.reason.trim().is_empty(), "{context}: {root}");
+    denial.reason
+}
+
+fn assert_native_recovery_fail_open(output: &Output, context: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{context}: {stderr}");
+    assert!(output.stdout.is_empty(), "{context}: {output:?}");
+    assert!(stderr.contains("fail-open"), "{context}: {stderr}");
+}
+
+#[test]
+fn antigravity_recovery_oversized_native_commands_are_denied() {
+    for agent in [
+        NativeRecoveryAgent::NoMarker,
+        NativeRecoveryAgent::Environment,
+    ] {
+        for command in [
+            format!("git reset --hard\n# {}", "x".repeat(PADDING_BYTES)),
+            format!("# {}\ngit reset --hard", "x".repeat(PADDING_BYTES)),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let input = native_recovery_payload(&command);
+            assert!(input.len() > 256 * 1024);
+            let output = run_native_recovery(input.as_bytes(), temp.path(), agent, false);
+            let reason = assert_native_recovery_denial(&output, &format!("oversized {agent:?}"));
+            assert!(reason.contains("core.git:reset-hard"), "{reason}");
+        }
+    }
+}
+
+#[test]
+fn antigravity_recovery_malformed_native_commands_are_denied() {
+    let mut payloads = malformed_native_payloads(&native_recovery_payload("git reset --hard"));
+    payloads.push((
+        "truncated command string",
+        br#"{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"#.to_vec(),
+    ));
+    payloads.push((
+        "complete command containing a surrogate pair",
+        br#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo \ud83e\uddea\ngit reset --hard"}}} trailing"#
+            .to_vec(),
+    ));
+    payloads.push((
+        "truncated command containing a surrogate pair",
+        br#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo \ud83e\uddea\ngit reset --hard"#
+            .to_vec(),
+    ));
+    for agent in [
+        NativeRecoveryAgent::NoMarker,
+        NativeRecoveryAgent::Environment,
+    ] {
+        for (kind, input) in &payloads {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let output = run_native_recovery(input, temp.path(), agent, false);
+            let reason = assert_native_recovery_denial(&output, &format!("{kind} {agent:?}"));
+            assert!(reason.contains("core.git:reset-hard"), "{kind}: {reason}");
+        }
+    }
+}
+
+#[test]
+fn antigravity_recovery_nameless_and_escaped_native_commands_are_denied() {
+    for input in [
+        r#"{"tool_call":{"args":{"CommandLine":"git reset --hard"}}} trailing"#,
+        r#"{"tool\u0043all":{"na\u006de":"run_command","ar\u0067s":{"Command\u004cine":"git reset --hard"}}} trailing"#,
+        r#"{"toolCall":{"name":"run_command","args":"{\"CommandLine\":\"git reset --hard"#,
+    ] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = run_native_recovery(
+            input.as_bytes(),
+            temp.path(),
+            NativeRecoveryAgent::NoMarker,
+            false,
+        );
+        let reason = assert_native_recovery_denial(&output, input);
+        assert!(reason.contains("core.git:reset-hard"), "{reason}");
+    }
+}
+
+#[test]
+fn antigravity_recovery_safe_commands_keep_default_fail_open() {
+    let mut payloads = malformed_native_payloads(&native_recovery_payload("echo harmless"));
+    payloads.push((
+        "oversized safe command",
+        native_recovery_payload(&format!("echo harmless\n# {}", "x".repeat(PADDING_BYTES)))
+            .into_bytes(),
+    ));
+    for agent in [
+        NativeRecoveryAgent::NoMarker,
+        NativeRecoveryAgent::Environment,
+    ] {
+        for (kind, input) in &payloads {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let output = run_native_recovery(input, temp.path(), agent, false);
+            assert_native_recovery_fail_open(&output, &format!("{kind} {agent:?}"));
+        }
+    }
+}
+
+#[test]
+fn antigravity_recovery_non_shell_and_planted_metadata_stay_inert() {
+    let oversized_non_shell = serde_json::json!({
+        "toolCall": {
+            "name": "readFile",
+            "args": {"CommandLine": format!("git reset --hard {}", "x".repeat(PADDING_BYTES))}
+        }
+    })
+    .to_string();
+    for agent in [
+        NativeRecoveryAgent::NoMarker,
+        NativeRecoveryAgent::Environment,
+    ] {
+        for input in [
+            oversized_non_shell.as_str(),
+            r#"{"metadata":{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"}}}} trailing"#,
+            r#"{"toolCall":{"name":"readFile","args":{"CommandLine":"git reset --hard"},"metadata":{"name":"run_command"}}} trailing"#,
+            r#"{"metadata":{"command":"git reset --hard"},"toolCall":{"name":"run_command","args":{"metadata":{"CommandLine":"git reset --hard"},"CommandLine":"echo harmless"}}} trailing"#,
+            r#"{"metadata":"\"toolCall\":{\"name\":\"run_command\",\"args\":{\"CommandLine\":\"git reset --hard\"}}"} trailing"#,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let output = run_native_recovery(input.as_bytes(), temp.path(), agent, false);
+            assert_native_recovery_fail_open(&output, &format!("inert metadata {agent:?}"));
+        }
+    }
+}
+
+#[test]
+fn antigravity_recovery_fail_closed_uses_the_native_protocol() {
+    let mut payloads = malformed_native_payloads(&native_recovery_payload("echo harmless"));
+    payloads.push((
+        "oversized safe command",
+        native_recovery_payload(&format!("echo harmless {}", "x".repeat(PADDING_BYTES)))
+            .into_bytes(),
+    ));
+    for agent in [
+        NativeRecoveryAgent::NoMarker,
+        NativeRecoveryAgent::Environment,
+        NativeRecoveryAgent::Forced("agy"),
+    ] {
+        for (kind, input) in &payloads {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let output = run_native_recovery(input, temp.path(), agent, true);
+            let reason = assert_native_recovery_denial(&output, &format!("{kind} {agent:?}"));
+            assert!(reason.contains("DCG_FAIL_CLOSED"), "{kind}: {reason}");
+        }
+    }
+}
+
+#[test]
+fn antigravity_recovery_preserves_explicit_agent_precedence() {
+    let mut input = native_recovery_payload("git reset --hard").into_bytes();
+    input.push(0xff);
+    for fail_closed in [false, true] {
+        for agent in ["codex", "reasonix"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let output = run_native_recovery(
+                &input,
+                temp.path(),
+                NativeRecoveryAgent::Forced(agent),
+                fail_closed,
+            );
+            if agent == "reasonix" {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(!output.stderr.is_empty(), "{output:?}");
+            } else {
+                assert_eq!(output.status.code(), Some(0), "{output:?}");
+                let json: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("Codex JSON denial");
+                assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+                assert!(json.get("decision").is_none(), "{json}");
+            }
+        }
+    }
+}
+
+#[test]
+fn antigravity_recovery_preserves_real_shell_batch_precedence() {
+    let input = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"}},"toolcalls":[{"name":"bash","args":{"command":"echo harmless"}}]} trailing"#;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = run_native_recovery(
+        input.as_bytes(),
+        temp.path(),
+        NativeRecoveryAgent::NoMarker,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("Claude-compatible batch denial");
+    assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(json.get("decision").is_none(), "{json}");
 }

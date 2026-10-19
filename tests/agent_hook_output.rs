@@ -768,6 +768,94 @@ fn test_antigravity_warning_preserves_ordinary_permission_checks() {
 }
 
 #[test]
+fn test_antigravity_command_keys_cannot_hide_a_destructive_native_command() {
+    for decoy in ["echo harmless", "git stash drop", "echo '", "echo \\"] {
+        let input = serde_json::json!({
+            "toolCall": {
+                "name": "run_command",
+                "args": {"command": decoy, "CommandLine": "git reset --hard"}
+            }
+        })
+        .to_string();
+        let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+        let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+        assert!(
+            denial.reason.contains("core.git:reset-hard"),
+            "a harmless, warning, or unfinished alias cannot hide the native command: {decoy:?}\n{}",
+            denial.reason
+        );
+    }
+}
+
+#[test]
+fn test_antigravity_displaced_tool_call_retains_all_command_keys() {
+    let input = serde_json::json!({
+        "tool_call": {"name": "run_command", "args": {"CommandLine": "echo primary"}},
+        "toolCall": {
+            "name": "run_command",
+            "args": {"command": "echo alias", "CommandLine": "git reset --hard"}
+        }
+    })
+    .to_string();
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+    let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+    assert!(denial.reason.contains("core.git:reset-hard"));
+}
+
+#[test]
+fn test_antigravity_benign_command_aliases_preserve_permissions() {
+    for args in [
+        serde_json::json!({"command": "echo first", "CommandLine": "git status"}),
+        serde_json::json!({"command": "git status", "CommandLine": "git status"}),
+        serde_json::json!({"command": "", "CommandLine": "git status"}),
+        serde_json::json!({"command": "echo 'git reset --hard'", "CommandLine": "git status"}),
+    ] {
+        let input =
+            serde_json::json!({"toolCall": {"name": "run_command", "args": args}}).to_string();
+        let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+        assert_eq!(exit_code, 0, "{input}\nstderr: {stderr}");
+        assert!(
+            stdout.is_empty(),
+            "benign aliases must not decide host permission: {stdout}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "benign aliases must remain silent: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_stringified_args_cannot_hide_command_aliases() {
+    let args =
+        serde_json::json!({"command": "echo harmless", "Command": "git reset --hard"}).to_string();
+    let cases = [
+        (
+            serde_json::json!({"toolCalls": [{"name": "bash", "args": args}]}),
+            "/hookSpecificOutput/permissionDecision",
+        ),
+        (
+            serde_json::json!({"event": "pre-tool-use", "toolName": "bash", "toolArgs": args}),
+            "/permissionDecision",
+        ),
+    ];
+    for (input, decision_pointer) in cases {
+        let (stdout, stderr, exit_code) = run_hook_mode_raw(&input.to_string());
+        assert_eq!(exit_code, 0, "{input}\nstderr: {stderr}");
+        let output: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|error| panic!("missing denial for {input}: {error}\n{stderr}"));
+        assert_eq!(
+            output
+                .pointer(decision_pointer)
+                .and_then(serde_json::Value::as_str),
+            Some("deny"),
+            "{output}"
+        );
+        assert!(stdout.contains("core.git:reset-hard"), "{output}");
+    }
+}
+
+#[test]
 fn test_antigravity_warning_does_not_mask_destructive_companion() {
     let input = antigravity_payload("git stash drop; git reset --hard");
     let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
