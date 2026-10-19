@@ -729,6 +729,120 @@ pub(crate) enum RmExecutableCertainty {
     Other,
 }
 
+/// The two unlink rules share an executed-argv proof, not a raw-text search.
+/// Keep the arguments as source text for their existing pattern attribution.
+pub(crate) struct UnlinkCommand {
+    pub(crate) matching_view: String,
+    pub(crate) safe: bool,
+}
+
+pub(crate) fn is_unlink_rule(name: Option<&str>) -> bool {
+    matches!(name, Some("unlink-root-home" | "unlink-general"))
+}
+
+/// Recover a literal POSIX unlink invocation without interpreting its argv as
+/// another command (#550). Shell quote removal applies to the executable word:
+/// `'unlink'`, `u'n'link` and `'/usr/bin/unlink'` all execute the same utility.
+/// Only that word is replaced in the matching view; operands retain their
+/// quoting, and the original command remains available to every other rule.
+pub(crate) fn unlink_command_for_pattern_matching(
+    command: &str,
+    dialect: ShellDialect,
+) -> Option<UnlinkCommand> {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || (!command.contains("unlink") && !command.contains(['\'', '"', '\\']))
+    {
+        return None;
+    }
+    let (ungrouped, _) = strip_leading_posix_group_openers(command);
+    let (unprefixed, _) = strip_leading_rm_prefixes(ungrouped);
+    let stripped = crate::normalize::strip_wrapper_prefixes(unprefixed);
+    if stripped.wrapper_limit_reached {
+        return None;
+    }
+    let source = stripped.normalized.as_ref();
+    let tokens = tokenize_for_shell_dialect(source, ShellDialect::Posix);
+    let executable = tokens.first()?;
+    if executable.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+    let executable_end = crate::normalize::consume_posix_word_token(
+        source.as_bytes(),
+        executable.byte_range.start,
+        source.len(),
+    );
+    let decoded = crate::normalize::decode_posix_literal_word(
+        source.get(executable.byte_range.start..executable_end)?,
+    )?;
+    if decoded.rsplit('/').next() != Some("unlink") {
+        return None;
+    }
+
+    let arguments: Vec<&str> = tokens
+        .iter()
+        .skip(1)
+        .filter_map(|token| token.text(source))
+        .collect();
+    let single_command = executable_end == executable.byte_range.end
+        && tokens
+            .iter()
+            .all(|token| token.kind == NormalizeTokenKind::Word);
+    let informational = single_command
+        && matches!(arguments.as_slice(), [argument] if
+            crate::normalize::decode_posix_literal_word(argument)
+                .is_some_and(|value| matches!(value.as_ref(), "--help" | "--version")));
+    let operand = match arguments.as_slice() {
+        [operand] => Some(*operand),
+        [options_end, operand]
+            if crate::normalize::decode_posix_literal_word(options_end)
+                .is_some_and(|value| value == "--") =>
+        {
+            Some(*operand)
+        }
+        _ => None,
+    };
+    // Exempt only one statically recovered target below a literal temp root.
+    // Decoding a quoted operand here proves its value; it never turns that
+    // value into executable source or makes a dynamic temp root trustworthy.
+    let temporary = single_command
+        && command == unprefixed
+        && !crate::normalize::wrapper_changes_filesystem_context(command)
+        && operand
+            // Unknown dialects can interpret POSIX quoting as path bytes or
+            // expand native shell syntax. Pack APIs carry no dialect, so only
+            // syntax-free ASCII operands get this new exemption there.
+            // Preserve the old temp rules' backslash boundary in all dialects.
+            .filter(|operand| {
+                !operand.contains('\\')
+                    && (dialect == ShellDialect::Posix
+                        || operand.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                        }))
+            })
+            .and_then(crate::normalize::decode_posix_literal_word)
+            .is_some_and(|path| {
+                !path.contains(['\0', '\\'])
+                    && LITERAL_TEMP_PREFIXES
+                        .iter()
+                        .find_map(|prefix| path.strip_prefix(prefix))
+                        .is_some_and(|suffix| {
+                            temp_path_suffix_has_real_component(suffix)
+                                && !has_dotdot_segment(suffix)
+                                // Win32 can normalize trailing dots/spaces;
+                                // an unknown shell cannot prove these literal.
+                                && (dialect == ShellDialect::Posix
+                                    || suffix.split('/').all(|component| {
+                                        !component.ends_with(['.', ' '])
+                                    }))
+                        })
+            });
+    Some(UnlinkCommand {
+        matching_view: format!("unlink {}", &source[executable_end..]),
+        safe: informational || temporary,
+    })
+}
+
 #[derive(Debug)]
 struct PathToken<'a> {
     unquoted: &'a str,
@@ -1745,6 +1859,10 @@ fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
                 .normalized
                 .as_ref(),
         )
+        // Leading redirects, grouping, and a redirect attached to argv0 do
+        // not change the executable. The unlink proof shares the actual word
+        // boundary so those forms cannot hide a quoted basename from this gate.
+        || unlink_command_for_pattern_matching(segment, ShellDialect::Posix).is_some()
 }
 
 /// Whether the first word of `segment`, as spelled, is a writer the semantic
@@ -1769,7 +1887,8 @@ fn segment_names_semantic_writer(segment: &str) -> bool {
             let executable = rm_frontend_basename(decoded.as_ref());
             // An obfuscated writer spelling (`t''ee`, `\tee`) carries no
             // keyword; `credential-file-write` still has to see it.
-            executable == "rm" || super::credential_files::is_credential_writer(executable)
+            matches!(executable, "rm" | "unlink")
+                || super::credential_files::is_credential_writer(executable)
         })
 }
 
@@ -5352,11 +5471,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // is one-shot data destruction with no recovery and no recursion
         // budget to slow it down.
         //
-        // The regex matches `unlink` at any word boundary (so it fires in
-        // compound forms and after `sudo`/`env` wrappers, and on
-        // path-prefixed binaries via PATH_NORMALIZER), then a sensitive
-        // path token. Single argument only — multi-arg unlink isn't
-        // standard.
+        // The executed-argv classifier supplies a bare command word for
+        // literal quoted/path-prefixed spellings. These patterns retain the
+        // established rule IDs and sensitive-path attribution, with executable
+        // scoping on the legacy raw-text fallback. Single argument only —
+        // multi-arg unlink isn't standard.
         destructive_pattern!(
             "unlink-root-home",
             r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
@@ -6702,6 +6821,11 @@ mod tests {
             "foo --unlink /tmp/x",
             "cat unlink /tmp/x",
             "printf '%s' unlink /etc/passwd",
+            "echo 'unlink' /etc/passwd",
+            "cat '/tmp/unlink /etc/passwd'",
+            "command -v 'unlink'",
+            "'un link' /etc/passwd",
+            r"'un\link' /etc/passwd",
         ] {
             assert_no_match(&pack, command);
         }
@@ -6709,13 +6833,83 @@ mod tests {
         for command in [
             "'unlink' /home/user/notes.txt",
             "\"unlink\" /etc/passwd",
+            "'unlink' '/etc/passwd'",
+            "u'n'link /etc/passwd",
+            "u'n'l'i'n'k' /etc/passwd",
+            r"un\link /etc/passwd",
+            r"$'\165nlink' /etc/passwd",
+            "'/usr/bin/unlink' /etc/shadow",
+            "\"/usr/bin/unlink\" /etc/passwd",
+            "('/usr/bin/unlink' /etc/passwd)",
             "/usr/bin/unlink /etc/shadow",
             "sudo unlink /etc/sudoers",
+            "sudo 'unlink' /etc/sudoers",
             "env FOO=bar unlink /etc/passwd",
+            "env FOO=bar 'unlink' /etc/passwd",
             "command unlink /etc/passwd",
+            "command -- 'unlink' /etc/passwd",
+            "u'n'l'i'n'k'>/tmp/unlink.log /etc/passwd",
+            ">/tmp/unlink.log u'n'l'i'n'k' /etc/passwd",
         ] {
             assert_blocks(&pack, command, "unlink");
         }
+    }
+
+    #[test]
+    fn quoted_unlink_preserves_literal_temp_and_information_exceptions() {
+        let pack = create_pack();
+        for command in [
+            "'unlink' /tmp/scratch",
+            "\"/usr/bin/unlink\" /var/tmp/cache",
+            "u'n'l'i'n'k' -- /private/tmp/cache",
+            "command -- 'unlink' /private/var/tmp/cache",
+            "'unlink' --help",
+            "u'n'l'i'n'k' --version",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+        // Quoted operands are a POSIX-only proof. The standalone Pack API has
+        // no dialect and must not grant new exemptions for Cmd expansion,
+        // quote removal, or Windows path normalization.
+        for command in [
+            "'unlink' '/tmp/file with spaces'",
+            "'unlink' /tmp/\"literal;name\"",
+            r#"unlink "/tmp/%DCG_ESCAPE%/notes.txt""#,
+            r#"unlink /tmp/"%DCG_ESCAPE%/notes.txt""#,
+            "unlink /tmp/%DCG_ESCAPE%/notes.txt",
+            r#"unlink "/tmp/!DCG_ESCAPE!/notes.txt""#,
+            "unlink /tmp/!DCG_ESCAPE!/notes.txt",
+            r#"unlink "/tmp/"^.^."/Users/user/notes.txt""#,
+            "unlink /tmp/^.^./Users/user/notes.txt",
+            r#"unlink "/tmp/.. /Users/user/notes.txt""#,
+            r#"unlink "/tmp/.../Users/user/notes.txt""#,
+            "unlink /tmp/.../Users/user/notes.txt",
+            r#"'unlink' "/tmp/cache./notes.txt""#,
+            "unlink /tmp/cache./notes.txt",
+        ] {
+            assert!(
+                unlink_command_for_pattern_matching(command, ShellDialect::Posix)
+                    .is_some_and(|command| command.safe),
+                "known POSIX literal operand: {command}"
+            );
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "unlink");
+        }
+        for command in [
+            "'unlink' /tmp/../etc/passwd",
+            "'unlink' /tmp/\"../etc/passwd\"",
+            r"unlink /tmp/cache\..\..\Users/user/notes.txt",
+            r#""unlink" "/tmp/cache/..\..\Users/user/notes.txt""#,
+            r"'unlink' '/tmp/cache/..\..\Users/user/notes.txt'",
+            "'unlink' \"$TMPDIR/scratch\"",
+            "'unlink' /tmp/scratch /etc/passwd",
+            "'unlink' /tmp/scratch; 'unlink' /etc/passwd",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "unlink");
+        }
+        assert_no_safe_match(&pack, "'unlink'>/etc/passwd /tmp/scratch");
     }
 
     #[test]

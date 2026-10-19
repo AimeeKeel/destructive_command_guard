@@ -461,6 +461,54 @@ fn smoke_claude_destructive_command_blocked() {
     );
 }
 
+/// The native Bash hook keeps the caller's POSIX quoting. Pack-only tests did
+/// not catch the path where raw quoted argv0 skipped both unlink rules (#550).
+#[test]
+fn claude_hook_quoted_unlink_keeps_destructive_commands_blocked_issue_550() {
+    for command in [
+        "'unlink' /home/user/notes.txt",
+        "\"unlink\" /etc/passwd",
+        "u'n'l'i'n'k' /etc/passwd",
+        "'/usr/bin/unlink' /etc/passwd",
+        "sudo 'unlink' /etc/passwd",
+        "'unlink' /tmp/scratch; 'unlink' /etc/passwd",
+    ] {
+        let outcome = run_claude_hook(command);
+        assert!(
+            outcome.is_claude_block_shape(),
+            "quoted unlink must deny {command:?}\n{outcome}"
+        );
+        let json = outcome.stdout_json();
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{command:?}\n{outcome}"
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["ruleId"], "core.filesystem:unlink-root-home",
+            "the unlink rule must run, not merely exhaust the budget: {command:?}\n{outcome}"
+        );
+    }
+}
+
+#[test]
+fn claude_hook_quoted_unlink_keeps_data_and_literal_temp_exceptions_issue_550() {
+    for command in [
+        "ob sync-unlink --path /home/user/vault",
+        "foo --unlink /tmp/x",
+        "cat unlink /tmp/x",
+        "'unlink' /tmp/scratch",
+        "u'n'l'i'n'k' -- /var/tmp/cache",
+        "'unlink' '/tmp/file with spaces'",
+        "'unlink' --help",
+    ] {
+        let outcome = run_claude_hook(command);
+        assert!(
+            outcome.is_allow_shape(),
+            "data or a literal temp/help unlink must remain allowed: {command:?}\n{outcome}"
+        );
+    }
+}
+
 /// Regression for #125 (part b, dcg-side): on Windows, Codex executes shell
 /// commands by wrapping them as `powershell.exe -Command '<inner>'`. When that
 /// wrapped form reaches dcg as the hook command, dcg must descend into the

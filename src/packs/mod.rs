@@ -706,6 +706,17 @@ impl Pack {
         if self.destructive_match_vetoes_safe(cmd) {
             return false;
         }
+        if self.id == "core.filesystem"
+            && let Some(command) =
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+        {
+            // This proof owns unlink's exemptions. A permissive legacy temp
+            // regex must not override a rejected literal-path boundary.
+            return command.safe;
+        }
         if self.id == "system.permissions"
             && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
         {
@@ -767,6 +778,15 @@ impl Pack {
         }
         if self.destructive_match_vetoes_safe_with_deadline(cmd, deadline) {
             return false;
+        }
+        if self.id == "core.filesystem"
+            && let Some(command) =
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+        {
+            return command.safe;
         }
         if self.id == "system.permissions"
             && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
@@ -886,10 +906,22 @@ impl Pack {
                     .matches_destructive_named_by(cmd, |name| name != Some("branch-force-delete"));
             }
         }
-        let found = self
-            .destructive_patterns
-            .iter()
-            .find(|p| p.matches_command(cmd));
+        let unlink_command = (self.id == "core.filesystem")
+            .then(|| {
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+            })
+            .flatten();
+        let found = self.destructive_patterns.iter().find(|pattern| {
+            if crate::packs::core::filesystem::is_unlink_rule(pattern.name)
+                && let Some(command) = &unlink_command
+            {
+                return !command.safe && pattern.regex.is_match(&command.matching_view);
+            }
+            pattern.matches_command(cmd)
+        });
         // #509: the `branch-force-delete` regex is the fallback for a branch
         // command the parser could not read; a readable merge-checked
         // deletion is reported as `branch-delete`, as the parser would.
@@ -1036,7 +1068,13 @@ impl Pack {
 
     fn check_single(&self, cmd: &str) -> Option<DestructiveMatch> {
         // Quick reject if no keywords match
-        if !self.might_match(cmd) {
+        if !self.might_match(cmd)
+            && !(self.id == "core.filesystem"
+                && crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                ))
+        {
             return None;
         }
 

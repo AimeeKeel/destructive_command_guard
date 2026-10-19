@@ -30298,6 +30298,17 @@ fn evaluate_pack_destructive_patterns(
     } else {
         pattern_command
     };
+    let unlink_command = (pack_id == "core.filesystem"
+        && pattern_filter.is_none_or(|include| {
+            include(Some("unlink-root-home")) || include(Some("unlink-general"))
+        }))
+    .then(|| {
+        crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+            command_slice,
+            shell_dialect,
+        )
+    })
+    .flatten();
 
     // Executable-scoped rules (issue #289). Resolve each top-level segment of
     // this slice once, in the same coordinate space as `matched_span`
@@ -30344,27 +30355,42 @@ fn evaluate_pack_destructive_patterns(
         if semantic_branch_rule.is_some() && !semantic_branch_match {
             continue;
         }
+        // The source spelling of argv0 is not its executable value (#550).
+        // This proof decodes only a literal unlink command word and keeps its
+        // arguments intact; other filesystem rules still see their ordinary
+        // sanitized source. It also owns unlink's literal temp/help exceptions.
+        let semantic_unlink_match = if crate::packs::core::filesystem::is_unlink_rule(pattern.name)
+            && let Some(command) = &unlink_command
+        {
+            if command.safe || !pattern.regex.is_match(&command.matching_view) {
+                continue;
+            }
+            true
+        } else {
+            false
+        };
 
         // Parser-only matches (for example a unique long-option abbreviation)
         // deliberately carry no source span. A broad regex span can point at
         // option data such as an earlier `--format -d`, which is worse than no
         // span and would mislead explain/audit output.
-        let matched_span = if semantic_branch_match || transformed_without_source_map {
-            None
-        } else {
-            find_actionable_command_pattern_span(
-                pack_id,
-                pattern.name,
-                &pattern.regex,
-                pattern_command,
-                normalized_offset
-                    .map(|offset| (original_command, offset.saturating_add(slice_offset))),
-            )
-            .map(|span| MatchSpan {
-                start: span.start + slice_offset,
-                end: span.end + slice_offset,
-            })
-        };
+        let matched_span =
+            if semantic_branch_match || semantic_unlink_match || transformed_without_source_map {
+                None
+            } else {
+                find_actionable_command_pattern_span(
+                    pack_id,
+                    pattern.name,
+                    &pattern.regex,
+                    pattern_command,
+                    normalized_offset
+                        .map(|offset| (original_command, offset.saturating_add(slice_offset))),
+                )
+                .map(|span| MatchSpan {
+                    start: span.start + slice_offset,
+                    end: span.end + slice_offset,
+                })
+            };
 
         if deadline_exceeded(deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -30372,7 +30398,11 @@ fn evaluate_pack_destructive_patterns(
 
         let decoded_regex_match =
             transformed_without_source_map && pattern.regex.is_match(pattern_command);
-        if !semantic_branch_match && !decoded_regex_match && matched_span.is_none() {
+        if !semantic_branch_match
+            && !semantic_unlink_match
+            && !decoded_regex_match
+            && matched_span.is_none()
+        {
             continue;
         }
 
@@ -30392,7 +30422,9 @@ fn evaluate_pack_destructive_patterns(
         // rules) instead requires *some* segment of this slice to be run by a
         // declared executable — the coarsest sound reading, since there is no
         // position to attribute. A dynamic argv0 never satisfies the rule.
-        if let Some(executables) = pattern.executables {
+        if let Some(executables) = pattern.executables
+            && !semantic_unlink_match
+        {
             let segments = executable_segments.as_deref().unwrap_or(&[]);
             let governed = match matched_span.as_ref() {
                 Some(span) => span_is_inside_executable_segment(
@@ -40312,6 +40344,138 @@ mod tests {
                     "must allow {command:?} with index={}: {:?}",
                     index.is_some(),
                     result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_unlink_reaches_its_rules_in_both_evaluator_paths_issue_550() {
+        let ordered_packs = ["core.filesystem".to_string()];
+        let enabled_keywords = crate::packs::core::filesystem::create_pack().keywords;
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for index in [None, keyword_index.as_ref()] {
+                let evaluate = |command| {
+                    evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                        command,
+                        enabled_keywords,
+                        &ordered_packs,
+                        index,
+                        &compiled,
+                        &allowlists,
+                        &heredoc_settings,
+                        None,
+                        None,
+                        None,
+                        dialect,
+                    )
+                };
+                for (command, rule) in [
+                    ("'unlink' /etc/passwd", "unlink-root-home"),
+                    ("'unlink' '/etc/passwd'", "unlink-root-home"),
+                    ("u'n'l'i'n'k' /etc/passwd", "unlink-root-home"),
+                    (r"un\link /etc/passwd", "unlink-root-home"),
+                    ("sudo 'unlink' /etc/passwd", "unlink-root-home"),
+                    ("'unlink' ./important.db", "unlink-general"),
+                    ("'unlink' /tmp/../etc/passwd", "unlink-general"),
+                    (
+                        r"unlink /tmp/cache\..\..\Users/user/notes.txt",
+                        "unlink-general",
+                    ),
+                    (
+                        r#""unlink" "/tmp/cache/..\..\Users/user/notes.txt""#,
+                        "unlink-general",
+                    ),
+                    (
+                        r"'unlink' '/tmp/cache/..\..\Users/user/notes.txt'",
+                        "unlink-general",
+                    ),
+                    ("u'n'l'i'n'k'>/tmp/log /etc/passwd", "unlink-general"),
+                    (
+                        "'unlink' /tmp/scratch; 'unlink' /etc/passwd",
+                        "unlink-root-home",
+                    ),
+                    ("echo $('unlink' /etc/passwd)", "unlink-root-home"),
+                    (
+                        "'unlink' /tmp/scratch > /etc/passwd",
+                        "credential-file-write",
+                    ),
+                    ("'unlink'>/etc/passwd /tmp/scratch", "credential-file-write"),
+                    ("'unlink' --help > /etc/passwd", "credential-file-write"),
+                ] {
+                    let result = evaluate(command);
+                    assert!(
+                        result.is_denied(),
+                        "{command:?}, dialect={dialect:?}, indexed={}: {result:?}",
+                        index.is_some()
+                    );
+                    assert_eq!(
+                        result
+                            .pattern_info
+                            .as_ref()
+                            .and_then(|info| info.pattern_name.as_deref()),
+                        Some(rule),
+                        "wrong rule for {command:?}, dialect={dialect:?}, indexed={}",
+                        index.is_some()
+                    );
+                }
+                for command in [
+                    "ob sync-unlink --path /home/user/vault",
+                    "foo --unlink /tmp/x",
+                    "cat unlink /tmp/x",
+                    "echo 'unlink' /etc/passwd",
+                    "'unlink' /tmp/scratch",
+                    "u'n'l'i'n'k' -- /var/tmp/cache",
+                    "'unlink' --help",
+                    "command -v 'unlink'",
+                ] {
+                    let result = evaluate(command);
+                    assert!(
+                        result.is_allowed(),
+                        "{command:?}, dialect={dialect:?}, indexed={}: {result:?}",
+                        index.is_some()
+                    );
+                }
+                let mut unexpected_temp_decisions = Vec::new();
+                for command in [
+                    "'unlink' '/tmp/file with spaces'",
+                    "'unlink' /tmp/\"literal;name\"",
+                    r#"unlink "/tmp/%DCG_ESCAPE%/notes.txt""#,
+                    r#"unlink /tmp/"%DCG_ESCAPE%/notes.txt""#,
+                    "unlink /tmp/%DCG_ESCAPE%/notes.txt",
+                    r#"unlink "/tmp/!DCG_ESCAPE!/notes.txt""#,
+                    "unlink /tmp/!DCG_ESCAPE!/notes.txt",
+                    r#"unlink "/tmp/"^.^."/Users/user/notes.txt""#,
+                    "unlink /tmp/^.^./Users/user/notes.txt",
+                    r#"unlink "/tmp/.. /Users/user/notes.txt""#,
+                    r#"unlink "/tmp/.../Users/user/notes.txt""#,
+                    "unlink /tmp/.../Users/user/notes.txt",
+                    r#"'unlink' "/tmp/cache./notes.txt""#,
+                    "unlink /tmp/cache./notes.txt",
+                ] {
+                    let result = evaluate(command);
+                    let rule = result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref());
+                    if result.is_allowed() != (dialect == ShellDialect::Posix)
+                        || (dialect == ShellDialect::Unknown && rule != Some("unlink-general"))
+                    {
+                        unexpected_temp_decisions.push(format!(
+                            "{command:?}, dialect={dialect:?}, indexed={}: {result:?}",
+                            index.is_some()
+                        ));
+                    }
+                }
+                assert!(
+                    unexpected_temp_decisions.is_empty(),
+                    "unexpected temp decisions:\n{}",
+                    unexpected_temp_decisions.join("\n")
                 );
             }
         }
