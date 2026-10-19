@@ -990,9 +990,18 @@ pub(super) fn interpreter_literal_shell_commands_with_execution_evidence(
         return Err(interpreter_literal_timeout(started, budget));
     }
     // A timed-out parser retains its permit until its source and AST are gone;
-    // subsequent requests cannot leave an unbounded number of workers running.
-    static ACTIVE: AtomicBool = AtomicBool::new(false);
-    if ACTIVE
+    // subsequent requests from the same evaluator cannot leave an unbounded
+    // number of workers running. The slot belongs to the evaluating thread,
+    // not the process: a process-wide slot made a concurrent evaluation (the
+    // MCP server, a parallel hook batch, parallel tests) report this analysis
+    // as unavailable — an Indeterminate verdict for a benign program — merely
+    // because another command was being analysed at the same moment (#565).
+    thread_local! {
+        static ACTIVE: std::sync::Arc<AtomicBool> =
+            std::sync::Arc::new(AtomicBool::new(false));
+    }
+    let active = ACTIVE.with(std::sync::Arc::clone);
+    if active
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
@@ -1001,13 +1010,13 @@ pub(super) fn interpreter_literal_shell_commands_with_execution_evidence(
             detail: "interpreter literal analysis is still busy".into(),
         });
     }
-    struct Permit(&'static AtomicBool);
+    struct Permit(std::sync::Arc<AtomicBool>);
     impl Drop for Permit {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Release);
         }
     }
-    let permit = Permit(&ACTIVE);
+    let permit = Permit(active);
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let source = code.to_string();
     let (sender, receiver) = mpsc::sync_channel(1);

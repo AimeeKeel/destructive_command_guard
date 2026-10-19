@@ -499,8 +499,10 @@ pub struct EvaluationResult {
     pub effective_mode: Option<crate::packs::DecisionMode>,
     /// Whether evaluation skipped deeper analysis due to a deadline overrun.
     pub skipped_due_to_budget: bool,
-    /// A regex failed during this request. Positive evidence may still deny,
-    /// but a policy/confidence downgrade cannot authorize incomplete work.
+    /// A regex, or an optional embedded-source proof such as interpreter
+    /// literal recovery, failed during this request. Positive evidence may
+    /// still deny, but a policy/confidence downgrade cannot authorize
+    /// incomplete work.
     pub regex_evaluation_incomplete: bool,
     /// Whether the evaluator proved that no enabled-pack keyword was present
     /// and returned through the bounded quick-reject fast path.
@@ -14105,7 +14107,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // A positive denial remains decisive. An exact-command grant explicitly
     // authorizes the whole request. Every other would-be allow (including a
     // warn/log result or a rule-scoped exemption) requires complete analysis.
-    // A failed regex search is not a successful proof that no rule matched.
+    // A failed regex search is not a successful proof that no rule matched,
+    // and neither is an embedded-source proof that could not finish.
     if scope.has_failed() && result.bypass_method != Some(BypassMethod::AllowOnce) {
         if result.decision != EvaluationDecision::Deny {
             result = EvaluationResult {
@@ -15153,10 +15156,17 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
     // The deadline covers extraction and both the Bash receiver proof and
     // the Python/JavaScript parse. Node/byte limits alone do not bound the
     // parser's wall time (git_safety_guard-bl1c).
-    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    //
+    // One worker slot per evaluating thread, not per process: concurrent
+    // evaluations (the MCP server, a parallel hook batch, parallel tests)
+    // must not lose each other's proof merely by overlapping (#565).
+    thread_local! {
+        static ACTIVE: std::sync::Arc<std::sync::atomic::AtomicBool> =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    }
     let source = command.to_string();
     run_documentation_mask_worker(
-        &ACTIVE,
+        ACTIVE.with(std::sync::Arc::clone),
         crate::ast_matcher::protected_scan_budget(),
         move || match mask_proven_interpreter_documentation_inner(&source) {
             Cow::Owned(masked) => Some(masked),
@@ -15166,11 +15176,11 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
     .map_or(Cow::Borrowed(command), Cow::Owned)
 }
 
-/// At most one parser may outlive its optional documentation proof. The
-/// permit remains owned through timeout or panic until analysis finishes; a
-/// busy slot keeps the conservative source view instead of spawning more work.
+/// At most one parser per slot may outlive its optional documentation proof.
+/// The permit remains owned through timeout or panic until analysis finishes;
+/// a busy slot keeps the conservative source view instead of spawning more work.
 fn run_documentation_mask_worker(
-    active: &'static std::sync::atomic::AtomicBool,
+    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     budget: std::time::Duration,
     analyze: impl FnOnce() -> Option<String> + Send + 'static,
 ) -> Option<String> {
@@ -15184,7 +15194,7 @@ fn run_documentation_mask_worker(
     {
         return None;
     }
-    struct Permit(&'static std::sync::atomic::AtomicBool);
+    struct Permit(std::sync::Arc<std::sync::atomic::AtomicBool>);
     impl Drop for Permit {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Release);
@@ -32276,7 +32286,27 @@ fn exec_sink_pack_verdict(
         Ok(commands) => commands,
         Err(error) => {
             tracing::debug!(%error, "interpreter literal analysis did not complete");
-            return Some(EvaluationResult::indeterminate_due_to_budget());
+            // An optional recovery that could not finish (a grammar error, a
+            // node/literal limit, its own 20 ms budget) is neither evidence
+            // about the program nor exhaustion of the hook deadline. Returning
+            // a budget Indeterminate here pre-empted every later layer — so
+            // `python3 -c '…os.system(sys.stdin.read())' <<'PY'` lost the pack
+            // denial of the body it executes — and reported a grammar error as
+            // "could not complete safety evaluation within 5000ms" (#565).
+            // Record the incomplete analysis for the request instead: a later
+            // positive finding still denies, and every would-be allow becomes
+            // Indeterminate at the evaluation boundary. Only an exhausted
+            // deadline, or a caller with no evaluation scope to carry the
+            // record, still stops here.
+            if deadline_exceeded(context.deadline)
+                || !crate::packs::regex_engine::record_incomplete_analysis(
+                    "interpreter_literal_recovery",
+                    &error,
+                )
+            {
+                return Some(EvaluationResult::indeterminate_due_to_budget());
+            }
+            return None;
         }
     };
     reconstructed_interpreter_commands_verdict(command, content, context, recovered)
@@ -33634,26 +33664,31 @@ mod tests {
 
     #[test]
     fn documentation_mask_timeout_keeps_live_worker_permit() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
-        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let active = Arc::new(AtomicBool::new(false));
         let (release, wait) = std::sync::mpsc::channel();
         let (finished, completion) = std::sync::mpsc::channel();
-        let result = run_documentation_mask_worker(&ACTIVE, Duration::from_millis(10), move || {
-            // Simulate a parser that cannot observe cooperative checks.
-            // The safety timeout also releases this test worker on panic.
-            let _ = wait.recv_timeout(Duration::from_secs(5));
-            let _ = finished.send(());
-            Some("late mask".to_string())
-        });
+        let result = run_documentation_mask_worker(
+            Arc::clone(&active),
+            Duration::from_millis(10),
+            move || {
+                // Simulate a parser that cannot observe cooperative checks.
+                // The safety timeout also releases this test worker on panic.
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+                let _ = finished.send(());
+                Some("late mask".to_string())
+            },
+        );
         assert!(result.is_none(), "expired analysis must not produce a mask");
         assert!(matches!(
             completion.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
-        assert!(ACTIVE.load(Ordering::Acquire));
+        assert!(active.load(Ordering::Acquire));
         assert!(
-            run_documentation_mask_worker(&ACTIVE, Duration::from_secs(1), || {
+            run_documentation_mask_worker(Arc::clone(&active), Duration::from_secs(1), || {
                 panic!("a live parser must retain the only worker permit")
             })
             .is_none()
@@ -33664,18 +33699,19 @@ mod tests {
 
     #[test]
     fn documentation_mask_completed_worker_releases_permit() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
-        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let active = Arc::new(AtomicBool::new(false));
         assert_eq!(
-            run_documentation_mask_worker(&ACTIVE, Duration::from_secs(5), || {
+            run_documentation_mask_worker(Arc::clone(&active), Duration::from_secs(5), || {
                 Some("completed mask".to_string())
             }),
             Some("completed mask".to_string())
         );
-        assert!(!ACTIVE.load(Ordering::Acquire));
+        assert!(!active.load(Ordering::Acquire));
         assert!(
-            run_documentation_mask_worker(&ACTIVE, Duration::ZERO, || {
+            run_documentation_mask_worker(Arc::clone(&active), Duration::ZERO, || {
                 panic!("an expired budget must not start a worker")
             })
             .is_none()
@@ -44457,22 +44493,31 @@ mod tests {
 
         // The former positive fixture was raw Markdown, not Python source.
         // The bounded interpreter-literal parser reports a grammar error;
-        // exec_sink_pack_verdict preserves that as Indeterminate, not Allow.
-        for consumer in [
-            "python3 -",
-            "python -",
-            "/usr/bin/python3 -",
-            "python3 script.py",
-        ] {
+        // that incomplete analysis is Indeterminate, not Allow, and it is
+        // not a budget overrun.
+        for consumer in ["python3 -", "python -", "/usr/bin/python3 -"] {
             let command = format!("{consumer} <<'PY'\n{FENCED_BODY}\nPY\n");
             for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
                 let result =
                     evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
                 assert!(
-                    result.is_indeterminate(),
+                    result.is_indeterminate() && !result.skipped_due_to_budget,
                     "invalid Python must remain unverified: {consumer:?} ({dialect:?}): {result:?}"
                 );
             }
+        }
+        // For an opaque script consumer the body is stdin DATA that the
+        // script may hand to a shell, so the layers that judge such data run
+        // too (the valid-Python control below is denied outright). The
+        // literal-recovery grammar error no longer pre-empts them (#565): the
+        // verdict is never an allow, and a later finding may deny.
+        let command = format!("python3 script.py <<'PY'\n{FENCED_BODY}\nPY\n");
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_indeterminate() || result.is_denied(),
+                "invalid Python fed to an opaque script must stay blocked ({dialect:?}): {result:?}"
+            );
         }
 
         // A script file is an opaque consumer of stdin, not a proven program
@@ -44578,6 +44623,29 @@ mod tests {
             "an unrecognized receiver must keep the fail-closed treatment: {:?}",
             result.pattern_info
         );
+    }
+
+    /// #560: a quoted delimiter stops only the OUTER shell's expansion. A
+    /// shell receiver runs the body as a program, so a substitution in it
+    /// executes and must keep its own rule, even though the outer-command
+    /// substitution enumeration (correctly) reports nothing for that body.
+    #[test]
+    fn quoted_shell_heredoc_substitution_is_still_evaluated_560() {
+        for command in [
+            "bash <<'SH'\necho $(git reset --hard)\nSH",
+            "sh <<'SH'\necho $(git reset --hard)\nSH",
+            "zsh <<\"SH\"\necho `git reset --hard`\nSH",
+            "bash <<-'SH'\n\techo $(git reset --hard)\n\tSH",
+            "cat <<'SH' | bash\necho $(git reset --hard)\nSH",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "a shell runs this body: {command:?} ({dialect:?}): {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -52232,11 +52300,34 @@ mod tests {
                 "ruby <<'RB'\ngit branch $name\nRB",
                 "perl <<'PL'\ngit branch $name\nPL",
                 "cd /tmp/project && python3 - <<'PY'\ns = open('a.ts').read()\n# git branch $name\nopen('a.ts', 'w').write(s)\nPY",
+                "node - <<'JS'\n// git branch $(cat name)\nconsole.log(\"git branch $(cat name)\");\nJS",
             ] {
                 assert!(
                     !denied(command),
                     "no shell ever expands this body: {command:?}"
                 );
+            }
+            // Raw shell text is not a valid Python/JavaScript program. Once it
+            // carries a substitution marker, the #544 literal recovery cannot
+            // finish, and incomplete analysis never approves (fb60af1 made the
+            // matching #363/#382 shapes Indeterminate). That incompleteness
+            // must not be reported as a deny either.
+            for command in [
+                "node - <<'JS'\ngit branch $(cat name)\nJS",
+                "python3 <<'PY'\ngit branch $(cat name)\nPY",
+            ] {
+                for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                    let result = evaluate_with_pack_ids_in_dialect(
+                        command,
+                        &["core.git", "core.filesystem"],
+                        dialect,
+                    );
+                    assert!(
+                        result.is_indeterminate() && !result.skipped_due_to_budget,
+                        "unparseable program source is unverified, not a budget overrun: \
+                         {command:?} ({dialect:?}): {result:?}"
+                    );
+                }
             }
         }
 
@@ -52314,18 +52405,31 @@ mod tests {
             for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
                 // These exact old fixtures are invalid Python. Neither the
                 // former `!denied` assertion nor a forced Deny describes the
-                // parser's explicit incomplete-analysis decision correctly.
-                for malformed in [reported.as_str(), unquoted_report.as_str()] {
-                    let result = evaluate_with_pack_ids_in_dialect(
-                        malformed,
-                        &["core.git", "core.filesystem"],
-                        dialect,
-                    );
-                    assert!(
-                        result.is_indeterminate(),
-                        "raw doc prose is unverified Python ({dialect:?}): {result:?}"
-                    );
-                }
+                // parser's explicit incomplete-analysis decision correctly
+                // for the quoted report: its `<i>` is not an outer redirect.
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &reported,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_indeterminate() && !result.skipped_due_to_budget,
+                    "raw doc prose is unverified Python ({dialect:?}): {result:?}"
+                );
+                // With an unquoted delimiter the outer shell runs the prose's
+                // backticks, `~/.app/instances/<i>/store-data/` included, so
+                // the shell layers judge that text as well. The grammar error
+                // no longer pre-empts them (#565): never an allow, and a
+                // shell finding may deny outright.
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &unquoted_report,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_indeterminate() || result.is_denied(),
+                    "expanded raw prose must stay blocked ({dialect:?}): {result:?}"
+                );
 
                 let result = evaluate_with_pack_ids_in_dialect(
                     &quoted_literal,

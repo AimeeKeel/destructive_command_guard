@@ -47,7 +47,7 @@ use regex::RegexSet;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, mpsc};
+use std::sync::{Arc, LazyLock, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace, warn};
 
@@ -8522,6 +8522,11 @@ pub(crate) fn mask_inert_interpreter_stdin(command: &str) -> Cow<'_, str> {
 /// extra operands, redirects, substitutions, pipelines or continued commands.
 fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool {
     let owner = plain_heredoc_command_at(command, operator_start).or_else(|| {
+        // A heredoc ending an `&&`/`||` list belongs to the list's last
+        // command; that is an AST proof, not the looser recovery below.
+        if let Some(tail) = list_tail_heredoc_command_at(command, operator_start) {
+            return Some(tail);
+        }
         // A size or parser-work failure cannot justify weaker ownership.
         if command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
             || longest_pipeline_stages(command) > MAX_PARSED_PIPELINE_STAGES
@@ -8556,15 +8561,8 @@ fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool 
         }
         let words = shell_words::split(header).ok()?;
         let (program, arguments) = words.split_first()?;
-        let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-        if !matches!(
-            ScriptLanguage::from_command(name),
-            ScriptLanguage::Python
-                | ScriptLanguage::JavaScript
-                | ScriptLanguage::Ruby
-                | ScriptLanguage::Perl
-                | ScriptLanguage::Php
-        ) || !(arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
+        if !is_non_shell_interpreter_stdin_command(program)
+            || !(arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
         {
             return None;
         }
@@ -8579,15 +8577,13 @@ fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool 
     let Some((program, arguments)) = words.split_first() else {
         return false;
     };
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    matches!(
-        ScriptLanguage::from_command(name),
-        ScriptLanguage::Python
-            | ScriptLanguage::JavaScript
-            | ScriptLanguage::Ruby
-            | ScriptLanguage::Perl
-            | ScriptLanguage::Php
-    ) && (arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
+    // The receiver-name contract is `is_non_shell_interpreter_stdin_command`
+    // (#357: python/node/deno/bun/ruby/perl/php/go); this proof adds only
+    // the operand rule. Keeping a narrower private language list here
+    // silently withdrew the #357 exemption from deno/bun/go when #560 made
+    // every exemption consumer require this proof.
+    is_non_shell_interpreter_stdin_command(program)
+        && (arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
 }
 /// A quoted cat or tee body written verbatim and immediately read by a concrete
 /// interpreter. This proof supplies a language, never an allow:
@@ -8679,6 +8675,29 @@ pub(crate) fn range_is_quoted_interpreter_source(
         let Some(mut body) = inert_interpreter_stdin_body(command, heredoc) else {
             return false;
         };
+        // `<<-` strips leading tabs from every body line and from the
+        // terminator line. tree-sitter's body span starts after the first
+        // line's tabs and keeps the terminator line's tabs after the final
+        // newline; the extractor's raw span keeps the former and drops the
+        // latter. Reconcile only those two tab runs (plus the newline below).
+        // The analysed program is the extractor's tab-stripped content,
+        // which is exactly what the interpreter reads (#560).
+        let tab_stripped = command
+            .get(heredoc.operator_start..)
+            .is_some_and(|rest| rest.starts_with("<<-"));
+        if tab_stripped {
+            let Some(text) = command.get(body.clone()) else {
+                return false;
+            };
+            body.end -= text.len() - text.trim_end_matches('\t').len();
+            if range.start < body.start
+                && command
+                    .get(range.start..body.start)
+                    .is_some_and(|gap| gap.bytes().all(|byte| byte == b'\t'))
+            {
+                body.start = range.start;
+            }
+        }
         let Some(text) = command.get(body.clone()) else {
             return false;
         };
@@ -9399,6 +9418,90 @@ pub(crate) fn plain_heredoc_command_at(command: &str, operator_start: usize) -> 
                 .map(|owner| owner.text().to_string());
         }
         pending.extend(node.children());
+    }
+    None
+}
+
+/// The command owning a heredoc that ends an `&&`/`||` list.
+///
+/// tree-sitter-bash hangs a trailing heredoc on the whole list
+/// (`cd dir && python3 - <<'PY'`), although the shell gives it to the list's
+/// last simple command, so [`plain_heredoc_command_at`] (which requires a
+/// lone command) proves nothing there. Recover that last command — only when
+/// it is a plain `command` immediately before the operator, the list joins
+/// with `&&`/`||` alone, and the redirect carries nothing but this heredoc.
+/// Callers still apply their own receiver, operand and rebinding checks.
+fn list_tail_heredoc_command_at(command: &str, operator_start: usize) -> Option<String> {
+    if command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+        || longest_pipeline_stages(command) > MAX_PARSED_PIPELINE_STAGES
+    {
+        return None;
+    }
+    let ast = try_parse_shell_ast(command).ok()?;
+    if ast.root().get_inner_node().has_error() {
+        return None;
+    }
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() != "heredoc_redirect"
+            || node
+                .text()
+                .find("<<")
+                .map(|offset| node.range().start + offset)
+                != Some(operator_start)
+        {
+            pending.extend(node.children());
+            continue;
+        }
+        if node
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .any(|child| {
+                !matches!(
+                    child.kind().as_ref(),
+                    "heredoc_start" | "heredoc_body" | "heredoc_end"
+                )
+            })
+        {
+            return None;
+        }
+        let statement = node.parent()?;
+        let named: Vec<_> = statement
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .collect();
+        let [list, redirect] = named.as_slice() else {
+            return None;
+        };
+        if statement.kind().as_ref() != "redirected_statement"
+            || list.kind().as_ref() != "list"
+            || redirect.range() != node.range()
+            || list
+                .children()
+                .any(|child| !child.is_named() && !matches!(child.kind().as_ref(), "&&" | "||"))
+        {
+            return None;
+        }
+        let members: Vec<_> = list
+            .children()
+            .filter(ast_grep_core::Node::is_named)
+            .collect();
+        let tail = members.last()?;
+        // tree-sitter leaves a bare `-` operand (`python3 - <<'PY'`) outside
+        // the command node. Allow only that between the command and the
+        // operator, and hand the caller every byte from the command word to
+        // the operator, so its operand rule judges exactly what precedes it.
+        if tail.kind().as_ref() != "command"
+            || !command
+                .get(tail.range().end..operator_start)?
+                .bytes()
+                .all(|byte| matches!(byte, b' ' | b'\t' | b'-'))
+        {
+            return None;
+        }
+        return command
+            .get(tail.range().start..operator_start)
+            .map(|owner| owner.trim_end().to_string());
     }
     None
 }
@@ -10473,7 +10576,7 @@ struct ProvenFileDataConsumer {
 
 /// A timed-out optional proof must not leave room for another live parser.
 /// Releasing this permit after analysis also covers unwind and spawn failure.
-struct FileDataProofPermit(&'static AtomicBool);
+struct FileDataProofPermit(Arc<AtomicBool>);
 
 impl Drop for FileDataProofPermit {
     fn drop(&mut self) {
@@ -10481,10 +10584,24 @@ impl Drop for FileDataProofPermit {
     }
 }
 
+thread_local! {
+    /// The #543 proof's worker slot, one per evaluating thread.
+    ///
+    /// A timed-out worker cannot be cancelled, so it keeps its permit until
+    /// its parser is gone and the same evaluator cannot start a second one:
+    /// repeated timeouts never accumulate parsers. The slot is deliberately
+    /// NOT process-wide. A process-wide slot let one evaluation's proof
+    /// silently withdraw a concurrent evaluation's waiver whenever the two
+    /// overlapped — the MCP server and a parallel hook batch evaluate
+    /// concurrently, and so do unit tests — making the verdict for the same
+    /// command depend on unrelated traffic (#565).
+    static FILE_DATA_PROOF_BUSY: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+}
+
 /// The parser and every nested remote-command proof run off the hook thread.
 /// All failure paths discard the exemption and keep the existing raw scan.
 fn run_file_data_proof(
-    busy: &'static AtomicBool,
+    busy: Arc<AtomicBool>,
     started: Instant,
     budget: Duration,
     analyze: impl FnOnce() -> Vec<ProvenFileDataConsumer> + Send + 'static,
@@ -10541,14 +10658,14 @@ fn literal_file_data_consumers(command: &str, outside: &str) -> Vec<ProvenFileDa
     }
     // Match the existing AST timeout's only-raise convention. Keep the cheap
     // trigger and byte cap outside the worker, and include input ownership and
-    // thread startup in the same deadline. One process-wide slot applies in
-    // tests too; a busy or expired optional proof simply supplies no waiver.
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    // thread startup in the same deadline. This evaluator's own slot applies
+    // in tests too; a busy or expired optional proof simply supplies no waiver.
+    let busy = FILE_DATA_PROOF_BUSY.with(Arc::clone);
     let budget = crate::ast_matcher::protected_scan_budget();
     let started = Instant::now();
     let command = command.to_owned();
     let outside = outside.to_owned();
-    run_file_data_proof(&BUSY, started, budget, move || {
+    run_file_data_proof(busy, started, budget, move || {
         literal_file_data_consumers_inner(&command, &outside, started, budget)
     })
 }
@@ -14360,24 +14477,72 @@ mod tests {
     #[test]
     fn expired_and_busy_transfer_proofs_supply_no_exemption_543() {
         // Exercise the same runner with an isolated slot; public helpers
-        // always use the process-wide slot, including in test builds.
-        static BUSY: AtomicBool = AtomicBool::new(false);
+        // always use the evaluating thread's slot, including in test builds.
+        let busy = Arc::new(AtomicBool::new(false));
         assert!(
-            run_file_data_proof(&BUSY, Instant::now(), Duration::ZERO, || {
+            run_file_data_proof(Arc::clone(&busy), Instant::now(), Duration::ZERO, || {
                 panic!("an expired proof must not begin parsing")
             })
             .is_empty()
         );
-        assert!(!BUSY.load(Ordering::Acquire));
-        BUSY.store(true, Ordering::Release);
+        assert!(!busy.load(Ordering::Acquire));
+        busy.store(true, Ordering::Release);
         assert!(
-            run_file_data_proof(&BUSY, Instant::now(), Duration::from_secs(5), || panic!(
-                "a busy worker must not launch another parser"
-            ))
+            run_file_data_proof(
+                Arc::clone(&busy),
+                Instant::now(),
+                Duration::from_secs(5),
+                || panic!("a busy worker must not launch another parser")
+            )
             .is_empty()
         );
-        assert!(BUSY.load(Ordering::Acquire));
-        BUSY.store(false, Ordering::Release);
+        assert!(busy.load(Ordering::Acquire));
+        busy.store(false, Ordering::Release);
+    }
+
+    /// #565: the proof slot belongs to the evaluating thread. While one
+    /// evaluator still owns a live (for example timed-out) proof worker, that
+    /// evaluator gets no second parser and keeps the conservative view, but a
+    /// concurrent evaluation on another thread still proves its own workflow.
+    /// A process-wide slot made this depend on whatever else was running.
+    #[test]
+    fn a_live_proof_on_one_evaluator_does_not_withdraw_another_evaluators_waiver_565() {
+        let body = "eval $COMMAND";
+        let data_only = format!(
+            "scp external.txt host:/tmp/data.bin\ncat > m.txt <<'EOF'\n{body}\nEOF\nscp m.txt host:/tmp/m.txt"
+        );
+        assert!(!mask_non_expanding_data_heredocs(&data_only).contains(body));
+
+        let (ready, held) = mpsc::channel();
+        let (release, wait) = mpsc::channel::<()>();
+        let command = data_only.clone();
+        let holder = std::thread::spawn(move || {
+            let busy = FILE_DATA_PROOF_BUSY.with(Arc::clone);
+            busy.store(true, Ordering::Release);
+            // This evaluator's slot is held: no second parser, no waiver.
+            let own_view_kept_body = mask_non_expanding_data_heredocs(&command).contains(body);
+            ready.send(()).expect("report the held slot");
+            let _ = wait.recv_timeout(Duration::from_secs(30));
+            busy.store(false, Ordering::Release);
+            let released_view_kept_body = mask_non_expanding_data_heredocs(&command).contains(body);
+            (own_view_kept_body, released_view_kept_body)
+        });
+        held.recv_timeout(Duration::from_secs(30))
+            .expect("holder thread holds its slot");
+        assert!(
+            !mask_non_expanding_data_heredocs(&data_only).contains(body),
+            "another evaluator's live proof must not withdraw this proof"
+        );
+        release.send(()).expect("release the holder");
+        let (own_view_kept_body, released_view_kept_body) = holder.join().expect("holder thread");
+        assert!(
+            own_view_kept_body,
+            "a busy evaluator must keep the conservative view"
+        );
+        assert!(
+            !released_view_kept_body,
+            "the evaluator's slot is usable again once its worker is gone"
+        );
     }
 
     #[test]
@@ -17025,6 +17190,40 @@ mod tests {
                 assert!(
                     range_is_quoted_interpreter_source(&command, range, ScriptLanguage::Python),
                     "extraction and source identity must agree: {command:?}"
+                );
+            }
+        }
+
+        /// `<<-` hands the interpreter the tab-stripped body, which is the
+        /// extractor's content. Source identity must agree with extraction
+        /// for that spelling too (#560), and still requires the bare
+        /// receiver: a script operand reads the body as data.
+        #[test]
+        fn tab_stripped_quoted_body_keeps_source_identity_560() {
+            let program = "import re\ns = re.sub(r'x$', \"it's `tool --help`\", 'x')";
+            let indented = "\timport re\n\ts = re.sub(r'x$', \"it's `tool --help`\", 'x')";
+            for (header, terminator, expected) in [
+                ("python3 - <<-'EOF'", "\tEOF", true),
+                ("python3 - <<-'EOF'", "EOF", true),
+                ("python3 <<-\"EOF\"", "\t\tEOF", true),
+                ("python3 script.py <<-'EOF'", "\tEOF", false),
+                ("env python3 - <<-'EOF'", "\tEOF", false),
+            ] {
+                let command = format!("{header}\n{indented}\n{terminator}");
+                let ExtractionResult::Extracted(contents) =
+                    extract_content(&command, &ExtractionLimits::structural_scan())
+                else {
+                    panic!("expected the complete tab-stripped body: {command:?}");
+                };
+                let [content] = contents.as_slice() else {
+                    panic!("exactly one body: {command:?}: {contents:?}");
+                };
+                assert_eq!(content.content, program, "{command:?}");
+                let range = content.content_range.as_ref().expect("raw body span");
+                assert_eq!(
+                    range_is_quoted_interpreter_source(&command, range, ScriptLanguage::Python),
+                    expected,
+                    "{command:?}"
                 );
             }
         }
@@ -19771,6 +19970,79 @@ EOF";
             }
         }
 
+        /// tree-sitter hangs a heredoc that ends an `&&`/`||` list on the
+        /// whole list; the shell gives it to the last command. That command
+        /// is the receiver, and it still has to pass every other check.
+        #[test]
+        fn list_tail_receiver_keeps_every_other_check() {
+            for command in [
+                "cd /tmp/proj && python3 - <<'PY'\ngit branch $name\nPY",
+                "cd /tmp/proj || true && node - <<'JS'\ngit branch $name\nJS",
+                "test -d x || python3 <<'PY'\ngit branch $name\nPY",
+            ] {
+                assert!(
+                    needle_is_inert(command, "git branch $name"),
+                    "the list's last command reads this program: {command:?}"
+                );
+            }
+            for command in [
+                "cd /tmp/proj && bash <<'SH'\ngit branch $name\nSH",
+                "true || sh <<'SH'\ngit branch $name\nSH",
+                "cd /tmp/proj && python3 script.py <<'PY'\ngit branch $name\nPY",
+                "cd /tmp/proj && python3 -c 'import os,sys; os.system(sys.stdin.read())' <<'PY'\ngit branch $name\nPY",
+                "cd /tmp/proj && env python3 - <<'PY'\ngit branch $name\nPY",
+                "alias python3='bash -s' && python3 - <<'PY'\ngit branch $name\nPY",
+                "python3() { bash -s; } && python3 - <<'PY'\ngit branch $name\nPY",
+                "PATH=/tmp && python3 - <<'PY'\ngit branch $name\nPY",
+                "cd /tmp/proj && python3 - <<'PY' | sh\ngit branch $name\nPY",
+                "cd /tmp/proj && python3 - <<'PY' > run.sh\ngit branch $name\nPY",
+            ] {
+                assert!(
+                    !needle_is_inert(command, "git branch $name"),
+                    "this receiver is not a proven bare interpreter: {command:?}"
+                );
+            }
+        }
+
+        /// The #560 operand rule covers every proven receiver name, including
+        /// deno/bun/go: an inline program or a script file may read the body
+        /// as data and hand it to a shell, so only a bare receiver (or `-`)
+        /// takes its program from the heredoc.
+        #[test]
+        fn typescript_and_go_receivers_keep_the_program_operand_rule() {
+            for command in [
+                "bun <<'TS'\ngit branch $name\nTS",
+                "bun - <<'TS'\ngit branch $name\nTS",
+                "deno <<'TS'\ngit branch $name\nTS",
+                "go <<'GO'\ngit branch $name\nGO",
+            ] {
+                assert!(
+                    needle_is_inert(command, "git branch $name"),
+                    "a bare receiver takes its program from the body: {command:?}"
+                );
+            }
+            for command in [
+                "bun -e 'Bun.spawnSync([\"sh\"], {stdin: \"inherit\"})' <<'TS'\ngit branch $name\nTS",
+                "bun script.ts <<'TS'\ngit branch $name\nTS",
+                "bun <<'TS' script.ts\ngit branch $name\nTS",
+                "deno eval 'x' <<'TS'\ngit branch $name\nTS",
+                "deno run - <<'TS'\ngit branch $name\nTS",
+                "go run main.go <<'GO'\ngit branch $name\nGO",
+                "env bun <<'TS'\ngit branch $name\nTS",
+                "/tmp/bun <<'TS'\ngit branch $name\nTS",
+            ] {
+                assert!(
+                    !needle_is_inert(command, "git branch $name"),
+                    "stdin may be data for another program here: {command:?}"
+                );
+                assert_eq!(
+                    mask_inert_interpreter_stdin(command).as_ref(),
+                    command,
+                    "{command:?}"
+                );
+            }
+        }
+
         /// Both conditions are load-bearing. An unquoted delimiter is
         /// expanded by the OUTER shell before the receiver runs; a shell
         /// receiver expands the body itself when it executes it; and an
@@ -20409,7 +20681,27 @@ mod issue_560_masking_tests {
     fn quoted_shell_heredoc_is_never_hidden_by_interpreter_mask() {
         let command = "bash <<'SH'\necho $(printf dangerous)\nSH";
         assert_eq!(mask_inert_interpreter_stdin(command).as_ref(), command);
-        let substitutions = extract_posix_command_substitutions(command).unwrap();
+        // The OUTER shell performs no expansion in a quoted body, so the
+        // outer-command enumeration correctly reports none (#377 contract,
+        // `backquotes_in_quoted_heredoc_body_are_literal_text`). The
+        // substitution runs when bash executes the body, which the evaluator
+        // extracts as a Bash program and analyses as shell source in its own
+        // right (see `quoted_shell_heredoc_substitution_is_still_evaluated_560`
+        // in the evaluator); that body view must still enumerate it.
+        assert_eq!(
+            extract_posix_command_substitutions(command).unwrap(),
+            Vec::<PosixCommandSubstitution>::new()
+        );
+        let ExtractionResult::Extracted(contents) =
+            extract_content(command, &ExtractionLimits::structural_scan())
+        else {
+            panic!("the bash heredoc body must be extracted: {command:?}");
+        };
+        let [body] = contents.as_slice() else {
+            panic!("exactly one embedded program: {contents:?}");
+        };
+        assert_eq!(body.language, ScriptLanguage::Bash);
+        let substitutions = extract_posix_command_substitutions(&body.content).unwrap();
         assert_eq!(substitutions.len(), 1);
         assert_eq!(substitutions[0].body.trim(), "printf dangerous");
     }

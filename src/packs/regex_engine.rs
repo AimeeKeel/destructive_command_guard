@@ -58,6 +58,28 @@ impl Drop for RegexEvaluationScope {
     }
 }
 
+/// Record that an optional embedded-source proof (the interpreter literal
+/// recovery) could not complete for the active evaluation, under the same
+/// contract as a failed regex: positive evidence may still deny, but no
+/// would-be allow or downgrade can authorize the incomplete request.
+///
+/// Returns `false` when no evaluation scope is active on this thread; the
+/// caller then has nobody to carry the record and must fail closed itself.
+pub(crate) fn record_incomplete_analysis(
+    stage: &'static str,
+    error: &impl std::fmt::Display,
+) -> bool {
+    let recorded = EVALUATION_FAILURES.with(|stack| {
+        stack.borrow_mut().last_mut().is_some_and(|failed| {
+            *failed = true;
+            true
+        })
+    });
+    // Diagnostics contain no submitted command text.
+    tracing::debug!(target: "dcg_perf", stage, error = %error, recorded, "analysis incomplete");
+    recorded
+}
+
 fn record_evaluation_failure(stage: &'static str, error: &impl std::fmt::Display) {
     EVALUATION_FAILURES.with(|stack| {
         if let Some(failed) = stack.borrow_mut().last_mut() {
