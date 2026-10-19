@@ -3240,25 +3240,98 @@ pub fn configure_colors() {
 /// ordinary commands are untouched and stay copy-pasteable.
 const MAX_EXPLAIN_HINT_COMMAND: usize = 400;
 
-/// Format the explain hint line for copy-paste convenience.
-fn format_explain_hint(command: &str) -> String {
-    // Escape double quotes in command for safe copy-paste
-    let escaped = command.replace('"', "\\\"");
-    if escaped.len() <= MAX_EXPLAIN_HINT_COMMAND {
-        return format!("Tip: dcg explain \"{escaped}\"");
+const EXPLAIN_STDIN_COMMAND: &str = "dcg test --stdin --explain";
+const EXPLAIN_STDIN_INSTRUCTION: &str = "Pass the original command on stdin as data.";
+
+/// Quote a complete argument only when it is literal in every supported shell.
+///
+/// The output APIs do not know which shell will receive a pasted hint. POSIX
+/// single-quote escaping is not portable to PowerShell or cmd.exe, and double
+/// quotes alone still expand substitutions and variables. Keep the convenient
+/// inline form for a conservative ASCII subset; other commands use stdin.
+fn inline_explain_command(command: &str, max_argument_bytes: usize) -> Option<String> {
+    if command.is_empty()
+        || command.len() > max_argument_bytes.saturating_sub(2)
+        || !command.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b' ' | b'/' | b'.' | b'_' | b'-' | b':' | b'+' | b'=' | b',' | b'@' | b'~'
+                )
+        })
+    {
+        return None;
     }
 
-    // Past the cap the tip cannot be copy-pasteable anyway, so spend the
-    // bytes on the head of the command and say how much was dropped. The
-    // elided byte count is the useful signal here, not the elided bytes.
-    let head = truncate_for_display(&escaped, MAX_EXPLAIN_HINT_COMMAND);
-    let total = command.len();
-    let elided = total.saturating_sub(MAX_EXPLAIN_HINT_COMMAND);
-    format!(
-        "Tip: dcg explain \"{head}\"\n\
-         (command truncated for this report: {elided} of {total} bytes elided; \
-         rerun `dcg explain` against the full command for the complete report)"
-    )
+    // Quoting keeps spaces in one argument; `--` also keeps a leading hyphen
+    // in command data instead of letting Clap interpret it as a dcg option.
+    Some(format!("dcg explain -- \"{command}\""))
+}
+
+fn json_character_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        '\u{0}'..='\u{1f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+/// Bound the encoded display preview without ever slicing an escape sequence.
+fn explain_command_preview(command: &str) -> (String, usize) {
+    let fits = command
+        .chars()
+        .try_fold(2_usize, |bytes, character| {
+            let next = bytes + json_character_bytes(character);
+            (next <= MAX_EXPLAIN_HINT_COMMAND).then_some(next)
+        })
+        .is_some();
+
+    let included = if fits {
+        command.len()
+    } else {
+        // Reserve the JSON quotes and the display-only ellipsis. Count the
+        // encoded size first, then serialize the whole retained source slice.
+        let mut bytes = 5;
+        let mut end = 0;
+        for (offset, character) in command.char_indices() {
+            bytes += json_character_bytes(character);
+            if bytes > MAX_EXPLAIN_HINT_COMMAND {
+                break;
+            }
+            end = offset + character.len_utf8();
+        }
+        end
+    };
+    let elided = command.len() - included;
+    let mut preview = command[..included].to_string();
+    if elided != 0 {
+        preview.push_str("...");
+    }
+    (serde_json::Value::String(preview).to_string(), elided)
+}
+
+/// Format a copyable diagnostic invocation without interpolating shell source.
+fn format_explain_hint(command: &str) -> String {
+    if let Some(invocation) = inline_explain_command(command, MAX_EXPLAIN_HINT_COMMAND) {
+        return format!("Tip: {invocation}");
+    }
+
+    let (preview, elided) = explain_command_preview(command);
+    let mut hint = format!(
+        "Tip: {EXPLAIN_STDIN_COMMAND}\n\
+         {EXPLAIN_STDIN_INSTRUCTION}\n\
+         Command preview (JSON string): {preview}"
+    );
+    if elided != 0 {
+        use std::fmt::Write as _;
+        let total = command.len();
+        let _ = write!(
+            hint,
+            "\n(command truncated for this report: {elided} of {total} bytes elided; \
+             supply the full command on stdin for the complete report)"
+        );
+    }
+    hint
 }
 
 fn build_rule_id(pack: Option<&str>, pattern: Option<&str>) -> Option<String> {
@@ -3397,12 +3470,12 @@ fn format_matched_message(
         |rule| format!("Rule: {rule}\n\n"),
     );
 
-    // The command deliberately appears ONCE, inside the `Tip:` line. A hook
+    // The command deliberately appears ONCE, in the hint or its preview. A hook
     // decision lands in the agent's transcript and is replayed on every
     // subsequent turn, so a second verbatim echo is paid for repeatedly and
     // tells the reader nothing the first did not — the agent just wrote this
-    // command and has it in context. Keeping the `Tip:` copy rather than a
-    // bare `Command:` line preserves the one form that is also actionable.
+    // command and has it in context. The diagnostic invocation remains
+    // actionable even when a shell-sensitive or long command needs stdin.
     format!(
         "{heading}\n\n\
          {explain_hint}\n\n\
@@ -3494,9 +3567,8 @@ pub(crate) fn print_colorful_warning_to(
 
     let _ = writeln!(writer, "{}", denial.render(&theme));
 
-    let escaped_cmd = command.replace('"', "\\\"");
-    let truncated_cmd = truncate_for_display(&escaped_cmd, 45);
-    let explain_cmd = format!("dcg explain \"{truncated_cmd}\"");
+    let inline_explain = inline_explain_command(command, 45);
+    let explain_cmd = inline_explain.as_deref().unwrap_or(EXPLAIN_STDIN_COMMAND);
 
     let footer_style = if theme.colors_enabled { "\x1b[90m" } else { "" };
     let reset = if theme.colors_enabled { "\x1b[0m" } else { "" };
@@ -3506,6 +3578,9 @@ pub(crate) fn print_colorful_warning_to(
         WarningAudience::HumanOperator => {
             let _ = writeln!(writer, "{footer_style}Learn more:{reset}");
             let _ = writeln!(writer, "  $ {cyan}{explain_cmd}{reset}");
+            if inline_explain.is_none() {
+                let _ = writeln!(writer, "    {EXPLAIN_STDIN_INSTRUCTION}");
+            }
 
             // Advertise the scoped single-command remedy ahead of the
             // persistent allowlist widening (GH#332).
@@ -3613,22 +3688,6 @@ pub fn print_colorful_warning(
         None,
         WarningAudience::HumanOperator,
     );
-}
-
-/// Truncate a string for display, appending "..." if truncated.
-fn truncate_for_display(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        // Find a safe UTF-8 boundary for truncation
-        let target = max_len.saturating_sub(3);
-        let boundary = s
-            .char_indices()
-            .take_while(|(i, _)| *i < target)
-            .last()
-            .map_or(0, |(i, c)| i + c.len_utf8());
-        format!("{}...", &s[..boundary])
-    }
 }
 
 /// Get context-specific suggestion based on the blocked command.
@@ -6186,6 +6245,209 @@ mod tests {
         let json = r#"{"tool_name":"Bash","tool_input":{"command":123}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(extract_command(&input), None);
+    }
+
+    #[test]
+    fn explain_hint_preserves_a_whole_literal_argument_and_leading_hyphens() {
+        use clap::Parser as _;
+
+        let _lock = test_env::lock();
+        for command in [
+            "git reset --hard",
+            "printf path/to_file-1.2",
+            "printf user@example.org:a+b=c,~/file",
+            "--help",
+            "--format=json",
+        ] {
+            let hint = format_explain_hint(command);
+            let invocation = hint.strip_prefix("Tip: ").unwrap();
+            let argv = shell_words::split(invocation).unwrap();
+            assert_eq!(argv, ["dcg", "explain", "--", command]);
+
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let Some(crate::cli::Command::Explain {
+                command: actual, ..
+            }) = cli.command
+            else {
+                panic!("hint must invoke explain: {hint}");
+            };
+            assert_eq!(actual, command, "command text must not become dcg options");
+        }
+
+        // The fallback is a supported CLI operation, not an invented
+        // `dcg explain --stdin` flag.
+        let cli = crate::cli::Cli::try_parse_from(["dcg", "test", "--stdin", "--explain"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::cli::Command::TestCommand {
+                command: None,
+                stdin: true,
+                explain: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn explain_hint_keeps_shell_syntax_out_of_the_copyable_invocation() {
+        for command in [
+            "",
+            "printf $(printf SUBSTITUTED)",
+            "printf `printf SUBSTITUTED`",
+            "printf $HOME",
+            r#"printf \"; printf ESCAPED; #"#,
+            "printf 'apostrophe'",
+            "printf %PATH%",
+            "printf !PATH!",
+            r"printf C:\Users\Example",
+            "printf ^& echo CONTROL",
+            "printf first\nprintf second",
+            "printf \r\t\0\u{1b}",
+            "printf café 界 🛸",
+            "printf \u{201c}smart quotes\u{201d}",
+        ] {
+            let hint = format_explain_hint(command);
+            assert_eq!(
+                hint.lines().next(),
+                Some("Tip: dcg test --stdin --explain"),
+                "shell-sensitive source must stay off the command line: {command:?}"
+            );
+            assert!(hint.contains(EXPLAIN_STDIN_INSTRUCTION));
+            let preview = hint
+                .lines()
+                .find_map(|line| line.strip_prefix("Command preview (JSON string): "))
+                .unwrap();
+            let decoded: String = serde_json::from_str(preview).unwrap();
+            assert_eq!(decoded, command, "the display preview must preserve data");
+            assert!(!hint.contains("bytes elided"));
+        }
+    }
+
+    #[test]
+    fn explain_hint_truncation_keeps_json_complete_and_reports_exact_elision() {
+        let commands = [
+            "a".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            "\"".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            "\\".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            "\0".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            "界🛸".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            format!("{}\\\"; printf HARMLESS", "a".repeat(394)),
+            format!("{}\"$(printf HARMLESS)", "a".repeat(395)),
+        ];
+        for command in commands {
+            let hint = format_explain_hint(&command);
+            assert_eq!(
+                hint.lines().next(),
+                Some("Tip: dcg test --stdin --explain"),
+                "a truncated preview must never become a runnable reproduction"
+            );
+            let preview = hint
+                .lines()
+                .find_map(|line| line.strip_prefix("Command preview (JSON string): "))
+                .unwrap();
+            assert!(preview.len() <= MAX_EXPLAIN_HINT_COMMAND);
+            let decoded: String = serde_json::from_str(preview).unwrap();
+            let included = decoded.strip_suffix("...").unwrap();
+            assert!(command.starts_with(included));
+            let elided = command.len() - included.len();
+            assert!(elided > 0);
+            assert!(hint.contains(&format!("{elided} of {} bytes elided", command.len())));
+        }
+    }
+
+    #[test]
+    fn explain_hint_inline_limit_counts_the_complete_quoted_argument() {
+        let command = "a".repeat(MAX_EXPLAIN_HINT_COMMAND - 2);
+        assert_eq!(
+            format_explain_hint(&command),
+            format!("Tip: dcg explain -- \"{command}\"")
+        );
+
+        let longer = command + "a";
+        let hint = format_explain_hint(&longer);
+        assert!(hint.starts_with("Tip: dcg test --stdin --explain\n"));
+        assert!(hint.contains("bytes elided"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_hint_round_trips_through_a_real_shell_without_running_source() {
+        // `dcg` is a shell function that ONLY captures argv. Every fixture
+        // that could expose the old interpolation bug uses harmless printf
+        // controls, so a regression cannot run a destructive target command.
+        for (command, expected) in [
+            ("printf hello", ["explain", "--", "printf hello"]),
+            ("--help", ["explain", "--", "--help"]),
+            (
+                "printf $(printf SUBSTITUTED)",
+                ["test", "--stdin", "--explain"],
+            ),
+            (
+                "printf `printf SUBSTITUTED`",
+                ["test", "--stdin", "--explain"],
+            ),
+            (
+                r#"printf \"; printf ESCAPED; #"#,
+                ["test", "--stdin", "--explain"],
+            ),
+            ("printf $HOME\\tail", ["test", "--stdin", "--explain"]),
+        ] {
+            let hint = format_explain_hint(command);
+            let invocation = hint.lines().next().unwrap().strip_prefix("Tip: ").unwrap();
+            let script = format!("dcg() {{ printf '%s\\0' \"$@\"; }}\n{invocation}");
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "shell rejected hint: {hint}");
+            assert!(output.stderr.is_empty(), "unexpected shell diagnostics");
+            let mut expected_bytes = Vec::new();
+            for argument in expected {
+                expected_bytes.extend_from_slice(argument.as_bytes());
+                expected_bytes.push(0);
+            }
+            assert_eq!(
+                output.stdout, expected_bytes,
+                "only literal argv may reach the capture function: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_hint_human_warning_footer_uses_the_same_safe_command_policy() {
+        for (command, expected) in [
+            ("printf hello", "dcg explain -- \"printf hello\""),
+            ("--help", "dcg explain -- \"--help\""),
+            ("printf $(printf SUBSTITUTED)", EXPLAIN_STDIN_COMMAND),
+            (
+                "printf this harmless command exceeds the footer limit",
+                EXPLAIN_STDIN_COMMAND,
+            ),
+        ] {
+            let mut output = Vec::new();
+            print_colorful_warning_to(
+                &mut output,
+                command,
+                "fixture",
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                WarningAudience::HumanOperator,
+            );
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(expected), "incorrect footer: {output}");
+            if expected == EXPLAIN_STDIN_COMMAND {
+                assert!(output.contains(EXPLAIN_STDIN_INSTRUCTION));
+                assert!(!output.contains("dcg explain \""));
+            }
+        }
     }
 
     #[test]

@@ -1068,12 +1068,12 @@ impl Pack {
 
     fn check_single(&self, cmd: &str) -> Option<DestructiveMatch> {
         // Quick reject if no keywords match
-        if !self.might_match(cmd)
-            && !(self.id == "core.filesystem"
+        if !(self.might_match(cmd)
+            || (self.id == "core.filesystem"
                 && crate::packs::core::filesystem::filesystem_semantic_scan_required(
                     cmd,
                     crate::normalize::ShellDialect::Unknown,
-                ))
+                )))
         {
             return None;
         }
