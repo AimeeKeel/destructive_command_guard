@@ -586,20 +586,31 @@ fn test_hook_output_remediation_safe_alternative() {
 // Antigravity CLI (`agy`) end-to-end hook integration.
 //
 // Feeds the dcg binary the exact stdin envelope that `agy` passes to a
-// PreToolUse hook. Issue #573 verified a clean denial with exactly
-// {"decision":"deny","reason":...} on stdout and exit 0. Additional Gemini
-// fields fail Antigravity 1.4.0's strict parser. This subprocess regression
-// passes commands as data; no command is executed.
+// PreToolUse hook and checks the strict response contract from issue #573:
+// exactly {"decision":"deny","reason":...} on exit 0. Gemini metadata is
+// rejected by Antigravity 1.4.0, and an explicit allow can skip its ordinary
+// permission prompt. Safe and warning outcomes must therefore emit zero
+// stdout bytes. These tests pass commands as data; no command is executed.
 // ============================================================================
 
 /// Run dcg in hook mode with a raw JSON envelope (for non-Claude wire shapes).
 fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
+    run_hook_mode_raw_with_options(input, &[], &[])
+}
+
+fn run_hook_mode_raw_with_options(
+    input: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (String, String, i32) {
     let _guard = HOOK_PROCESS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut child_command = Command::new(dcg_binary());
     configure_isolated_hook_child(&mut child_command);
     let mut child = child_command
+        .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -620,67 +631,212 @@ fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
     (stdout, stderr, exit_code)
 }
 
-#[test]
-fn test_antigravity_envelope_produces_deny_decision() {
-    // Exact agy stdin shape captured from a real `agy` PreToolUse hook run.
-    let input = r#"{
-        "artifactDirectoryPath":"/tmp/.gemini/brain/abc",
-        "conversationId":"a3bbcaba-0bb2-4e58-b614-49f42fa6f004",
-        "stepIdx":4,
-        "toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard","Cwd":"/work","WaitMsBeforeAsync":500}},
-        "transcriptPath":"/tmp/.gemini/brain/abc/transcript_full.jsonl",
-        "workspacePaths":["/work"]
-    }"#;
+/// Independent consumer schema: extra output fields must fail deserialization,
+/// rather than being ignored by `serde_json::Value`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AntigravityDenial {
+    decision: String,
+    reason: String,
+}
 
-    let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
+fn decode_antigravity_denial(stdout: &str) -> Result<AntigravityDenial, serde_json::Error> {
+    let shape: serde_json::Value = serde_json::from_str(stdout)?;
+    if !shape.is_object() {
+        return Err(serde::de::Error::custom("agy denial must be an object"));
+    }
+    // Decode the original bytes, not the Value, so duplicate fields are
+    // rejected. String fields also reject Serde's alternate enum encodings.
+    let denial: AntigravityDenial = serde_json::from_str(stdout)?;
+    if denial.decision != "deny" {
+        return Err(serde::de::Error::custom("agy decision must be deny"));
+    }
+    Ok(denial)
+}
 
-    // Deliver a valid JSON denial instead of relying on hook-error handling.
+fn assert_antigravity_denial(stdout: &str, stderr: &str, exit_code: i32) -> AntigravityDenial {
     assert_eq!(
         exit_code, 0,
-        "agy hook must exit 0 so the JSON block decision is honored\nstderr: {stderr}"
+        "agy must exit 0 for the JSON denial to be honored\nstderr: {stderr}"
     );
-    assert!(!stdout.is_empty(), "stdout must carry the block JSON");
-
-    let json: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("agy hook output must be valid JSON");
-
-    assert_eq!(
-        json["decision"], "deny",
-        "agy denial must use the documented \"deny\" keyword"
-    );
-    assert_eq!(
-        json.as_object().map(serde_json::Map::len),
-        Some(2),
-        "agy denies through decision and reason only; extra fields fail parsing"
+    let denial = decode_antigravity_denial(stdout).unwrap_or_else(|error| {
+        panic!(
+            "agy denial must satisfy its strict schema: {error}\nstdout: {stdout}\nstderr: {stderr}"
+        )
+    });
+    assert_eq!(denial.decision, "deny");
+    assert!(
+        !denial.reason.trim().is_empty(),
+        "agy denial must carry a nonempty reason"
     );
     assert!(
-        json["reason"].as_str().is_some_and(|r| !r.is_empty()),
-        "block must carry a non-empty reason, got: {}",
-        json["reason"]
+        !stderr.trim().is_empty(),
+        "agy denial must retain the operator-visible diagnostic"
     );
-    // Must NOT emit Claude's hookSpecificOutput envelope (agy uses decision/reason).
-    assert!(
-        json.get("hookSpecificOutput").is_none(),
-        "agy output must not use Claude's hookSpecificOutput shape"
-    );
+    denial
+}
+
+fn antigravity_payload(command: &str) -> String {
+    // Include the diagnostic metadata from a captured native request, not
+    // just the tool call; none of it belongs in the strict response schema.
+    serde_json::json!({
+        "artifactDirectoryPath": "/tmp/.gemini/brain/abc",
+        "conversationId": "a3bbcaba-0bb2-4e58-b614-49f42fa6f004",
+        "stepIdx": 4,
+        "toolCall": {
+            "name": "run_command",
+            "args": {"CommandLine": command, "Cwd": "/work", "WaitMsBeforeAsync": 500}
+        },
+        "transcriptPath": "/tmp/.gemini/brain/abc/transcript_full.jsonl",
+        "workspacePaths": ["/work"]
+    })
+    .to_string()
+}
+
+#[test]
+fn test_antigravity_strict_decoder_rejects_invalid_denials() {
+    for invalid in [
+        r#"{"decision":"deny","reason":"blocked","systemMessage":"blocked"}"#,
+        r#"{"decision":"deny","reason":"blocked","ruleId":"core.git:reset-hard"}"#,
+        r#"{"decision":"deny","reason":"blocked","remediation":{}}"#,
+        r#"{"decision":"block","reason":"blocked"}"#,
+        r#"{"decision":"allow","reason":"blocked"}"#,
+        r#"{"decision":"ask","reason":"blocked"}"#,
+        r#"{"decision":{"deny":null},"reason":"blocked"}"#,
+        r#"["deny","blocked"]"#,
+        r#"{"decision":"deny","reason":null}"#,
+        r#"{"decision":"deny"}"#,
+        r#"{"decision":"deny","decision":"allow","reason":"blocked"}"#,
+        r#"{"decision":"deny","reason":"blocked"} {"decision":"allow"}"#,
+    ] {
+        assert!(
+            decode_antigravity_denial(invalid).is_err(),
+            "strict agy denial decoder accepted an incompatible payload: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn test_antigravity_envelope_produces_strict_deny_with_review_details() {
+    let input = antigravity_payload("git reset --hard");
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+    let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+
+    for detail in [
+        "git reset --hard",
+        "core.git:reset-hard",
+        "dcg explain",
+        "dcg allow-once",
+    ] {
+        assert!(
+            denial.reason.contains(detail),
+            "agy reason must preserve review detail {detail:?}: {}",
+            denial.reason
+        );
+    }
 }
 
 #[test]
 fn test_antigravity_envelope_allows_safe_command() {
-    // No permission decision: the host retains its ordinary permission checks.
-    let input = r#"{
-        "conversationId":"c1",
-        "stepIdx":1,
-        "toolCall":{"name":"run_command","args":{"CommandLine":"echo hello","Cwd":"/work"}},
-        "workspacePaths":["/work"]
-    }"#;
-
-    let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
+    let input = antigravity_payload("echo hello");
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
     assert_eq!(exit_code, 0, "safe command must exit 0\nstderr: {stderr}");
     assert!(
         stdout.is_empty(),
-        "safe agy hook output must be silent, got: {stdout}"
+        "safe agy output must have zero bytes to preserve normal permissions, got: {stdout:?}"
     );
+}
+
+#[test]
+fn test_antigravity_warning_preserves_ordinary_permission_checks() {
+    // This medium-severity rule warns under the shipped policy. An explicit
+    // `allow` would let a successful hook pre-approve Antigravity's tool call.
+    let input = antigravity_payload("git stash drop");
+    let invocations: [&[&str]; 2] = [&[], &["--agent", "agy"]];
+    for args in invocations {
+        let (stdout, stderr, exit_code) = run_hook_mode_raw_with_options(&input, args, &[]);
+        assert_eq!(exit_code, 0, "agy warn must exit 0\nstderr: {stderr}");
+        assert!(
+            stdout.is_empty(),
+            "agy warn must emit zero stdout bytes, never pre-approve a command: {stdout:?}"
+        );
+        assert!(
+            stderr.contains("WARNING") && stderr.contains("git stash drop"),
+            "agy warn must remain visible to the operator\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_antigravity_warning_does_not_mask_destructive_companion() {
+    let input = antigravity_payload("git stash drop; git reset --hard");
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+    let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+    assert!(
+        denial.reason.contains("core.git:reset-hard"),
+        "a warning cannot replace the destructive command's denial: {}",
+        denial.reason
+    );
+}
+
+#[test]
+fn test_antigravity_explicit_agent_fail_closed_uses_strict_denial() {
+    // Without a parseable envelope, --agent is the supported way to select
+    // the hook protocol. A parse failure must still deliver a usable denial.
+    let (stdout, stderr, exit_code) = run_hook_mode_raw_with_options(
+        "not a JSON hook payload",
+        &["--agent", "agy"],
+        &[("DCG_FAIL_CLOSED", "1")],
+    );
+    let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+    assert!(
+        denial.reason.contains("DCG_FAIL_CLOSED"),
+        "forced agy protocol must explain the fail-closed denial: {}",
+        denial.reason
+    );
+}
+
+#[test]
+fn test_antigravity_oversized_command_stays_denied_for_both_review_policies() {
+    let input = antigravity_payload(&format!(
+        "echo {}",
+        "x".repeat(destructive_command_guard::config::DEFAULT_MAX_COMMAND_BYTES)
+    ));
+    for policy in ["ask", "deny"] {
+        let (stdout, stderr, exit_code) =
+            run_hook_mode_raw_with_options(&input, &[], &[("DCG_UNVERIFIED_DECISION", policy)]);
+        let denial = assert_antigravity_denial(&stdout, &stderr, exit_code);
+        assert!(
+            denial.reason.contains("exceeds limit") && denial.reason.contains("did not evaluate"),
+            "agy must deny an unverified oversized command under {policy}: {}",
+            denial.reason
+        );
+    }
+}
+
+#[test]
+fn test_gemini_retains_its_own_deny_and_warning_protocol() {
+    for (command, expected_decision) in [("git reset --hard", "deny"), ("git stash drop", "allow")]
+    {
+        let input = serde_json::json!({
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": command}
+        })
+        .to_string();
+        let (stdout, stderr, exit_code) = run_hook_mode_raw(&input);
+        assert_eq!(exit_code, 0, "Gemini must exit 0\nstderr: {stderr}");
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Gemini must retain its JSON response");
+        assert_eq!(json["decision"], expected_decision);
+        assert!(
+            json["systemMessage"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "the dedicated agy response must not remove Gemini's own metadata: {json}"
+        );
+        assert!(!stderr.is_empty(), "Gemini must retain its diagnostic");
+    }
 }
 
 // ============================================================================

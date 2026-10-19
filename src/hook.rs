@@ -6814,6 +6814,9 @@ mod tests {
             reason: String,
         }
 
+        let shape: serde_json::Value =
+            serde_json::from_slice(stdout).expect("Antigravity denial must be valid JSON");
+        assert!(shape.is_object(), "Antigravity denial must be an object");
         let denial: Denial = serde_json::from_slice(stdout)
             .expect("Antigravity denial must contain only decision and reason");
         assert_eq!(denial.decision, "deny");
