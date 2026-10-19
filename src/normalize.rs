@@ -2025,9 +2025,7 @@ fn decode_posix_token(token: &str, literal_word: bool) -> Option<Cow<'_, str>> {
                     changed = true;
                 }
                 '\\' => {
-                    let Some(escaped) = chars.next() else {
-                        return None;
-                    };
+                    let escaped = chars.next()?;
                     match escaped {
                         '\n' => changed = true,
                         '\r' if chars.peek() == Some(&'\n') => {
@@ -2062,9 +2060,7 @@ fn decode_posix_token(token: &str, literal_word: bool) -> Option<Cow<'_, str>> {
                     changed = true;
                 }
                 '\\' => {
-                    let Some(escaped) = chars.next() else {
-                        return None;
-                    };
+                    let escaped = chars.next()?;
                     changed = true;
                     match escaped {
                         '\n' => {}
@@ -2117,7 +2113,10 @@ fn decode_posix_token(token: &str, literal_word: bool) -> Option<Cow<'_, str>> {
 fn posix_dollar_expands(next: Option<char>) -> bool {
     next.is_some_and(|ch| {
         ch.is_ascii_alphanumeric()
-            || matches!(ch, '_' | '(' | '{' | '[' | '$' | '?' | '!' | '#' | '@' | '*' | '-')
+            || matches!(
+                ch,
+                '_' | '(' | '{' | '[' | '$' | '?' | '!' | '#' | '@' | '*' | '-'
+            )
     })
 }
 

@@ -376,7 +376,8 @@ fn scalar_word(
                     return None;
                 }
                 let value = resolve(&name, quote == Some('"'))?;
-                if result.len().saturating_add(value.len()) > MAX_VALUE_BYTES || value.contains('\0')
+                if result.len().saturating_add(value.len()) > MAX_VALUE_BYTES
+                    || value.contains('\0')
                 {
                     return None;
                 }
@@ -384,10 +385,8 @@ fn scalar_word(
                 result.push_str(&value);
             }
             (_, '`')
-            | (
-                None,
-                '~' | '{' | '}' | '*' | '?' | '[' | '(' | ')' | ';' | '&' | '|' | '<' | '>',
-            ) => {
+            | (None, '~' | '{' | '}' | '*' | '?' | '[' | '(' | ')' | ';' | '&' | '|' | '<' | '>') =>
+            {
                 return None;
             }
             (None, ch) if ch.is_whitespace() => return None,
@@ -918,7 +917,7 @@ mod tests {
             "${S}/e2e.log",
             r#""${S}"/e2e.log"#,
             "prefix${S}${T}/file",
-            r#"${S}'$(not executed)'"#,
+            r"${S}'$(not executed)'",
         ] {
             assert!(
                 scalar_word(raw, |_, _| Some(String::new())).is_some(),
@@ -963,7 +962,7 @@ mod tests {
             ("${E}${E}", vec![]),
             ("${E}''${E}", vec![""]),
             ("${E}/file", vec!["/file"]),
-            (r#"${S}'*'"#, vec!["/tmp/élève work*"]),
+            (r"${S}'*'", vec!["/tmp/élève work*"]),
         ] {
             assert_eq!(expand(raw, &state).unwrap(), expected, "{raw}");
         }
@@ -1066,7 +1065,8 @@ mod tests {
                 shell::GIT_INTERNALS_WRITE_NAME,
             ] {
                 assert!(
-                    hits.iter().any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                    hits.iter()
+                        .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
                     "uncertainty cannot grant either family: {source}: {hits:?}"
                 );
             }

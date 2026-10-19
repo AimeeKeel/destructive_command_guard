@@ -1908,7 +1908,12 @@ mod tests {
                 );
             }
         }
-        for target in ["$HOME_suffix/..", "$TARGET/..", "/tmp/$(name)/..", "/tmp/*/.."] {
+        for target in [
+            "$HOME_suffix/..",
+            "$TARGET/..",
+            "/tmp/$(name)/..",
+            "/tmp/*/..",
+        ] {
             assert!(permission_word(target).is_none(), "{target:?}");
         }
     }
@@ -2020,14 +2025,8 @@ mod tests {
                 "chmod a+xs /tmp/file \"$EXTRA\"",
                 vec!["chmod-setuid", "chmod-setgid"],
             ),
-            (
-                "chmod u+xs /tmp/file \"$EXTRA\"",
-                vec!["chmod-setuid"],
-            ),
-            (
-                "chmod -R 2755 /tmp/file \"$EXTRA\"",
-                vec!["chmod-setgid"],
-            ),
+            ("chmod u+xs /tmp/file \"$EXTRA\"", vec!["chmod-setuid"]),
+            ("chmod -R 2755 /tmp/file \"$EXTRA\"", vec!["chmod-setgid"]),
         ] {
             assert_eq!(
                 posix_permission_decision(command, ShellDialect::Posix),

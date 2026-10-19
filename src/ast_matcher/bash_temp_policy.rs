@@ -29,7 +29,10 @@ fn literal_temp_rm(command: &str) -> bool {
     if command.is_empty()
         || !command.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
-                || matches!(byte, b'/' | b'.' | b'_' | b'-' | b' ' | b'\t' | b'\'' | b'"')
+                || matches!(
+                    byte,
+                    b'/' | b'.' | b'_' | b'-' | b' ' | b'\t' | b'\'' | b'"'
+                )
         })
     {
         return false;
@@ -84,7 +87,10 @@ fn literal_temp_rm(command: &str) -> bool {
     }
     recursive
         && targets > 0
-        && matches!(parse_rm_command_segment(command, false), RmParseDecision::Allow)
+        && matches!(
+            parse_rm_command_segment(command, false),
+            RmParseDecision::Allow
+        )
 }
 
 fn literal_temp_descendant(path: &str) -> bool {
@@ -113,7 +119,9 @@ pub(super) fn refine(
 ) -> Vec<PatternMatch> {
     if language != ScriptLanguage::Bash
         || budget.is_zero()
-        || !findings.iter().any(|hit| is_recursive_rm_rule(&hit.rule_id))
+        || !findings
+            .iter()
+            .any(|hit| is_recursive_rm_rule(&hit.rule_id))
     {
         return findings;
     }
@@ -129,7 +137,8 @@ pub(super) fn refine(
         // refinement. Keep unrelated rules, spans, ordering and duplicates.
         if is_recursive_rm_rule(&hit.rule_id) && hit.start == start && hit.end == end {
             hit.rule_id.push_str(".temp");
-            hit.reason.push_str(" (all targets are literal temp subdirectories)");
+            hit.reason
+                .push_str(" (all targets are literal temp subdirectories)");
             hit.severity = Severity::Medium;
         }
     }
@@ -169,10 +178,16 @@ mod tests {
             "rm -rf /tmp/probe/child",
         ] {
             assert!(
-                matches!(parse_rm_command_segment(code, false), RmParseDecision::Allow),
+                matches!(
+                    parse_rm_command_segment(code, false),
+                    RmParseDecision::Allow
+                ),
                 "core must independently approve every fixture: {code}"
             );
-            assert!(literal_temp_rm(code), "literal cleanup was not refined: {code}");
+            assert!(
+                literal_temp_rm(code),
+                "literal cleanup was not refined: {code}"
+            );
         }
     }
 
@@ -208,7 +223,10 @@ mod tests {
             "sudo rm -rf /tmp/safe",
             "printf 'rm -rf /tmp/safe'",
         ] {
-            assert!(!literal_temp_rm(code), "unproved command gained an exemption: {code}");
+            assert!(
+                !literal_temp_rm(code),
+                "unproved command gained an exemption: {code}"
+            );
             let original = finding("heredoc.bash.rm_rf", code);
             assert_eq!(
                 refine(code, ScriptLanguage::Bash, vec![original.clone()], BUDGET),
@@ -227,7 +245,9 @@ mod tests {
         partial.end -= 1;
         let mut expected = rm.clone();
         expected.rule_id.push_str(".temp");
-        expected.reason.push_str(" (all targets are literal temp subdirectories)");
+        expected
+            .reason
+            .push_str(" (all targets are literal temp subdirectories)");
         expected.severity = Severity::Medium;
         assert_eq!(
             refine(
@@ -242,7 +262,10 @@ mod tests {
             (ScriptLanguage::Python, BUDGET),
             (ScriptLanguage::Bash, Duration::ZERO),
         ] {
-            assert_eq!(refine(code, language, vec![rm.clone()], budget), vec![rm.clone()]);
+            assert_eq!(
+                refine(code, language, vec![rm.clone()], budget),
+                vec![rm.clone()]
+            );
         }
         let oversized = format!("rm -rf /tmp/{}", "x".repeat(MAX_LITERAL_COMMAND_BYTES));
         assert!(!literal_temp_rm(&oversized));
@@ -260,7 +283,12 @@ mod tests {
         ] {
             assert!(!literal_temp_descendant(path), "{path}");
         }
-        for path in ["/tmp/probe", "/var/tmp/probe", "/tmp/foo..bar", "/tmp/./probe/"] {
+        for path in [
+            "/tmp/probe",
+            "/var/tmp/probe",
+            "/tmp/foo..bar",
+            "/tmp/./probe/",
+        ] {
             assert!(literal_temp_descendant(path), "{path}");
         }
     }
@@ -274,18 +302,29 @@ mod tests {
             let custom = super::super::AstMatcher::new()
                 .find_matches_with_timeout(code, ScriptLanguage::Bash, BUDGET)
                 .expect("the independent AST corpus completes");
-            assert!(custom.iter().any(|hit| hit.rule_id == rule && hit.severity.blocks_by_default()));
+            assert!(
+                custom
+                    .iter()
+                    .any(|hit| hit.rule_id == rule && hit.severity.blocks_by_default())
+            );
             let default = super::super::DEFAULT_MATCHER
                 .find_matches_with_timeout(code, ScriptLanguage::Bash, BUDGET)
                 .expect("the default policy completes");
-            assert!(default.iter().any(|hit| hit.rule_id == format!("{rule}.temp")));
+            assert!(
+                default
+                    .iter()
+                    .any(|hit| hit.rule_id == format!("{rule}.temp"))
+            );
             assert!(!default.iter().any(|hit| hit.severity.blocks_by_default()));
         }
         for code in ["rm -rf /tmp", "rm -rf /tmp/probe /etc", "rm -rf /etc"] {
             let hits = super::super::DEFAULT_MATCHER
                 .find_matches_with_timeout(code, ScriptLanguage::Bash, BUDGET)
                 .expect("destructive control completes");
-            assert!(hits.iter().any(|hit| hit.severity.blocks_by_default()), "{code}");
+            assert!(
+                hits.iter().any(|hit| hit.severity.blocks_by_default()),
+                "{code}"
+            );
         }
     }
 }

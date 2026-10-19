@@ -154,7 +154,11 @@ impl<'a> LiteralTarget<'a> {
             match byte {
                 b'\'' | b'"' => self.string()?,
                 b'#' => {
-                    while self.bytes.get(self.cursor).is_some_and(|byte| *byte != b'\n') {
+                    while self
+                        .bytes
+                        .get(self.cursor)
+                        .is_some_and(|byte| *byte != b'\n')
+                    {
                         self.cursor += 1;
                     }
                 }
@@ -400,9 +404,7 @@ fn prove_with_binding_index<const INDEX_BINDINGS: bool>(
         // can identify an earlier alias or write as relevant. Original DFS
         // indices preserve node-limit accounting; the complete first walk
         // still validates every node, including syntax errors and missing nodes.
-        if INDEX_BINDINGS
-            && immutable
-            && matches!(node.kind().as_ref(), "identifier" | "attribute")
+        if INDEX_BINDINGS && immutable && matches!(node.kind().as_ref(), "identifier" | "attribute")
         {
             binding_uses.push((index, node.clone()));
         }
@@ -454,24 +456,20 @@ fn prove_with_binding_index<const INDEX_BINDINGS: bool>(
             let kind = match (module.as_deref(), source.as_str()) {
                 (None, "tempfile") => Some(ImportKind::Module),
                 (Some("tempfile"), "mkdtemp") => Some(ImportKind::Mkdtemp),
-                (Some("tempfile"), "TemporaryDirectory") => {
-                    Some(ImportKind::TemporaryDirectory)
-                }
-                (
-                    None,
-                    "os" | "os.path" | "posixpath" | "ntpath" | "genericpath",
-                )
+                (Some("tempfile"), "TemporaryDirectory") => Some(ImportKind::TemporaryDirectory),
+                (None, "os" | "os.path" | "posixpath" | "ntpath" | "genericpath")
                 | (Some("os"), "path")
                 | (
-                    Some("os.path" | "posixpath" | "ntpath" | "genericpath" | "shutil"
-                        | "pathlib" | "pathlib._local"),
+                    Some(
+                        "os.path" | "posixpath" | "ntpath" | "genericpath" | "shutil" | "pathlib"
+                        | "pathlib._local",
+                    ),
                     "os" | "genericpath",
                 )
-                | (Some("tempfile"), "_os") => {
-                    Some(ImportKind::DependencyModule)
+                | (Some("tempfile"), "_os") => Some(ImportKind::DependencyModule),
+                (None, "shutil" | "pathlib" | "pathlib._local") | (Some("tempfile"), "_shutil") => {
+                    Some(ImportKind::DependencyCarrier)
                 }
-                (None, "shutil" | "pathlib" | "pathlib._local")
-                | (Some("tempfile"), "_shutil") => Some(ImportKind::DependencyCarrier),
                 _ => None,
             };
             declarations
@@ -735,15 +733,26 @@ fn dependency_read_only_use<D: Doc>(name: &Node<'_, D>) -> bool {
             && value.field("attribute").is_some_and(|attribute| {
                 matches!(
                     attribute.text().as_ref(),
-                    "name" | "sep" | "altsep" | "curdir" | "pardir" | "pathsep"
-                        | "defpath" | "extsep" | "devnull"
+                    "name"
+                        | "sep"
+                        | "altsep"
+                        | "curdir"
+                        | "pardir"
+                        | "pathsep"
+                        | "defpath"
+                        | "extsep"
+                        | "devnull"
                 )
             });
         return scalar
             && (matches!(
                 parent.kind().as_ref(),
-                "argument_list" | "keyword_argument" | "comparison_operator"
-                    | "binary_operator" | "return_statement" | "expression_statement"
+                "argument_list"
+                    | "keyword_argument"
+                    | "comparison_operator"
+                    | "binary_operator"
+                    | "return_statement"
+                    | "expression_statement"
             ) || parent.kind() == "assignment"
                 && parent
                     .field("right")
@@ -990,7 +999,9 @@ mod tests {
                     denied,
                     "factory analysis must not change a constant-target verdict: {source}",
                 );
-                assert!(has_literal_first_target(&format!("shutil.rmtree({prefix}{target})")));
+                assert!(has_literal_first_target(&format!(
+                    "shutil.rmtree({prefix}{target})"
+                )));
             }
         }
     }
@@ -1007,9 +1018,13 @@ mod tests {
             ("shutil.rmtree(tempfile.mkdtemp())", true),
             ("shutil.rmtree('/tmp')", true),
         ] {
-            let start = source.find(call).expect("fixture contains each complete call");
+            let start = source
+                .find(call)
+                .expect("fixture contains each complete call");
             assert_eq!(
-                actual.iter().any(|hit| hit.start == start && hit.severity.blocks_by_default()),
+                actual
+                    .iter()
+                    .any(|hit| hit.start == start && hit.severity.blocks_by_default()),
                 denied,
                 "each deletion keeps its own proof requirement: {call}",
             );
@@ -1051,25 +1066,48 @@ mod tests {
             ),
             ("import shutil\nshutil.rmtree('/tmp/build')", false),
             ("import shutil\nshutil.rmtree('/tmp/mkdtemp-cache')", false),
-            ("import shutil\nshutil.rmtree('/tmp/TemporaryDirectory-cache')", false),
-            ("import shutil\nshutil.rmtree('/tmp/' + 'mkdtemp-cache')", false),
-            ("import shutil\nshutil.rmtree(path='/tmp/mkdtemp-cache')", false),
-            ("from shutil import rmtree as wipe\nwipe('/tmp/mkdtemp-cache')", false),
-            ("import shutil\nshutil.rmtree('/tmp/cache', onerror=mkdtemp)", false),
-            ("import shutil\nshutil.rmtree('/tmp/cache', onerror=lambda *args: mkdtemp())", false),
+            (
+                "import shutil\nshutil.rmtree('/tmp/TemporaryDirectory-cache')",
+                false,
+            ),
+            (
+                "import shutil\nshutil.rmtree('/tmp/' + 'mkdtemp-cache')",
+                false,
+            ),
+            (
+                "import shutil\nshutil.rmtree(path='/tmp/mkdtemp-cache')",
+                false,
+            ),
+            (
+                "from shutil import rmtree as wipe\nwipe('/tmp/mkdtemp-cache')",
+                false,
+            ),
+            (
+                "import shutil\nshutil.rmtree('/tmp/cache', onerror=mkdtemp)",
+                false,
+            ),
+            (
+                "import shutil\nshutil.rmtree('/tmp/cache', onerror=lambda *args: mkdtemp())",
+                false,
+            ),
             ("import shutil\nshutil.rmtree('/tmp/.')", true),
-            ("import shutil\nshutil.rmtree('/tmp/mkdtemp-cache/..')", true),
-            ("import shutil\nshutil.rmtree('/tmp/mkdtemp-cache/../../etc')", true),
-            ("import shutil\nshutil.rmtree(Path('/tmp/mkdtemp-cache').parent)", true),
+            (
+                "import shutil\nshutil.rmtree('/tmp/mkdtemp-cache/..')",
+                true,
+            ),
+            (
+                "import shutil\nshutil.rmtree('/tmp/mkdtemp-cache/../../etc')",
+                true,
+            ),
+            (
+                "import shutil\nshutil.rmtree(Path('/tmp/mkdtemp-cache').parent)",
+                true,
+            ),
             ("import shutil\nshutil.rmtree(path=mkdtemp())", true),
             ("import shutil\nshutil.rmtree('/tmp')", true),
         ] {
             let original = super::super::source_analysis::DEFAULT_MATCHER
-                .find_matches_with_timeout(
-                    source,
-                    ScriptLanguage::Python,
-                    Duration::from_secs(5),
-                )
+                .find_matches_with_timeout(source, ScriptLanguage::Python, Duration::from_secs(5))
                 .expect("complete source classification before withholding the optional proof");
             let matches = validate(source, ScriptLanguage::Python, original, Duration::ZERO);
             assert_eq!(
@@ -1246,7 +1284,12 @@ mod tests {
             candidate,
         ];
         assert_eq!(
-            validate(source, ScriptLanguage::Bash, original.clone(), Duration::ZERO),
+            validate(
+                source,
+                ScriptLanguage::Bash,
+                original.clone(),
+                Duration::ZERO
+            ),
             original,
         );
         let result = validate(source, ScriptLanguage::Python, original, Duration::ZERO);
@@ -1316,9 +1359,8 @@ mod tests {
                 "value = max(min(left, right), abs(other))\n".repeat(300),
             ),
         ] {
-            let source = format!(
-                "import shutil, tempfile\n{body}shutil.rmtree(tempfile.mkdtemp())\n"
-            );
+            let source =
+                format!("import shutil, tempfile\n{body}shutil.rmtree(tempfile.mkdtemp())\n");
             let candidates = candidate_spans(&source);
             assert!(!candidates.is_empty());
             let cancelled = AtomicBool::new(false);

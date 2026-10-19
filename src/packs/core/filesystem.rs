@@ -5776,9 +5776,15 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // path forms. Without these, `mv $'/etc' /tmp/x` slipped
         // through as a HIGH-impact bypass since mv has no general
         // tier to fall back on.
+        //
+        // `mv` must be a whole shell word (#550): `\bmv\b` also matched it
+        // inside a hyphenated or dotted token, so `git checkout -b
+        // fix-mv-handling /home/u/repo`, `tool x-mv …` and `tool --no-mv
+        // /etc/hosts` were denied as moves. A quoted or path-prefixed `mv`
+        // still counts.
         destructive_pattern!(
             "mv-sensitive-source-root-home",
-            r#"\bmv\b[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?['"]?(?=[\s;&|)]|$)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`mv /etc /tmp/x && rm -rf /tmp/x` is the canonical cross-segment bypass: \
@@ -5811,9 +5817,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // continuation, not part of any path token, so it is excluded from
         // the backslash evidence (#356). A doubled backslash before a newline
         // still matches at the first backslash, as it is a real escaped byte.
+        // The same whole-word `mv` boundary as above (#550).
         destructive_pattern!(
             "mv-dynamic-path",
-            r"\bmv\b[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))",
+            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?['"]?(?=[\s;&|)]|$)[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))"#,
             "mv with a shell-expanded or escaped path cannot be verified before execution.",
             High,
             "Shell variables and command substitutions are controlled by the calling environment and may resolve to `/`, `/etc`, a home directory, or another persistent tree. Backslash escapes can also hide traversal from lexical path checks, so dcg cannot safely classify this move.\n\n\
@@ -6125,9 +6132,15 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // The shell expands redirect targets at runtime. A variable, command
         // substitution, or backslash-obfuscated suffix can therefore resolve
         // outside an apparent temp path before O_TRUNC opens the file.
+        //
+        // `(?!>)` after the operator keeps an append out (#575): the
+        // lookbehind already stops a match from starting at the second `>` of
+        // `>>`, but without it a match could start at the first one and let
+        // the target class swallow the second (`>>"$LOG"`, `2>>$LOG`,
+        // `&>>"$LOG"`), so only the spaced spelling was treated as an append.
         destructive_pattern!(
             "redirect-truncate-dynamic-path",
-            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:[^|;&\s]*[\\$`]|~[A-Za-z_][^|;&\s]*|(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))/[^|;&\s]*['"?*\[][^|;&\s]*|[%!][^|;&\s]*|\^(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))[^|;&\s]+)"#,
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)(?!>)\s*(?:[^|;&\s]*[\\$`]|~[A-Za-z_][^|;&\s]*|(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))/[^|;&\s]*['"?*\[][^|;&\s]*|[%!][^|;&\s]*|\^(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))[^|;&\s]+)"#,
             "shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval.",
             High,
             "The redirect target is expanded by the shell at runtime, so dcg cannot prove where it points before the file is opened with O_TRUNC.\n\n\
@@ -6809,6 +6822,34 @@ mod tests {
             "unlink ",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn mv_rules_match_the_whole_command_word_issue_550() {
+        let pack = create_pack();
+        for command in [
+            "git checkout -b fix-mv-handling /home/user/repo",
+            "tool x-mv /home/user/repo",
+            "tool mv-y /home/user/repo",
+            "tool --no-mv /etc/hosts",
+            "tool x.mv /etc/hosts",
+            "tool --mv=/etc/hosts",
+            "tool fix-mv-$x",
+        ] {
+            assert_no_match(&pack, command);
+        }
+        for (command, rule) in [
+            ("mv /home/user/repo /tmp/r", "mv-sensitive-source-root-home"),
+            ("'mv' /home/user/repo /tmp/r", "mv-sensitive-source-root-home"),
+            ("\"mv\" /etc/hosts /tmp/h", "mv-sensitive-source-root-home"),
+            ("/bin/mv /etc/hosts /tmp/h", "mv-sensitive-source-root-home"),
+            ("sudo mv /etc /tmp/x", "mv-sensitive-source-root-home"),
+            ("find . -exec mv {} /etc/ \\;", "mv-sensitive-source-root-home"),
+            ("mv \"$src\" d/", "mv-dynamic-path"),
+            ("'mv' $src d/", "mv-dynamic-path"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
         }
     }
 
@@ -7850,6 +7891,47 @@ mod tests {
             "Write-Output x *>> /etc/passwd",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn unspaced_append_to_dynamic_path_is_not_a_truncation_575() {
+        // The dynamic-path rule ignored `>> "$LOG"` but read `>>"$LOG"` as a
+        // truncating `>` whose target began with the second `>`.
+        let pack = create_pack();
+        let dynamic_path = pack
+            .destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some("redirect-truncate-dynamic-path"))
+            .expect("redirect-truncate-dynamic-path rule");
+        for cmd in [
+            "echo done >>\"$LOG\"",
+            "echo done >>$LOG",
+            "echo done 2>>\"$LOG\"",
+            "echo done 2>>$LOG",
+            "echo done &>>\"$LOG\"",
+            "echo done >>\"$HOME/notes.txt\"",
+            "echo done >>${LOG}",
+            "echo done >>`pwd`/log",
+        ] {
+            assert!(
+                !dynamic_path.regex.is_match(cmd),
+                "append must not be read as a truncating redirect: {cmd:?}"
+            );
+        }
+        // Truncating spellings of the same targets still deny, including a
+        // truncation that shares the line with an append.
+        for cmd in [
+            "echo done >\"$LOG\"",
+            "echo done > \"$LOG\"",
+            "echo done >|\"$LOG\"",
+            "echo done 2>\"$LOG\"",
+            "echo done &>\"$LOG\"",
+            "echo done >$LOG",
+            "echo a >>/tmp/x >\"$LOG\"",
+            "echo a >\"$LOG\" >>/tmp/x",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-dynamic-path");
         }
     }
 

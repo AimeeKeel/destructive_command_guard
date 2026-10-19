@@ -272,10 +272,13 @@ fn many_inert_shell_looking_literals_do_not_exhaust_recovery_budget() {
     for interpreter in ["python3", "node"] {
         let mut source = format!("{interpreter} - <<'LITERAL_DATA'\n");
         for index in 0..160 {
+            use std::fmt::Write as _;
             let declaration = if interpreter == "node" { "const " } else { "" };
-            source.push_str(&format!(
-                "{declaration}item_{index} = \"it's `tool --help` $(date)\";\n"
-            ));
+            writeln!(
+                source,
+                "{declaration}item_{index} = \"it's `tool --help` $(date)\";"
+            )
+            .expect("writing to a String cannot fail");
         }
         source.push_str("LITERAL_DATA");
         assert_decision(&source, "allow");

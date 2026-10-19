@@ -53,18 +53,18 @@ fn assert_verdict(case: &Case, command: &str, hook: bool) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the DCG classifier");
-    writeln!(child.stdin.take().expect("piped stdin"), "{input}")
-        .expect("write classifier input");
+    writeln!(child.stdin.take().expect("piped stdin"), "{input}").expect("write classifier input");
     let output = child.wait_with_output().expect("classifier exit");
-    let verdict: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "{} hook={hook}: {error}; status={}; stdout={}; stderr={}",
-            case.id,
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        )
-    });
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{} hook={hook}: {error}; status={}; stdout={}; stderr={}",
+                case.id,
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        });
     assert_eq!(
         verdict["decision"].as_str(),
         Some(case.decision.as_str()),
@@ -75,10 +75,9 @@ fn assert_verdict(case: &Case, command: &str, hook: bool) {
 }
 
 fn check_cases(hook: bool) {
-    let cases: Vec<Case> = serde_json::from_str(include_str!(
-        "fixtures/python_tempfile_provenance.json"
-    ))
-    .expect("valid regression fixtures");
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("fixtures/python_tempfile_provenance.json"))
+            .expect("valid regression fixtures");
     assert!(!cases.is_empty());
     for case in cases {
         let quoted = format!("'{}'", case.source.replace('\'', "'\\''"));
@@ -94,10 +93,9 @@ fn check_cases(hook: bool) {
 }
 
 fn check_reflective_cases(hook: bool) {
-    let cases: Vec<Case> = serde_json::from_str(include_str!(
-        "fixtures/python_reflective_rmtree.json"
-    ))
-    .expect("valid reflective-deletion fixtures");
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("fixtures/python_reflective_rmtree.json"))
+            .expect("valid reflective-deletion fixtures");
     assert!(!cases.is_empty());
     for case in cases {
         let quoted = format!("'{}'", case.source.replace('\'', "'\\''"));

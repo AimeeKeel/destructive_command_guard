@@ -2080,8 +2080,10 @@ impl PythonDeleteScan<'_> {
         let mut defaults = HashMap::new();
         for parameter in parameters.children().filter(ast_grep_core::Node::is_named) {
             self.visit(parameter.clone(), bindings, class_enclosing, depth + 1)?;
-            if matches!(parameter.kind().as_ref(), "default_parameter" | "typed_default_parameter")
-                && let Some(name) = parameter.field("name")
+            if matches!(
+                parameter.kind().as_ref(),
+                "default_parameter" | "typed_default_parameter"
+            ) && let Some(name) = parameter.field("name")
                 && let Some(value) = parameter.field("value")
             {
                 let binding = self.binding(&value, bindings, depth + 1)?;
@@ -2128,7 +2130,12 @@ impl PythonDeleteScan<'_> {
                             .as_ref()
                             .is_some_and(|parameters| child.range() == parameters.range())
                         {
-                            defaults = self.parameter_defaults(&child, bindings, class_enclosing, depth + 1)?;
+                            defaults = self.parameter_defaults(
+                                &child,
+                                bindings,
+                                class_enclosing,
+                                depth + 1,
+                            )?;
                         } else {
                             self.visit(child, bindings, class_enclosing, depth + 1)?;
                         }
@@ -5975,10 +5982,22 @@ mod tests {
     fn python_default_parameter_captures_preserve_rmtree_binding() {
         let matcher = AstMatcher::new().with_timeout(Duration::from_secs(5));
         for (source, denied) in [
-            ("import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove('/tmp')\ncleanup()", true),
-            ("import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove('/tmp/build')\ncleanup()", false),
-            ("from shutil import rmtree as remove\ndef cleanup(remove):\n    remove('/tmp')\ncleanup(print)", false),
-            ("import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove = print\n    remove('/tmp')\ncleanup()", false),
+            (
+                "import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove('/tmp')\ncleanup()",
+                true,
+            ),
+            (
+                "import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove('/tmp/build')\ncleanup()",
+                false,
+            ),
+            (
+                "from shutil import rmtree as remove\ndef cleanup(remove):\n    remove('/tmp')\ncleanup(print)",
+                false,
+            ),
+            (
+                "import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove = print\n    remove('/tmp')\ncleanup()",
+                false,
+            ),
         ] {
             let matches = matcher
                 .find_matches(source, ScriptLanguage::Python)
@@ -5995,8 +6014,14 @@ mod tests {
     fn python_default_parameter_capture_respects_definition_order() {
         let matcher = AstMatcher::new().with_timeout(Duration::from_secs(5));
         for (source, denied) in [
-            ("from shutil import rmtree as erase\ndef cleanup(remove=erase, marker=(erase := print)):\n    remove('/tmp')\ncleanup()", true),
-            ("from shutil import rmtree as erase\ndef cleanup(marker=(erase := print), remove=erase):\n    remove('/tmp')\ncleanup()", false),
+            (
+                "from shutil import rmtree as erase\ndef cleanup(remove=erase, marker=(erase := print)):\n    remove('/tmp')\ncleanup()",
+                true,
+            ),
+            (
+                "from shutil import rmtree as erase\ndef cleanup(marker=(erase := print), remove=erase):\n    remove('/tmp')\ncleanup()",
+                false,
+            ),
         ] {
             let matches = matcher
                 .find_matches(source, ScriptLanguage::Python)

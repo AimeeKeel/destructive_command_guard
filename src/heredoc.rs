@@ -2012,19 +2012,15 @@ fn inline_program_at<'a>(
     fallback: Range<usize>,
     skip_reasons: &mut Vec<SkipReason>,
 ) -> InlineProgram<'a> {
-    let end = crate::normalize::consume_posix_word_token(
-        command.as_bytes(),
-        start,
-        command.len(),
-    );
+    let end = crate::normalize::consume_posix_word_token(command.as_bytes(), start, command.len());
     if end >= fallback.end
         && end > start
         && let Some(raw) = command.get(start..end)
     {
         if let Some(content) = crate::normalize::decode_posix_literal_word(raw) {
             let inner = unquoted_payload_range(raw, start);
-            let content_range = (command.get(inner.clone()) == Some(content.as_ref()))
-                .then_some(inner);
+            let content_range =
+                (command.get(inner.clone()) == Some(content.as_ref())).then_some(inner);
             return InlineProgram {
                 content,
                 content_range,
@@ -2088,8 +2084,7 @@ static INLINE_SCRIPT_ARGUMENT: LazyLock<Regex> = LazyLock::new(|| {
         .as_str()
         .strip_suffix(r"\s*'([^']*)'")
         .expect("inline locator has the documented payload suffix");
-    Regex::new(&format!(r"{prefix}\s+(\S)"))
-        .expect("inline argument locator compiles")
+    Regex::new(&format!(r"{prefix}\s+(\S)")).expect("inline argument locator compiles")
 });
 
 static INLINE_SHELL_ARGUMENT_AFTER_C: LazyLock<Regex> = LazyLock::new(|| {
@@ -2097,8 +2092,7 @@ static INLINE_SHELL_ARGUMENT_AFTER_C: LazyLock<Regex> = LazyLock::new(|| {
         .as_str()
         .strip_suffix(r"\s+'([^']*)'")
         .expect("shell locator has the documented payload suffix");
-    Regex::new(&format!(r"{prefix}\s+(\S)"))
-        .expect("shell argument locator compiles")
+    Regex::new(&format!(r"{prefix}\s+(\S)")).expect("shell argument locator compiles")
 });
 
 /// Extract inline scripts from -c/-e flags.
@@ -2200,12 +2194,17 @@ fn extract_inline_scripts(
             }
 
             let full_match = cap.get(0).unwrap();
-            if covered_programs.iter().any(|range| range.contains(&full_match.start())) {
+            if covered_programs
+                .iter()
+                .any(|range| range.contains(&full_match.start()))
+            {
                 // The downstream language analyzer owns this complete source.
                 // Do not mine its string literals as new outer-shell launches.
                 continue;
             }
-            let Some(content_match) = content_match else { continue };
+            let Some(content_match) = content_match else {
+                continue;
+            };
             let captured = content_match.start()..content_match.end();
             let program = if is_powershell {
                 InlineProgram {
@@ -3644,9 +3643,10 @@ fn extract_awk_inline_scripts(
                 let Some(content) = decoded.content.get(payload.clone()) else {
                     continue;
                 };
-                let content_range = decoded.content_range.as_ref().map(|source| {
-                    source.start + payload.start..source.start + payload.end
-                });
+                let content_range = decoded
+                    .content_range
+                    .as_ref()
+                    .map(|source| source.start + payload.start..source.start + payload.end);
                 if !push_windows_inner(
                     extracted,
                     skip_reasons,
@@ -4662,9 +4662,10 @@ fn extract_osascript_inline_scripts(
                 let Some(content) = decoded.content.get(payload.clone()) else {
                     continue;
                 };
-                let content_range = decoded.content_range.as_ref().map(|source| {
-                    source.start + payload.start..source.start + payload.end
-                });
+                let content_range = decoded
+                    .content_range
+                    .as_ref()
+                    .map(|source| source.start + payload.start..source.start + payload.end);
                 if !push_windows_inner(
                     extracted,
                     skip_reasons,
@@ -8293,7 +8294,11 @@ fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool 
         let prefix = command.get(..operator_start)?;
         let line_start = prefix.rfind(['\n', '\r']).map_or(0, |index| index + 1);
         // Earlier source might continue a -c/-e invocation or open quote.
-        if !prefix.get(..line_start)?.bytes().all(|byte| matches!(byte, b' ' | b'\t' | b'\n')) {
+        if !prefix
+            .get(..line_start)?
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
+        {
             return None;
         }
         let header = prefix.get(line_start..)?.trim();

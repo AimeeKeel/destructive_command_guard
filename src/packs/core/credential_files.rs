@@ -72,8 +72,8 @@ pub(crate) fn classify_embedded_credential_file_writes(
 #[cfg(test)]
 mod source_ownership_tests {
     use super::{
-        classify_embedded_credential_file_writes, scan_extracted, scan_outer_writer_arguments, shell,
-        word_splitting,
+        classify_embedded_credential_file_writes, scan_extracted, scan_outer_writer_arguments,
+        shell, word_splitting,
     };
     use crate::heredoc::{ExtractionLimits, ExtractionResult, extract_content};
     use crate::normalize::ShellDialect;
@@ -108,7 +108,9 @@ mod source_ownership_tests {
     fn data_program(interpreter: &str, tail: &str) -> String {
         let body = match interpreter {
             "python3" => "note = \"IFS=@; it's `tool --help`; $DEST; élève\"\nprint(note)",
-            "node" => "const note = \"IFS=@; it's `tool --help`; $DEST; élève\";\nconsole.log(note);",
+            "node" => {
+                "const note = \"IFS=@; it's `tool --help`; $DEST; élève\";\nconsole.log(note);"
+            }
             _ => panic!("unsupported test interpreter"),
         };
         format!("{interpreter} - <<'CODE'\n{body}\n{tail}\nCODE")
@@ -124,8 +126,10 @@ mod source_ownership_tests {
             assert!(!word_splitting::candidate(outer.as_ref()));
             assert!(scan_outer_writer_arguments(&command, ShellDialect::Posix).is_empty());
             assert!(
-                classify_embedded_credential_file_writes(&command, ShellDialect::Posix, |_, _| false)
-                    .is_empty(),
+                classify_embedded_credential_file_writes(&command, ShellDialect::Posix, |_, _| {
+                    false
+                })
+                .is_empty(),
                 "literal interpreter data is not a protected write: {command}"
             );
         }
@@ -136,7 +140,10 @@ mod source_ownership_tests {
         let writer = "IFS=@; tee $UNRESOLVED";
         for interpreter in ["python3", "node"] {
             let program = data_program(interpreter, "");
-            for command in [format!("{writer}\n{program}"), format!("{program}\n{writer}")] {
+            for command in [
+                format!("{writer}\n{program}"),
+                format!("{program}\n{writer}"),
+            ] {
                 let start = command.find("tee $UNRESOLVED").unwrap();
                 let expected_span = start..start + "tee $UNRESOLVED".len();
                 // Even an explicit interpreter exemption must not grant a
@@ -186,12 +193,14 @@ mod source_ownership_tests {
         ] {
             let command = data_program(interpreter, tail);
             let outer = crate::heredoc::mask_inert_interpreter_stdin(&command);
-            assert!(!outer.contains(tail), "the test must exercise a masked body");
-            let hits = classify_embedded_credential_file_writes(
-                &command,
-                ShellDialect::Posix,
-                |_, _| false,
+            assert!(
+                !outer.contains(tail),
+                "the test must exercise a masked body"
             );
+            let hits =
+                classify_embedded_credential_file_writes(&command, ShellDialect::Posix, |_, _| {
+                    false
+                });
             assert!(
                 hits.iter()
                     .any(|hit| hit.rule == rule && command.get(hit.span.clone()).is_some()),

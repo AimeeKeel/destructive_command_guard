@@ -2886,8 +2886,15 @@ mod javascript_regex_regressions_560 {
 
     fn assert_data(source: &str) -> Vec<std::ops::Range<usize>> {
         let ranges = inert_documentation_literal_ranges(source, LANGUAGE);
-        assert!(!ranges.is_empty(), "missing regex text-edit proof: {source}");
-        assert!(ranges.iter().all(|range| source.get(range.clone()).is_some()));
+        assert!(
+            !ranges.is_empty(),
+            "missing regex text-edit proof: {source}"
+        );
+        assert!(
+            ranges
+                .iter()
+                .all(|range| source.get(range.clone()).is_some())
+        );
         assert!(
             interpreter_literal_shell_commands_inner(source, LANGUAGE, true)
                 .expect("bounded complete data program")
@@ -2955,12 +2962,15 @@ mod javascript_regex_regressions_560 {
 
     #[test]
     fn regex_data_still_requires_the_independent_outer_consumer_proof() {
-        let source = "const text = 'x'.replace(/x/, 'echo $(git reset --hard)'); console.log(text);";
+        let source =
+            "const text = 'x'.replace(/x/, 'echo $(git reset --hard)'); console.log(text);";
         assert_data(source);
         let commands = interpreter_literal_shell_commands_inner(source, LANGUAGE, false)
             .expect("an unproved outer consumer retains the conservative literal evidence");
         assert!(
-            commands.iter().any(|command| command.command == "echo $(git reset --hard)"),
+            commands
+                .iter()
+                .any(|command| command.command == "echo $(git reset --hard)"),
             "a source proof cannot authorize a later shell consumer"
         );
     }
@@ -2980,7 +2990,8 @@ mod javascript_regex_regressions_560 {
                 DEFAULT_MATCHER.find_matches(&source, LANGUAGE).unwrap(),
             ] {
                 assert!(
-                    hits.iter().any(|hit| hit.rule_id == rule && hit.severity.blocks_by_default()),
+                    hits.iter()
+                        .any(|hit| hit.rule_id == rule && hit.severity.blocks_by_default()),
                     "literal data must retain the original protected-write policy: {source}: {hits:?}"
                 );
             }
@@ -2990,14 +3001,15 @@ mod javascript_regex_regressions_560 {
     #[test]
     fn regex_replacements_do_not_hide_indirect_execution() {
         for sink in ["run(text);", "require('child_process').execSync(text);"] {
-            let source = format!(
-                "const text = 'x'.replace(/x/, 'echo $(git reset --hard)'); {sink}"
-            );
+            let source =
+                format!("const text = 'x'.replace(/x/, 'echo $(git reset --hard)'); {sink}");
             assert!(inert_documentation_literal_ranges(&source, LANGUAGE).is_empty());
             let commands = interpreter_literal_shell_commands_inner(&source, LANGUAGE, true)
                 .expect("indirect execution retains its source evidence");
             assert!(
-                commands.iter().any(|command| command.command == "echo $(git reset --hard)"),
+                commands
+                    .iter()
+                    .any(|command| command.command == "echo $(git reset --hard)"),
                 "the data proof must fail for the whole executable program: {source}"
             );
         }

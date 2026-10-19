@@ -2,7 +2,8 @@
 //! Fixtures are input to DCG only; no destructive fixture is executed.
 
 use destructive_command_guard::heredoc::{
-    ExtractedContent, ExtractionLimits, ExtractionResult, ScriptLanguage, SkipReason, extract_content,
+    ExtractedContent, ExtractionLimits, ExtractionResult, ScriptLanguage, SkipReason,
+    extract_content,
 };
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -47,27 +48,85 @@ fn complete(source: &str) -> Vec<ExtractedContent> {
 #[test]
 fn every_quoted_segment_reaches_the_existing_language_analyzer() {
     for (launcher, language, code) in [
-        ("bash -c", ScriptLanguage::Bash, "echo 'x'; git reset --hard"),
-        ("sh -c", ScriptLanguage::Bash, "printf '%s' x; git reset --hard"),
-        ("dash -c", ScriptLanguage::Bash, "echo 'x'; git reset --hard"),
+        (
+            "bash -c",
+            ScriptLanguage::Bash,
+            "echo 'x'; git reset --hard",
+        ),
+        (
+            "sh -c",
+            ScriptLanguage::Bash,
+            "printf '%s' x; git reset --hard",
+        ),
+        (
+            "dash -c",
+            ScriptLanguage::Bash,
+            "echo 'x'; git reset --hard",
+        ),
         ("zsh -c", ScriptLanguage::Bash, "echo 'x'; git reset --hard"),
         ("ksh -c", ScriptLanguage::Bash, "echo 'x'; git reset --hard"),
-        ("mksh -c", ScriptLanguage::Bash, "echo 'x'; git reset --hard"),
-        ("python3 -c", ScriptLanguage::Python, "import os; os.system('git reset --hard')"),
-        ("python3.11 -I -c", ScriptLanguage::Python, "import os; os.system('git reset --hard')"),
-        ("node -e", ScriptLanguage::JavaScript, "require('child_process').execSync('git reset --hard')"),
-        ("nodejs -p", ScriptLanguage::JavaScript, "require('child_process').execSync('git reset --hard')"),
-        ("ruby -e", ScriptLanguage::Ruby, "system('git reset --hard')"),
-        ("perl -e", ScriptLanguage::Perl, "system('git reset --hard')"),
-        ("perl -E", ScriptLanguage::Perl, "system('git reset --hard')"),
+        (
+            "mksh -c",
+            ScriptLanguage::Bash,
+            "echo 'x'; git reset --hard",
+        ),
+        (
+            "python3 -c",
+            ScriptLanguage::Python,
+            "import os; os.system('git reset --hard')",
+        ),
+        (
+            "python3.11 -I -c",
+            ScriptLanguage::Python,
+            "import os; os.system('git reset --hard')",
+        ),
+        (
+            "node -e",
+            ScriptLanguage::JavaScript,
+            "require('child_process').execSync('git reset --hard')",
+        ),
+        (
+            "nodejs -p",
+            ScriptLanguage::JavaScript,
+            "require('child_process').execSync('git reset --hard')",
+        ),
+        (
+            "ruby -e",
+            ScriptLanguage::Ruby,
+            "system('git reset --hard')",
+        ),
+        (
+            "perl -e",
+            ScriptLanguage::Perl,
+            "system('git reset --hard')",
+        ),
+        (
+            "perl -E",
+            ScriptLanguage::Perl,
+            "system('git reset --hard')",
+        ),
     ] {
         for style in 0..3 {
             let source = format!("{launcher} {}", quote(code, style));
             let items = complete(&source);
-            let programs: Vec<_> = items.iter().filter(|item| item.language == language).collect();
-            assert_eq!(programs.len(), 1, "duplicate or missing program: {source}: {items:?}");
-            assert_eq!(programs[0].content, code, "truncated/incorrect argv: {source}");
-            assert_eq!(programs[0].byte_range.end, source.len(), "incomplete source range: {source}");
+            let programs: Vec<_> = items
+                .iter()
+                .filter(|item| item.language == language)
+                .collect();
+            assert_eq!(
+                programs.len(),
+                1,
+                "duplicate or missing program: {source}: {items:?}"
+            );
+            assert_eq!(
+                programs[0].content, code,
+                "truncated/incorrect argv: {source}"
+            );
+            assert_eq!(
+                programs[0].byte_range.end,
+                source.len(),
+                "incomplete source range: {source}"
+            );
             for item in &items {
                 if let Some(range) = &item.content_range {
                     assert_eq!(source.get(range.clone()), Some(item.content.as_str()));
@@ -80,21 +139,51 @@ fn every_quoted_segment_reaches_the_existing_language_analyzer() {
 #[test]
 fn decoding_preserves_literals_empty_segments_unicode_and_boundaries() {
     for (word, code) in [
-        (r#"'echo '\''x'\''; git reset --hard'"#, "echo 'x'; git reset --hard"),
-        (r#""echo \"x\"; git reset --hard""#, "echo \"x\"; git reset --hard"),
-        (r#"'echo '"'"'élève'"'"'; git reset --hard'"#, "echo 'élève'; git reset --hard"),
-        (r#"''"echo x; "'git reset --hard'"#, "echo x; git reset --hard"),
+        (
+            r#"'echo '\''x'\''; git reset --hard'"#,
+            "echo 'x'; git reset --hard",
+        ),
+        (
+            r#""echo \"x\"; git reset --hard""#,
+            "echo \"x\"; git reset --hard",
+        ),
+        (
+            r#"'echo '"'"'élève'"'"'; git reset --hard'"#,
+            "echo 'élève'; git reset --hard",
+        ),
+        (
+            r#"''"echo x; "'git reset --hard'"#,
+            "echo x; git reset --hard",
+        ),
         (r#"echo\ 'x; git reset --hard'"#, "echo x; git reset --hard"),
         (r#"git\ reset\ --hard"#, "git reset --hard"),
-        (r#"$'echo \'x\'; git reset --hard'"#, "echo 'x'; git reset --hard"),
-        (r#"$'echo safe\0ignored'\;'git reset --hard'"#, "echo safe;git reset --hard"),
-        ("'echo x; '\\\n'git reset --hard'", "echo x; git reset --hard"),
-        (r#""printf '%s' '\q \$VALUE \`date\`'""#, "printf '%s' '\\q $VALUE `date`'"),
-        (r#"'printf %s "$VALUE * ? [x]"'"#, "printf %s \"$VALUE * ? [x]\""),
+        (
+            r#"$'echo \'x\'; git reset --hard'"#,
+            "echo 'x'; git reset --hard",
+        ),
+        (
+            r#"$'echo safe\0ignored'\;'git reset --hard'"#,
+            "echo safe;git reset --hard",
+        ),
+        (
+            "'echo x; '\\\n'git reset --hard'",
+            "echo x; git reset --hard",
+        ),
+        (
+            r#""printf '%s' '\q \$VALUE \`date\`'""#,
+            "printf '%s' '\\q $VALUE `date`'",
+        ),
+        (
+            r#"'printf %s "$VALUE * ? [x]"'"#,
+            "printf %s \"$VALUE * ? [x]\"",
+        ),
     ] {
         let source = format!("bash -c {word}>out ignored_argument");
         let items = complete(&source);
-        assert!(items.iter().any(|item| item.content == code), "{source}: {items:?}");
+        assert!(
+            items.iter().any(|item| item.content == code),
+            "{source}: {items:?}"
+        );
         for item in &items {
             assert!(item.byte_range.end <= source.find(">out").unwrap());
             if let Some(range) = &item.content_range {
@@ -132,10 +221,16 @@ fn unresolved_or_malformed_words_are_not_reported_as_complete() {
         r#"mise exec -c 'echo '"$VALUE"'; echo tail'"#,
     ] {
         let skipped = match extraction(source, 10) {
-            ExtractionResult::Partial { skipped, .. } | ExtractionResult::Skipped(skipped) => skipped,
+            ExtractionResult::Partial { skipped, .. } | ExtractionResult::Skipped(skipped) => {
+                skipped
+            }
             other => panic!("incomplete argument silently accepted: {source}: {other:?}"),
         };
-        assert!(skipped.iter().any(|reason| matches!(reason, SkipReason::MalformedInput { .. })));
+        assert!(
+            skipped
+                .iter()
+                .any(|reason| matches!(reason, SkipReason::MalformedInput { .. }))
+        );
     }
 }
 
@@ -145,36 +240,59 @@ fn decision(source: &str, expected: &str, strict: bool) {
         let home = temp.path().join("home");
         std::fs::create_dir(&home).expect("isolated home");
         let config = temp.path().join("config.toml");
-        std::fs::write(&config, format!("[heredoc]\ntimeout_ms = 5000\nfallback_on_parse_error = {}\n", !strict))
-            .expect("explicit test configuration");
+        std::fs::write(
+            &config,
+            format!(
+                "[heredoc]\ntimeout_ms = 5000\nfallback_on_parse_error = {}\n",
+                !strict
+            ),
+        )
+        .expect("explicit test configuration");
         let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
         let input = if hook {
             command.args(["hook", "--batch"]);
             serde_json::json!({
                 "hook_event_name": "PreToolUse", "tool_name": "Bash",
                 "tool_input": {"command": source},
-            }).to_string()
+            })
+            .to_string()
         } else {
             command.args(["test", "--stdin", "--dialect", "posix", "--format", "json"]);
             source.to_string()
         };
-        let mut child = command.env_clear()
-            .env("HOME", &home).env("USERPROFILE", &home)
+        let mut child = command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .env("DCG_CONFIG", &config)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
-            .env("DCG_NO_SELF_HEAL", "1").env("DCG_HISTORY_ENABLED", "false")
-            .env("DCG_HOOK_TIMEOUT_MS", "5000").env("DCG_AST_TIMEOUT_MS", "5000")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .env("DCG_HISTORY_ENABLED", "false")
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .env("DCG_AST_TIMEOUT_MS", "5000")
             .current_dir(temp.path())
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-            .spawn().expect("spawn DCG, never the fixture");
-        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn DCG, never the fixture");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
         let output = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let verdict: serde_json::Value = serde_json::from_str(&stdout)
             .unwrap_or_else(|error| panic!("{error}: stdout={stdout}; stderr={stderr}"));
-        assert_eq!(verdict["decision"].as_str(), Some(expected),
-            "hook={hook}, strict={strict}, source={source:?}, status={}, verdict={verdict}, stderr={stderr}", output.status);
+        assert_eq!(
+            verdict["decision"].as_str(),
+            Some(expected),
+            "hook={hook}, strict={strict}, source={source:?}, status={}, verdict={verdict}, stderr={stderr}",
+            output.status
+        );
     }
 }
 
@@ -183,7 +301,10 @@ fn confirmed_interpreter_repros_deny_in_cli_and_hook_mode() {
     for (launcher, code) in [
         ("bash -c", "echo 'x'; git reset --hard"),
         ("python3 -I -c", "import os; os.system('git reset --hard')"),
-        ("node -e", "require('child_process').execSync('git reset --hard')"),
+        (
+            "node -e",
+            "require('child_process').execSync('git reset --hard')",
+        ),
         ("ruby -e", "system('git reset --hard')"),
         ("perl -e", "system('git reset --hard')"),
     ] {
@@ -197,10 +318,20 @@ fn confirmed_interpreter_repros_deny_in_cli_and_hook_mode() {
 fn wrappers_and_option_variants_keep_the_complete_program() {
     let code = "echo 'x'; git reset --hard";
     for launcher in [
-        "bash -lc", "bash -o pipefail -c", "bash -c --", "bash -c -o errexit",
-        "sudo -u root bash -c", "env FOO=1 sh -c", "timeout 5 bash -c",
-        "printf x | xargs sh -c", "ssh -p 22 host", "mise exec -c", "mise x --command",
-        "bun exec", "watch -n 1", "/usr/bin/bash -c",
+        "bash -lc",
+        "bash -o pipefail -c",
+        "bash -c --",
+        "bash -c -o errexit",
+        "sudo -u root bash -c",
+        "env FOO=1 sh -c",
+        "timeout 5 bash -c",
+        "printf x | xargs sh -c",
+        "ssh -p 22 host",
+        "mise exec -c",
+        "mise x --command",
+        "bun exec",
+        "watch -n 1",
+        "/usr/bin/bash -c",
     ] {
         decision(&format!("{launcher} {}", quote(code, 0)), "deny", false);
     }
@@ -210,8 +341,16 @@ fn wrappers_and_option_variants_keep_the_complete_program() {
         ("mise exec --command=", ""),
         ("mise exec -c", ""),
     ] {
-        let body = if prefix.starts_with("python") { "import os; os.system('git reset --hard')" } else { code };
-        decision(&format!("{prefix}{}{suffix}", quote(body, 0)), "deny", false);
+        let body = if prefix.starts_with("python") {
+            "import os; os.system('git reset --hard')"
+        } else {
+            code
+        };
+        decision(
+            &format!("{prefix}{}{suffix}", quote(body, 0)),
+            "deny",
+            false,
+        );
     }
     let nested = format!("bash -c {}", quote(code, 0));
     decision(&format!("bash -c {}", quote(&nested, 1)), "deny", false);
@@ -221,7 +360,10 @@ fn wrappers_and_option_variants_keep_the_complete_program() {
 fn awk_and_osascript_decode_the_outer_program_before_extracting_sinks() {
     for (launcher, code) in [
         ("awk", "BEGIN { system(\"echo 'x'; git reset --hard\") }"),
-        ("osascript -e", "do shell script \"echo 'x'; git reset --hard\""),
+        (
+            "osascript -e",
+            "do shell script \"echo 'x'; git reset --hard\"",
+        ),
     ] {
         for style in 0..3 {
             decision(&format!("{launcher} {}", quote(code, style)), "deny", false);
@@ -244,10 +386,18 @@ fn harmless_command_like_strings_remain_data_in_both_modes() {
         ("osascript -e", "return \"git reset --hard\""),
     ] {
         for style in 0..3 {
-            decision(&format!("{launcher} {}", quote(code, style)), "allow", false);
+            decision(
+                &format!("{launcher} {}", quote(code, style)),
+                "allow",
+                false,
+            );
         }
     }
-    decision(r#"ssh host printf '%s' "'git reset --hard'""#, "allow", false);
+    decision(
+        r#"ssh host printf '%s' "'git reset --hard'""#,
+        "allow",
+        false,
+    );
 }
 
 #[test]
@@ -255,6 +405,10 @@ fn uncertainty_obeys_the_existing_configured_policy() {
     let source = r#"python3 -c 'print('"$VALUE"')'"#;
     decision(source, "allow", false);
     decision(source, "deny", true);
-    decision(r#"bash -c 'echo '"$VALUE"'; git reset --hard'"#, "deny", false);
+    decision(
+        r#"bash -c 'echo '"$VALUE"'; git reset --hard'"#,
+        "deny",
+        false,
+    );
     decision("bash -c 'echo unterminated", "deny", true);
 }

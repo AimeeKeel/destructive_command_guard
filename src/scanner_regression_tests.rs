@@ -97,8 +97,15 @@ fn stdin_data_does_not_borrow_program_source_proof_560() {
         for body in ["git reset --hard", "print('quoted shell-looking data')"] {
             let command = format!("{header}\n{body}\nDCG_STDIN");
             let range = header.len() + 1..header.len() + 1 + body.len();
-            assert!(!range_is_inert_interpreter_stdin(&command, &range), "{header}");
-            assert_eq!(mask_inert_interpreter_stdin(&command).as_ref(), command, "{header}");
+            assert!(
+                !range_is_inert_interpreter_stdin(&command, &range),
+                "{header}"
+            );
+            assert_eq!(
+                mask_inert_interpreter_stdin(&command).as_ref(),
+                command,
+                "{header}"
+            );
         }
     }
 }
@@ -107,12 +114,21 @@ fn stdin_data_does_not_borrow_program_source_proof_560() {
 fn program_stdin_preserves_outer_shell_boundaries_560() {
     use crate::heredoc::{mask_inert_interpreter_stdin, range_is_inert_interpreter_stdin};
     for (header, body) in [
-        ("python3 - <<'DCG_STDIN'", "print('literal shell-like text')"),
-        ("node - <<'DCG_STDIN'", "console.log('literal shell-like text');"),
+        (
+            "python3 - <<'DCG_STDIN'",
+            "print('literal shell-like text')",
+        ),
+        (
+            "node - <<'DCG_STDIN'",
+            "console.log('literal shell-like text');",
+        ),
     ] {
         let command = format!("{header}\n{body}\nDCG_STDIN\ngit status");
         let range = header.len() + 1..header.len() + 1 + body.len();
-        assert!(range_is_inert_interpreter_stdin(&command, &range), "{header}");
+        assert!(
+            range_is_inert_interpreter_stdin(&command, &range),
+            "{header}"
+        );
         let masked = mask_inert_interpreter_stdin(&command);
         assert_eq!(masked.len(), command.len());
         assert_eq!(&masked[..range.start], &command[..range.start]);

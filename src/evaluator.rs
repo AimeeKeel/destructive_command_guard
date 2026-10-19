@@ -26283,10 +26283,16 @@ fn resolve_variable_bindings(
                         .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
                     && conditional_binding_dominates_redirect(source, end, segment_start)));
         if binds_in_parent {
-            if let Some(raw) = strip_assignment_declaration(segment)
-                .strip_prefix(name)
-                .and_then(|rest| rest.strip_prefix('='))
-            {
+            let assignments = strip_assignment_declaration(segment);
+            let binding = match assignment_only_segment_binding(assignments, name) {
+                AssignmentOnlyBinding::NotAssignmentOnly => assignments
+                    .strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('=')),
+                AssignmentOnlyBinding::Binds(raw) => Some(raw),
+                AssignmentOnlyBinding::DoesNotBind => None,
+                AssignmentOnlyBinding::Ambiguous => return None,
+            };
+            if let Some(raw) = binding {
                 if values.is_some() {
                     return None;
                 }
@@ -26356,15 +26362,17 @@ fn resolve_variable_bindings(
             // and cannot change what a later `$NAME` expands to (#422).
             // Checked against `source`, not `segment`: printf's arguments are
             // stripped as data before this scan, so the segment is bare.
-            "printf" => command_word_was_quoted || printf_can_bind_variable(source),
+            "printf" => command_word_was_quoted || printf_can_bind_variable(source, name),
+            // `read` binds only the variables it names, `REPLY` when it names
+            // none, and its `-a` array (#574). Same source-level scan.
+            "read" => command_word_was_quoted || read_can_bind_variable(source, name),
             // These invalidate permission-lifting proofs. The deny-only
             // pass retains the earlier literal as a conservative candidate,
             // so adding this guard cannot hide an existing sensitive target.
             "trap" | "alias" => !matches!(mode, VariableResolution::DenyOnlyLiteral),
             other => matches!(
                 other,
-                "read"
-                    | "readonly"
+                "readonly"
                     | "declare"
                     | "typeset"
                     | "local"
@@ -26544,7 +26552,7 @@ fn printf_argument_end(after: &str) -> usize {
     bytes.len()
 }
 
-fn printf_can_bind_variable(source: &str) -> bool {
+fn printf_can_bind_variable(source: &str, name: &str) -> bool {
     let mut rest = source;
     while let Some(index) = rest.find("printf") {
         let after = &rest[index + "printf".len()..];
@@ -26583,26 +26591,48 @@ fn printf_can_bind_variable(source: &str) -> bool {
             {
                 return true;
             }
-            // Every word is inspected, including anything that looks like a
-            // redirect. A redirect may legally precede the arguments —
-            // `printf > /dev/null -v p /etc/passwd` binds `p` in bash — so
-            // stopping at the first `>` would walk straight past the flag that
-            // matters. Scanning through costs only a false *hazard* when
-            // printf's own redirect target is dynamic, which denies, and
-            // denying is the safe direction here.
-            for word in args.split_ascii_whitespace() {
-                // `-v NAME` and the concatenated `-vNAME` both bind, and an
-                // expansion could become either at run time.
-                //
-                // The quote and backslash bytes belong here too: bash strips
-                // them before the builtin sees its argv, so `printf "-v" p /x`,
-                // `printf '-v' p /x`, `printf -"v" p /x` and `printf \-v p /x`
-                // all bind exactly as the bare spelling does — verified in bash
-                // 5.3. Dropping them from this set turned each into an allowed
-                // `rm -rf`. Fail closed on anything this cannot read literally.
-                if word.starts_with("-v") || word.contains(['$', '`', '\\', '\'', '"']) {
+            // Options end at printf's format, its first non-option word, so
+            // only the words before it are read (#574): `printf a "$(true)"`
+            // binds nothing, because bash never parses `$(true)` as an option.
+            let mut words = args.split_ascii_whitespace();
+            while let Some(word) = words.next() {
+                // The quote and backslash bytes are hazards wherever an option
+                // may still appear: bash strips them before the builtin sees
+                // its argv, so `printf "-v" p /x`, `printf '-v' p /x`,
+                // `printf -"v" p /x` and `printf \-v p /x` all bind exactly as
+                // the bare spelling does — verified in bash 5.3. Dropping them
+                // turned each into an allowed `rm -rf`. An expansion, a glob
+                // or a brace expansion could likewise become `-v` at run time.
+                // Fail closed on anything this cannot read literally.
+                if word.contains(['$', '`', '\\', '\'', '"', '*', '?', '[', '{', '~']) {
                     return true;
                 }
+                // `-v NAME` and the concatenated `-vNAME` bind NAME (or the
+                // array NAME for `NAME[i]`). Binding a different, literally
+                // named variable leaves `name` alone (#574).
+                if let Some(attached) = word.strip_prefix("-v") {
+                    let target = if attached.is_empty() {
+                        words.next()
+                    } else {
+                        Some(attached)
+                    };
+                    let Some(target) = target else {
+                        return true;
+                    };
+                    if !printf_target_is_other_literal_variable(target, name) {
+                        return true;
+                    }
+                    continue;
+                }
+                // Any other option-like word (`-n`, `--`) keeps the scan in
+                // option position. bash rejects unknown options and honours
+                // `--`, but neither is modeled: reading on only costs a false
+                // hazard for a later `-v`.
+                if word.starts_with('-') {
+                    continue;
+                }
+                // The format: nothing after it is an option.
+                break;
             }
             // Resume AFTER this printf's own arguments, not just after the word.
             // A `printf` inside another printf's argument list is that printf's
@@ -26617,6 +26647,307 @@ fn printf_can_bind_variable(source: &str) -> bool {
         rest = after;
     }
     false
+}
+
+/// How one parent-shell segment that consists only of assignment words
+/// (`B=/tmp/b T=/tmp/t`) binds a variable (#574).
+#[derive(Debug, PartialEq, Eq)]
+enum AssignmentOnlyBinding<'a> {
+    /// Not a multi-word assignment-only segment: the single-assignment rules
+    /// apply unchanged.
+    NotAssignmentOnly,
+    /// The segment assigns `name` exactly once, with this raw value text.
+    Binds(&'a str),
+    /// The segment assigns only other variables.
+    DoesNotBind,
+    /// The segment assigns `name` more than once or by appending, assigns an
+    /// element of it, or changes `IFS`: no single value can be proven.
+    Ambiguous,
+}
+
+/// With no command word, every assignment word in a simple command is
+/// performed by the current shell, left to right, so each one is a binding
+/// exactly like a lone `NAME=value` segment. The previous single-assignment
+/// parse read `B=/tmp/b T=/tmp/t` as the value `/tmp/b T=/tmp/t` and lost the
+/// proof. A segment with a command word (`B=/tmp/b cmd`) only sets `B` for
+/// that command and stays outside this path.
+fn assignment_only_segment_binding<'a>(segment: &'a str, name: &str) -> AssignmentOnlyBinding<'a> {
+    let Some(words) = split_assignment_words(segment) else {
+        return AssignmentOnlyBinding::NotAssignmentOnly;
+    };
+    if words.len() < 2 {
+        return AssignmentOnlyBinding::NotAssignmentOnly;
+    }
+    let mut parsed = Vec::with_capacity(words.len());
+    for word in &words {
+        let Some(equals) = word.find('=') else {
+            return AssignmentOnlyBinding::NotAssignmentOnly;
+        };
+        let (target, append) = match word[..equals].strip_suffix('+') {
+            Some(target) => (target, true),
+            None => (&word[..equals], false),
+        };
+        let base = target.split_once('[').map_or(target, |(base, _)| base);
+        let valid_name = base
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && base
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !valid_name || (base.len() != target.len() && !target.ends_with(']')) {
+            return AssignmentOnlyBinding::NotAssignmentOnly;
+        }
+        parsed.push((
+            base,
+            target.len() != base.len() || append,
+            &word[equals + 1..],
+        ));
+    }
+    let mut binding = None;
+    for (base, element_or_append, value) in parsed {
+        if base == "IFS" {
+            return AssignmentOnlyBinding::Ambiguous;
+        }
+        if base != name {
+            continue;
+        }
+        if element_or_append || binding.is_some() {
+            return AssignmentOnlyBinding::Ambiguous;
+        }
+        binding = Some(value);
+    }
+    binding.map_or(
+        AssignmentOnlyBinding::DoesNotBind,
+        AssignmentOnlyBinding::Binds,
+    )
+}
+
+/// Raw words of an assignment-only simple command, split on unquoted blanks.
+/// Quoting, backslash escapes, `$( … )`, `${ … }` and backquotes stay inside
+/// the word that contains them. `None` when the text is not readable that way
+/// (unbalanced quoting or nesting, or a shell operator), which callers treat
+/// as "not an assignment-only segment".
+fn split_assignment_words(text: &str) -> Option<Vec<&str>> {
+    let bytes = text.as_bytes();
+    let mut words = Vec::new();
+    let mut word_start: Option<usize> = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b' ' | b'\t' => {
+                if let Some(start) = word_start.take() {
+                    words.push(&text[start..index]);
+                }
+                index += 1;
+            }
+            b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' => return None,
+            byte => {
+                word_start.get_or_insert(index);
+                index = match byte {
+                    b'\\' => index + 2,
+                    b'\'' => index + 1 + text.get(index + 1..)?.find('\'')? + 1,
+                    b'"' => skip_double_quoted_word_part(text, index)?,
+                    b'`' => skip_backquoted_word_part(text, index)?,
+                    b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                        skip_dollar_group_word_part(text, index)?
+                    }
+                    _ => index + 1,
+                };
+            }
+        }
+    }
+    if index > bytes.len() {
+        return None;
+    }
+    if let Some(start) = word_start {
+        words.push(text.get(start..)?);
+    }
+    Some(words)
+}
+
+/// End offset (exclusive) of the double-quoted string opening at `start`.
+fn skip_double_quoted_word_part(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some(index + 1),
+            b'`' => index = skip_backquoted_word_part(text, index)?,
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                index = skip_dollar_group_word_part(text, index)?;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// End offset (exclusive) of the backquoted substitution opening at `start`.
+fn skip_backquoted_word_part(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'`' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// End offset (exclusive) of the `$( … )` or `${ … }` group opening at
+/// `start`, honouring nested groups and quoting inside it.
+fn skip_dollar_group_word_part(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let (open, close) = match bytes.get(start + 1)? {
+        b'(' => (b'(', b')'),
+        b'{' => (b'{', b'}'),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\'' => index += 1 + text.get(index + 1..)?.find('\'')? + 1,
+            b'"' => index = skip_double_quoted_word_part(text, index)?,
+            b'`' => index = skip_backquoted_word_part(text, index)?,
+            byte if byte == open => {
+                depth += 1;
+                index += 1;
+            }
+            byte if byte == close => {
+                depth -= 1;
+                index += 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Whether a `printf -v` / `read -a` target is a plain, literally spelled
+/// variable name other than `name`. Anything else — an expansion, quoting, an
+/// array subscript, or `name` itself — may bind `name` and is a hazard.
+fn printf_target_is_other_literal_variable(target: &str, name: &str) -> bool {
+    target != name
+        && target
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Whether a `read` command anywhere in `source` could bind `name` (#574).
+///
+/// `read` assigns only the variables it names (or `REPLY` when it names none,
+/// and the array given to `-a`), so `S=/tmp/x; read x; cat a > "$S/o"` cannot
+/// change `$S`. Like the printf scan this reads the original command text and
+/// is coarse in the safe direction: every `read` word in the command counts,
+/// and anything not statically readable — an expansion, quoting, a glob, an
+/// unknown option, a non-identifier name — is a hazard.
+fn read_can_bind_variable(source: &str, name: &str) -> bool {
+    let mut rest = source;
+    while let Some(index) = rest.find("read") {
+        let after = &rest[index + "read".len()..];
+        // Only a real command word counts; `readonly`, `fread` and
+        // `sys.stdin.read()` do not.
+        let joined_left = rest[..index]
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+        let joined_right = after
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_'));
+        if joined_left || joined_right {
+            rest = after;
+            continue;
+        }
+        let end = printf_argument_end(after);
+        if read_arguments_may_bind(&after[..end], name) {
+            return true;
+        }
+        rest = &after[end..];
+    }
+    false
+}
+
+fn read_arguments_may_bind(args: &str, name: &str) -> bool {
+    let mut words = args.split_ascii_whitespace();
+    let mut in_options = true;
+    let mut binds_named_variable = false;
+    while let Some(word) = words.next() {
+        // A redirection is not an operand. A bare operator owns the next word.
+        if let Some(target_attached) = redirect_operator_suffix(word) {
+            if target_attached.is_empty() {
+                words.next();
+            }
+            continue;
+        }
+        if word.contains(['$', '`', '\\', '\'', '"', '*', '?', '[', '{', '~', '(', ')']) {
+            return true;
+        }
+        if in_options && word == "--" {
+            in_options = false;
+            continue;
+        }
+        if in_options && word.len() > 1 && word.starts_with('-') {
+            let cluster = &word[1..];
+            for (offset, option) in cluster.char_indices() {
+                match option {
+                    'e' | 'E' | 'r' | 's' => {}
+                    'a' | 'd' | 'i' | 'n' | 'N' | 'p' | 't' | 'u' => {
+                        let attached = &cluster[offset + 1..];
+                        let argument = if attached.is_empty() {
+                            words.next()
+                        } else {
+                            Some(attached)
+                        };
+                        let Some(argument) = argument else {
+                            return true;
+                        };
+                        if option == 'a' {
+                            if !printf_target_is_other_literal_variable(argument, name) {
+                                return true;
+                            }
+                            binds_named_variable = true;
+                        }
+                        break;
+                    }
+                    _ => return true,
+                }
+            }
+            continue;
+        }
+        in_options = false;
+        if !printf_target_is_other_literal_variable(word, name) {
+            return true;
+        }
+        binds_named_variable = true;
+    }
+    !binds_named_variable && name == "REPLY"
+}
+
+/// For a word that begins with a redirection operator, the text after the
+/// operator (empty when the target is the next word); `None` otherwise.
+fn redirect_operator_suffix(word: &str) -> Option<&str> {
+    let unnumbered = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let unnumbered = unnumbered.strip_prefix('&').unwrap_or(unnumbered);
+    for operator in ["<<<", "<<-", "<<", "<>", ">>", ">|", "<&", ">&", "<", ">"] {
+        if let Some(target) = unnumbered.strip_prefix(operator) {
+            return Some(target);
+        }
+    }
+    None
 }
 
 /// Whether a segment range is nested inside another extracted segment (the
@@ -34043,10 +34374,21 @@ mod tests {
             "my_printf -v p x",
             "printfoo -v p x",
             "p=/tmp/x.txt; echo hi > \"$p\"",
+            // #574: options end at the format, so an expansion or quoting
+            // after it cannot become `-v`.
+            "printf a \"$(true)\"",
+            "printf a $(true)",
+            "printf a `true`",
+            "printf %s \"$x\" '-v' p",
+            "p=/tmp/x; { printf a \"$(true)\"; } > \"$p/o\"",
+            // #574: `-v` naming a different, literal variable leaves `p` alone.
+            "printf -v other a",
+            "printf -vother a \"$(true)\"",
+            "p=/tmp/x; printf -v other a; cat a > \"$p/o\"",
         ] {
             assert!(
-                !printf_can_bind_variable(inert),
-                "{inert:?} cannot bind a variable"
+                !printf_can_bind_variable(inert, "p"),
+                "{inert:?} cannot bind p"
             );
         }
         for binds in [
@@ -34095,10 +34437,320 @@ mod tests {
             "printf -\"v\" p /etc/passwd",
             "printf \\-v p /etc/passwd",
             "p=/tmp/x.txt; printf \"-v\" p /etc/passwd; echo hi > \"$p\"",
+            // Still option position: the second `-v` binds p.
+            "printf -v other -v p x",
+            "printf -n -v p x",
+            "printf -- -v p x",
+            // A target that is not a plain literal name could be p.
+            "printf -v \"$t\" x",
+            "printf -v 'p' x",
+            "printf -v p[0] x",
+            // Expansion, glob or brace expansion before the format.
+            "printf \"$(true)\" p x",
+            "printf * x",
+            "printf {-v,p} x",
         ] {
             assert!(
-                printf_can_bind_variable(binds),
+                printf_can_bind_variable(binds, "p"),
                 "{binds:?} must stay a mutation hazard"
+            );
+        }
+    }
+
+    /// #574: `read` binds only the names it is given (or `REPLY`), plus its
+    /// `-a` array. Anything it cannot read statically stays a hazard.
+    #[test]
+    fn read_binds_only_named_variables() {
+        for inert in [
+            "read x",
+            "read -r line",
+            "read -r -p prompt line",
+            "read -rp prompt line",
+            "read -t 5 -u 3 a b c",
+            "read -a arr",
+            "read -r line < /etc/hostname",
+            "read -r line </etc/hostname",
+            "read -r a b <<< x",
+            "IFS=, read a b",
+            "p=/tmp/x; read x; cat a > \"$p/o\"",
+            "sys.stdin.read() > out",
+            "readonly q=1",
+        ] {
+            assert!(
+                !read_can_bind_variable(inert, "p"),
+                "{inert:?} cannot bind p"
+            );
+        }
+        for binds in [
+            "read p",
+            "read -r x p",
+            "read -a p",
+            "read -ra p",
+            "read -- p",
+            // No name: REPLY.
+            "read",
+        ] {
+            let name = if binds == "read" { "REPLY" } else { "p" };
+            assert!(
+                read_can_bind_variable(binds, name),
+                "{binds:?} must bind {name}"
+            );
+        }
+        for unreadable in [
+            "read $v",
+            "read \"$v\"",
+            "read 'p'",
+            "read p[0]",
+            "read -X p",
+            "read -a",
+            "read x $(echo p)",
+            "read -p \"two words\" p",
+            "read * ",
+        ] {
+            assert!(
+                read_can_bind_variable(unreadable, "p"),
+                "{unreadable:?} is not statically readable and must stay a hazard"
+            );
+        }
+    }
+
+    /// #574: an assignment-only segment performs every assignment in it, so a
+    /// sibling assignment no longer hides the binding a redirect relies on.
+    #[test]
+    fn assignment_only_segments_bind_each_name_574() {
+        assert_eq!(
+            assignment_only_segment_binding("B=/tmp/b T=/tmp/t", "B"),
+            AssignmentOnlyBinding::Binds("/tmp/b")
+        );
+        assert_eq!(
+            assignment_only_segment_binding("B=/tmp/b T=/tmp/t", "T"),
+            AssignmentOnlyBinding::Binds("/tmp/t")
+        );
+        assert_eq!(
+            assignment_only_segment_binding("B=$(mktemp -d) T=$(mktemp)", "B"),
+            AssignmentOnlyBinding::Binds("$(mktemp -d)")
+        );
+        assert_eq!(
+            assignment_only_segment_binding("B='a b' T=\"c d\"", "T"),
+            AssignmentOnlyBinding::Binds("\"c d\"")
+        );
+        assert_eq!(
+            assignment_only_segment_binding("B=/tmp/b T=/tmp/t", "X"),
+            AssignmentOnlyBinding::DoesNotBind
+        );
+        for ambiguous in [
+            "B=/tmp/b B=/home/u",
+            "B=/tmp/b B+=/x",
+            "B=/tmp/b B[1]=/x",
+            "B=/tmp/b IFS=/",
+        ] {
+            assert_eq!(
+                assignment_only_segment_binding(ambiguous, "B"),
+                AssignmentOnlyBinding::Ambiguous,
+                "{ambiguous:?}"
+            );
+        }
+        for not_assignment_only in [
+            "B=/tmp/b",
+            "B=/tmp/b cmd",
+            "B=/tmp/b T=/tmp/t cmd",
+            "B=/tmp/b >out",
+            "B=(a b) T=/tmp/t",
+            "B='unterminated T=/tmp/t",
+        ] {
+            assert_eq!(
+                assignment_only_segment_binding(not_assignment_only, "B"),
+                AssignmentOnlyBinding::NotAssignmentOnly,
+                "{not_assignment_only:?}"
+            );
+        }
+    }
+
+    /// #575 end to end: an unspaced append is an append.
+    #[test]
+    fn unspaced_append_to_a_dynamic_path_is_allowed_575() {
+        for command in [
+            "echo done >>\"$LOG\"",
+            "echo done >>$LOG",
+            "echo done 2>>\"$LOG\"",
+            "echo done &>>\"$LOG\"",
+            "echo done >>\"$HOME/notes.txt\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "echo done >\"$LOG\"",
+            "echo done 2>$LOG",
+            "echo x >>~/.bashrc",
+            "echo x >>\"$HOME/.bashrc\"",
+            "echo a >>/tmp/x >\"$LOG\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #548 end to end: force evidence for `docker rm`/`rmi` and `umount` comes
+    /// only from that command's own option words.
+    #[test]
+    fn force_removal_rules_take_flags_from_their_own_command_548() {
+        let packs = ["core.filesystem", "containers.docker", "system.disk"];
+        for command in [
+            "docker image rm cve-followup/web:1.2",
+            "docker rm probe-xf",
+            "docker rm probe-a probe-b; docker ps -a --format '{{.Names}}'",
+            "docker network rm probe-net && grep -f patterns.txt file.txt",
+            "cat docker-compose.yml && rm -f /tmp/a",
+            "flock /tmp/l docker run --rm --platform linux/arm64 alpine true",
+            "mytool run -- docker run --rm --platform linux/arm64 alpine true",
+            "sudo umount /mnt/x; sudo ip netns delete drill-firewall-test",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for (command, rule) in [
+            ("docker rm -f probe-a", "rm-force"),
+            ("docker rm probe-a -f", "rm-force"),
+            ("flock /tmp/l docker rm -f c1", "rm-force"),
+            ("docker ps -a; docker rm -f c1", "rm-force"),
+            ("docker rmi -f img", "rmi-force"),
+            ("sudo umount -f /mnt/x", "umount-force"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some(rule),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// #550 end to end: `unlink`/`mv` inside a longer token is not the command,
+    /// while launchers that run their operand stay covered. An argv0-scoped
+    /// unlink rule allowed every launcher row below.
+    #[test]
+    fn unlink_and_mv_rules_judge_the_command_word_550() {
+        for command in [
+            "ob sync-unlink --path /home/user/vault",
+            "foo --unlink /tmp/x",
+            "printf '%s' unlink /etc/passwd",
+            "git checkout -b fix-mv-handling /home/user/repo",
+            "tool x-mv /home/user/repo",
+            "tool --no-mv /etc/hosts",
+            "unlink /tmp/scratch/file",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "'unlink' /home/user/notes.txt",
+            "\"unlink\" /etc/passwd",
+            "find . -name x -exec unlink {} \\;",
+            "find /etc -name passwd -exec unlink {} +",
+            "flock /tmp/l unlink /etc/passwd",
+            "doas unlink /etc/passwd",
+            "parallel unlink ::: /etc/passwd",
+            "x=unlink; $x /etc/passwd",
+            "sudo unlink /etc/sudoers",
+            "mv /home/user/repo /tmp/r",
+            "'mv' /home/user/repo /tmp/r",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #574 end to end: the literal temp binding survives a grouped printf with
+    /// a substitution argument, a sibling prefix assignment, and a mutator that
+    /// names another variable, while every real rebinding still denies.
+    #[test]
+    fn redirect_binding_survives_unrelated_mutators_574() {
+        for command in [
+            "S=/tmp/x; { printf a \"$(true)\"; } > \"$S/o\"",
+            "S=/tmp/x; { printf a $(true); } > \"$S/o\"",
+            "S=/tmp/x; { printf a `true`; } > \"$S/o\"",
+            "B=/tmp/b T=/tmp/t && cat a > \"$B\"",
+            "B=/tmp/b T=/tmp/t; cat a > \"$B\"",
+            "B=$(mktemp) T=$(mktemp) && cat a > \"$B\"",
+            "S=/tmp/x; read x; cat a > \"$S/o\"",
+            "S=/tmp/x; printf -v other a; cat a > \"$S/o\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "proven /tmp redirect must stay allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "S=/tmp/x; printf -v S a; cat a > \"$S/o\"",
+            "S=/tmp/x; read S; cat a > \"$S/o\"",
+            "S=/tmp/x; read -a S; cat a > \"$S/o\"",
+            "S=/tmp/x; read; cat a > \"$REPLY/o\"",
+            "S=/home/u; cat a > \"$S/.bashrc\"",
+            "B=/tmp/b B=/home/u/.bashrc && cat a > \"$B\"",
+            "B=/tmp/b IFS=/ && cat a > $B",
+            "B=/tmp/b cmd && cat a > \"$B\"",
+            "S=/tmp/x; printf \"$(echo -v)\" S /etc; cat a > \"$S/o\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven or sensitive redirect target must stay denied: {command:?}: {:?}",
+                result.pattern_info
             );
         }
     }

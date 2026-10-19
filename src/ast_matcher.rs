@@ -5,12 +5,12 @@
 //! temporary-directory producer grants before the evaluator can use them.
 //! An unknown or replaced factory keeps the existing recursive-deletion rule.
 
+#[path = "ast_matcher/bash_temp_policy.rs"]
+mod bash_temp_policy;
 #[path = "ast_source_analysis.rs"]
 mod source_analysis;
 #[path = "ast_matcher/tempfile_provenance.rs"]
 mod tempfile_provenance;
-#[path = "ast_matcher/bash_temp_policy.rs"]
-mod bash_temp_policy;
 
 pub use source_analysis::*;
 
@@ -76,8 +76,8 @@ impl DefaultPolicyMatcher {
         timeout: Duration,
     ) -> Result<Vec<PatternMatch>, MatchError> {
         let started = Instant::now();
-        let matches = source_analysis::DEFAULT_MATCHER
-            .find_matches_with_timeout(code, language, timeout)?;
+        let matches =
+            source_analysis::DEFAULT_MATCHER.find_matches_with_timeout(code, language, timeout)?;
         let matches = bash_temp_policy::refine(
             code,
             language,
@@ -410,13 +410,11 @@ mod shared_literal_ast_tests {
 
     fn incumbent(code: &str, language: ScriptLanguage, isolated: bool) -> Snapshot {
         let result = match literal_recovery_scope(code, language, isolated) {
-            Some(allow_documentation) => {
-                source_analysis::interpreter_literal_shell_commands_inner(
-                    code,
-                    language,
-                    allow_documentation,
-                )
-            }
+            Some(allow_documentation) => source_analysis::interpreter_literal_shell_commands_inner(
+                code,
+                language,
+                allow_documentation,
+            ),
             None => Ok(Vec::new()),
         };
         snapshot(result)
@@ -455,9 +453,9 @@ mod shared_literal_ast_tests {
                     assert_eq!(actual, expected, "{language:?}, {lines}, {isolated}");
                     let commands = actual.expect("complete execution fixture");
                     assert!(
-                        commands.iter().any(|(command, _, _)| {
-                            command == "echo $(git reset --hard)"
-                        }),
+                        commands
+                            .iter()
+                            .any(|(command, _, _)| { command == "echo $(git reset --hard)" }),
                         "an indirect executable payload must survive AST sharing"
                     );
                     for (_, start, end) in commands {
@@ -496,31 +494,62 @@ mod shared_literal_ast_tests {
             }
         }
         for (language, source) in [
-            (ScriptLanguage::Python, "import os\nf = getattr(os, 'system')\nf('$(git reset --hard)')"),
-            (ScriptLanguage::Python, "def f(value):\n    os.system(value)\nf('$(git reset --hard)')"),
-            (ScriptLanguage::JavaScript, "const f = cp['execSync']; f('$(git reset --hard)');"),
+            (
+                ScriptLanguage::Python,
+                "import os\nf = getattr(os, 'system')\nf('$(git reset --hard)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "def f(value):\n    os.system(value)\nf('$(git reset --hard)')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const f = cp['execSync']; f('$(git reset --hard)');",
+            ),
             (ScriptLanguage::JavaScript, "tag`echo $(git reset --hard)`;"),
         ] {
             let actual = shared(source, language, true);
             assert_eq!(actual, incumbent(source, language, true), "{source}");
-            assert!(!actual.expect("complete reflective fixture").is_empty(), "{source}");
+            assert!(
+                !actual.expect("complete reflective fixture").is_empty(),
+                "{source}"
+            );
         }
     }
 
     #[test]
     fn shared_literal_ast_keeps_incomplete_analysis_and_cheap_gates() {
-        let oversized = format!("#{}\ntext = '$(git reset --hard)'", "x".repeat(LITERAL_EVIDENCE_MAX_BYTES));
-        let many_nodes = format!("{}text = '$(git reset --hard)'", "pass\n".repeat(LITERAL_EVIDENCE_MAX_NODES));
+        let oversized = format!(
+            "#{}\ntext = '$(git reset --hard)'",
+            "x".repeat(LITERAL_EVIDENCE_MAX_BYTES)
+        );
+        let many_nodes = format!(
+            "{}text = '$(git reset --hard)'",
+            "pass\n".repeat(LITERAL_EVIDENCE_MAX_NODES)
+        );
         for (language, source) in [
-            (ScriptLanguage::Python, "import os\ntext = '$(git reset --hard)'\nos.system("),
-            (ScriptLanguage::JavaScript, "const text = '$(git reset --hard)'; cp.execSync("),
+            (
+                ScriptLanguage::Python,
+                "import os\ntext = '$(git reset --hard)'\nos.system(",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const text = '$(git reset --hard)'; cp.execSync(",
+            ),
             (ScriptLanguage::Python, oversized.as_str()),
             (ScriptLanguage::Python, many_nodes.as_str()),
         ] {
             for isolated in [false, true] {
                 let actual = shared(source, language, isolated);
-                assert_eq!(actual, incumbent(source, language, isolated), "{language:?}");
-                assert!(actual.is_err(), "an incomplete tree cannot become empty success");
+                assert_eq!(
+                    actual,
+                    incumbent(source, language, isolated),
+                    "{language:?}"
+                );
+                assert!(
+                    actual.is_err(),
+                    "an incomplete tree cannot become empty success"
+                );
             }
         }
         for source in [
@@ -626,7 +655,10 @@ mod shared_literal_ast_tests {
         ] {
             let source = execution_source(language, lines);
             let expected = incumbent(&source, language, isolated).expect("reference completes");
-            assert!(!expected.is_empty(), "do not benchmark missing recovery as success");
+            assert!(
+                !expected.is_empty(),
+                "do not benchmark missing recovery as success"
+            );
             let mut old_ns = Vec::with_capacity(RUNS);
             let mut shared_ns = Vec::with_capacity(RUNS);
             for pair in 0..WARMUP + RUNS {
@@ -649,18 +681,21 @@ mod shared_literal_ast_tests {
                     let _ = black_box(actual);
                 }
             }
-            println!("{}", serde_json::json!({
-                "kind": "paired_shared_literal_ast",
-                "scope": "in_process_literal_recovery",
-                "reference_source": "36596fab6ca26aa5d40a70f4acbdced3db0d1886",
-                "reference": "previous_composition_with_shared_predicates",
-                "shape": shape,
-                "source_bytes": source.len(),
-                "runs": RUNS,
-                "warmup": WARMUP,
-                "old_ns": old_ns,
-                "shared_ns": shared_ns,
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "paired_shared_literal_ast",
+                    "scope": "in_process_literal_recovery",
+                    "reference_source": "36596fab6ca26aa5d40a70f4acbdced3db0d1886",
+                    "reference": "previous_composition_with_shared_predicates",
+                    "shape": shape,
+                    "source_bytes": source.len(),
+                    "runs": RUNS,
+                    "warmup": WARMUP,
+                    "old_ns": old_ns,
+                    "shared_ns": shared_ns,
+                })
+            );
         }
     }
 }
@@ -848,10 +883,7 @@ mod literal_execution_evidence_tests {
                 ScriptLanguage::JavaScript,
                 "const f = cp['exe' + 'cSync']; f('echo $(date)');",
             ),
-            (
-                ScriptLanguage::JavaScript,
-                "Function('return process')();",
-            ),
+            (ScriptLanguage::JavaScript, "Function('return process')();"),
             (ScriptLanguage::JavaScript, "tag`echo $(date)`;"),
             (ScriptLanguage::JavaScript, r"e\u0076al('echo $(date)');"),
             (
