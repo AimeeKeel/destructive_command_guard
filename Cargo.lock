@@ -149,22 +149,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "ast-grep-core"
-version = "0.51.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea8fe60a16a988662ebb1b14aafc94e03260a987fb909a54525555188473269"
-dependencies = [
- "bit-set 0.11.1",
- "regex",
- "thiserror",
- "tree-sitter",
-]
-
-[[package]]
 name = "ast-grep-language-dcg"
 version = "0.45.3"
 dependencies = [
- "ast-grep-core 0.45.3",
+ "ast-grep-core",
  "ignore",
  "serde",
  "tree-sitter",
@@ -955,7 +943,7 @@ version = "0.15.3"
 dependencies = [
  "aho-corasick",
  "assert_cmd",
- "ast-grep-core 0.51.0",
+ "ast-grep-core",
  "ast-grep-language-dcg",
  "async-trait",
  "base64",
