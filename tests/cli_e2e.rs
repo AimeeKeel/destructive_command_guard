@@ -2518,6 +2518,41 @@ mod config_tests {
         (home_dir, xdg_config_dir, bin_dir)
     }
 
+    /// The machine-wide config file the binary always reads
+    /// (`system_config_dir()` in `src/config.rs`).
+    fn machine_config_path() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::env::var_os("ProgramData")
+                .filter(|dir| !dir.is_empty())
+                .map_or_else(
+                    || std::path::PathBuf::from(r"C:\ProgramData"),
+                    std::path::PathBuf::from,
+                )
+                .join("dcg")
+                .join("config.toml")
+        } else if cfg!(target_os = "macos") {
+            std::path::PathBuf::from("/private/etc/dcg/config.toml")
+        } else {
+            std::path::PathBuf::from("/etc/dcg/config.toml")
+        }
+    }
+
+    /// The host's machine-wide config, when it exists AND `doctor` reports it
+    /// loaded.
+    ///
+    /// That layer is trusted policy with no environment override (an agent
+    /// must not be able to shed it), so the scratch HOME/XDG these tests use
+    /// cannot hide it. On a host with dcg installed system-wide (a machine-wide
+    /// `/etc/dcg/config.toml`) doctor correctly reports one
+    /// loaded file instead of built-in defaults, and `--fix` correctly leaves
+    /// the user config alone. Requiring both the file and doctor's own report
+    /// keeps the strict expectations on every host without such a file.
+    fn loaded_machine_config(doctor_output: &str) -> Option<std::path::PathBuf> {
+        let path = machine_config_path();
+        (path.is_file() && doctor_output.contains(&format!("system: {} [loaded;", path.display())))
+            .then_some(path)
+    }
+
     /// #320: a pinned install refuses `dcg update` before any network or
     /// installer work, with an actionable message naming the escape hatch.
     #[test]
@@ -3622,10 +3657,19 @@ mod config_tests {
             combined.contains("dcg doctor"),
             "expected header in doctor output\noutput:\n{combined}"
         );
-        assert!(
-            combined.contains("Checking configuration... USING DEFAULTS"),
-            "expected defaults notice\noutput:\n{combined}"
-        );
+        if let Some(machine_config) = loaded_machine_config(&combined) {
+            assert!(
+                combined.contains("Checking configuration... ")
+                    && !combined.contains("USING DEFAULTS"),
+                "{} is loaded, so doctor must not claim built-in defaults\noutput:\n{combined}",
+                machine_config.display()
+            );
+        } else {
+            assert!(
+                combined.contains("Checking configuration... USING DEFAULTS"),
+                "expected defaults notice\noutput:\n{combined}"
+            );
+        }
         assert!(
             combined.contains("Checking allowlist entries... NONE"),
             "expected allowlist none notice\noutput:\n{combined}"
@@ -3770,7 +3814,23 @@ mod config_tests {
         );
 
         let config_path = xdg_config_dir.join("dcg").join("config.toml");
-        let config_contents = std::fs::read_to_string(&config_path).expect("read config.toml");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(machine_config) = loaded_machine_config(&combined) {
+            // A loaded trusted layer is not "no configuration", so there is
+            // nothing for --fix to create.
+            assert!(
+                !config_path.exists(),
+                "{} is loaded; doctor --fix must not add a default user config\noutput:\n{combined}",
+                machine_config.display()
+            );
+            return;
+        }
+        let config_contents = std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|error| panic!("read config.toml: {error}\noutput:\n{combined}"));
         assert!(
             !config_contents.trim().is_empty(),
             "expected config.toml to be created"
@@ -5907,23 +5967,56 @@ block = [
     }
 
     #[test]
-    fn hook_mode_missing_dcg_config_fails_open() {
-        // If the user sets DCG_CONFIG incorrectly, hook mode must not break
-        // workflows (fail-open). It should behave as if no config was loaded.
-        let missing = std::ffi::OsStr::new("/tmp/dcg_config_missing_should_not_exist");
-        let result = run_dcg_hook_with_env("git status", &[("DCG_CONFIG", missing)]);
+    fn hook_mode_missing_dcg_config_fails_closed() {
+        // An explicitly selected config that does not exist is an unknown
+        // policy, not the default one: the custom packs, policy rules and
+        // fail_closed it was meant to carry are missing. Since #568
+        // (5b1d5bf) hook mode denies every shell command with the reason
+        // instead of silently evaluating with built-in defaults; it used to
+        // fail open here.
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let missing = scratch
+            .path()
+            .join("dcg_config_missing_should_not_exist.toml");
+        let result = run_dcg_hook_with_env("git status", &[("DCG_CONFIG", missing.as_os_str())]);
 
         assert!(
             result.output.status.success(),
-            "hook mode should exit successfully\nstdout:\n{}\nstderr:\n{}",
+            "hook protocol denial still exits 0\nstdout:\n{}\nstderr:\n{}",
             result.stdout_str(),
             result.stderr_str()
         );
+        let json: serde_json::Value = serde_json::from_str(result.stdout_str().trim())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "expected a JSON denial for a missing DCG_CONFIG ({error})\nstdout:\n{}\nstderr:\n{}",
+                    result.stdout_str(),
+                    result.stderr_str()
+                )
+            });
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{json}"
+        );
+        let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("denial carries a reason");
         assert!(
-            result.stdout_str().trim().is_empty(),
-            "expected allow (no stdout) even with missing DCG_CONFIG\nstdout:\n{}\nstderr:\n{}",
-            result.stdout_str(),
-            result.stderr_str()
+            reason.contains("DCG configuration error")
+                && reason.contains("dcg_config_missing_should_not_exist.toml")
+                && reason.contains("does not exist"),
+            "the reason must name the missing file: {reason}"
+        );
+
+        // Control: the same harmless command is allowed when no config is
+        // selected, so the denial above comes from the missing selection.
+        let control = run_dcg_hook("git status");
+        assert!(control.output.status.success());
+        assert!(
+            control.stdout_str().trim().is_empty(),
+            "git status without DCG_CONFIG must stay allowed\nstdout:\n{}\nstderr:\n{}",
+            control.stdout_str(),
+            control.stderr_str()
         );
     }
 

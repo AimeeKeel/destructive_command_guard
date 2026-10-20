@@ -402,11 +402,14 @@ fn configuration_denials_preserve_each_harness_blocking_contract() {
             "/decision",
             "deny",
         ),
+        // Antigravity's strict protojson parser accepts only its documented
+        // fields; since #573 (16b4225) a denial is exactly
+        // {"decision":"deny","reason":...}.
         (
             "antigravity",
             json!({"toolCall":{"name":"run_command","args":{"CommandLine":HARMLESS}},"conversationId":"568","stepIdx":1}),
             "/decision",
-            "block",
+            "deny",
         ),
         (
             "crush",
@@ -452,6 +455,20 @@ fn configuration_denials_preserve_each_harness_blocking_contract() {
                         "{value}"
                     );
                 }
+            }
+            if *host == "antigravity" {
+                let mut fields: Vec<&str> = value
+                    .as_object()
+                    .expect("Antigravity reply is a JSON object")
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                fields.sort_unstable();
+                assert_eq!(
+                    fields,
+                    ["decision", "reason"],
+                    "any other field fails agy's strict parser (#573): {value}"
+                );
             }
         }
         let mut command = fixture.command();

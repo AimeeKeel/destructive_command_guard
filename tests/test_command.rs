@@ -330,14 +330,19 @@ reason = "must remain inactive without a regular config file"
         &[("DCG_CONFIG", missing_project_config.as_path())],
     );
 
+    // A missing selected config is not a trust signal. Since #568 (5b1d5bf)
+    // it is not a silent fallback to defaults either: the command is refused
+    // as a configuration error (exit 3), before any allowlist is consulted.
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(3),
         "a missing selected config is not a trust signal\nstdout: {}\nstderr: {}",
         stdout_text(&output),
         stderr_text(&output)
     );
-    assert_eq!(parse_json(&output)["decision"], "deny");
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["error"]["kind"], "configuration_error", "{json}");
 }
 
 #[test]

@@ -80,7 +80,6 @@ fn archive_extraction_respects_directory_scope_and_real_modes() {
         "tar -xf payload.tar -C /home/user/.ssh -T members.txt -C /tmp",
         "tar -xf payload.tar -C /home/user/.ssh --files-from=members.txt -C /tmp",
         "tar -xf payload.tar -C /home/user/.ssh --add-file=member -C /tmp",
-        "tar -xf payload.tar -C /tmp $EMPTY -C /home/user/.ssh",
         "tar -xf payload.tar --exclude -O -C ~/.ssh",
         "tar -xf -O -C ~/.ssh",
         "unzip payload.zip -l -d ~/.ssh",
@@ -103,7 +102,11 @@ fn archive_extraction_respects_directory_scope_and_real_modes() {
         "tar -cf -x -C ~/.ssh file",
         "tar -tf payload.tar -- -x -C ~/.ssh",
         "tar -xf payload.tar -- -C ~/.ssh",
-        "tar -xfC ~/.ssh",
+        // `f` takes the rest of the bundle ("C") as the archive, so the
+        // operand is a member name, not a -C directory. Spelled absolutely:
+        // an unquoted `~` operand is an unresolved expansion to tar's helper
+        // analysis (4535310), which is not what this case is about.
+        "tar -xfC /home/user/.ssh",
         "unzip -l payload.zip -d ~/.ssh",
         "unzip -t payload.zip -d ~/.ssh",
         "unzip -p payload.zip -d ~/.ssh",
@@ -119,6 +122,31 @@ fn archive_extraction_respects_directory_scope_and_real_modes() {
     ] {
         assert_decision(command, home.path(), None);
     }
+
+    // An unresolved word among tar's options can expand to a helper option
+    // (`--to-command=...`, `-I prog`), so since 4535310 it is denied first
+    // under `tar-exec-unverified`. That review is its own grant: allowing it
+    // must not let the expansion hide the later `~/.ssh` destination.
+    let dynamic = "tar -xf payload.tar -C /tmp $EMPTY -C /home/user/.ssh";
+    assert_decision(dynamic, home.path(), Some("tar-exec-unverified"));
+    let granted = self::home();
+    fs::write(
+        granted.path().join("xdg/dcg/allowlist.toml"),
+        "[[allow]]\nrule = \"core.filesystem:tar-exec-unverified\"\nreason = \"helper review only\"\n",
+    )
+    .unwrap();
+    assert_decision(dynamic, granted.path(), Some("credential-file-write"));
+    // The word may itself be a member, extracted into the directory before it.
+    assert_decision(
+        "tar -xf payload.tar -C ~/.ssh $EMPTY -C /tmp",
+        granted.path(),
+        Some("credential-file-write"),
+    );
+    assert_decision(
+        "tar -xf payload.tar -C /tmp $EMPTY -C /tmp/scratch",
+        granted.path(),
+        None,
+    );
 }
 
 #[test]

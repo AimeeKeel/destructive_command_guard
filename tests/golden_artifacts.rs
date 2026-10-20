@@ -14,6 +14,7 @@
 //! normalized before comparison.
 
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -147,7 +148,119 @@ fn explain_artifact(name: &str, command: &str) {
     let mut json: Value =
         serde_json::from_str(&output.stdout).expect("explain --format json stdout is JSON");
     canonicalize_explain_json(&mut json);
-    assert_golden_json(&format!("explain/{name}.json"), &json);
+    let golden = format!("explain/{name}.json");
+    if let Some(host_keywords) = host_machine_pack_keywords() {
+        discount_host_keywords(&golden, &mut json, &host_keywords);
+    }
+    assert_golden_json(&golden, &json);
+}
+
+/// The machine-wide config file the binary always reads
+/// (`system_config_dir()` in `src/config.rs`).
+fn machine_config_path() -> PathBuf {
+    if cfg!(windows) {
+        std::env::var_os("ProgramData")
+            .filter(|dir| !dir.is_empty())
+            .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
+            .join("dcg")
+            .join("config.toml")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from("/private/etc/dcg/config.toml")
+    } else {
+        PathBuf::from("/etc/dcg/config.toml")
+    }
+}
+
+/// Keywords of the external packs that the host's machine-wide config loads.
+///
+/// That config is trusted policy that no environment variable can mask (by
+/// design: an agent must not be able to shed it), so `run_dcg` cannot isolate
+/// it the way it isolates HOME. A build host may ship one whose
+/// `custom_paths` loads an external pack (for example one that adds the
+/// keywords `modprobe` and `rmmod`), and `explain` truthfully lists those
+/// keywords with the built-in ones.
+/// `None` means the host has no such file, which is the environment the
+/// artifacts are captured in. Only literal and glob `custom_paths` entries
+/// are read; a keyword from any other source stays unexplained and fails the
+/// comparison.
+fn host_machine_pack_keywords() -> Option<BTreeSet<String>> {
+    let path = machine_config_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let config: toml::Value = toml::from_str(&text)
+        .unwrap_or_else(|err| panic!("parse machine-wide config {}: {err}", path.display()));
+    let mut keywords = BTreeSet::new();
+    let patterns = config
+        .get("packs")
+        .and_then(|packs| packs.get("custom_paths"))
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str);
+    for pattern in patterns {
+        for pack_path in glob::glob(pattern).into_iter().flatten().flatten() {
+            let pack_text = std::fs::read_to_string(&pack_path)
+                .unwrap_or_else(|err| panic!("read pack {}: {err}", pack_path.display()));
+            let pack: serde_yaml::Value = serde_yaml::from_str(&pack_text)
+                .unwrap_or_else(|err| panic!("parse pack {}: {err}", pack_path.display()));
+            keywords.extend(
+                pack.get("keywords")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .map(str::to_owned),
+            );
+        }
+    }
+    Some(keywords)
+}
+
+/// Drop from `actual` the keywords that only the host's external packs add.
+///
+/// A host keyword that the golden itself lists is kept, so a built-in keyword
+/// is never discounted: every built-in keyword must still be present, and any
+/// other extra keyword still fails the exact comparison.
+fn discount_host_keywords(golden: &str, actual: &mut Value, host_keywords: &BTreeSet<String>) {
+    if host_keywords.is_empty() {
+        return;
+    }
+    assert!(
+        std::env::var_os(UPDATE_ENV).is_none(),
+        "refusing to record {golden}: {} loads external packs whose keywords {host_keywords:?} \
+         would be committed as built-in ones; regenerate on a host without it",
+        machine_config_path().display()
+    );
+    let path = Path::new(GOLDEN_ROOT).join(golden);
+    let expected: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("missing golden artifact {}: {err}", path.display())),
+    )
+    .unwrap_or_else(|err| panic!("invalid golden artifact {}: {err}", path.display()));
+    let expected_keywords: BTreeSet<&str> = expected["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|step| step["details"]["keywords_checked"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    for step in actual
+        .get_mut("steps")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(keywords) = step
+            .pointer_mut("/details/keywords_checked")
+            .and_then(Value::as_array_mut)
+        {
+            keywords.retain(|keyword| {
+                keyword.as_str().is_none_or(|keyword| {
+                    !host_keywords.contains(keyword) || expected_keywords.contains(keyword)
+                })
+            });
+        }
+    }
 }
 
 fn canonicalize_explain_json(value: &mut Value) {

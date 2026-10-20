@@ -29,7 +29,11 @@ enum Verdict {
     Deny(&'static str),
 }
 
-const RULES: &[&str] = &["redirect-truncate-root-home", "credential-file-write"];
+const RULES: &[&str] = &[
+    "redirect-truncate-root-home",
+    "credential-file-write",
+    "redirect-truncate-git-internals-relative",
+];
 
 /// Evaluate one shell command in hook mode with `home` as `$HOME`.
 fn verdict(command: &str, home: &Path) -> Verdict {
@@ -145,13 +149,18 @@ fn absent_literal_home_targets_are_creation_regardless_of_vcs() {
         verdict("echo hi > ~/missing-parent/absent.txt", home),
         Verdict::Deny("redirect-truncate-root-home")
     );
+    // A redirect into any `.git` directory is repository state, not a new
+    // file: since #492 (c6bced6) the protected-path classifier, which runs
+    // ahead of the redirect regexes, decodes these targets and denies them
+    // under the Critical Git redirect rule, whose grant is separate from the
+    // home rule's. The absent-file carve-out never reaches them.
     assert_eq!(
         verdict("echo hi > ~/repo/.git/HEAD-new", home),
-        Verdict::Deny("redirect-truncate-root-home")
+        Verdict::Deny("redirect-truncate-git-internals-relative")
     );
     assert_eq!(
         verdict("echo hi > ~/.claude/.git/config", home),
-        Verdict::Deny("redirect-truncate-root-home")
+        Verdict::Deny("redirect-truncate-git-internals-relative")
     );
     assert_eq!(
         verdict("echo hi > ~/.claude/absent.txt > ~/.vimrc", home),
