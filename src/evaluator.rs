@@ -52327,6 +52327,43 @@ mod tests {
         }
     }
 
+    /// The Trash soft-delete dcg recommends reads a quoted `&` as a file-name
+    /// byte (#552), and an unquoted brace list no longer rides it past the
+    /// `..` guard.
+    #[test]
+    fn trash_rescue_quoted_separators_and_braces_end_to_end_posix() {
+        for command in [
+            r#"mv "/Users/u/Documents/Kevin & Linh's Wedding.pdf" ~/.Trash/"#,
+            r"mv '/home/u/docs/a;b.txt' /home/u/.local/share/Trash/",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "a quoted separator in a Trash move is file-name data: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "mv ~/a/{..,b}/{..,c}/{..,d}/etc ~/.Trash/",
+            r#"mv "/Users/u/Documents/a & b.txt" ~/.Trash/ && rm -rf ~"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "the Trash rescue must stay bounded: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
     #[test]
     fn nested_substitution_bindings_do_not_prove_outer_variables() {
         // A binding inside `$( )`, backticks, or `<( )` runs in a subshell;

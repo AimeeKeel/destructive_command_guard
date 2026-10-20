@@ -4944,11 +4944,13 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `/Users/<user>` root, or a sensitive system tree — and both
         // sides carry the standard `..`-traversal guard. Dynamic paths
         // (`$`, backticks, backslashes) fall through to the fail-closed
-        // rules.
+        // rules, and so does an unquoted `{`: bash expands a brace list
+        // before mv runs, past the `..` guard, so
+        // `mv ~/a/{..,b}/{..,c}/{..,d}/etc ~/.Trash/` moved `/etc`.
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-to-trash",
-            r"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:~/|/home/[^/\s]+/|/Users/[^/\s]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&]*)+[ \t]+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&]*)?\s*$"
+            r"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:~/|/home/[^/\s{]+/|/Users/[^/\s{]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&{]*)+[ \t]+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&{]*)?\s*$"
         ),
         // -----------------------------------------------------------------
         // `mv` into the platform Trash, with quoted paths and a resolved
@@ -4969,10 +4971,20 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `/home/<user>` or `/Users/<user>` root, nor a sensitive system
         // tree), only with quoted variants added. The destination is still a
         // Trash directory, so the rescued operation stays recoverable.
+        //
+        // Quoted sources read `;`, `|` and `&` as file-name bytes, as
+        // `mv-within-home` does (GitHub #552): `mv "~/Documents/a & b.txt"
+        // ~/.Trash/` was denied while the same name with a space was allowed.
+        // That needs the regex to read quoting exactly as the shell does, so
+        // the dynamic-byte guard scans the whole text (no backslash anywhere
+        // means a quote closes only on its own kind), and an unquoted source
+        // may contain no quote character and no `{` (bash brace expansion,
+        // which would get past the `..` guard). Unquoted user names carry the
+        // component restrictions too.
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-to-trash-quoted",
-            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~/|/home/[^/\s'"]+/|/Users/[^/\s'"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&]*|"(?:~/|/home/[^/"]+/|/Users/[^/"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|")|[^"]*/\.\.(?:/|"))[A-Za-z0-9._][^"$`;|&]*"|'(?:~/|/home/[^/']+/|/Users/[^/']+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|')|[^']*/\.\.(?:/|'))[A-Za-z0-9._][^'$`;|&]*'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?|"(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?"|'(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?')[ \t]*$"#
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~/|/home/[^/\s'"$`;|&{]+/|/Users/[^/\s'"$`;|&{]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&'"{]*|"(?:~/|/home/[^/"]+/|/Users/[^/"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|")|[^"]*/\.\.(?:/|"))[A-Za-z0-9._][^"$`]*"|'(?:~/|/home/[^/']+/|/Users/[^/']+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|')|[^']*/\.\.(?:/|'))[A-Za-z0-9._][^'$`]*'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"'{]*)?|"(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?"|'(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?')[ \t]*$"#
         ),
         // -----------------------------------------------------------------
         // Ordinary renames and moves *inside* one home subtree.
@@ -8872,6 +8884,44 @@ mod tests {
             assert!(
                 pack.check(cmd).is_none(),
                 "a quoted separator in a harmless command must stay data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn trash_rescues_read_quoted_separators_and_refuse_brace_expansion() {
+        // #552 for the Trash soft-delete: a quoted `&`, `;` or `|` is a
+        // file-name byte, exactly like the space that was already allowed.
+        let pack = create_pack();
+        for cmd in [
+            r#"mv "/Users/u/Documents/a & b.txt" ~/.Trash/"#,
+            r"mv '/Users/u/Documents/a;b.txt' '/Users/u/.Trash/'",
+            r#"mv "/home/u/docs/a | b.txt" /home/u/.local/share/Trash/"#,
+            r#"mv "a & b" ~/.Trash/"#,
+            r#"mv "/Users/u/Documents/{a,b}.txt" ~/.Trash/"#,
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator in a Trash move is file-name data: {cmd}"
+            );
+        }
+        // An unquoted brace list expands past the `..` guard before mv runs,
+        // and the quote-aware reading must not let a real separator through.
+        for cmd in [
+            "mv ~/a/{..,b}/{..,c}/{..,d}/etc ~/.Trash/",
+            "mv /Users/{u,root}/Documents/x ~/.Trash/",
+            "mv ~/Documents/x ~/.Trash/{..,a}",
+            r#"mv ~/D/a" "/Users/u/D/b & rm -rf ~ & x" ~/.Trash/"#,
+            r#"mv "/Users/u/Documents/a & b.txt" ~/.Trash/ & rm -rf ~"#,
+            r#"mv "/Users/u/Documents/../../../etc & x" ~/.Trash/"#,
+            r#"mv "$HOME/a & b" ~/.Trash/"#,
+            r#"mv "/etc/a & b" ~/.Trash/"#,
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "the Trash rescue must stay bounded: {cmd}"
             );
         }
     }
