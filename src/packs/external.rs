@@ -512,102 +512,66 @@ fn external_executable_name_error(name: &str) -> Option<&'static str> {
     None
 }
 
-/// Return true only when a regex is structurally incapable of consuming
-/// input: anchors, lookarounds, and flag-only groups are allowed, but there is
-/// no literal/character-class/dot/backreference atom outside a lookaround.
+/// Prove that a parsed regex contains only non-consuming expressions.
 ///
-/// External rules with this shape are operationally dangerous: they can
-/// validate successfully yet yield only zero-width matches. Reject them
-/// instead of letting operators believe an inert guard is active.
+/// A byte-level heuristic cannot distinguish group syntax from literal `:`,
+/// `=`, or `-`, and rejecting one valid rule drops the entire external pack.
+/// Use the same parser as the regex engine, which owns inline flags, comments,
+/// character classes and captures. Nullable expressions with consuming atoms
+/// remain valid; this is deliberately not a general match-width analysis.
 ///
-/// This is deliberately a narrow structural proof, not a general nullable-
-/// regex analysis. Patterns that can both consume and match empty are left
-/// alone.
+/// An unfamiliar expression or exhausted proof budget is not evidence that a
+/// pack is inert. Keep ordinary validation/matching in those cases instead of
+/// disabling a possibly effective protection pack. No regex is executed here.
 fn pattern_is_zero_width_only(pattern: &str) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut index = 0usize;
-    let mut class = false;
-    let mut lookaround_depth = 0usize;
-    let mut group_stack: Vec<bool> = Vec::new();
+    use fancy_regex::Expr;
 
-    while index < bytes.len() {
-        let byte = bytes[index];
-
-        if class {
-            if byte == b'\\' {
-                index = index.saturating_add(2);
-                continue;
-            }
-            if byte == b']' {
-                class = false;
-            }
-            if lookaround_depth == 0 && byte != b']' {
-                return false;
-            }
-            index += 1;
-            continue;
-        }
-
-        if byte == b'\\' {
-            let Some(next) = bytes.get(index + 1).copied() else {
-                return false;
-            };
-            if lookaround_depth == 0 && !matches!(next, b'A' | b'Z' | b'z' | b'G' | b'b' | b'B') {
-                return false;
-            }
-            index += 2;
-            continue;
-        }
-
-        if byte == b'[' {
-            class = true;
-            if lookaround_depth == 0 {
-                return false;
-            }
-            index += 1;
-            continue;
-        }
-
-        if byte == b'(' {
-            let rest = &pattern[index..];
-            let is_lookaround = rest.starts_with("(?=")
-                || rest.starts_with("(?!")
-                || rest.starts_with("(?<=")
-                || rest.starts_with("(?<!");
-            group_stack.push(is_lookaround);
-            if is_lookaround {
-                lookaround_depth += 1;
-            }
-            index += 1;
-            continue;
-        }
-
-        if byte == b')' {
-            if group_stack.pop().unwrap_or(false) {
-                lookaround_depth = lookaround_depth.saturating_sub(1);
-            }
-            index += 1;
-            continue;
-        }
-
-        if lookaround_depth == 0 {
-            match byte {
-                b'^' | b'$' | b'|' | b'*' | b'+' | b'?' | b'{' | b'}' | b',' | b':' | b'='
-                | b'!' | b'<' | b'>' | b'-' => {}
-                b'a'..=b'z' | b'A'..=b'Z' => {
-                    let flag = index >= 2 && &bytes[index - 2..index] == b"(?";
-                    if !flag {
-                        return false;
-                    }
-                }
-                _ => return false,
-            }
-        }
-        index += 1;
+    const MAX_PATTERN_BYTES: usize = 8 * 1024;
+    const MAX_NODES: usize = 4096;
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return false;
     }
-
+    let Ok(tree) = Expr::parse_tree(pattern) else {
+        return false;
+    };
+    let mut pending = vec![(&tree.expr, false)];
+    let mut remaining = MAX_NODES;
+    while let Some((expression, in_lookaround)) = pending.pop() {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        match expression {
+            Expr::Empty | Expr::Assertion(_) => {}
+            // Inspect the body too: match-boundary operations such as \K,
+            // subroutines and control verbs are not an ordinary assertion
+            // proof just because they are nested inside a lookaround.
+            Expr::LookAround(child, _) => pending.push((child.as_ref(), true)),
+            Expr::Concat(children) | Expr::Alt(children) => {
+                // Bound the work list before extending it, not only when
+                // visiting it. The iterative walk also avoids recursion.
+                if children.len() > remaining.saturating_sub(pending.len()) {
+                    return false;
+                }
+                pending.extend(children.iter().map(|child| (child, in_lookaround)));
+            }
+            Expr::Group(child) => pending.push((child.as_ref(), in_lookaround)),
+            Expr::AtomicGroup(child) | Expr::Repeat { child, .. } => {
+                pending.push((child.as_ref(), in_lookaround));
+            }
+            Expr::Literal { .. } | Expr::Any { .. } | Expr::Delegate { .. } => {
+                if !in_lookaround {
+                    return false;
+                }
+            }
+            // Backreferences, subroutines, control verbs and future node
+            // kinds need proofs we do not make here.
+            _ => return false,
+        }
+    }
     true
 }
+
 /// Validate an external pack structure.
 ///
 /// Checks:
@@ -1180,6 +1144,152 @@ impl ExternalPackLoader {
 #[allow(clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
+
+    fn width_test_pack(pattern: &str, safe: bool) -> String {
+        let section = if safe {
+            "safe_patterns"
+        } else {
+            "destructive_patterns"
+        };
+        // JSON string syntax is valid YAML and preserves regex backslashes.
+        let quoted = serde_json::to_string(pattern).unwrap();
+        format!(
+            "id: test.width\nname: Width\nversion: 1.0.0\n{section}:\n  - name: width\n    pattern: {quoted}\n"
+        )
+    }
+
+    #[test]
+    fn zero_width_analysis_keeps_consuming_punctuation_and_nullable_rules() {
+        for (pattern, witness) in [
+            (":", ":"),
+            ("=", "="),
+            ("-", "-"),
+            (",", ","),
+            ("!", "!"),
+            ("<", "<"),
+            (">", ">"),
+            ("#", "#"),
+            ("^:$", ":"),
+            ("(?:=)", "="),
+            ("(?i:-)", "-"),
+            ("(?=:)[:]+", ":"),
+            ("[[:punct:]]", "="),
+            ("(?:(?=x)|:)", ":"),
+            (":?", ":"),
+            ("(?:tee|)", "tee"),
+            (r"\btee\b", "tee"),
+            (r"(?=(a))\1", "a"),
+            ("(?=λ)λ", "λ"),
+        ] {
+            let regex = fancy_regex::Regex::new(pattern).unwrap();
+            let matched = regex.find(witness).unwrap().expect("consuming witness");
+            assert!(matched.end() > matched.start(), "{pattern}: {witness}");
+            assert!(!pattern_is_zero_width_only(pattern), "{pattern}");
+            for safe in [false, true] {
+                let pack = parse_pack_string(&width_test_pack(pattern, safe))
+                    .unwrap_or_else(|error| panic!("{pattern}, safe={safe}: {error}"))
+                    .into_pack();
+                if safe {
+                    assert!(pack.matches_safe(witness), "{pattern}");
+                } else {
+                    assert!(pack.matches_destructive(witness).is_some(), "{pattern}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_width_analysis_uses_parsed_flags_comments_groups_and_lookarounds() {
+        for pattern in [
+            "",
+            "^",
+            "$",
+            r"\A\z",
+            r"\b",
+            "(?=tee)",
+            "(?!tee)",
+            "(?<=tee)",
+            "(?<!tee)",
+            "(?im:^$)",
+            "(?P<empty>^)",
+            "(?>(?=tee))",
+            "(?:(?=tee)|$)",
+            "(?=tee){2}",
+            "(?x:\n# ignored literal text\n^ (?=tee)\n)",
+        ] {
+            fancy_regex::Regex::new(pattern).expect("valid zero-width regex");
+            assert!(pattern_is_zero_width_only(pattern), "{pattern}");
+            for safe in [false, true] {
+                let error = parse_pack_string(&width_test_pack(pattern, safe))
+                    .expect_err("zero-width-only rule must be diagnosed");
+                assert!(
+                    matches!(&error, PackParseError::InvalidPattern { name, .. } if name == "width"),
+                    "{pattern}, safe={safe}: {error}"
+                );
+                assert!(error.to_string().contains("no consuming match"));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_width_reporter_repair_has_a_real_nonempty_runtime_match() {
+        let source = "S=/tmp/scratch/a@/etc/profile; IFS=@; echo x | tee $S";
+        let pattern = r"(?s)(?=.*IFS=@)(?=.*tee)[\s\S]*";
+        let pack = parse_pack_string(&width_test_pack(pattern, false))
+            .unwrap()
+            .into_pack();
+        // Parsing alone would not catch accidentally doubled backslashes in
+        // the character class: assert the actual runtime regex spans source.
+        assert_eq!(
+            pack.destructive_patterns[0].regex.find(source),
+            Some((0, source.len()))
+        );
+        assert!(pack.matches_destructive(source).is_some());
+    }
+
+    #[test]
+    fn zero_width_proof_limits_and_unknown_expressions_do_not_disable_packs() {
+        assert!(!pattern_is_zero_width_only("("));
+        assert!(!pattern_is_zero_width_only(&"^".repeat(8 * 1024 + 1)));
+        assert!(!pattern_is_zero_width_only(&"^".repeat(4097)));
+        // A lookahead can capture a value that a later backreference consumes.
+        assert!(!pattern_is_zero_width_only(r"(?=(a))\1"));
+        assert!(!pattern_is_zero_width_only(r"(a)\1"));
+        // Unsupported nodes cannot be hidden inside a lookaround either.
+        assert!(!pattern_is_zero_width_only(r"(?=(a)\1)"));
+        assert!(!pattern_is_zero_width_only(r"(?<=\Ka)"));
+    }
+
+    #[test]
+    fn punctuation_rule_cannot_drop_other_protections_from_loaded_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guard.yaml");
+        for section in ["safe_patterns", "destructive_patterns"] {
+            let yaml = format!(
+                "id: test.guarded\nname: Guarded\nversion: 1.0.0\n{section}:\n  - name: punctuation\n    pattern: '^:$'\n"
+            );
+            let yaml = if section == "safe_patterns" {
+                format!("{yaml}destructive_patterns:\n  - name: danger\n    pattern: danger\n")
+            } else {
+                format!("{yaml}  - name: danger\n    pattern: danger\n")
+            };
+            std::fs::write(&path, yaml).unwrap();
+            let loader = ExternalPackLoader::from_paths(&[path.to_string_lossy().into_owned()]);
+            for loaded in [loader.load_all(), loader.load_all_deduped()] {
+                assert!(
+                    loaded.warnings.is_empty(),
+                    "{section}: {:?}",
+                    loaded.warnings
+                );
+                assert_eq!(loaded.packs.len(), 1, "{section}");
+                let pack = loaded.packs.into_iter().next().unwrap().pack.into_pack();
+                let hit = pack
+                    .check("danger")
+                    .expect("other protection must remain active");
+                assert_eq!(hit.name, Some("danger"));
+            }
+        }
+    }
 
     #[test]
     fn test_parse_valid_pack() {
