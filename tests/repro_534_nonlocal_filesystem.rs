@@ -598,6 +598,58 @@ fn remote_denials_describe_the_other_environment() {
     );
 }
 
+/// #554: a quoted inline ssh script folds its own `mktemp -d` directory like
+/// the same script locally, in `bash -c`, and in a quoted `ssh host <<'EOF'`
+/// body. The fold is lexical, so no local file can change the remote verdict.
+#[test]
+fn inline_ssh_scripts_fold_their_own_temporary_directory_issue_554() {
+    let fixture = Fixture::new();
+    for command in [
+        "T=$(mktemp -d); echo x > $T/s",
+        "bash -c 'T=$(mktemp -d); echo x > $T/s'",
+        "ssh h <<'EOF'\nT=$(mktemp -d); echo x > $T/s\nEOF",
+        "ssh h 'T=$(mktemp -d); echo x > $T/s'",
+        "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"'",
+        "ssh h 'T=$(mktemp -d -p /tmp); echo x > \"$T/s\"'",
+        "ssh h 'S=/tmp/sub; echo x > \"$S/out\"'",
+    ] {
+        fixture.allowed(command);
+    }
+    for (command, rule) in [
+        (
+            "ssh h 'T=~/x; echo x > $T/s'",
+            "core.filesystem:redirect-truncate-dynamic-path",
+        ),
+        (
+            "ssh h 'echo x > $HOME/.bashrc'",
+            "core.filesystem:credential-file-write",
+        ),
+        (
+            "ssh h 'echo x > $X/s'",
+            "core.filesystem:redirect-truncate-dynamic-path",
+        ),
+        (
+            "ssh h \"T=$(mktemp -d); echo x > $T/s\"",
+            "core.filesystem:redirect-truncate-dynamic-path",
+        ),
+    ] {
+        fixture.denied(command, rule);
+    }
+    for command in [
+        "T=$(mktemp -d); ssh h 'echo x > $T/s'",
+        "ssh h bash -c 'T=$(mktemp -d); echo x > $T/s'",
+        "ssh h 'T=$(mktemp -d /etc/v-XXXXXX); echo x > \"$T/p\"'",
+        "ssh h 'T=$(mktemp -d); echo x > \"$T/../../etc/passwd\"'",
+        "ssh h 'T=$(mktemp -d); echo x > \"$T/.git/config\"'",
+        "ssh h 'T=$(mktemp -d); T=/etc; echo x > \"$T/passwd\"'",
+        "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"; echo y > ~/note'",
+        "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"; git reset --hard'",
+    ] {
+        let (decision, rule, reason) = fixture.judge(command);
+        assert_eq!(decision, "deny", "{command:?}: {rule} {reason}");
+    }
+}
+
 #[test]
 fn remote_database_inputs_and_startup_files_are_unverified() {
     let fixture = Fixture::new();

@@ -14,6 +14,8 @@ mod tempfile_provenance;
 
 pub use source_analysis::*;
 
+pub(crate) use bash_temp_policy::literal_temp_rm;
+
 use crate::heredoc::ScriptLanguage;
 use std::ops::Deref;
 use std::sync::LazyLock;

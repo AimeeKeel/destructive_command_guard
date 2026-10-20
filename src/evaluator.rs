@@ -26064,7 +26064,17 @@ fn literal_bash_source_range(
             })
             .then(|| range.clone());
     }
-    if !bash || nonlocal {
+    // `ssh destination '<script>'` hands these exact single-quoted bytes to
+    // the remote shell as its command line: the inline counterpart of the
+    // quoted `ssh destination <<'EOF'` body above (#554). The same POSIX
+    // receiver model applies, and so does the #534 boundary: the proofs that
+    // consume this range are lexical (literal /tmp bindings, `mktemp -d`
+    // folds) and the evaluation that uses them keeps the remote filesystem
+    // scope, so nothing from the caller's filesystem is borrowed. The AST
+    // walk below still requires the exact `ssh destination '<script>'` argv.
+    let ssh_inline =
+        content.heredoc_type.is_none() && content.target_command.as_deref() == Some("ssh");
+    if (!bash || nonlocal) && !ssh_inline {
         return None;
     }
     let ast = crate::heredoc::try_parse_shell_ast(command).ok()?;
@@ -26087,18 +26097,30 @@ fn literal_bash_source_range(
                 .children()
                 .filter(ast_grep_core::Node::is_named)
                 .collect();
-            let [program, flag, argument] = words.as_slice() else {
+            let [program, operand, argument] = words.as_slice() else {
                 return None;
             };
+            let program_name = program.text();
+            let operand_text = operand.text();
+            // A local POSIX shell's `-c` script, or (only for an extracted
+            // ssh payload) a direct ssh session with one literal destination
+            // and no options: options and remote argv words are outside this
+            // proof, exactly as they are for the heredoc receiver.
+            let shell_script = bash
+                && !nonlocal
+                && literal_posix_shell_program(program_name.as_ref())
+                && operand_text.as_ref() == "-c";
+            let ssh_script = ssh_inline
+                && matches!(program_name.as_ref(), "ssh" | "/bin/ssh" | "/usr/bin/ssh")
+                && literal_ssh_destination(operand_text.as_ref());
             if program.kind().as_ref() != "command_name"
-                || !literal_posix_shell_program(program.text().as_ref())
-                || flag.kind().as_ref() != "word"
-                || flag.text().as_ref() != "-c"
+                || operand.kind().as_ref() != "word"
+                || !(shell_script || ssh_script)
                 || argument.range() != node.range()
                 || crate::heredoc::stdin_data_sink_may_be_overridden(
                     command,
                     program.range().end,
-                    program.text().as_ref(),
+                    program_name.as_ref(),
                 )
             {
                 return None;
@@ -26129,6 +26151,18 @@ fn literal_posix_shell_program(program: &str) -> bool {
         .or_else(|| program.strip_prefix("/usr/bin/"))
         .unwrap_or(program);
     matches!(name, "bash" | "sh" | "dash" | "ksh" | "zsh")
+}
+
+/// An ssh destination the local shell passes through unchanged: one plain
+/// word that cannot be an option and carries no expansion, quoting or glob.
+/// Any other spelling could add ssh options or remote argv words in front of
+/// the script, which the inline ssh ownership proof does not model.
+fn literal_ssh_destination(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'_' | b'-' | b':')
+        })
 }
 
 /// Keep proven redirects tied to their owning embedded Bash body. These
@@ -30149,6 +30183,101 @@ fn range_intersects_conservatively_scanned_interpreter_input(
     })
 }
 
+/// The `core.filesystem` regex rules that read recursive `rm` syntax.
+fn is_core_filesystem_recursive_rm_rule(pack_id: &str, name: Option<&str>) -> bool {
+    pack_id == "core.filesystem"
+        && matches!(
+            name,
+            Some(
+                "rm-rf-root-home"
+                    | "rm-r-f-separate-root-home"
+                    | "rm-recursive-force-root-home"
+                    | "rm-rf-general"
+                    | "rm-r-f-separate"
+                    | "rm-recursive-force-long"
+            )
+        )
+}
+
+/// Whether a recursive-`rm` regex hit lies inside a verified literal shell
+/// script that is, as a whole, one literal cleanup of `/tmp` or `/var/tmp`
+/// descendants (#576).
+///
+/// The outer command's view still contains the script's bytes, so
+/// `sh -c 'rm -rf /tmp/probe'` matched `rm-rf-root-home` on `rm -rf /`: the
+/// core rm parser, which grants the literal-temp exemption, only ever sees
+/// `sh` as this segment's executable. The script itself is evaluated again as
+/// its own top-level text, where that exemption applies, and the hit here is
+/// the same text read without it. Stand the outer hit down only when:
+///
+/// * the script's bytes reach its shell unchanged (`literal_bash_source_range`:
+///   a single-quoted `-c` script of a literal POSIX shell owning the command,
+///   a quoted heredoc body, or a direct ssh payload), so no outer expansion,
+///   wrapper, function or trailing argv can rewrite it; and
+/// * the WHOLE script passes the same proof the `heredoc.bash` rm refinement
+///   uses (bb3a7d1): one literal `rm` argv with only recursive/force flags,
+///   every operand a real temp descendant without traversal, and the core
+///   parser's independent Allow.
+///
+/// Roots, traversal, other operands, expansions, globs, separators, redirects,
+/// interactive flags and every other rule keep the outer denial.
+fn recursive_rm_match_is_literal_temp_inline_script(
+    pack_id: &str,
+    pattern_name: Option<&str>,
+    command: &str,
+    span: MatchSpan,
+    source_context: Option<(&str, usize)>,
+) -> bool {
+    if !is_core_filesystem_recursive_rm_rule(pack_id, pattern_name) {
+        return false;
+    }
+    let Some((source, source_base)) = source_context else {
+        return false;
+    };
+    // The regex may include the boundary byte before `rm` (the script's
+    // opening quote), so attribute the hit from the command word itself.
+    let Some(keyword) = command
+        .get(span.start..span.end)
+        .and_then(|matched| {
+            matched
+                .bytes()
+                .position(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        .map(|offset| span.start.saturating_add(offset))
+    else {
+        return false;
+    };
+    let (Some(start), Some(end)) = (
+        source_base.checked_add(keyword),
+        source_base.checked_add(span.end),
+    ) else {
+        return false;
+    };
+    // The matching views are length preserving; any other mapping is refused.
+    if source
+        .get(start..end)
+        .is_none_or(|mapped| command.get(keyword..span.end) != Some(mapped))
+    {
+        return false;
+    }
+    if crate::heredoc::check_triggers(source) == crate::heredoc::TriggerResult::NoTrigger {
+        return false;
+    }
+    // Structural budget (#443): a timeout keeps the deny.
+    let ExtractionResult::Extracted(contents) =
+        extract_content(source, &crate::heredoc::ExtractionLimits::structural_scan())
+    else {
+        return false;
+    };
+    contents.iter().any(|content| {
+        literal_bash_source_range(source, content).is_some_and(|range| {
+            range.start <= start
+                && end <= range.end
+                && crate::ast_matcher::literal_temp_rm(&content.content)
+        })
+    })
+}
+
 fn find_actionable_command_pattern_span(
     pack_id: &str,
     pattern_name: Option<&str>,
@@ -30183,6 +30312,12 @@ fn find_actionable_command_pattern_span(
             continue;
         }
         if !command_pattern_match_is_inert_quoted_data(
+            pack_id,
+            pattern_name,
+            command,
+            span,
+            source_context,
+        ) && !recursive_rm_match_is_literal_temp_inline_script(
             pack_id,
             pattern_name,
             command,
@@ -43176,6 +43311,111 @@ mod tests {
         }
     }
 
+    /// #554: the single-quoted script of a direct `ssh host '…'` supplies its
+    /// own temporary binding, exactly as the same bytes do in a quoted
+    /// `ssh host <<'EOF'` body (#534) and in `bash -c '…'`. `mktemp -d` mints a
+    /// new, empty, uniquely named directory on whichever host runs it, and the
+    /// #275/#536 fold is lexical: it consults neither TMPDIR nor the local
+    /// filesystem, so the remote script borrows no local evidence.
+    #[test]
+    fn inline_ssh_scripts_supply_their_own_temporary_binding_issue_554() {
+        for command in [
+            "ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"'",
+            "ssh user@host.example 'T=$(mktemp -d /tmp/v-XXXXXX); echo x > \"$T/s\"'",
+            "/usr/bin/ssh h 'S=/tmp/sub; echo x > \"$S/out\"'",
+        ] {
+            assert_eq!(
+                embedded_bash_proven_redirect_offsets(command),
+                vec![command.find('>').unwrap()],
+                "the quoted remote script supplies its own binding: {command:?}"
+            );
+        }
+        for command in [
+            // The local shell expands a double-quoted script before ssh runs.
+            "ssh h \"T=$(mktemp -d); echo x > $T/s\"",
+            // A local binding never reaches the remote shell.
+            "T=$(mktemp -d); ssh h 'echo x > $T/s'",
+            // Options, remote argv words and dynamic destinations are outside
+            // the ownership proof, as they are for the heredoc receiver.
+            "ssh -p 22 h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh -o RemoteCommand=pwsh h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h -- 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh $H 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h bash -c 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d); echo x > $T/s' extra",
+            "sudo ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            "/tmp/ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh(){ pwsh -Command -; }; ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            // The remote values themselves must still be proven temporary.
+            "ssh h 'T=~/x; echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d /etc/v-XXXXXX); echo x > \"$T/p\"'",
+            "ssh h 'T=$(mktemp -u); echo x > \"$T\"'",
+        ] {
+            assert!(
+                embedded_bash_proven_redirect_offsets(command).is_empty(),
+                "uncertain source, owner or value cannot supply a remote proof: {command:?}"
+            );
+        }
+        for command in [
+            "ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"'",
+            "ssh h 'T=$(mktemp -d -p /tmp); echo x > \"$T/s\"'",
+            "ssh h 'D=$(mktemp -d); T=\"$D/sub\"; echo hi > \"$T/x\"'",
+            "/usr/bin/ssh h 'S=/tmp/sub; echo x > \"$S/out\"'",
+        ] {
+            let scope = NonlocalFilesystemScope::enter(true);
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem", "core.git"],
+                ShellDialect::Posix,
+            );
+            assert_eq!(
+                result.decision,
+                EvaluationDecision::Allow,
+                "{command:?}: {:?}",
+                result.pattern_info
+            );
+            assert!(NonlocalFilesystemScope::active());
+            drop(scope);
+            assert_eq!(default_posix_verdict(command), "Allow ", "{command:?}");
+        }
+        for command in [
+            "ssh h 'T=~/x; echo x > $T/s'",
+            "ssh h 'echo x > $HOME/.bashrc'",
+            "ssh h 'echo x > $X/s'",
+            "ssh h 'T=$(mktemp -d); echo x > $X/s'",
+            "ssh h \"T=$(mktemp -d); echo x > $T/s\"",
+            "T=$(mktemp -d); ssh h 'echo x > $T/s'",
+            "ssh h bash -c 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d /etc/v-XXXXXX); echo x > \"$T/p\"'",
+            "ssh h 'T=$(mktemp -u); echo x > \"$T\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/../../etc/passwd\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/.git/config\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/.ssh/authorized_keys\"'",
+            "ssh h 'T=$(mktemp -d); T=/etc; echo x > \"$T/passwd\"'",
+            "ssh h 'false && T=$(mktemp -d); echo x > \"$T/s\"'",
+            "ssh h 'if false; then T=$(mktemp -d); fi; echo x > \"$T/s\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"; echo y > \"$OTHER\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"; echo y > ~/new-note'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"; git reset --hard'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem", "core.git"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "complete evaluation must keep remote denials: {command:?}"
+            );
+            assert!(
+                default_posix_verdict(command).starts_with("Deny "),
+                "{command:?}"
+            );
+        }
+    }
+
     #[test]
     fn heredoc_bindings_cannot_prove_outer_redirects_issue_526() {
         for command in [
@@ -48173,6 +48413,101 @@ mod tests {
         for command in ["cat <<'EOF'\n$X -d 1\nEOF", "grep x <<< \"$a -d $b\""] {
             assert_eq!(default_posix_verdict(command), "Allow ", "{command:?}");
         }
+    }
+
+    /// #576: a verified literal shell script keeps the literal-temp exemption
+    /// its text gets at top level. The outer command still holds the script's
+    /// bytes, and the recursive-rm regexes matched `rm -rf /` in them
+    /// (`core.filesystem:rm-rf-root-home`), because the core rm parser that
+    /// grants the exemption sees only `sh` as that segment's executable.
+    /// Prints every row before asserting.
+    #[test]
+    fn literal_temp_cleanup_scripts_keep_their_top_level_allow_issue_576() {
+        let mut mismatches = Vec::new();
+        for text in [
+            "rm -rf /tmp/probe",
+            "rm -rf /var/tmp/probe",
+            "rm -r /tmp/probe",
+            "rm -fr /tmp/probe/child",
+            "rm -r -f -- /tmp/probe /var/tmp/other",
+            "rm --recursive --force /tmp/probe",
+            "rm -rf \"/var/tmp/quoted\"",
+        ] {
+            let top = default_posix_verdict(text);
+            eprintln!("576 | top    | {text:?} | {top}");
+            if top != "Allow " {
+                mismatches.push(format!("top-level {text:?}: {top}"));
+            }
+            for script in [
+                format!("sh -c '{text}'"),
+                format!("bash -c '{text}'"),
+                format!("dash -c '{text}'"),
+                format!("zsh -c '{text}'"),
+                format!("/bin/sh -c '{text}'"),
+                format!("ssh host '{text}'"),
+            ] {
+                let verdict = default_posix_verdict(&script);
+                eprintln!("576 | script | {script:?} | {verdict}");
+                if verdict != top {
+                    mismatches.push(format!("{script:?}: {verdict} != top-level {top}"));
+                }
+            }
+        }
+        // The core rule itself stands down; this is not only the AST policy.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "sh -c 'rm -rf /tmp/probe'",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        if !result.is_allowed() {
+            mismatches.push(format!("core.filesystem alone: {:?}", result.pattern_info));
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// #576, other direction: the exemption covers exactly one literal
+    /// cleanup of temp descendants in a script whose bytes reach the shell
+    /// unchanged. Roots, traversal, other operands, expansions, globs,
+    /// additional commands, outer commands and outer redirects keep a denial.
+    #[test]
+    fn inline_scripts_keep_recursive_rm_denials_issue_576() {
+        let mut allowed = Vec::new();
+        for command in [
+            "sh -c 'rm -rf /tmp'",
+            "sh -c 'rm -rf /tmp/'",
+            "sh -c 'rm -rf /var/tmp'",
+            "sh -c 'rm -rf /home/user/Documents'",
+            "sh -c 'rm -rf /tmp/../home/user'",
+            "sh -c 'rm -rf /tmp/probe/../../etc'",
+            "sh -c 'rm -rf -- -x /tmp/a'",
+            "sh -c 'rm -rf /tmp/a /home/user'",
+            "sh -c 'rm -rf / /tmp/a'",
+            "sh -c 'rm -rf /tmp/probe -rf /etc'",
+            "sh -c \"rm -rf /tmp/$X\"",
+            "sh -c 'rm -rf /tmp/$X'",
+            "sh -c 'rm -rf /tmp/*'",
+            "sh -c 'rm -rf /tmp/{a,../etc}'",
+            "bash -c 'rm -rf /tmp/probe $(rm -rf /)'",
+            "sh -c 'cd /; rm -rf tmp/probe'",
+            "sh -c 'rm -rf ~/tmp/probe'",
+            "sh -c 'rm -rf $HOME'",
+            "sh -c 'rm -rf /tmp/probe; rm -rf /'",
+            "sh -c 'rm -rf /tmp/probe && rm -rf ~'",
+            "sh -c 'rm -rf /tmp/probe\nrm -rf /'",
+            "sh -c 'rm -rf /tmp/probe' && rm -rf /",
+            "sh -c 'rm -rf /tmp/probe'; rm -rf ~",
+            "sh -c 'rm -rf /tmp/probe' > /etc/passwd",
+            "ssh host 'rm -rf /'",
+            "ssh host 'rm -rf /tmp'",
+            "ssh host 'rm -rf /tmp/probe /home/user'",
+        ] {
+            let verdict = default_posix_verdict(command);
+            eprintln!("576 | deny   | {command:?} | {verdict}");
+            if !verdict.starts_with("Deny ") {
+                allowed.push(format!("{command:?}: {verdict}"));
+            }
+        }
+        assert!(allowed.is_empty(), "{allowed:#?}");
     }
 
     /// dash, ksh and mksh are POSIX shells like sh/bash: their `-c` payload is

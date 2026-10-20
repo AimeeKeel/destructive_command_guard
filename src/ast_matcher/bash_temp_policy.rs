@@ -18,7 +18,11 @@ fn is_recursive_rm_rule(rule: &str) -> bool {
 /// The lexical screen proves a single literal argv and bounds the destination
 /// shape. Core's existing parser must independently approve the complete command.
 /// Never borrow a custom core-rule grant for a root or traversing destination.
-fn literal_temp_rm(command: &str) -> bool {
+///
+/// The evaluator applies the same proof to the outer core rm rules when they
+/// match the text of a verified literal inline shell payload (#576), so both
+/// views of one payload share a single definition of literal temp cleanup.
+pub(crate) fn literal_temp_rm(command: &str) -> bool {
     if command.len() > MAX_LITERAL_COMMAND_BYTES {
         return false;
     }
