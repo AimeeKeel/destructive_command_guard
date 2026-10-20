@@ -6841,11 +6841,17 @@ mod tests {
         }
         for (command, rule) in [
             ("mv /home/user/repo /tmp/r", "mv-sensitive-source-root-home"),
-            ("'mv' /home/user/repo /tmp/r", "mv-sensitive-source-root-home"),
+            (
+                "'mv' /home/user/repo /tmp/r",
+                "mv-sensitive-source-root-home",
+            ),
             ("\"mv\" /etc/hosts /tmp/h", "mv-sensitive-source-root-home"),
             ("/bin/mv /etc/hosts /tmp/h", "mv-sensitive-source-root-home"),
             ("sudo mv /etc /tmp/x", "mv-sensitive-source-root-home"),
-            ("find . -exec mv {} /etc/ \\;", "mv-sensitive-source-root-home"),
+            (
+                "find . -exec mv {} /etc/ \\;",
+                "mv-sensitive-source-root-home",
+            ),
             ("mv \"$src\" d/", "mv-dynamic-path"),
             ("'mv' $src d/", "mv-dynamic-path"),
         ] {
