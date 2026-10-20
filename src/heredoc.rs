@@ -9070,13 +9070,20 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
             "comment" => {}
             "command" | "redirected_statement" => {
                 statements.push(node);
-                if statements.len() > 3 {
+                if statements.len() > 5 {
                     return None;
                 }
             }
             _ => return None,
         }
     }
+    // A literal `cd` only changes which directory a relative path names. The
+    // proof below still compares the writer's destination with the consumer's
+    // operand and admits no other statement, so a `cd` cannot hand the written
+    // body to a shell: at worst the consumer runs a different file and the
+    // body is not executed at all (#583: `cat > f <<'EOF' … EOF` then
+    // `cd /tmp && node f`).
+    statements.retain(|statement| !literal_cd_setup(statement));
     let (writer, consumer) = match statements.as_slice() {
         [writer, consumer] => (writer, consumer),
         [setup, writer, consumer] if literal_mkdir_setup(setup) => (writer, consumer),
@@ -9278,7 +9285,8 @@ fn literal_heredoc_write_owner<'a, D: ast_grep_core::Doc>(
     }
     // Bash's grammar attaches `mkdir ... && cat >file <<EOF` redirects
     // to the list. Only its final command consumes the heredoc. Admit this exact
-    // setup shape; a grouped, branching or longer command is not a proof.
+    // setup shape (a literal `mkdir` or `cd`, #583); a grouped, branching or
+    // longer command is not a proof.
     if body.kind().as_ref() != "list" {
         return None;
     }
@@ -9286,10 +9294,28 @@ fn literal_heredoc_write_owner<'a, D: ast_grep_core::Doc>(
     let [setup, operator, owner] = children.as_slice() else {
         return None;
     };
-    (literal_mkdir_setup(setup)
+    ((literal_mkdir_setup(setup) || literal_cd_setup(setup))
         && operator.kind().as_ref() == "&&"
         && owner.kind().as_ref() == "command")
         .then(|| owner.clone())
+}
+
+/// `cd` with at most one plain literal directory: it runs no program and
+/// changes no file, only the directory later relative paths resolve against.
+fn literal_cd_setup<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> bool {
+    if node.kind().as_ref() != "command" {
+        return false;
+    }
+    let Some(words) = literal_script_words(node) else {
+        return false;
+    };
+    let literal = match words.as_slice() {
+        [program] => program == "cd",
+        [program, directory] => program == "cd" && is_plain_file_path(directory),
+        _ => false,
+    };
+    // An exported shell function named `cd` would run instead of the builtin.
+    literal && trusted_literal_script_program("cd")
 }
 
 fn literal_stdout_overwrite_destination<D: ast_grep_core::Doc>(
@@ -19206,6 +19232,56 @@ fi"#;
         // A body that cannot be parsed is never syntax evidence.
         let malformed = "cat >/tmp/a.js <<'EOF'\nf(u => !x;\nEOF\nnode /tmp/a.js";
         assert!(written_javascript_arrow_offsets(malformed).is_empty());
+    }
+
+    #[test]
+    fn written_script_proof_admits_literal_cd_steps_583() {
+        let body = "f(u => !x);\nconst label = (u) => `${u.name}`;";
+        for (prefix, writer, consumer) in [
+            (
+                "",
+                "cat > /tmp/x/a.js <<'EOF'",
+                "cd /tmp && node /tmp/x/a.js",
+            ),
+            (
+                "cd /tmp && ",
+                "cat > /tmp/x/a.js <<'EOF'",
+                "node /tmp/x/a.js",
+            ),
+            ("", "cat > /tmp/x/a.js <<'EOF'", "cd /tmp\nnode /tmp/x/a.js"),
+            (
+                "cd client\n",
+                "cat > /tmp/x/a.js <<'EOF'",
+                "cd\nnode /tmp/x/a.js",
+            ),
+        ] {
+            let command = format!("{prefix}{writer}\n{body}\nEOF\n{consumer}");
+            let proof = written_heredoc_interpreter(&command)
+                .unwrap_or_else(|| panic!("literal cd keeps the handoff proven: {command}"));
+            assert_eq!(proof.language, ScriptLanguage::JavaScript, "{command}");
+            assert_eq!(&command[proof.body.clone()], body, "{command}");
+            assert_eq!(
+                written_javascript_arrow_offsets(&command).len(),
+                2,
+                "both real arrows are language syntax: {command}"
+            );
+        }
+        // A cd that is not literal, or any other extra statement, still voids
+        // the proof; and a shell consumer keeps its body under shell analysis.
+        for command in [
+            "cat > /tmp/x/a.js <<'EOF'\nf(u => !x);\nEOF\ncd $D && node /tmp/x/a.js",
+            "cat > /tmp/x/a.js <<'EOF'\nf(u => !x);\nEOF\ncd /tmp && touch y && node /tmp/x/a.js",
+            "cat > /tmp/x/a.js <<'EOF'\nf(u => !x);\nEOF\ncd /tmp || node /tmp/x/a.js",
+            "cat > /tmp/x/a.js <<'EOF'\nf(u => !x);\nEOF\ncd -L /tmp && node /tmp/x/a.js",
+        ] {
+            assert!(
+                written_heredoc_interpreter(command).is_none(),
+                "must retain conservative analysis: {command}"
+            );
+        }
+        let shell = "cat > /tmp/x/a.sh <<'EOF'\ngit reset --hard\nEOF\ncd /tmp && bash /tmp/x/a.sh";
+        let proof = written_heredoc_interpreter(shell).expect("shell handoff");
+        assert_eq!(proof.language, ScriptLanguage::Bash);
     }
 
     /// #136 REVERTED: a python (or any interpreter) heredoc body is NOT masked —

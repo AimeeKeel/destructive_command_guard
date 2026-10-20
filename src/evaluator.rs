@@ -34775,6 +34775,44 @@ mod tests {
         }
     }
 
+    /// #583 end to end: a literal `cd` around a written JavaScript file and its
+    /// `node` run keeps arrow functions out of the redirect rules.
+    #[test]
+    fn written_javascript_survives_literal_cd_steps_583() {
+        for body in ["f(u => !x);", "const label = (u) => `${u.name}`;"] {
+            for command in [
+                format!("cat > /tmp/x/a.js <<'EOF'\n{body}\nEOF\ncd /tmp && node /tmp/x/a.js"),
+                format!("cd /tmp && cat > /tmp/x/a.js <<'EOF'\n{body}\nEOF\nnode /tmp/x/a.js"),
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &command,
+                    &["core.filesystem"],
+                    ShellDialect::Posix,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "{command:?} must stay allowed: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+        for command in [
+            "cat > /tmp/x/a.sh <<'EOF'\nrm -rf /home/user\nEOF\ncd /tmp && bash /tmp/x/a.sh",
+            "cd /tmp && cat > /tmp/x/a.sh <<'EOF'\nrm -rf /home/user\nEOF\nbash /tmp/x/a.sh",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
     /// #575 end to end: an unspaced append is an append.
     #[test]
     fn unspaced_append_to_a_dynamic_path_is_allowed_575() {
