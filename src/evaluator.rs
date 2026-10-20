@@ -35102,6 +35102,55 @@ mod tests {
         }
     }
 
+    /// #583 row 4 end to end: `cat > f <<'EOF' && node f` keeps arrow
+    /// functions out of the redirect rules, and a program written and run in
+    /// that shape receives its own language's checks (it was allowed unseen).
+    #[test]
+    fn written_script_with_a_heredoc_line_consumer_583() {
+        for body in [
+            "f(u => !x);",
+            "const label = (u) => `${u.name}`;",
+            "const label = 'name';",
+        ] {
+            let command = format!("cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\n{body}\nEOF");
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?} must be allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\nrm -rf /home/user\nEOF",
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\necho bad > $TARGET\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' || node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js && bash /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF\nbash /tmp/x/a.js",
+            "cat > /tmp/x/a.js <<'EOF' && node $F\nf(u => !x);\nEOF",
+            "cd /tmp && cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nrequire('child_process').execSync('echo bad > /etc/passwd');\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nrequire('child_process').execSync('rm -rf /home/user');\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF",
+            "cat > /tmp/x/a.py <<'EOF' && python3 /tmp/x/a.py\nimport shutil\nshutil.rmtree('/home/user')\nEOF",
+            "cat > /tmp/x/a.py <<'EOF' && python3 /tmp/x/a.py\nimport subprocess\nsubprocess.run(['rm', '-rf', '/home/user'])\nEOF",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must be denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
     /// #575 end to end: an unspaced append is an append.
     #[test]
     fn unspaced_append_to_a_dynamic_path_is_allowed_575() {

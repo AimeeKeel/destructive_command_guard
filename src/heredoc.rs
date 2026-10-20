@@ -9149,7 +9149,9 @@ pub(crate) fn written_javascript_arrow_offsets(command: &str) -> Vec<usize> {
 
 /// Keep the file provenance deliberately small: one plain overwrite followed
 /// by one direct interpreter invocation, optionally preceded by a literal
-/// mkdir. No append, transformations, extra consumers, mutable bindings,
+/// mkdir, or (as the whole command) one plain overwrite whose heredoc line
+/// chains a direct non-shell interpreter invocation with `&&` (#583).
+/// No append, transformations, extra consumers, mutable bindings,
 /// wrappers, branches, pipelines or deferred execution can establish this
 /// proof. In particular a later `bash file` must not borrow an earlier
 /// `node file` classification merely because the filename matches.
@@ -9186,6 +9188,7 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
             _ => return None,
         }
     }
+    let entire_command_is_one_statement = statements.len() == 1;
     // A literal `cd` only changes which directory a relative path names. The
     // proof below still compares the writer's destination with the consumer's
     // operand and admits no other statement, so a `cd` cannot hand the written
@@ -9193,14 +9196,39 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
     // body is not executed at all (#583: `cat > f <<'EOF' … EOF` then
     // `cd /tmp && node f`).
     statements.retain(|statement| !literal_cd_setup(statement));
-    let (writer, consumer) = match statements.as_slice() {
-        [writer, consumer] => (writer, consumer),
-        [setup, writer, consumer] if literal_mkdir_setup(setup) => (writer, consumer),
+    let (write, consumer, chained) = match statements.as_slice() {
+        // Bash's grammar attaches a consumer chained on the heredoc line
+        // (`cat > f <<'EOF' && node f`) to the heredoc itself (#583). Admit
+        // it only as the entire command: one plain writer with no setup step
+        // or other statement, and exactly one `&&`-chained plain command,
+        // which must then pass the same consumer checks as a later line.
+        [writer]
+            if entire_command_is_one_statement
+                && writer
+                    .field("body")
+                    .is_some_and(|body| body.kind().as_ref() == "command") =>
+        {
+            let write = literal_file_write(writer)?;
+            let consumer = write.chained_consumer.clone()?;
+            (write, consumer, true)
+        }
+        [writer, consumer] => (literal_file_write(writer)?, consumer.clone(), false),
+        [setup, writer, consumer] if literal_mkdir_setup(setup) => {
+            (literal_file_write(writer)?, consumer.clone(), false)
+        }
         _ => return None,
     };
-    let (operator_start, body, destinations) = literal_cat_file_write(writer)
-        .map(|(operator_start, body, destination)| (operator_start, body, vec![destination]))
-        .or_else(|| literal_tee_file_write(writer))?;
+    let LiteralFileWrite {
+        operator_start,
+        body,
+        destinations,
+        chained_consumer,
+    } = write;
+    // A writer that also chains a command on its heredoc line has a second,
+    // unproven consumer before the later one.
+    if !chained && chained_consumer.is_some() {
+        return None;
+    }
     if consumer.kind().as_ref() != "command"
         || consumer
             .children()
@@ -9214,13 +9242,18 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
     {
         return None;
     }
-    let words = literal_script_words(consumer)?;
+    let words = literal_script_words(&consumer)?;
     let [program, path] = words.as_slice() else {
         return None;
     };
     let interpreter = program.rsplit('/').next()?;
     let language = ScriptLanguage::from_command(interpreter);
     let supported_shell = matches!(interpreter, "bash" | "sh" | "dash" | "ksh" | "zsh");
+    // The heredoc-line shape supplies a non-shell language only; a shell
+    // consumer chained there keeps the conservative raw-shell analysis.
+    if chained && supported_shell {
+        return None;
+    }
     if !destinations.contains(path)
         // Every output must leave the interpreter's normal contract intact,
         // including tee outputs that the consumer does not read. Comparing
@@ -9252,9 +9285,15 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
     })
 }
 
-fn literal_cat_file_write<D: ast_grep_core::Doc>(
-    writer: &ast_grep_core::Node<'_, D>,
-) -> Option<(usize, Range<usize>, String)> {
+fn literal_file_write<'a, D: ast_grep_core::Doc>(
+    writer: &ast_grep_core::Node<'a, D>,
+) -> Option<LiteralFileWrite<'a, D>> {
+    literal_cat_file_write(writer).or_else(|| literal_tee_file_write(writer))
+}
+
+fn literal_cat_file_write<'a, D: ast_grep_core::Doc>(
+    writer: &ast_grep_core::Node<'a, D>,
+) -> Option<LiteralFileWrite<'a, D>> {
     if writer.kind().as_ref() != "redirected_statement" {
         return None;
     }
@@ -9273,18 +9312,23 @@ fn literal_cat_file_write<D: ast_grep_core::Doc>(
     {
         return None;
     }
-    let (operator_start, body, destination) = literal_quoted_write_input(writer)?;
-    let destination = destination.filter(|path| path != "/dev/null")?;
-    Some((operator_start, body, destination))
+    let input = literal_quoted_write_input(writer)?;
+    let destination = input.stdout.filter(|path| path != "/dev/null")?;
+    Some(LiteralFileWrite {
+        operator_start: input.operator_start,
+        body: input.body,
+        destinations: vec![destination],
+        chained_consumer: input.chained_consumer,
+    })
 }
 
 /// Tee writes the same quoted stdin bytes to each literal output in overwrite
 /// mode. Stdout may remain unchanged or be discarded; a stdout file,
 /// descriptor duplication, or input redirect needs a different provenance proof.
 /// Keep this separate from the cat-only transfer-data proof (#543).
-fn literal_tee_file_write<D: ast_grep_core::Doc>(
-    writer: &ast_grep_core::Node<'_, D>,
-) -> Option<(usize, Range<usize>, Vec<String>)> {
+fn literal_tee_file_write<'a, D: ast_grep_core::Doc>(
+    writer: &ast_grep_core::Node<'a, D>,
+) -> Option<LiteralFileWrite<'a, D>> {
     if writer.kind().as_ref() != "redirected_statement" {
         return None;
     }
@@ -9317,19 +9361,30 @@ fn literal_tee_file_write<D: ast_grep_core::Doc>(
     {
         return None;
     }
-    let (operator_start, body, stdout) = literal_quoted_write_input(writer)?;
-    if stdout.is_some_and(|path| path != "/dev/null") {
+    let input = literal_quoted_write_input(writer)?;
+    if input.stdout.is_some_and(|path| path != "/dev/null") {
         return None;
     }
-    Some((operator_start, body, destinations.to_vec()))
+    Some(LiteralFileWrite {
+        operator_start: input.operator_start,
+        body: input.body,
+        destinations: destinations.to_vec(),
+        chained_consumer: input.chained_consumer,
+    })
 }
 
 /// Recover one quoted stdin heredoc and at most one plain stdout overwrite.
 /// Bash may attach a trailing redirect to the heredoc instead of the writer;
 /// inspect both locations before claiming that the body reaches the writer.
-fn literal_quoted_write_input<D: ast_grep_core::Doc>(
-    writer: &ast_grep_core::Node<'_, D>,
-) -> Option<(usize, Range<usize>, Option<String>)> {
+///
+/// Bash's grammar also attaches a statement chained on the heredoc line
+/// (`cat > f <<'EOF' && node f`) to the heredoc node. That statement is not
+/// part of the writer: it is returned separately, only when it is one plain
+/// command after `&&`, for the caller to prove as the file's sole consumer
+/// (#583). `||`, pipes and longer chains attached there are not a proof.
+fn literal_quoted_write_input<'a, D: ast_grep_core::Doc>(
+    writer: &ast_grep_core::Node<'a, D>,
+) -> Option<LiteralQuotedWriteInput<'a, D>> {
     let mut redirects = Vec::new();
     let mut heredoc = None;
     for child in writer.children().filter(ast_grep_core::Node::is_named) {
@@ -9343,9 +9398,24 @@ fn literal_quoted_write_input<D: ast_grep_core::Doc>(
     let heredoc = heredoc?;
     let text = heredoc.text();
     let operator_offset = text.find("<<")?;
+    let chained = match (heredoc.field("operator"), heredoc.field("right")) {
+        (None, None) => None,
+        (Some(operator), Some(right))
+            if operator.kind().as_ref() == "&&" && right.kind().as_ref() == "command" =>
+        {
+            Some(right)
+        }
+        _ => return None,
+    };
     let mut body = None;
     let mut quoted = false;
     for child in heredoc.children().filter(ast_grep_core::Node::is_named) {
+        if chained
+            .as_ref()
+            .is_some_and(|consumer| consumer.node_id() == child.node_id())
+        {
+            continue;
+        }
         match child.kind().as_ref() {
             "heredoc_start" => {
                 quoted = heredoc_delimiter_is_quoted(
@@ -9382,7 +9452,30 @@ fn literal_quoted_write_input<D: ast_grep_core::Doc>(
         [redirect] => Some(literal_stdout_overwrite_destination(redirect)?),
         _ => return None,
     };
-    Some((heredoc.range().start + operator_offset, body?, destination))
+    Some(LiteralQuotedWriteInput {
+        operator_start: heredoc.range().start + operator_offset,
+        body: body?,
+        stdout: destination,
+        chained_consumer: chained,
+    })
+}
+
+/// One quoted heredoc written verbatim, with the command (if any) that Bash's
+/// grammar chains to it with `&&` on the heredoc line.
+struct LiteralQuotedWriteInput<'a, D: ast_grep_core::Doc> {
+    operator_start: usize,
+    body: Range<usize>,
+    stdout: Option<String>,
+    chained_consumer: Option<ast_grep_core::Node<'a, D>>,
+}
+
+/// A literal file write: the heredoc operator, its exact body, the files it
+/// overwrites, and the command chained on the heredoc line (#583).
+struct LiteralFileWrite<'a, D: ast_grep_core::Doc> {
+    operator_start: usize,
+    body: Range<usize>,
+    destinations: Vec<String>,
+    chained_consumer: Option<ast_grep_core::Node<'a, D>>,
 }
 
 fn literal_heredoc_write_owner<'a, D: ast_grep_core::Doc>(
@@ -10922,7 +11015,12 @@ fn literal_file_data_consumers_inner(
                 }
                 pending.extend(node.children().filter(ast_grep_core::Node::is_named));
             }
-            "redirected_statement" if literal_cat_file_write(&node).is_some() => {}
+            // A command chained on the heredoc line (`cat > f <<'EOF' && x`)
+            // lives inside this node and would escape the walk; it is not a
+            // proven data consumer.
+            "redirected_statement"
+                if literal_cat_file_write(&node)
+                    .is_some_and(|write| write.chained_consumer.is_none()) => {}
             "command"
                 if consumers
                     .iter()
@@ -19554,6 +19652,117 @@ fi"#;
         let shell = "cat > /tmp/x/a.sh <<'EOF'\ngit reset --hard\nEOF\ncd /tmp && bash /tmp/x/a.sh";
         let proof = written_heredoc_interpreter(shell).expect("shell handoff");
         assert_eq!(proof.language, ScriptLanguage::Bash);
+    }
+
+    /// #583 row 4: Bash's grammar attaches `&& node f` on the heredoc line to
+    /// the heredoc itself. As the whole command, that one chained plain
+    /// interpreter run is the file's sole consumer, exactly like a next line.
+    #[test]
+    fn written_script_proof_admits_a_heredoc_line_consumer_583() {
+        let body = "f(u => !x);\nconst label = (u) => `${u.name}`;";
+        for header in [
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js",
+            "cat <<'EOF' > /tmp/x/a.js && node /tmp/x/a.js",
+            "/bin/cat >| '/tmp/x/a.js' <<\"EOF\" && /usr/bin/node '/tmp/x/a.js'",
+            "tee /tmp/x/a.js <<'EOF' >/dev/null && node /tmp/x/a.js",
+            "tee /tmp/x/a.js >/dev/null <<'EOF' && node /tmp/x/a.js",
+        ] {
+            let command = format!("{header}\n{body}\nEOF");
+            let proof = written_heredoc_interpreter(&command)
+                .unwrap_or_else(|| panic!("heredoc-line handoff must be proven: {command}"));
+            assert_eq!(proof.language, ScriptLanguage::JavaScript, "{command}");
+            assert_eq!(proof.interpreter, "node", "{command}");
+            assert_eq!(&command[proof.body.clone()], body, "{command}");
+            assert_eq!(
+                written_javascript_arrow_offsets(&command).len(),
+                2,
+                "both real arrows are language syntax: {command}"
+            );
+            assert!(
+                range_is_quoted_interpreter_source(
+                    &command,
+                    &proof.body,
+                    ScriptLanguage::JavaScript
+                ),
+                "{command}"
+            );
+            assert!(
+                mask_non_executing_heredocs(&command).contains(body),
+                "executed source keeps its raw safety evidence: {command}"
+            );
+        }
+        // The written program reaches its actual language's checks: the
+        // extracted body is typed and owned by the chained interpreter.
+        let command = "cat > /tmp/x/a.py <<'EOF' && python3 /tmp/x/a.py\nimport shutil\nshutil.rmtree('/home/user')\nEOF";
+        let proof = written_heredoc_interpreter(command).expect("python handoff");
+        let ExtractionResult::Extracted(contents) =
+            extract_content(command, &ExtractionLimits::structural_scan())
+        else {
+            panic!("complete extraction required: {command}");
+        };
+        let content = contents
+            .iter()
+            .find(|source| source.byte_range.start == proof.operator_start)
+            .expect("the exact written body must reach typed analysis");
+        assert_eq!(content.language, ScriptLanguage::Python);
+        assert_eq!(content.target_command.as_deref(), Some("python3"));
+        assert_eq!(
+            content.content,
+            "import shutil\nshutil.rmtree('/home/user')"
+        );
+
+        for command in [
+            // A shell consumer keeps its body under raw-shell analysis.
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.sh <<'EOF' && sh /tmp/x/a.sh\nf(u => !x);\nEOF",
+            // Other operators, longer chains, and later statements.
+            "cat > /tmp/x/a.js <<'EOF' || node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' | node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js && bash /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js | sh\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js > /tmp/out\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF\nbash /tmp/x/a.js",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF\nnode /tmp/x/a.js",
+            // Setup steps or other statements around the heredoc-line shape.
+            "cd /tmp && cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "mkdir -p /tmp/x && cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cd /tmp\ncat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "alias node=bash\ncat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            // Non-literal, different, or optioned consumers.
+            "cat > /tmp/x/a.js <<'EOF' && node $F\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/b.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node --check /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && env node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && /tmp/node /tmp/x/a.js\nf(u => !x);\nEOF",
+            // The writer itself must still be a plain quoted overwrite.
+            "cat > /tmp/x/a.js <<EOF && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat >> /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat -n > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+        ] {
+            assert!(
+                written_heredoc_interpreter(command).is_none(),
+                "must retain conservative analysis: {command}"
+            );
+            assert!(
+                written_javascript_arrow_offsets(command).is_empty(),
+                "unproven source cannot exempt an arrow: {command}"
+            );
+        }
+    }
+
+    /// A command chained on a writer's heredoc line is not a proven data
+    /// consumer (#543): it would otherwise sit inside the accepted writer.
+    #[test]
+    fn heredoc_line_command_is_not_a_proven_data_consumer_543() {
+        let body = "eval $COMMAND";
+        let command =
+            format!("cat > m.txt <<'EOF' && sh m.txt\n{body}\nEOF\nscp m.txt host:/tmp/m.txt");
+        for view in [
+            mask_non_executing_heredocs(&command),
+            mask_non_expanding_data_heredocs(&command),
+        ] {
+            assert!(view.contains(body), "executed body stays visible: {view:?}");
+        }
     }
 
     /// #136 REVERTED: a python (or any interpreter) heredoc body is NOT masked —

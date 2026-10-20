@@ -454,6 +454,38 @@ EOF";
         }
     }
 
+    /// #583 row 4: the consumer chained with `&&` on the heredoc line runs
+    /// the written program exactly like a consumer on the next line.
+    #[test]
+    fn issue_583_heredoc_line_consumer_runs_the_written_program() {
+        for command in [
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nconst label = (u) => `${u.name}`;\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nconst label = 'name';\nEOF",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
+        }
+        for command in [
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\nrm -rf /home/user\nEOF",
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\necho bad > $TARGET\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' || node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' | node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js && bash /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF\nbash /tmp/x/a.js",
+            "cat > /tmp/x/a.js <<'EOF' && node $F\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nrequire('child_process').execSync('echo bad > /etc/passwd');\nEOF",
+            // Allowed unseen before: the written program never reached its
+            // language's checks in this shape.
+            "cat > /tmp/x/a.py <<'EOF' && python3 /tmp/x/a.py\nimport shutil\nshutil.rmtree('/home/user')\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "deny", "must deny {command:?}: {rule}");
+            assert!(!rule.is_empty(), "denial must name its rule: {command:?}");
+        }
+    }
+
     #[test]
     fn issue_544_reported_python_and_node_documentation_strings_are_allowed() {
         for command in [
