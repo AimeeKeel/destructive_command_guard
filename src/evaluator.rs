@@ -52073,6 +52073,39 @@ mod tests {
         }
     }
 
+    /// An unquoted brace list expands before mv runs, so it must not ride the
+    /// home-subtree rescues past their `..` and dotfile checks. Bash is the
+    /// dialect that expands it.
+    #[test]
+    fn mv_within_home_brace_expansion_end_to_end_posix() {
+        for command in [
+            "mv ~/{..,a}/{..,b}/etc ~/Documents/x",
+            "mv ~/{Documents,.ssh}/id_rsa ~/Documents/y",
+            "mv {..,a}/{..,b}/x /home/tester/Documents/y",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "brace expansion must not ride the home-subtree rescue: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        let result = evaluate_with_pack_ids_in_dialect(
+            r#"mv "/home/tester/Documents/{draft}.txt" "/home/tester/Documents/final.txt""#,
+            &["core.git", "core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_allowed(),
+            "a quoted brace is literal file-name data: {:?}",
+            result.pattern_info
+        );
+    }
+
     #[test]
     fn nested_substitution_bindings_do_not_prove_outer_variables() {
         // A binding inside `$( )`, backticks, or `<( )` runs in a subshell;

@@ -5010,6 +5010,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         //   `$HOME/...` and command substitution still fall through to the
         //   fail-closed rules. Flags may not take a value, which keeps
         //   `mv -t /etc ...` and `--target-directory=/etc` out.
+        // - Brace expansion is expansion too: an unquoted `{` withholds the
+        //   rescue. Bash expands the token before mv sees it, past both checks
+        //   above: `~/{..,a}/{..,b}/etc` becomes `~/../../etc`, and
+        //   `~/{Documents,.ssh}/id_rsa` becomes a dotfile path. Inside quotes
+        //   a brace is literal and stays allowed.
         // - Anchored whole-command, so a compound that appends a destructive
         //   second segment is not rescued: an unquoted `;`, `|` or `&` can
         //   appear in no token, including the home-root user name.
@@ -5028,7 +5033,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-within-home",
-            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"$`;|&]+|/Users/[^/\s'"$`;|&]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&]+|/Users/[^/\s'"$`;|&]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
         ),
         // -----------------------------------------------------------------
         // The same ordinary rename, written with a relative source.
@@ -5060,7 +5065,8 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // - A leading `/` cannot match at all: the component class excludes
         //   it, so absolute sources keep going through `mv-within-home`.
         // - `..` is refused in every later component, so no source can climb
-        //   out of the tree it names.
+        //   out of the tree it names, and an unquoted `{` withholds the
+        //   rescue on both sides, since `{..,a}/x` expands to `../x`.
         // - Dynamic expansion is excluded anywhere in the command and inside
         //   every token, and the whole command is anchored, so a compound
         //   that appends a destructive second segment is not rescued.
@@ -5072,7 +5078,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-relative-into-home",
-            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:\./)?(?![-~.])[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:\./)?(?![-~.])[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&]+|/Users/[^/\s'"$`;|&]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:\./)?(?![-~.])[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:\./)?(?![-~.])[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
         ),
     ];
     // Every possible safe match still runs its complete authored regex. The
@@ -8757,6 +8763,48 @@ mod tests {
             assert!(
                 pack.check(cmd).is_some(),
                 "home-subtree rescue must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_withholds_the_rescue_on_brace_expansion() {
+        // Bash expands an unquoted brace list before mv runs, so the `..` and
+        // dotfile checks on the written token never see the real operands:
+        // `~/{..,a}/{..,b}/etc` is `~/../../etc ~/../b/etc ~/a/../etc
+        // ~/a/b/etc`, and the move of `/etc` was allowed while the spelled-out
+        // `mv ~/../../etc ~/Documents/x` was denied.
+        let pack = create_pack();
+        for cmd in [
+            "mv ~/{..,a}/{..,b}/etc ~/Documents/x",
+            "mv /home/tester/{..,x}/{..,y}/opt/homebrew /home/tester/Documents/x",
+            "mv ~/{Documents,.ssh}/id_rsa ~/Documents/y",
+            "mv ~/Documents/a ~/{Documents,.ssh}",
+            "mv /home/{tester,root}/Documents/a/b /home/tester/Documents/c",
+            "mv {..,a}/{..,b}/x /home/tester/Documents/y",
+            "mv a.md ~/Documents/{..,x}/{..,y}/{..,z}/etc/cron.d",
+            // The accepted cost: an ordinary brace list loses the rescue too
+            // and needs its operands spelled out (or quoted, if literal).
+            "mv ~/Documents/{a,b}.txt ~/Documents/dir/",
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "brace expansion must not ride the home-subtree rescue: {cmd}"
+            );
+        }
+        // Inside quotes a brace is a literal byte, and a lone `}` never
+        // starts an expansion.
+        for cmd in [
+            r#"mv "/home/tester/Documents/{draft}.txt" "/home/tester/Documents/final.txt""#,
+            r"mv '/home/tester/Documents/a{1,2}.txt' /home/tester/Documents/dir/",
+            r#"mv "a{..,b}.md" /home/tester/Documents/x.md"#,
+            "mv ~/Documents/a} ~/Documents/b",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a literal brace inside a home-subtree operand is file-name data: {cmd}"
             );
         }
     }
