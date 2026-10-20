@@ -11396,15 +11396,18 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                     }
                 } else {
                     println!(
-                        "  → Run 'dcg doctor --fix' to set enabled = true, or edit \
-                         ~/.codex/config.toml"
+                        "  → Run 'dcg doctor --fix' to set enabled = true, or edit {}",
+                        codex_file_display("config.toml")
                     );
                 }
             }
             CodexHookProbe::HooksFileMissing => {
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
-                println!("  Codex is in use but ~/.codex/hooks.json does not exist");
+                println!(
+                    "  Codex is in use but {} does not exist",
+                    codex_file_display("hooks.json")
+                );
                 println!(
                     "  → Re-run the dcg install script to register the hook, then start \
                      Codex once to approve it"
@@ -11415,8 +11418,8 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
                 println!(
-                    "  ~/.codex/hooks.json loads, but has no dcg PreToolUse command hook \
-                     that selects Bash"
+                    "  {} loads, but has no dcg PreToolUse command hook that selects Bash",
+                    codex_file_display("hooks.json")
                 );
                 println!(
                     "  → Re-run the dcg install script to register it, then start Codex \
@@ -11428,8 +11431,8 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 println!("{}", "MISPLACED".red());
                 issues += 1;
                 println!(
-                    "  A dcg hook is in ~/.codex/hooks.json but not where Codex runs it for \
-                     shell commands:"
+                    "  A dcg hook is in {} but not where Codex runs it for shell commands:",
+                    codex_file_display("hooks.json")
                 );
                 println!("  {detail}");
                 println!(
@@ -11457,14 +11460,20 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             CodexHookProbe::HooksFileInvalid(err) => {
                 println!("{}", "ERROR".red());
                 issues += 1;
-                println!("  ~/.codex/hooks.json is not valid JSON: {err}");
+                println!(
+                    "  {} is not valid JSON: {err}",
+                    codex_file_display("hooks.json")
+                );
                 println!("  Codex loads none of its hooks");
                 println!("  → Fix the JSON by hand, or move it aside and re-run the installer");
             }
             CodexHookProbe::HooksFileRejected(err) => {
                 println!("{}", "REJECTED BY CODEX".red());
                 issues += 1;
-                println!("  Codex rejects ~/.codex/hooks.json: {err}");
+                println!(
+                    "  Codex rejects {}: {err}",
+                    codex_file_display("hooks.json")
+                );
                 println!(
                     "  It loads NONE of the file's hooks, so the dcg hook never reaches trust \
                      review"
@@ -12870,11 +12879,10 @@ fn collect_doctor_report(
                     (
                         DoctorCheckStatus::Error,
                         format!("Codex dcg hook is trusted but 'enabled = false' ({state_key})"),
-                        Some(
-                            "Run 'dcg doctor --fix' to set enabled = true, or edit \
-                             ~/.codex/config.toml"
-                                .to_string(),
-                        ),
+                        Some(format!(
+                            "Run 'dcg doctor --fix' to set enabled = true, or edit {}",
+                            codex_file_display("config.toml")
+                        )),
                     )
                 }
             }
@@ -12882,9 +12890,11 @@ fn collect_doctor_report(
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
-                    "Codex is in use but ~/.codex/hooks.json does not exist — its shell \
-                     commands are not guarded"
-                        .to_string(),
+                    format!(
+                        "Codex is in use but {} does not exist — its shell commands are not \
+                         guarded",
+                        codex_file_display("hooks.json")
+                    ),
                     Some(
                         "Re-run the dcg install script to register the hook, then start \
                          Codex once to approve it"
@@ -12896,9 +12906,11 @@ fn collect_doctor_report(
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
-                    "~/.codex/hooks.json loads, but has no dcg PreToolUse command hook that \
-                     selects Bash — Codex shell commands are not guarded"
-                        .to_string(),
+                    format!(
+                        "{} loads, but has no dcg PreToolUse command hook that selects Bash — \
+                         Codex shell commands are not guarded",
+                        codex_file_display("hooks.json")
+                    ),
                     Some(
                         "Re-run the dcg install script to register it, then start Codex \
                          once to approve the hook"
@@ -12911,8 +12923,9 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "A dcg hook is in ~/.codex/hooks.json but not where Codex runs it \
-                         for shell commands: {detail}"
+                        "A dcg hook is in {} but not where Codex runs it for shell commands: \
+                         {detail}",
+                        codex_file_display("hooks.json")
                     ),
                     Some(
                         "Register it under hooks.PreToolUse as {\"matcher\": \"Bash\", \
@@ -12944,8 +12957,8 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "~/.codex/hooks.json is not valid JSON ({err}); Codex loads none of \
-                         its hooks"
+                        "{} is not valid JSON ({err}); Codex loads none of its hooks",
+                        codex_file_display("hooks.json")
                     ),
                     Some(
                         "Fix the JSON by hand, or move it aside and re-run the installer"
@@ -12958,9 +12971,10 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "Codex rejects ~/.codex/hooks.json ({err}), so it loads NONE of the \
-                         file's hooks — the dcg hook never reaches trust review and there is \
-                         no approval prompt to accept"
+                        "Codex rejects {} ({err}), so it loads NONE of the file's hooks — the \
+                         dcg hook never reaches trust review and there is no approval prompt to \
+                         accept",
+                        codex_file_display("hooks.json")
                     ),
                     Some(
                         "Make the file match Codex's schema: only a top-level \"hooks\" object \
@@ -15139,21 +15153,47 @@ fn probe_opencode_plugin(path: &std::path::Path) -> OpencodePluginProbe {
 // Codex hook registration + enablement probe (#368)
 // ---------------------------------------------------------------------------
 
+/// Codex's state directory. Codex documents that it "stores its local state
+/// under `CODEX_HOME` (defaults to `~/.codex`)", so a set, non-empty
+/// `CODEX_HOME` is where its user hooks and config live (#539).
+fn codex_home_override() -> Option<std::path::PathBuf> {
+    codex_home_from_env_value(std::env::var_os("CODEX_HOME"))
+}
+
+/// An empty `CODEX_HOME` is treated as unset, as Codex does.
+fn codex_home_from_env_value(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    value
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn codex_home_dir() -> std::path::PathBuf {
+    codex_home_override()
+        .unwrap_or_else(|| crate::config::home_dir().unwrap_or_default().join(".codex"))
+}
+
+/// How doctor names a file in Codex's state directory: the conventional
+/// `~/.codex/<name>`, or the real path when `CODEX_HOME` moves it.
+fn codex_file_display(name: &str) -> String {
+    codex_file_display_in(codex_home_override().as_deref(), name)
+}
+
+fn codex_file_display_in(codex_home: Option<&std::path::Path>, name: &str) -> String {
+    codex_home.map_or_else(
+        || format!("~/.codex/{name}"),
+        |dir| dir.join(name).display().to_string(),
+    )
+}
+
 /// User-level Codex hooks file (written by the dcg install script).
 fn codex_hooks_json_path() -> std::path::PathBuf {
-    crate::config::home_dir()
-        .unwrap_or_default()
-        .join(".codex")
-        .join("hooks.json")
+    codex_home_dir().join("hooks.json")
 }
 
 /// User-level Codex configuration, which carries the `[hooks.state]` trust
 /// and enablement table.
 fn codex_config_toml_path() -> std::path::PathBuf {
-    crate::config::home_dir()
-        .unwrap_or_default()
-        .join(".codex")
-        .join("config.toml")
+    codex_home_dir().join("config.toml")
 }
 
 /// Whether this machine appears to run Codex: its config directory exists or
@@ -24514,6 +24554,30 @@ if ($errors.Count -ne 0) {
         assert!(!codex_command_is_dcg("my-dcg-wrapper"));
         assert!(!codex_command_is_dcg("python3 -c 'print(1)'"));
         assert!(!codex_command_is_dcg(""));
+    }
+
+    /// #539: doctor reads Codex's files from `CODEX_HOME` when it is set,
+    /// and names them by that real path; unset or empty means `~/.codex`.
+    #[test]
+    fn codex_home_override_moves_the_probed_files_539() {
+        assert_eq!(codex_home_from_env_value(None), None);
+        assert_eq!(
+            codex_home_from_env_value(Some(std::ffi::OsString::new())),
+            None
+        );
+        let custom = std::path::PathBuf::from("/srv/codex-home");
+        assert_eq!(
+            codex_home_from_env_value(Some(custom.clone().into_os_string())),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            codex_file_display_in(None, "hooks.json"),
+            "~/.codex/hooks.json"
+        );
+        assert_eq!(
+            codex_file_display_in(Some(&custom), "config.toml"),
+            custom.join("config.toml").display().to_string()
+        );
     }
 
     #[test]
