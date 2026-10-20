@@ -51966,6 +51966,113 @@ mod tests {
         }
     }
 
+    /// GitHub #552, end to end under the dialect the Claude Code `Bash` tool
+    /// declares. A quoted `&`, `;` or `|` is part of a file name: the move
+    /// between two `~/Downloads` paths is the same ordinary rename the
+    /// `mv-within-home` rescue already allowed with any other punctuation.
+    #[test]
+    fn mv_within_home_quoted_separators_end_to_end_posix_issue_552() {
+        for command in [
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ; b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a | b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a b.pdf" "/home/tester/Downloads/c & d.pdf""#,
+            r"mv '/home/tester/Downloads/a & b.pdf' '/home/tester/Downloads/c.pdf'",
+            r#"mv "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Kevin & Linh's Wedding - A Comprehensive Guide.pdf" "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Archive/""#,
+            r#"mv "a & b.pdf" /home/tester/Downloads/c.pdf"#,
+            // Controls from the report that were already allowed.
+            r#"mv "/home/tester/Downloads/a x b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ( b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/tmp/a & b.pdf" "/tmp/c.pdf""#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "a quoted separator in a home-subtree mv operand is file-name data: \
+                 {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Real separators still end the mv, and every boundary still holds.
+        let deny_cases: [(&str, &[&str]); 9] = [
+            // The second segment is judged on its own.
+            ("mv ~/Downloads/a ~/Downloads/b; rm -rf ~", &[]),
+            (
+                r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf" && rm -rf ~"#,
+                &[],
+            ),
+            // A one-operand mv before `&` is not a home-subtree rename, and
+            // the backgrounded mv after it is the canonical bypass.
+            (
+                "mv ~/Downloads/a & mv /etc /tmp/x",
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf" & mv /etc /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            // Relocate-then-delete across segments, with a quoted `&` in the
+            // name being relocated.
+            (
+                r#"mv "/home/tester/Downloads/a & b.pdf" /tmp/x && rm -rf /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                "mv /etc /tmp/x && rm -rf /tmp/x",
+                &["mv-sensitive-source-root-home"],
+            ),
+            // Dotfile trees and `..` stay gated inside quotes.
+            (
+                r#"mv "/home/tester/Downloads/x" "/home/tester/.ssh""#,
+                &["mv-sensitive-source-root-home", "credential-file-write"],
+            ),
+            (
+                r#"mv "/home/tester/Downloads/a & b/../../.ssh/k" "/home/tester/Downloads/c""#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            // Escaped operands are never rescued: every in-path backslash is
+            // unverifiable to the mv rules (#356).
+            (
+                r"mv /home/tester/Downloads/a\ \&\ b.pdf /home/tester/Downloads/c.pdf",
+                &["mv-sensitive-source-root-home", "mv-dynamic-path"],
+            ),
+        ];
+        for (command, expected_rules) in deny_cases {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "the #552 fix must not widen the home-subtree rescue: {command:?}: {:?}",
+                result.pattern_info
+            );
+            let name = result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref())
+                .unwrap_or("<none>");
+            if expected_rules.is_empty() {
+                assert!(
+                    name.starts_with("rm-"),
+                    "expected the trailing rm segment to deny {command:?}, got {name}"
+                );
+            } else {
+                assert!(
+                    expected_rules.contains(&name),
+                    "unexpected deny rule for {command:?}: {name} \
+                     (expected one of {expected_rules:?})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn nested_substitution_bindings_do_not_prove_outer_variables() {
         // A binding inside `$( )`, backticks, or `<( )` runs in a subshell;

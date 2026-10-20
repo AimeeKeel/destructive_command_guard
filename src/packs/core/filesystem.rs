@@ -5006,16 +5006,29 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // - `..` is rejected in every later component, so no token can climb
         //   out of the home tree it names.
         // - Dynamic expansion (`$`, backticks, backslashes) is excluded
-        //   globally and inside every path token, so `$HOME/...` and command
-        //   substitution still fall through to the fail-closed rules. Flags
-        //   may not take a value, which keeps `mv -t /etc ...` and
-        //   `--target-directory=/etc` out.
+        //   anywhere in the command and inside every path token, so
+        //   `$HOME/...` and command substitution still fall through to the
+        //   fail-closed rules. Flags may not take a value, which keeps
+        //   `mv -t /etc ...` and `--target-directory=/etc` out.
         // - Anchored whole-command, so a compound that appends a destructive
-        //   second segment is not rescued.
+        //   second segment is not rescued: an unquoted `;`, `|` or `&` can
+        //   appear in no token, including the home-root user name.
+        //
+        // Inside a quoted token, `;`, `|` and `&` are file-name bytes, not
+        // separators (GitHub #552): `mv "~/Downloads/a & b.pdf" ...` is one
+        // two-operand mv, and the segmenter that hands this pattern its text
+        // already keeps it whole. The quoted classes used to exclude them,
+        // which denied any personal file named with `&` while the same name
+        // under /tmp, or with any other punctuation, was allowed. That
+        // exclusion was only needed because the dynamic-expansion lookahead
+        // stopped scanning at the first `;|&`; it now scans the whole text.
+        // With no backslash anywhere, a quote can only be closed by its own
+        // kind, so each quoted token this pattern reads is exactly the word
+        // the shell reads, and no unquoted separator can hide inside one.
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-within-home",
-            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"$`;|&]+|/Users/[^/\s'"$`;|&]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&]+|/Users/[^/\s'"$`;|&]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
         ),
         // -----------------------------------------------------------------
         // The same ordinary rename, written with a relative source.
@@ -5048,16 +5061,18 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         //   it, so absolute sources keep going through `mv-within-home`.
         // - `..` is refused in every later component, so no source can climb
         //   out of the tree it names.
-        // - Dynamic expansion is excluded globally and inside every token,
-        //   and the whole command is anchored, so a compound that appends a
-        //   destructive second segment is not rescued.
+        // - Dynamic expansion is excluded anywhere in the command and inside
+        //   every token, and the whole command is anchored, so a compound
+        //   that appends a destructive second segment is not rescued.
+        // - Quoted tokens read `;`, `|` and `&` as the file-name bytes they
+        //   are, exactly as `mv-within-home` does (GitHub #552).
         // The destination alternation is lifted verbatim from
         // `mv-within-home` so the two cannot disagree about what a
         // home-rooted target is.
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-relative-into-home",
-            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:\./)?(?![-~.])[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:\./)?(?![-~.])[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:\./)?(?![-~.])[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:\./)?(?![-~.])[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&]+|/Users/[^/\s'"$`;|&]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
         ),
     ];
     // Every possible safe match still runs its complete authored regex. The
@@ -8653,6 +8668,95 @@ mod tests {
             assert!(
                 pack.check(cmd).is_some(),
                 "Trash carve-out must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_reads_quoted_separators_as_file_name_bytes_issue_552() {
+        // GitHub #552: inside a quoted operand `&`, `;` and `|` are bytes of
+        // the file name, not separators. The home-subtree rescues excluded
+        // them from their quoted token classes, so the move allowed with `x`,
+        // `(` or `#` in the name was denied with `&`.
+        let pack = create_pack();
+        for cmd in [
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ; b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a | b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a b.pdf" "/home/tester/Downloads/c & d.pdf""#,
+            r"mv '/home/tester/Downloads/a & b.pdf' '/home/tester/Downloads/c.pdf'",
+            r"mv '/home/tester/Downloads/a;b|c&d.pdf' /home/tester/Downloads/e.pdf",
+            // The reported real-world name, apostrophe included.
+            r#"mv "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Kevin & Linh's Wedding - A Comprehensive Guide.pdf" "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Archive/""#,
+            r#"mv -v "~/Documents/a&b.txt" "~/Documents/a;b.txt" ~/Documents/dest/"#,
+            // The other punctuation the report found allowed stays allowed.
+            r#"mv "/home/tester/Downloads/a x b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ( b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ) b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ' b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a , b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a # b.pdf" "/home/tester/Downloads/c.pdf""#,
+            // `mv-relative-into-home` shares the destination alternation and
+            // reads its quoted source the same way.
+            r#"mv "a & b.pdf" /home/tester/Downloads/c.pdf"#,
+            r#"mv a.pdf "/home/tester/Downloads/c | d.pdf""#,
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator inside a home-subtree operand is file-name data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_still_ends_at_unquoted_separators_issue_552() {
+        // The #552 fix must not widen the rescue: an unquoted `;`, `|` or `&`
+        // still ends the mv, every home-root, dotfile and `..` boundary still
+        // holds inside quotes, and dynamic or escaped text still withholds it.
+        let pack = create_pack();
+        for cmd in [
+            // A second segment after a real separator is never rescued.
+            "mv ~/Downloads/a ~/Downloads/b; rm -rf ~",
+            "mv ~/Downloads/a & mv /etc /tmp/x",
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf" & rm -rf ~"#,
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf"; mv /etc /tmp/x"#,
+            r#"mv "/home/tester/Downloads/a" & "/home/tester/Downloads/b""#,
+            r#"mv "/home/tester/Downloads/a"&"/home/tester/Downloads/b" "/home/tester/Downloads/c""#,
+            // An unquoted separator in the home-root user name is a separator
+            // too. The regex used to read each of these as one rescued mv;
+            // only the segmenter kept them from being exempt.
+            "mv /home/x;/Documents/a/b /home/u/Documents/c",
+            "mv /home/a&b/Docs/x/y /home/a&b/Docs/z",
+            "mv /home/a|b/Docs/x/y /home/a/Docs/z",
+            // Home roots, top-level home directories, dotfile trees and `..`
+            // stay gated when the name carries a quoted separator.
+            r#"mv "/home/tester & x" "/home/tester/Downloads/c""#,
+            r#"mv "/home/tester/Downloads & x" "/home/tester/Docs/y""#,
+            r#"mv "/home/tester/Downloads/x" "/home/tester/.ssh""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/.ssh/authorized_keys""#,
+            r#"mv "/home/tester/.ssh/id_rsa & x" "/home/tester/Downloads/c""#,
+            r#"mv "/home/tester/Downloads/a & b/../../.ssh/k" "/home/tester/Downloads/c""#,
+            r#"mv a.pdf "/home/tester/.ssh/x & y""#,
+            r#"mv ../a.pdf "/home/tester/Downloads/c & d.pdf""#,
+            r#"mv .ssh/id_rsa "/home/tester/Downloads/c & d""#,
+            // Leaving the home tree is still the relocate half of the bypass.
+            r#"mv "/home/tester/Downloads/a & b.pdf" /tmp/x"#,
+            // Expansion after a quoted separator is still seen.
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/$(rm -rf ~)""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/`id`""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/$USER""#,
+            // A backslash anywhere withholds the rescue: with one, a quote can
+            // be escaped and the regex could no longer track where quoting
+            // ends. `mv-dynamic-path` treats every in-path escape as
+            // unverifiable (#356), so the escaped spelling stays denied too.
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/c\" ; rm -rf ~ ; \"""#,
+            r"mv /home/tester/Downloads/a\ \&\ b.pdf /home/tester/Downloads/c.pdf",
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "home-subtree rescue must stay bounded: {cmd}"
             );
         }
     }
