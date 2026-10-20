@@ -140,7 +140,7 @@ fn every_quoted_segment_reaches_the_existing_language_analyzer() {
 fn decoding_preserves_literals_empty_segments_unicode_and_boundaries() {
     for (word, code) in [
         (
-            r#"'echo '\''x'\''; git reset --hard'"#,
+            r"'echo '\''x'\''; git reset --hard'",
             "echo 'x'; git reset --hard",
         ),
         (
@@ -155,14 +155,14 @@ fn decoding_preserves_literals_empty_segments_unicode_and_boundaries() {
             r#"''"echo x; "'git reset --hard'"#,
             "echo x; git reset --hard",
         ),
-        (r#"echo\ 'x; git reset --hard'"#, "echo x; git reset --hard"),
-        (r#"git\ reset\ --hard"#, "git reset --hard"),
+        (r"echo\ 'x; git reset --hard'", "echo x; git reset --hard"),
+        (r"git\ reset\ --hard", "git reset --hard"),
         (
-            r#"$'echo \'x\'; git reset --hard'"#,
+            r"$'echo \'x\'; git reset --hard'",
             "echo 'x'; git reset --hard",
         ),
         (
-            r#"$'echo safe\0ignored'\;'git reset --hard'"#,
+            r"$'echo safe\0ignored'\;'git reset --hard'",
             "echo safe;git reset --hard",
         ),
         (
@@ -195,7 +195,7 @@ fn decoding_preserves_literals_empty_segments_unicode_and_boundaries() {
 
 #[test]
 fn overlapping_locators_and_redirect_views_do_not_exhaust_the_payload_budget() {
-    let source = r#"bash 2>/dev/null -c 'echo '\''x'\''; git reset --hard'"#;
+    let source = r"bash 2>/dev/null -c 'echo '\''x'\''; git reset --hard'";
     match extraction(source, 1) {
         ExtractionResult::Extracted(items) => {
             assert_eq!(items.len(), 1);
@@ -211,12 +211,12 @@ fn unresolved_or_malformed_words_are_not_reported_as_complete() {
     for source in [
         r#"bash -c 'echo '"$VALUE"'; echo tail'"#,
         r#"python3 -c 'print('"$VALUE"')'"#,
-        r#"node -e 'console.log('$(printf value)')'"#,
-        r#"bash -c 'echo '`printf value`'; echo tail'"#,
+        r"node -e 'console.log('$(printf value)')'",
+        r"bash -c 'echo '`printf value`'; echo tail'",
         r#"bash -c $"echo translated""#,
         "bash -c 'echo unterminated",
-        r#"bash -c 'echo '\"#,
-        r#"bash -c 'echo '*"#,
+        r"bash -c 'echo '\",
+        r"bash -c 'echo '*",
         r#"ssh host 'echo '"$VALUE"'; echo tail'"#,
         r#"mise exec -c 'echo '"$VALUE"'; echo tail'"#,
     ] {

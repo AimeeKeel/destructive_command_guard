@@ -382,6 +382,16 @@ fn non_utf8_override_is_not_discarded_in_favor_of_the_default() {
 
     let env = Env::new();
     let config_dir = PathBuf::from(OsString::from_vec(b"claude-\xff".to_vec()));
+    // APFS refuses a name that is not valid UTF-8 (EILSEQ, "Illegal byte
+    // sequence"), so the scenario cannot exist on a macOS filesystem (#565).
+    // Every other refusal is still a fixture failure.
+    if let Err(error) = std::fs::create_dir_all(env.cwd.join(&config_dir)) {
+        if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) {
+            eprintln!("skipped: this filesystem cannot store a non-UTF-8 name: {error}");
+            return;
+        }
+        panic!("create non-UTF-8 settings directory: {error}");
+    }
     let settings_path = env.cwd.join(&config_dir).join("settings.json");
     write_settings(&settings_path, &unrelated_settings());
     write_settings(&env.default_settings(), &unrelated_settings());
