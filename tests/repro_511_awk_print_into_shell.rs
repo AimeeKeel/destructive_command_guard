@@ -105,7 +105,6 @@ fn command_strings_that_run_stdin_are_shells() {
     for command in [
         "awk 'BEGIN{print \"git reset --hard\" | \"sh -c sh\"}'",
         "awk 'BEGIN{print \"git reset --hard\" | \"sh -c \\\"cat | sh\\\"\"}'",
-        "awk 'BEGIN{print \"git reset --hard\" | \"sh -c \\\"eval $(cat)\\\"\"}'",
     ] {
         assert_eq!(
             hook(command),
@@ -113,6 +112,15 @@ fn command_strings_that_run_stdin_are_shells() {
             "{command}"
         );
     }
+    // The `eval` target's own command string is unverifiable code, like the
+    // `"$(cat)"` one below: `sh -c "eval $(cat)"` is denied by itself, as its
+    // text `eval $(cat)` is at top level (#551), and that denial comes first.
+    let command = "awk 'BEGIN{print \"git reset --hard\" | \"sh -c \\\"eval $(cat)\\\"\"}'";
+    assert_eq!(
+        hook(command),
+        ("deny".to_string(), "heredoc.posix:eval-dynamic".to_string()),
+        "{command}"
+    );
     for command in [
         "awk 'BEGIN{print \"git reset --hard\" | \"bash -c \\\". /dev/stdin\\\"\"}'",
         "awk 'BEGIN{print \"git reset --hard\" | \"sh -c \\\"$(cat)\\\"\"}'",

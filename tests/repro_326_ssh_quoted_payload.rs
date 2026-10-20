@@ -162,3 +162,68 @@ fn dynamic_payload_parity_with_local_treatment() {
         );
     }
 }
+
+fn rule(result: &destructive_command_guard::EvaluationResult) -> Option<String> {
+    result.pattern_info.as_ref().map(|info| {
+        format!(
+            "{}:{}",
+            info.pack_id.as_deref().unwrap_or_default(),
+            info.pattern_name.as_deref().unwrap_or_default()
+        )
+    })
+}
+
+/// #551: a payload whose only hazard is a dynamic executable before a delete
+/// flag carries no pack keyword, so the remote recursion skipped it while the
+/// same text run locally is denied as `core.git:branch-dynamic-token`, and
+/// an unrelated word (`.FullName`) in the payload flipped the verdict. The
+/// remote spelling must get the local verdict and rule whatever else the
+/// payload contains; benign dynamic payloads stay allowed like their local
+/// text.
+#[test]
+fn keyword_less_payloads_get_their_local_verdict_551() {
+    for (local, remote) in [
+        ("$G -D main", "ssh h '$G -D main'"),
+        ("$p = x -d 1", "ssh h '$p = x -d 1'"),
+        ("$p = x -d 1; $q.Name", "ssh h '$p = x -d 1; $q.Name'"),
+        (
+            "$p = x -d 1; $q.FullName",
+            "ssh h '$p = x -d 1; $q.FullName'",
+        ),
+        ("$p -d 1", "ssh -p 2222 user@host '$p -d 1'"),
+    ] {
+        for dialect in DIALECTS {
+            let local_result = evaluate(local, &[], dialect);
+            let remote_result = evaluate(remote, &[], dialect);
+            assert_eq!(
+                rule(&local_result).as_deref(),
+                Some("core.git:branch-dynamic-token"),
+                "{local:?} under {dialect:?}: {local_result:?}"
+            );
+            assert!(
+                remote_result.is_denied(),
+                "{remote:?} must be denied like {local:?} under {dialect:?}, got {remote_result:?}"
+            );
+            assert_eq!(
+                rule(&remote_result),
+                rule(&local_result),
+                "{remote:?} under {dialect:?}"
+            );
+        }
+    }
+    for (local, remote) in [
+        ("echo $X", "ssh h 'echo $X'"),
+        ("$CMD --help", "ssh h '$CMD --help'"),
+        ("cd $D && make", "ssh h 'cd $D && make'"),
+    ] {
+        for dialect in DIALECTS {
+            let local_result = evaluate(local, &[], dialect);
+            let remote_result = evaluate(remote, &[], dialect);
+            assert!(
+                local_result.is_allowed() && remote_result.is_allowed(),
+                "{remote:?} and {local:?} must stay allowed under {dialect:?}: \
+                 {remote_result:?} / {local_result:?}"
+            );
+        }
+    }
+}

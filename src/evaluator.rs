@@ -31869,11 +31869,12 @@ fn evaluate_heredoc(
             }
             // An inline `-c` script that is nothing but one expansion or
             // command substitution (`bash -c "$X"`, `sh -c "$(wget -qO- …)"`)
-            // runs source dcg never sees. The keyword pre-filter below skipped
-            // it — `$X` carries no pack keyword — so `x='rm -rf ~'; bash -c "$x"`
-            // was allowed while `eval "$x"` (heredoc.posix:eval-dynamic) and
-            // `curl … | sh` (pipeline-consumer) are denied. Partly dynamic
-            // scripts (`bash -c "cd $HOME/p && make"`) are still analysed.
+            // runs source dcg never sees. Its text cannot help: `$X` carries no
+            // pack keyword, and read whole (below) it is an unknown program, so
+            // `x='rm -rf ~'; bash -c "$x"` was allowed while `eval "$x"`
+            // (heredoc.posix:eval-dynamic) and `curl … | sh`
+            // (pipeline-consumer) are denied. Partly dynamic scripts
+            // (`bash -c "cd $HOME/p && make"`) are still analysed.
             if content.heredoc_type.is_none()
                 && inline_shell_script_is_wholly_dynamic(&content.content)
             {
@@ -31895,11 +31896,13 @@ fn evaluate_heredoc(
                         content.byte_range.start,
                         context.shell_dialect,
                     ));
-            // Pack keywords alone cannot gate recursion: a shell body may
-            // launch an embedded Python/JavaScript script whose destructive
-            // operations have no enabled shell-pack keyword. Preserve nested
-            // interpreter and heredoc triggers as independent reasons to
-            // evaluate the complete executable source.
+            // The per-command pass sends every simple command of the body,
+            // including those inside loops, functions and substitutions,
+            // through the evaluator on its own. Pack keywords alone cannot
+            // gate it: a shell body may launch an embedded Python/JavaScript
+            // script whose destructive operations have no enabled shell-pack
+            // keyword. Preserve nested interpreter and heredoc triggers as
+            // independent reasons to run it.
             // A keyword-less pack promises to inspect every executable
             // command. The outer quick-reject already honors that contract;
             // shell payload recursion must not silently discard it here.
@@ -31915,161 +31918,187 @@ fn evaluate_heredoc(
                     },
                     |index| index.has_any_keyword(&content.content),
                 );
+            let per_command_pass =
+                body_has_keywords || check_triggers(&content.content) == TriggerResult::Triggered;
 
-            if body_has_keywords || check_triggers(&content.content) == TriggerResult::Triggered {
-                // A payload arriving on `psql`'s stdin is PostgreSQL, and the
-                // denial should say so (#428). The two SQL packs carry a
-                // byte-identical `truncate-table`, so with both enabled
-                // `psql db <<SQL … TRUNCATE users; … SQL` was denied as
-                // `database.mysql:truncate-table` — the right decision under
-                // the wrong rule id, and rule ids are the stable allowlist
-                // key, so a user who allowlists what the denial names gets a
-                // surprise. The carrier's own pack is moved to the front of
-                // the order rather than the siblings being dropped: first
-                // match wins, so this fixes the attribution, and no pack loses
-                // its chance to deny something its sibling does not cover.
-                let carrier_first_packs = content
-                    .target_command
-                    .as_deref()
-                    .and_then(database_pack_for_client)
-                    .filter(|owner| context.ordered_packs.iter().any(|id| id == owner))
-                    .map(|owner| {
-                        let mut ids = Vec::with_capacity(context.ordered_packs.len());
-                        ids.push(owner.to_string());
-                        ids.extend(
-                            context
-                                .ordered_packs
-                                .iter()
-                                .filter(|id| id.as_str() != owner)
-                                .cloned(),
-                        );
-                        ids
-                    });
-                let inner_ordered_packs = carrier_first_packs
-                    .as_deref()
-                    .unwrap_or(context.ordered_packs);
-                let contextual_redirects = if literal_bash_source_range(command, &content).is_some()
-                {
+            // A payload arriving on `psql`'s stdin is PostgreSQL, and the
+            // denial should say so (#428). The two SQL packs carry a
+            // byte-identical `truncate-table`, so with both enabled
+            // `psql db <<SQL … TRUNCATE users; … SQL` was denied as
+            // `database.mysql:truncate-table` — the right decision under
+            // the wrong rule id, and rule ids are the stable allowlist
+            // key, so a user who allowlists what the denial names gets a
+            // surprise. The carrier's own pack is moved to the front of
+            // the order rather than the siblings being dropped: first
+            // match wins, so this fixes the attribution, and no pack loses
+            // its chance to deny something its sibling does not cover.
+            let carrier_first_packs = content
+                .target_command
+                .as_deref()
+                .and_then(database_pack_for_client)
+                .filter(|owner| context.ordered_packs.iter().any(|id| id == owner))
+                .map(|owner| {
+                    let mut ids = Vec::with_capacity(context.ordered_packs.len());
+                    ids.push(owner.to_string());
+                    ids.extend(
+                        context
+                            .ordered_packs
+                            .iter()
+                            .filter(|id| id.as_str() != owner)
+                            .cloned(),
+                    );
+                    ids
+                });
+            let inner_ordered_packs = carrier_first_packs
+                .as_deref()
+                .unwrap_or(context.ordered_packs);
+            let contextual_redirects =
+                if per_command_pass && literal_bash_source_range(command, &content).is_some() {
                     proven_bash_redirect_offsets(&content.content)
                 } else {
                     Vec::new()
                 };
-                let evaluate_source = |source: &str| {
-                    evaluate_command_with_pack_order_deadline_at_path_inner(
-                        source,
-                        context.enabled_keywords,
-                        inner_ordered_packs,
-                        context.keyword_index,
-                        context.compiled_overrides,
-                        context.allowlists,
-                        context.heredoc_settings,
-                        context.allow_once_audit,
-                        context.project_path,
-                        context.deadline,
-                        crate::normalize::ShellDialect::Posix,
-                        context.nested_command_depth + 1,
-                        inline_automated_stdin,
-                    )
+            let evaluate_source = |source: &str| {
+                evaluate_command_with_pack_order_deadline_at_path_inner(
+                    source,
+                    context.enabled_keywords,
+                    inner_ordered_packs,
+                    context.keyword_index,
+                    context.compiled_overrides,
+                    context.allowlists,
+                    context.heredoc_settings,
+                    context.allow_once_audit,
+                    context.project_path,
+                    context.deadline,
+                    crate::normalize::ShellDialect::Posix,
+                    context.nested_command_depth + 1,
+                    inline_automated_stdin,
+                )
+            };
+            let mut complete_source_result = None;
+            let inner_commands = if per_command_pass {
+                crate::heredoc::extract_shell_commands(&content.content)
+            } else {
+                // Without a keyword or trigger the per-command pass has
+                // nothing to look for, but the body is still a script the
+                // shell runs, and a missing keyword is no proof that it is
+                // safe. The evaluator's own quick reject forces analysis of
+                // keyword-less shapes (a dynamic executable before a delete
+                // flag, `$G -D main`, is `core.git:branch-dynamic-token`), and
+                // its earlier passes read alias and trap bodies and resolve
+                // assigned executables. Skipping recursion here allowed
+                // `bash -c '$G -D main'` and `ssh h '$p -d 1'` while their
+                // text is denied at top level, and an unrelated `ln` (or
+                // `xlnx`, a substring) anywhere in the script turned the
+                // denial back on (#551). Such a body is evaluated once, whole,
+                // exactly as its text is at top level. That evaluation's own
+                // quick reject still decides: a benign body costs one
+                // quick-reject pass, and past it only the packs the same text
+                // selects at top level are evaluated (`core.git`, forced by a
+                // live expansion), never the full pack list.
+                vec![crate::heredoc::ExtractedShellCommand {
+                    text: content.content.clone(),
+                    start: 0,
+                    end: content.content.len(),
+                    line_number: 1,
+                }]
+            };
+            for inner in inner_commands {
+                if deadline_exceeded(context.deadline) {
+                    return Some(EvaluationResult::indeterminate_due_to_budget());
+                }
+
+                // A leaf such as `echo > "/tmp/run-$i"` loses the `for`
+                // header or assignment that proves its target (#526).
+                // Evaluate its complete, literal Bash body when that
+                // exact operator has a scoped proof. This keeps every
+                // other rule and command in the evaluator; it is not a
+                // blanket exemption for the extracted leaf. The single
+                // whole-body command of a body without a per-command pass
+                // takes the same route, so a denial in it is mapped and
+                // line-numbered from its span.
+                let needs_source_context = !per_command_pass
+                    || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
+                        .is_some_and(|operator| {
+                            contextual_redirects.contains(&(inner.start + operator))
+                        });
+                let result = if needs_source_context {
+                    complete_source_result
+                        .get_or_insert_with(|| evaluate_source(&content.content))
+                        .clone()
+                } else {
+                    evaluate_source(&inner.text)
                 };
-                let mut complete_source_result = None;
-                let inner_commands = crate::heredoc::extract_shell_commands(&content.content);
-                for inner in inner_commands {
-                    if deadline_exceeded(context.deadline) {
-                        return Some(EvaluationResult::indeterminate_due_to_budget());
-                    }
+                let (evaluated_start, evaluated_end) = if needs_source_context {
+                    (0, content.content.len())
+                } else {
+                    (inner.start, inner.end)
+                };
 
-                    // A leaf such as `echo > "/tmp/run-$i"` loses the `for`
-                    // header or assignment that proves its target (#526).
-                    // Evaluate its complete, literal Bash body when that
-                    // exact operator has a scoped proof. This keeps every
-                    // other rule and command in the evaluator; it is not a
-                    // blanket exemption for the extracted leaf.
-                    let needs_source_context =
-                        first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
-                            .is_some_and(|operator| {
-                                contextual_redirects.contains(&(inner.start + operator))
-                            });
-                    let result = if needs_source_context {
-                        complete_source_result
-                            .get_or_insert_with(|| evaluate_source(&content.content))
-                            .clone()
-                    } else {
-                        evaluate_source(&inner.text)
-                    };
-                    let (evaluated_start, evaluated_end) = if needs_source_context {
-                        (0, content.content.len())
-                    } else {
-                        (inner.start, inner.end)
-                    };
+                // A nested evaluator may conservatively stop before the
+                // absolute deadline when the remaining budget is too
+                // small for its next stage. Propagate that result exactly;
+                // checking the clock again here can still be false and
+                // must never turn incomplete nested analysis into Allow.
+                if nested_evaluation_incomplete(&result) {
+                    return Some(EvaluationResult::indeterminate_due_to_budget());
+                }
 
-                    // A nested evaluator may conservatively stop before the
-                    // absolute deadline when the remaining budget is too
-                    // small for its next stage. Propagate that result exactly;
-                    // checking the clock again here can still be false and
-                    // must never turn incomplete nested analysis into Allow.
-                    if nested_evaluation_incomplete(&result) {
-                        return Some(EvaluationResult::indeterminate_due_to_budget());
-                    }
-
-                    if result.is_denied() {
-                        // Propagate denial, wrapping the reason context
-                        if let Some(mut info) = result.pattern_info {
-                            let line_number = if needs_source_context {
-                                info.matched_span
-                                    .as_ref()
-                                    .and_then(|span| content.content.get(..span.start))
-                                    .map_or(1, |prefix| {
-                                        prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
-                                    })
-                            } else {
-                                inner.line_number
-                            };
-                            info.reason = wrap_embedded_shell_denial_reason(
-                                &info.reason,
-                                content.heredoc_type.is_some(),
-                                content.target_command.as_deref(),
-                                line_number,
-                            );
-                            info.source = MatchSource::HeredocAst; // Mark as heredoc source
-                            if let Some(span) = info.matched_span {
-                                if let Some(mapped_inner) = map_heredoc_span(
-                                    command,
-                                    &content,
-                                    evaluated_start,
-                                    evaluated_end,
-                                ) {
-                                    let mapped = MatchSpan {
-                                        start: mapped_inner.start.saturating_add(span.start),
-                                        end: mapped_inner.start.saturating_add(span.end),
-                                    };
-                                    if mapped.end <= command.len() {
-                                        info.matched_span = Some(mapped);
-                                        info.matched_text_preview =
-                                            Some(extract_match_preview(command, &mapped));
-                                    } else {
-                                        info.matched_span = None;
-                                    }
+                if result.is_denied() {
+                    // Propagate denial, wrapping the reason context
+                    if let Some(mut info) = result.pattern_info {
+                        let line_number = if needs_source_context {
+                            info.matched_span
+                                .as_ref()
+                                .and_then(|span| content.content.get(..span.start))
+                                .map_or(1, |prefix| {
+                                    prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+                                })
+                        } else {
+                            inner.line_number
+                        };
+                        info.reason = wrap_embedded_shell_denial_reason(
+                            &info.reason,
+                            content.heredoc_type.is_some(),
+                            content.target_command.as_deref(),
+                            line_number,
+                        );
+                        info.source = MatchSource::HeredocAst; // Mark as heredoc source
+                        if let Some(span) = info.matched_span {
+                            if let Some(mapped_inner) =
+                                map_heredoc_span(command, &content, evaluated_start, evaluated_end)
+                            {
+                                let mapped = MatchSpan {
+                                    start: mapped_inner.start.saturating_add(span.start),
+                                    end: mapped_inner.start.saturating_add(span.end),
+                                };
+                                if mapped.end <= command.len() {
+                                    info.matched_span = Some(mapped);
+                                    info.matched_text_preview =
+                                        Some(extract_match_preview(command, &mapped));
                                 } else {
                                     info.matched_span = None;
                                 }
+                            } else {
+                                info.matched_span = None;
                             }
-
-                            return Some(EvaluationResult {
-                                decision: EvaluationDecision::Deny,
-                                pattern_info: Some(info),
-                                allowlist_override: None,
-                                effective_mode: Some(crate::packs::DecisionMode::Deny),
-                                skipped_due_to_budget: false,
-                                quick_rejected: false,
-                                regex_evaluation_incomplete: false,
-                                branch_context: None,
-                                session_occurrence: None,
-                                graduated_response: None,
-                                bypass_method: None,
-                            });
                         }
-                        return Some(result);
+
+                        return Some(EvaluationResult {
+                            decision: EvaluationDecision::Deny,
+                            pattern_info: Some(info),
+                            allowlist_override: None,
+                            effective_mode: Some(crate::packs::DecisionMode::Deny),
+                            skipped_due_to_budget: false,
+                            quick_rejected: false,
+                            regex_evaluation_incomplete: false,
+                            branch_context: None,
+                            session_occurrence: None,
+                            graduated_response: None,
+                            bypass_method: None,
+                        });
                     }
+                    return Some(result);
                 }
             }
         }
@@ -47790,6 +47819,173 @@ mod tests {
             None,
         );
         assert!(result.is_allowed(), "{:?}", result.pattern_info);
+    }
+
+    /// `command`'s decision and rule under the default pack set, in the POSIX
+    /// dialect the Bash hook uses, as `"<decision> <pack>:<rule>"`.
+    fn default_posix_verdict(command: &str) -> String {
+        let enabled = default_config().enabled_pack_ids();
+        let pack_ids: Vec<&str> = enabled.iter().map(String::as_str).collect();
+        let result = evaluate_with_pack_ids_in_dialect(command, &pack_ids, ShellDialect::Posix);
+        let rule = result
+            .pattern_info
+            .as_ref()
+            .map_or_else(String::new, |info| {
+                format!(
+                    "{}:{}",
+                    info.pack_id.as_deref().unwrap_or_default(),
+                    info.pattern_name.as_deref().unwrap_or_default()
+                )
+            });
+        format!("{:?} {rule}", result.decision)
+    }
+
+    /// Asserts that every launcher spelling of a row gets exactly the
+    /// verdict its payload text gets at top level, and that the top-level
+    /// verdict is `expected`. Prints the whole table before asserting, so a
+    /// failing run still shows every row.
+    fn assert_payloads_match_top_level(rows: &[(&str, &[&str])], expected: &str) {
+        let mut mismatches = Vec::new();
+        for (text, payloads) in rows {
+            let top = default_posix_verdict(text);
+            eprintln!("551 | top     | {text:?} | {top}");
+            if top.trim_end() != expected {
+                mismatches.push(format!("top-level {text:?}: {top} (expected {expected})"));
+            }
+            for payload in *payloads {
+                let nested = default_posix_verdict(payload);
+                eprintln!("551 | payload | {payload:?} | {nested}");
+                if nested != top {
+                    mismatches.push(format!("{payload:?}: {nested} != top-level {top}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// #551: an inline script gets the verdict its text gets at top level,
+    /// whatever unrelated words it contains. Recursion into a `bash -c`,
+    /// `sh -c`, `ssh` or `bash <<EOF` body was gated on some pack keyword
+    /// appearing in it, while the top-level quick reject also forces the
+    /// keyword-less dynamic-executable check. So `$G -D main` was denied as
+    /// `core.git:branch-dynamic-token` but `bash -c '$G -D main'` was
+    /// allowed, and an unrelated `ln` (or `xlnx`, a substring) switched the
+    /// denial back on. The first ten rows are the issue's table.
+    #[test]
+    fn inline_payloads_get_their_top_level_denial_551() {
+        assert_payloads_match_top_level(
+            &[
+                (
+                    "$G -D main",
+                    &[
+                        "bash -c '$G -D main'",
+                        "sh -c '$G -D main'",
+                        "zsh -c '$G -D main'",
+                        "fish -c '$G -D main'",
+                        "ssh h '$G -D main'",
+                        "bash <<'EOF'\n$G -D main\nEOF",
+                        "bash <<< '$G -D main'",
+                    ],
+                ),
+                (
+                    "$p = x -d 1",
+                    &["bash -c '$p = x -d 1'", "ssh h '$p = x -d 1'"],
+                ),
+                ("$p = x -d 1; $q.Name", &["ssh h '$p = x -d 1; $q.Name'"]),
+                (
+                    "$p = x -d 1; $q.FullName",
+                    &["ssh h '$p = x -d 1; $q.FullName'"],
+                ),
+                ("$p = x -d 1; ln", &["bash -c '$p = x -d 1; ln'"]),
+                ("$p = x -d 1; xlnx", &["bash -c '$p = x -d 1; xlnx'"]),
+                ("$p = x -d 1; xl nx", &["bash -c '$p = x -d 1; xl nx'"]),
+                (
+                    "$p = x -d 1; echo git",
+                    &["bash -c '$p = x -d 1; echo git'"],
+                ),
+                ("$p -d 1", &["bash -c '$p -d 1'"]),
+                ("$p -d 1; ln", &["bash -c '$p -d 1; ln'"]),
+                // Keyword-less shapes whose top-level reading reaches the
+                // same rule through control flow or a deferred body.
+                (
+                    "for i in 1; do $G -D main; done",
+                    &["bash -c 'for i in 1; do $G -D main; done'"],
+                ),
+                (
+                    "if true; then $G -D main; fi",
+                    &["bash -c 'if true; then $G -D main; fi'"],
+                ),
+                (
+                    "alias x='$G -D main'",
+                    &["bash <<'EOF'\nalias x='$G -D main'\nEOF"],
+                ),
+                (
+                    "trap '$G -D main' EXIT",
+                    &["bash <<'EOF'\ntrap '$G -D main' EXIT\nEOF"],
+                ),
+                (
+                    "x=$(cat f); $x -D main",
+                    &["bash -c 'x=$(cat f); $x -D main'"],
+                ),
+                // A here-string body is also read as Bash whatever its
+                // receiver (see `evaluate_heredoc`), as it already was when
+                // the body held a keyword; a data-sink receiver stays exempt.
+                ("$a -d $b", &["mytool <<< \"$a -d $b\""]),
+            ],
+            "Deny core.git:branch-dynamic-token",
+        );
+        // `eval` of a dynamic value carries no pack keyword either: inside
+        // `sh -c` it ran unchecked while the same text is denied.
+        assert_payloads_match_top_level(
+            &[
+                ("eval \"$X\"", &["sh -c 'eval \"$X\"'"]),
+                (
+                    "eval $(cat)",
+                    &["sh -c 'eval $(cat)'", "bash -c 'eval $(cat)'"],
+                ),
+            ],
+            "Deny heredoc.posix:eval-dynamic",
+        );
+    }
+
+    /// #551, other direction: keyword-less payloads that are allowed at top
+    /// level stay allowed inside a launcher. `G=echo; $G -D main` is the
+    /// sharpest: its executable is resolved from the assignment before it,
+    /// a proof only the whole script carries.
+    #[test]
+    fn inline_payloads_keep_their_top_level_allow_551() {
+        assert_payloads_match_top_level(
+            &[
+                ("echo hi", &["bash -c 'echo hi'", "ssh h 'echo hi'"]),
+                ("echo $X", &["bash -c 'echo $X'"]),
+                (
+                    "$CMD --help",
+                    &[
+                        "bash -c '$CMD --help'",
+                        "bash -c \"$CMD --help\"",
+                        "ssh h '$CMD --help'",
+                    ],
+                ),
+                ("$X $Y", &["bash -c '$X $Y'"]),
+                ("cd $D && make", &["bash -c 'cd $D && make'"]),
+                ("G=echo; $G -D main", &["bash -c 'G=echo; $G -D main'"]),
+                (
+                    "echo '$G -D main'",
+                    &["bash <<'EOF'\necho '$G -D main'\nEOF"],
+                ),
+                (
+                    "$line",
+                    &["read -r a b <<< \"$line\"", "jq . <<< \"$line\""],
+                ),
+            ],
+            "Allow",
+        );
+
+        // A data sink never runs its stdin, so a body whose text is denied
+        // as a command stays allowed there.
+        for command in ["cat <<'EOF'\n$X -d 1\nEOF", "grep x <<< \"$a -d $b\""] {
+            assert_eq!(default_posix_verdict(command), "Allow ", "{command:?}");
+        }
     }
 
     /// dash, ksh and mksh are POSIX shells like sh/bash: their `-c` payload is
