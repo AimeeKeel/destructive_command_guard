@@ -30343,18 +30343,189 @@ fn segment_executable_name(segment: &str) -> Option<String> {
 /// allowed at 97, and its unscoped twin denied at both. Answering "yes" there
 /// makes a scoped rule at least as strict as the unscoped rule it refines,
 /// which is the only defensible direction for a guard.
+///
+/// A launcher that runs its operand as a program (`find … -exec X`, `xargs X`,
+/// `flock LOCK X`, `doas X`, `parallel X`) also invokes `X`. The resolved argv0
+/// is the launcher, so without this a scoped rule never fired behind one: the
+/// unscoped `unlink` rules used to deny `find . -exec unlink {} \;` and
+/// `flock /tmp/l unlink /etc/passwd`, and scoping them (#550) allowed both.
+/// This applies to every `executables`-scoped rule, not only unlink's: a
+/// scoped chmod rule judges `find / -exec chmod …` as the chmod it runs.
 fn segment_invokes_executable_in_dialect(
     segment: &str,
     executables: &[&str],
     dialect: ShellDialect,
 ) -> bool {
-    match segment_executable_in_dialect(segment, dialect) {
-        SegmentExecutable::Name(argv0) => executables
+    let declared = |name: &str| {
+        executables
             .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(&argv0)),
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    };
+    match segment_executable_in_dialect(segment, dialect) {
+        SegmentExecutable::Name(argv0) => {
+            declared(&argv0)
+                || operand_launched_executables(segment, &argv0)
+                    .iter()
+                    .any(|launched| declared(launched))
+        }
         SegmentExecutable::WrapperChainTruncated => true,
         SegmentExecutable::Unresolvable => false,
     }
+}
+
+/// Basenames of the programs a launcher argv0 runs from its own operands.
+///
+/// Read from whitespace-separated words, so a quoted operand containing
+/// spaces can only make this see an extra program, which only widens a scope.
+/// Option values the launchers take as separate words are skipped so they are
+/// not mistaken for the program (`xargs -I {} X`, `flock -w 5 LOCK X`).
+///
+/// Launchers whose option grammar is not modeled here (`watch`, `strace`,
+/// `pkexec`, `chroot DIR`, ...) expose every operand word that is not an
+/// option. That may admit a word that is really an option value, which only
+/// widens the scope; reading one word too few would hide the program.
+fn operand_launched_executables(segment: &str, argv0: &str) -> Vec<String> {
+    let modeled = matches!(argv0, "find" | "xargs" | "flock" | "doas" | "parallel");
+    let unmodeled = matches!(
+        argv0,
+        "watch"
+            | "strace"
+            | "ltrace"
+            | "pkexec"
+            | "run0"
+            | "chroot"
+            | "unshare"
+            | "nsenter"
+            | "setpriv"
+            | "taskset"
+            | "numactl"
+            | "firejail"
+            | "systemd-run"
+            | "fakeroot"
+            | "unbuffer"
+            | "chronic"
+            | "caffeinate"
+            | "gtimeout"
+            | "torsocks"
+            | "proxychains"
+            | "proxychains4"
+            | "valgrind"
+    );
+    if !modeled && !unmodeled {
+        return Vec::new();
+    }
+    let basename = |word: &str| -> Option<String> {
+        let unquoted: String = word
+            .chars()
+            .filter(|ch| !matches!(ch, '\'' | '"' | '\\'))
+            .collect();
+        let name = unquoted
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        (!name.is_empty()).then_some(name)
+    };
+    let words: Vec<&str> = segment.split_ascii_whitespace().collect();
+    let Some(start) = words
+        .iter()
+        .position(|word| basename(word).as_deref() == Some(argv0))
+    else {
+        return Vec::new();
+    };
+    let operands = &words[start + 1..];
+    if unmodeled {
+        return operands
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .filter_map(|word| basename(word))
+            .collect();
+    }
+    if argv0 == "find" {
+        return operands
+            .windows(2)
+            .filter(|pair| matches!(pair[0], "-exec" | "-execdir" | "-ok" | "-okdir"))
+            .filter_map(|pair| basename(pair[1]))
+            .collect();
+    }
+    // Options whose value is a separate word, per launcher.
+    let takes_value: &[&str] = match argv0 {
+        // GNU `-e[EOF]`, `-i[R]` and `-l[N]` take only an attached value.
+        "xargs" => &[
+            "-a",
+            "-d",
+            "-E",
+            "-I",
+            "-L",
+            "-n",
+            "-P",
+            "-s",
+            "--arg-file",
+            "--delimiter",
+            "--eof",
+            "--max-lines",
+            "--max-args",
+            "--max-procs",
+            "--max-chars",
+            "--process-slot-var",
+        ],
+        "flock" => &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
+        "doas" => &["-a", "-C", "-u"],
+        // parallel: the common value-taking options.
+        _ => &[
+            "-a",
+            "-j",
+            "-P",
+            "-S",
+            "-n",
+            "-N",
+            "-L",
+            "-s",
+            "-d",
+            "-E",
+            "-I",
+            "-C",
+            "--jobs",
+            "--sshlogin",
+            "--arg-file",
+            "--delay",
+            "--timeout",
+            "--colsep",
+        ],
+    };
+    let mut index = 0;
+    // flock's first operand is the lock file or descriptor, not the program.
+    let mut lock_pending = argv0 == "flock";
+    while let Some(word) = operands.get(index) {
+        index += 1;
+        if word.starts_with('-') && word.len() > 1 {
+            // `flock LOCK -c 'cmd'` hands the command to a shell, which the
+            // embedded-script analysis already reads.
+            if argv0 == "flock" && matches!(*word, "-c" | "--command") {
+                return Vec::new();
+            }
+            if takes_value.contains(word) {
+                index += 1;
+            }
+            continue;
+        }
+        if lock_pending {
+            lock_pending = false;
+            continue;
+        }
+        // GNU parallel with no command runs each input as a command line:
+        // `parallel ::: 'unlink /etc/passwd'`. Every input word may then be a
+        // program, so expose them all; this can only widen the scope.
+        if argv0 == "parallel" && word.starts_with(":::") {
+            return operands[index..]
+                .iter()
+                .filter(|input| !input.starts_with(":::"))
+                .filter_map(|input| basename(input))
+                .collect();
+        }
+        return basename(word).into_iter().collect();
+    }
+    Vec::new()
 }
 
 fn segment_invokes_executable(segment: &str, executables: &[&str]) -> bool {
@@ -34692,6 +34863,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn operand_launchers_expose_the_program_they_run() {
+        for (segment, argv0, expected) in [
+            ("find . -name x -exec unlink {} \\;", "find", vec!["unlink"]),
+            (
+                "find / -execdir rm {} + -ok chmod 777 {} \\;",
+                "find",
+                vec!["rm", "chmod"],
+            ),
+            ("find . -name unlink -print", "find", vec![]),
+            ("xargs unlink", "xargs", vec!["unlink"]),
+            (
+                "xargs -I {} -P 4 /usr/bin/unlink {}",
+                "xargs",
+                vec!["unlink"],
+            ),
+            ("xargs -0 -n1 grep -l unlink", "xargs", vec!["grep"]),
+            // Optional-value options take no separate word.
+            ("xargs -l unlink", "xargs", vec!["unlink"]),
+            ("xargs -e unlink", "xargs", vec!["unlink"]),
+            ("flock /tmp/l unlink /etc/passwd", "flock", vec!["unlink"]),
+            (
+                "flock -w 5 -n 9 'unlink' /etc/passwd",
+                "flock",
+                vec!["unlink"],
+            ),
+            ("flock /tmp/l -c 'unlink /etc/passwd'", "flock", vec![]),
+            ("doas -u root unlink /etc/passwd", "doas", vec!["unlink"]),
+            ("parallel -j 4 unlink ::: a b", "parallel", vec!["unlink"]),
+            (
+                "parallel ::: 'unlink /etc/passwd' true",
+                "parallel",
+                vec!["unlink", "passwd", "true"],
+            ),
+            // Unmodeled grammars: every non-option operand.
+            ("watch -n 5 unlink x", "watch", vec!["5", "unlink", "x"]),
+            (
+                "strace -f -o log unlink x",
+                "strace",
+                vec!["log", "unlink", "x"],
+            ),
+            (
+                "chroot /srv/root unlink x",
+                "chroot",
+                vec!["root", "unlink", "x"],
+            ),
+            ("ls unlink", "ls", vec![]),
+            ("cat unlink /tmp/x", "cat", vec![]),
+        ] {
+            assert_eq!(
+                operand_launched_executables(segment, argv0),
+                expected,
+                "{segment:?}"
+            );
+        }
+    }
+
     /// #550 end to end: `unlink`/`mv` inside a longer token is not the command,
     /// while launchers that run their operand stay covered. An argv0-scoped
     /// unlink rule allowed every launcher row below.
@@ -34701,6 +34929,11 @@ mod tests {
             "ob sync-unlink --path /home/user/vault",
             "foo --unlink /tmp/x",
             "printf '%s' unlink /etc/passwd",
+            "cat unlink /tmp/x",
+            "find . -name unlink -print",
+            "git ls-files | xargs grep -n unlink src",
+            "find . -name '*.log' | xargs wc -l",
+            "watch -n 5 ls /etc",
             "git checkout -b fix-mv-handling /home/user/repo",
             "tool x-mv /home/user/repo",
             "tool --no-mv /etc/hosts",
@@ -34725,10 +34958,28 @@ mod tests {
             "flock /tmp/l unlink /etc/passwd",
             "doas unlink /etc/passwd",
             "parallel unlink ::: /etc/passwd",
-            "x=unlink; $x /etc/passwd",
+            // xargs supplies unlink's operands from its input, so they are
+            // never a proven temp path.
+            "xargs unlink",
+            "xargs unlink < list",
+            "xargs -0 unlink",
+            "cat list | xargs -n1 unlink",
+            "xargs -n1 /usr/bin/unlink /tmp/x",
+            "parallel ::: 'unlink /etc/passwd'",
+            "flock /tmp/l -c 'unlink /etc/passwd'",
+            "sudo find / -name passwd -exec unlink {} \\;",
+            "watch unlink /etc/passwd",
+            "strace -f unlink /etc/passwd",
+            "chroot /srv/root unlink /etc/passwd",
             "sudo unlink /etc/sudoers",
             "mv /home/user/repo /tmp/r",
             "'mv' /home/user/repo /tmp/r",
+            // Words the shell still reads as `mv`.
+            "mv\"\" /etc /tmp/x",
+            "mv'' /home/user/repo /tmp/r",
+            "mv>/dev/null /etc /tmp/x",
+            "mv</dev/null /home/user/repo /tmp/r",
+            "mv\"\" \"$src\" d/",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,

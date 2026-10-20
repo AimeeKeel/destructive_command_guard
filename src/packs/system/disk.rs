@@ -404,7 +404,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // (`; ip netns delete drill-firewall-test`) no longer counts.
         destructive_pattern!(
             "umount-force",
-            r#"\bumount(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+['"]?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
+            r#"\bumount(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "umount -f force unmounts which may cause data loss if device is in use."
         ),
         // losetup can be dangerous
@@ -1449,6 +1449,8 @@ mod tests {
             "umount /mnt/x -f",
             "umount -Rf /mnt",
             "ls; umount -f /mnt/x",
+            "umount $'-f' /mnt/x",
+            "umount $\"-lf\" /mnt/x",
         ] {
             assert_blocks_with_pattern(&pack, command, "umount-force");
         }

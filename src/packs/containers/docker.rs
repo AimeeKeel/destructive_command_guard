@@ -339,10 +339,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //   supplies the `f`.
         // Global options before the subcommand, one management word
         // (`container`, `image`, `compose`, `node`, ...), flags after operands
-        // (`docker rm c1 -f`), clusters (`-vf`) and quoted flags still match.
+        // (`docker rm c1 -f`), clusters (`-vf`) and quoted flags still match,
+        // including Bash's `$'-f'` and `$"-f"` spellings of the same word.
         destructive_pattern!(
             "rm-force",
-            r#"\bdocker(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*(?:(?:[ \t]|\\\n)+[a-z][a-z0-9-]*(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*)?(?:[ \t]|\\\n)+['"]?(?:rm|remove)['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+['"]?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
+            r#"\bdocker(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*(?:(?:[ \t]|\\\n)+[a-z][a-z0-9-]*(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*)?(?:[ \t]|\\\n)+['"]?(?:rm|remove)['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "docker rm -f forcibly removes containers, potentially losing data.",
             High,
             "docker rm -f forcibly stops and removes containers. This is dangerous because:\n\n\
@@ -361,7 +362,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm-force above (#548). `docker image rm -f` is caught by rm-force.
         destructive_pattern!(
             "rmi-force",
-            r#"\bdocker(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*(?:[ \t]|\\\n)+['"]?rmi['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+['"]?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
+            r#"\bdocker(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*(?:[ \t]|\\\n)+['"]?rmi['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "docker rmi -f forcibly removes images even if in use.",
             High,
             "docker rmi -f forcibly removes images, even if containers are using them. \
@@ -525,12 +526,16 @@ mod tests {
             ("docker rm c1 2>&1 -f", "rm-force"),
             ("docker rm 'a;b' -f c1", "rm-force"),
             ("docker rm \"-f\" c1", "rm-force"),
+            ("docker rm $'-f' c1", "rm-force"),
+            ("docker rm $\"-f\" c1", "rm-force"),
+            ("docker container rm $'--force' c1", "rm-force"),
             ("\"docker\" rm -f c1", "rm-force"),
             ("docker 'rm' -f c1", "rm-force"),
             ("docker rm \\\n  -f c1", "rm-force"),
             ("docker.exe rm -f c1", "rm-force"),
             ("docker rmi -f img", "rmi-force"),
             ("docker rmi img --force", "rmi-force"),
+            ("docker rmi $'-f' img", "rmi-force"),
         ] {
             assert_blocks_with_pattern(&pack, command, rule);
         }

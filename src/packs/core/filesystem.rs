@@ -774,6 +774,22 @@ pub(crate) fn unlink_command_for_pattern_matching(
     let decoded = crate::normalize::decode_posix_literal_word(
         source.get(executable.byte_range.start..executable_end)?,
     )?;
+    // `xargs [OPTION]... unlink [ARG]...` runs unlink with its input items
+    // appended, or substituted for an `-I` placeholder, so the real operands
+    // never appear on the line: `cat list | xargs -I{} unlink {}` was allowed
+    // once the rules were scoped to the executed command. Judge the child
+    // invocation with a synthetic operand standing for that input, as the rm
+    // parser does; input can never earn the temp or help exemption.
+    if decoded.rsplit('/').next() == Some("xargs") {
+        let frontend_tokens = tokenize_for_normalization(source);
+        let child_index = xargs_command_index(source, &frontend_tokens)?;
+        let child = rm_frontend_suffix(source, &frontend_tokens, child_index)?;
+        let nested = unlink_command_for_pattern_matching(child, dialect)?;
+        return Some(UnlinkCommand {
+            matching_view: format!("{} ./__dcg_xargs_input__", nested.matching_view.trim_end()),
+            safe: false,
+        });
+    }
     if decoded.rsplit('/').next() != Some("unlink") {
         return None;
     }
@@ -5781,10 +5797,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // inside a hyphenated or dotted token, so `git checkout -b
         // fix-mv-handling /home/u/repo`, `tool x-mv …` and `tool --no-mv
         // /etc/hosts` were denied as moves. A quoted or path-prefixed `mv`
-        // still counts.
+        // still counts, and so does a word the shell still reads as `mv`:
+        // empty quotes glued to it (`mv"" /etc /x`) or a redirection glued
+        // to it (`mv>/dev/null /etc /x`), both of which run mv.
         destructive_pattern!(
             "mv-sensitive-source-root-home",
-            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?['"]?(?=[\s;&|)]|$)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?(?=[\s;&|)<>'"]|$)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`mv /etc /tmp/x && rm -rf /tmp/x` is the canonical cross-segment bypass: \
@@ -5820,7 +5838,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // The same whole-word `mv` boundary as above (#550).
         destructive_pattern!(
             "mv-dynamic-path",
-            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?['"]?(?=[\s;&|)]|$)[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))"#,
+            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?(?=[\s;&|)<>'"]|$)[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))"#,
             "mv with a shell-expanded or escaped path cannot be verified before execution.",
             High,
             "Shell variables and command substitutions are controlled by the calling environment and may resolve to `/`, `/etc`, a home directory, or another persistent tree. Backslash escapes can also hide traversal from lexical path checks, so dcg cannot safely classify this move.\n\n\
@@ -6854,6 +6872,15 @@ mod tests {
             ),
             ("mv \"$src\" d/", "mv-dynamic-path"),
             ("'mv' $src d/", "mv-dynamic-path"),
+            // Empty quotes or a redirection glued to the word still run mv.
+            ("mv\"\" /etc /tmp/x", "mv-sensitive-source-root-home"),
+            (
+                "mv'' /home/user/repo /tmp/r",
+                "mv-sensitive-source-root-home",
+            ),
+            ("mv>/dev/null /etc /tmp/x", "mv-sensitive-source-root-home"),
+            ("mv</dev/null /etc /tmp/x", "mv-sensitive-source-root-home"),
+            ("mv\"\" \"$src\" d/", "mv-dynamic-path"),
         ] {
             assert_blocks_with_pattern(&pack, command, rule);
         }
