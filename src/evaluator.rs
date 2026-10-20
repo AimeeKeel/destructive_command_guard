@@ -23834,6 +23834,10 @@ fn evaluate_packs_with_allowlists_at_depth(
     //
     // The rm_parse optimization for core.filesystem is handled inline.
     let mut first_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
+    // Set when the bounded Windows filesystem pass stopped before reading
+    // every statement. Only a denial may follow it; an allow becomes the
+    // configured incomplete-analysis outcome below.
+    let mut windows_filesystem_analysis_incomplete = false;
 
     drop(preparation_phase);
     for &pack_id in &candidate_pack_ids {
@@ -24014,6 +24018,17 @@ fn evaluate_packs_with_allowlists_at_depth(
                         return result;
                     }
                     continue;
+                }
+                crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::Incomplete => {
+                    // The pass hit its size or statement bound before reading
+                    // every statement: no rule was verified either way. Run
+                    // this pack's patterns over the whole text (a visible
+                    // destructive spelling still denies under its own rule) and
+                    // let the end of this evaluation report the configured
+                    // incomplete-analysis outcome instead of an allow — never a
+                    // `windows-filesystem-semantic-unverified` finding the pass
+                    // did not make (#569).
+                    windows_filesystem_analysis_incomplete = true;
                 }
                 crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::NoMatch
                     if shell_dialect != ShellDialect::Unknown =>
@@ -24828,6 +24843,12 @@ fn evaluate_packs_with_allowlists_at_depth(
     }
 
     if deadline_exceeded(deadline) {
+        return EvaluationResult::indeterminate_due_to_budget();
+    }
+
+    // An unread remainder is not a clean one, and a rule-scoped allowlist hit
+    // elsewhere does not authorize what was never analyzed.
+    if windows_filesystem_analysis_incomplete {
         return EvaluationResult::indeterminate_due_to_budget();
     }
 
@@ -47423,6 +47444,112 @@ mod tests {
                     result.pattern_info
                 );
             }
+        }
+    }
+
+    /// #569: a Windows filesystem pass that stops at its size or statement
+    /// bound reports the configured incomplete-analysis outcome
+    /// (`Indeterminate`) instead of a `windows-filesystem-semantic-unverified`
+    /// finding it never made, while a visible destructive spelling still
+    /// denies under its own rule. A caller-proven POSIX command is not judged
+    /// by the Windows pack at all, even when the pack is enabled.
+    #[test]
+    fn issue_569_windows_filesystem_bound_is_incomplete_analysis_not_a_finding() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = [
+            "del",
+            "erase",
+            "rd",
+            "rmdir",
+            "format",
+            "Remove-Item",
+            "ri",
+            "rm",
+            "Clear-Content",
+            "Clear-RecycleBin",
+        ];
+        let ordered_packs = ["windows.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+        let evaluate = |command: &str,
+                        dialect: ShellDialect,
+                        index: Option<&crate::packs::EnabledKeywordIndex>| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                index,
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+            )
+        };
+
+        let statements = "Write-Output 'rm x'; ".repeat(140);
+        // The generator from the issue at the first failing size. Its `^`
+        // after `(x|y)` and the `ri` inside `print` are what select the pass.
+        let tuples = " ('a', 'b'), ('c', 'd'),\n".repeat(29);
+        let python = format!(
+            "python3 - <<'EOF'\nimport re\ns = 'text'\nR = [\n{tuples}]\nfor m in re.finditer(r'[^\\n]{{0,40}}(x|y)[^\\n]{{0,40}}', s):\n    print(m.group(0))\nEOF"
+        );
+
+        for index in [None, keyword_index.as_ref()] {
+            for (command, dialect) in [
+                (statements.as_str(), ShellDialect::PowerShell),
+                (statements.as_str(), ShellDialect::Unknown),
+                // Where the pack is on and the dialect is Unknown — a Windows
+                // host, which keeps interpreter source as Windows evidence.
+                (python.as_str(), ShellDialect::Unknown),
+            ] {
+                let result = evaluate(command, dialect, index);
+                assert_eq!(
+                    result.decision,
+                    EvaluationDecision::Indeterminate,
+                    "{dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+                assert!(
+                    result.pattern_info.is_none(),
+                    "an incomplete analysis names no rule: {:?}",
+                    result.pattern_info
+                );
+            }
+
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                let command = format!("{statements}Clear-Content C:\\important.conf");
+                let result = evaluate(&command, dialect, index);
+                assert!(
+                    result.is_denied(),
+                    "{dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some("clear-content"),
+                    "{dialect:?}; index={}",
+                    index.is_some()
+                );
+            }
+
+            let result = evaluate(&python, ShellDialect::Posix, index);
+            assert!(
+                result.is_allowed(),
+                "index={}: {:?}",
+                index.is_some(),
+                result.pattern_info
+            );
         }
     }
 

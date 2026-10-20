@@ -567,9 +567,10 @@ fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command
 /// `tool_input.command` or native Antigravity `toolCall.args.CommandLine`,
 /// so extract commands leniently and run them through the normal evaluation
 /// pipeline. A proven Deny/Ask publishes the ordinary blocking response;
-/// deadline exhaustion publishes an indeterminate response. Both return the
-/// protocol's exit status. Nothing extractable, a benign command, or a
-/// warn/log match returns `None` to keep the historic fail-open warning path.
+/// deadline exhaustion, or a window whose evaluation could not complete,
+/// publishes an indeterminate response. Both return the protocol's exit
+/// status. Nothing extractable, a benign command, or a warn/log match returns
+/// `None` to keep the historic fail-open warning path.
 ///
 /// Two attribution rules keep this from over-denying and from under-scanning:
 /// - The prefix must name a recognized SHELL tool (`tool_name`/`toolName` or
@@ -704,6 +705,16 @@ fn try_deny_unparseable_payload(
     // "nothing found", not an unknown, so a benign oversized payload keeps
     // failing open exactly as `issue_290_padded_benign_command_still_fails_open`
     // requires.
+    //
+    // A window whose own evaluation could not finish is the same unknown as an
+    // exhausted deadline: the evaluator answered Indeterminate (an incomplete
+    // regex search, a bounded analysis that stopped short — #569 turned the
+    // Windows filesystem statement bound into one — or a nested deadline). It
+    // used to fall through this loop into the fail-open `None`, including on
+    // the LAST window, where the next iteration's deadline check never ran.
+    // Keep it until the scan ends, so a later window's proven Deny still
+    // outranks it, and then publish it instead of allowing.
+    let mut pending_indeterminate: Option<ResolvedCommandOutcome> = None;
     for command in &commands {
         if deadline.is_exceeded() {
             let mut history_writer = if config.history.enabled {
@@ -739,8 +750,10 @@ fn try_deny_unparseable_payload(
         // inert unknown binary — reopening the #322 hole on the oversized path.
         let refined_dialect = hook::refine_shell_dialect(command, shell_dialect);
         let outcome = resolve_hook_command(&eval_context, command, refined_dialect, None);
-        if let ResolvedCommandOutcome::DenyFamily(resolved) = outcome {
-            if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
+        match outcome {
+            ResolvedCommandOutcome::DenyFamily(resolved)
+                if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) =>
+            {
                 let mut history_writer = if config.history.enabled {
                     let mut writer = create_history_writer(&config.history);
                     writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
@@ -758,9 +771,24 @@ fn try_deny_unparseable_payload(
                 drop_history_writer(history_writer);
                 return Some(exit_code);
             }
+            indeterminate @ (ResolvedCommandOutcome::DeadlineExhausted { .. }
+            | ResolvedCommandOutcome::OversizedCommand { .. }) => {
+                pending_indeterminate.get_or_insert(indeterminate);
+            }
+            ResolvedCommandOutcome::DenyFamily(_) | ResolvedCommandOutcome::Allow(_) => {}
         }
     }
-    None
+    let indeterminate = pending_indeterminate?;
+    let mut history_writer = if config.history.enabled {
+        let mut writer = create_history_writer(&config.history);
+        writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+        Some(writer)
+    } else {
+        None
+    };
+    let exit_code = publish_decisive_response(&eval_context, indeterminate, &mut history_writer);
+    drop_history_writer(history_writer);
+    Some(exit_code)
 }
 
 /// Process-wide registry of shutdown actions.

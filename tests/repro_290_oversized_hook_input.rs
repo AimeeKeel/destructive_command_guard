@@ -388,10 +388,21 @@ fn issue_290_oversized_envelope_without_tool_name_is_not_denied() {
 /// Run dcg on a raw oversized payload with `windows.filesystem` enabled, so
 /// the PowerShell/cmd rules participate (they are default-off on Unix).
 fn run_hook_raw_windows(input: &str, home: &Path) -> (String, String, i32) {
+    run_hook_raw_windows_with_budget(input, home, None)
+}
+
+/// As [`run_hook_raw_windows`], with an explicit hook budget in milliseconds
+/// (`None` keeps the shipped default).
+fn run_hook_raw_windows_with_budget(
+    input: &str,
+    home: &Path,
+    budget_ms: Option<u64>,
+) -> (String, String, i32) {
     let config_path = home.join("dcg-test-config.toml");
     fs::write(&config_path, "").expect("failed to write empty config");
 
-    let mut child = Command::new(dcg_binary())
+    let mut command = Command::new(dcg_binary());
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -405,9 +416,16 @@ fn run_hook_raw_windows(input: &str, home: &Path) -> (String, String, i32) {
             "DCG_PENDING_EXCEPTIONS_PATH",
             home.join("pending_exceptions.jsonl"),
         )
-        .env_remove("DCG_FAIL_CLOSED")
-        .spawn()
-        .expect("failed to spawn dcg process");
+        .env_remove("DCG_FAIL_CLOSED");
+    match budget_ms {
+        Some(ms) => {
+            command.env("DCG_HOOK_TIMEOUT_MS", ms.to_string());
+        }
+        None => {
+            command.env_remove("DCG_HOOK_TIMEOUT_MS");
+        }
+    }
+    let mut child = command.spawn().expect("failed to spawn dcg process");
 
     {
         let stdin = child.stdin.as_mut().expect("failed to get stdin");
@@ -456,6 +474,45 @@ fn issue_322_oversized_mislabeled_powershell_is_denied() {
             .unwrap_or_default(),
         "deny",
         "oversized mislabeled PowerShell payload must fail closed, got: {stdout:?}"
+    );
+}
+
+/// #569: the Windows filesystem pass reports a command past its statement
+/// bound as an incomplete analysis (Indeterminate) rather than an
+/// `Unverified` deny. This window scan used to publish only Deny/Ask and its
+/// own deadline check, so a window's Indeterminate fell into the fail-open
+/// branch: a spelling the pack's regexes cannot see (a cmd caret) behind more
+/// statements than the bound would have been ALLOWED once padded past the
+/// input limit. The budget is generous so the answer comes from the analysis
+/// bound, not from the clock; `echo rm` only gets the window past the keyword
+/// quick reject.
+#[test]
+fn issue_569_incomplete_window_analysis_on_an_oversized_payload_is_not_allowed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let command = format!(
+        "echo rm & r^d /s /q C:\\src & {}{}",
+        "echo a & ".repeat(140),
+        "A".repeat(PADDING_BYTES)
+    );
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command }
+    })
+    .to_string();
+    assert!(input.len() > 256 * 1024, "envelope must exceed the limit");
+
+    let (stdout, stderr, exit_code) =
+        run_hook_raw_windows_with_budget(&input, temp.path(), Some(5000));
+    assert_eq!(exit_code, 0, "hook mode exits 0\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("expected a blocking JSON verdict ({e}); stdout: {stdout:?}\nstderr: {stderr}")
+    });
+    let decision = json["hookSpecificOutput"]["permissionDecision"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        matches!(decision, "deny" | "ask"),
+        "an incompletely analyzed window must not fail open, got: {stdout:?}"
     );
 }
 

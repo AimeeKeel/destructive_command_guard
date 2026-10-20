@@ -2854,7 +2854,9 @@ fn command_has_powershell_shape(command: &str) -> bool {
             "command" if segment_has_windows_shape(node.text().as_ref()) => return true,
             // Interpreter source retains conservative Windows evidence:
             // an opaque or aliased sink can pass these strings to a shell.
-            // Only the separately proven data bodies have been masked.
+            // Only the separately proven data bodies have been masked — and,
+            // for pack activation off Windows, the proven inert interpreter
+            // bodies (`command_is_windows_shell_payload_on_host`).
             "heredoc_body" if has_candidate(node.text().as_ref()) => return true,
             _ => {}
         }
@@ -2901,12 +2903,79 @@ pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialec
     // Unknown, where the fail-closed union denied the commit (issue #412).
     // Everything outside the body is still judged, so a genuinely mislabeled
     // `Remove-Item -Recurse -Force` is down-trusted exactly as before.
+    //
+    // Interpreter source keeps widening the dialect (see the `heredoc_body`
+    // arm of `command_has_powershell_shape`), so the always-on rules still
+    // judge Windows-shaped strings an opaque sink could run. It no longer
+    // activates the disabled `windows.*` packs off Windows: that is
+    // `command_is_windows_shell_payload`'s narrower question (#569).
     let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
     if command_has_powershell_shape(visible.as_ref()) {
         ShellDialect::Unknown
     } else {
         labeled
     }
+}
+
+/// [`command_is_windows_shell_payload`] with the host platform made explicit,
+/// so both sides of its host-dependent interpreter-source rule are testable on
+/// every CI platform.
+///
+/// Activation asks whether the payload IS a Windows-shell payload, which is a
+/// narrower question than whether [`refine_shell_dialect`] should distrust the
+/// label. A proven, quoted non-shell interpreter body (`python3 - <<'PY'`, see
+/// [`crate::heredoc::mask_inert_interpreter_stdin`]) answers it no on a
+/// non-Windows host (#569). Its bytes are Python/JavaScript/… source, and the
+/// heredoc operator around them is itself proof that no PowerShell runs the
+/// payload: PowerShell reserves `<` and rejects the whole script at parse
+/// time, and cmd.exe does not exist there. What the source can hand to a shell
+/// is decided by its own runtime, and off Windows every implicit shell sink
+/// (`os.system`, `shell=True`, `child_process.exec`, Ruby/Perl `system`, PHP
+/// `shell_exec`) is `/bin/sh`. Counting a regex such as
+/// `r'[^\n]{0,40}(x|y)'` (the `^` after `(x|y)` reads as a cmd caret) or prose
+/// such as `install-l` as a Windows payload activated the disabled
+/// `windows.*` packs on Linux/macOS, whose PowerShell and cmd segmenters then
+/// judged the Python source and denied it as
+/// `windows-filesystem-semantic-unverified` — after a statement bound that
+/// 28 harmless lines stayed under and 29 crossed. The source itself still
+/// reaches the raw-shell pack scan, the language analysis and the widened
+/// dialect unchanged (#136, #278).
+///
+/// On a Windows host those implicit sinks run cmd.exe or PowerShell, so the
+/// body keeps its evidence (the packs are on there by default anyway). Off
+/// Windows the remaining routes are named by the text itself, and a command
+/// that names one keeps the evidence too ([`names_windows_shell_route`]): a
+/// PowerShell executable (`f("pwsh -c 'x; Clear-Content db'")` through an
+/// aliased `os.system`), or a Windows `.exe` program, whose shell sinks are
+/// cmd.exe even on a Linux host (WSL interop runs `python.exe - <<'PY'`).
+/// Unquoted delimiters, shell receivers, `-c`/script-file owners, rebound
+/// interpreter names and every other unproven case keep it on every host,
+/// because `mask_inert_interpreter_stdin` declines to mask them.
+fn command_is_windows_shell_payload_on_host(command: &str, host_is_windows: bool) -> bool {
+    let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    if !command_has_powershell_shape(visible.as_ref()) {
+        return false;
+    }
+    if host_is_windows || names_windows_shell_route(command) {
+        return true;
+    }
+    match crate::heredoc::mask_inert_interpreter_stdin(visible.as_ref()) {
+        std::borrow::Cow::Borrowed(_) => true,
+        std::borrow::Cow::Owned(outer) => command_has_powershell_shape(&outer),
+    }
+}
+
+/// Whether `command` names, anywhere and quoted or not, a way for interpreter
+/// source on a non-Windows host to reach a Windows shell: a PowerShell
+/// executable (`pwsh`, `powershell`, any directory or `.exe`) as a whole word,
+/// or any `.exe` program (WSL interop and Wine run them, and their implicit
+/// shell is cmd.exe). Deliberately loose: it only ever keeps conservative
+/// evidence.
+fn names_windows_shell_route(command: &str) -> bool {
+    command
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case("pwsh") || word.eq_ignore_ascii_case("powershell"))
+        || command.to_ascii_lowercase().contains(".exe")
 }
 
 /// Whether the command's own shape marks it a Windows-shell payload, which is
@@ -2924,10 +2993,11 @@ pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialec
 /// `Unknown` on its own must not activate the packs — it is also what an
 /// unrecognised tool name produces, which proves nothing about the payload.
 /// The command's shape is the signal, and it is the same one the refinement
-/// already trusts enough to re-decide the entire dialect on.
+/// already trusts enough to re-decide the entire dialect on — except that,
+/// off Windows, proven inert interpreter source does not count as the payload
+/// (#569; see [`command_is_windows_shell_payload_on_host`]).
 pub fn command_is_windows_shell_payload(command: &str) -> bool {
-    let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
-    command_has_powershell_shape(visible.as_ref())
+    command_is_windows_shell_payload_on_host(command, cfg!(windows))
 }
 
 pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
@@ -5340,6 +5410,98 @@ mod tests {
                 "{command}"
             );
             assert!(command_is_windows_shell_payload(command), "{command}");
+        }
+    }
+
+    /// #569: the source of a proven, quoted non-shell interpreter heredoc is
+    /// not a Windows-shell payload. Off Windows it does not activate the
+    /// disabled `windows.*` packs; on Windows, where the interpreter's own
+    /// shell sinks run cmd.exe/PowerShell, it keeps its conservative evidence.
+    /// It still widens the dialect on every host, so the always-on rules keep
+    /// judging what an opaque sink could run (#136, 3a8c330b). The host is
+    /// explicit so both sides run on every CI platform.
+    #[test]
+    fn issue_569_inert_interpreter_source_is_not_a_windows_payload_off_windows() {
+        let tuples = " ('a', 'b'), ('c', 'd'),\n".repeat(29);
+        let inert = [
+            // The 30-byte reduction from the issue (a lone `install-l` reads
+            // as an approved-verb cmdlet).
+            "python3 - <<'PY'\ninstall-l ''''\n`\n\nPY".to_string(),
+            // The generator from the issue: the `^` after `(x|y)` reads as a
+            // cmd caret starting a command word.
+            format!(
+                "python3 - <<'EOF'\nimport re\ns = 'text'\nR = [\n{tuples}]\nfor m in re.finditer(r'[^\\n]{{0,40}}(x|y)[^\\n]{{0,40}}', s):\n    print(m.group(0))\nEOF"
+            ),
+            "python3 - <<'PY'\nimport os\nos.system(\"echo & rd /s /q C:\\\\Users\")\nPY"
+                .to_string(),
+            "python3 - <<\"PY\"\nprint('a|g^it status')\nPY".to_string(),
+            "node - <<'JS'\nconsole.log('a|Remove-Item -Recurse -Force C:/x');\nJS".to_string(),
+        ];
+        for command in &inert {
+            assert!(
+                !command_is_windows_shell_payload_on_host(command, false),
+                "{command:?}"
+            );
+            assert!(
+                command_is_windows_shell_payload_on_host(command, true),
+                "{command:?}"
+            );
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+        }
+
+        // Everything that is not a proven inert interpreter body — and inert
+        // source whose text names a route to a Windows shell off Windows (a
+        // PowerShell executable, or a WSL-interop/Wine `.exe` interpreter
+        // whose `os.system` is cmd.exe) — stays a Windows payload on every
+        // host.
+        for command in [
+            "python.exe - <<'PY'\nimport os\nos.system(\"echo & rd /s /q C:\\\\Users\")\nPY",
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run('cmd.exe /c \"x & rd /s /q C:\\\\Users\"')\nPY",
+            "bash <<'SH'\nRemove-Item -Recurse -Force C:\\x\nSH",
+            "pwsh <<'PS'\nRemove-Item -Recurse -Force C:\\x\nPS",
+            "python3 - <<PY\ninstall-l x\nRemove-Item -Recurse -Force C:\\x\nPY",
+            "python3 script.py <<'PY'\ncopy nul .git\\config\nPY",
+            "python3 -c 'import sys; exec(sys.stdin.read())' <<'PY'\nRemove-Item -Recurse -Force C:\\x\nPY",
+            "python3() { bash -s; }; python3 - <<'PY'\nRemove-Item -Recurse -Force C:\\x\nPY",
+            "Remove-Item -Recurse -Force C:\\x; python3 - <<'PY'\nprint(1)\nPY",
+            "python3 - <<'PY'\nprint(1)\nPY\nRemove-Item -Recurse -Force C:\\x",
+            "python3 - <<'PY'\nprint(1)\nPY\nformat D: /q",
+            "python3 - <<'PY'\nimport os\nf = getattr(os, 'system')\nf(\"pwsh -c 'x; Clear-Content ~/important.db'\")\nPY",
+            "python3 - <<'PY'\nimport os\nf = getattr(os, 'system')\nf(\"/usr/bin/powershell -c 'x; Remove-Item -Recurse -Force ~/x'\")\nPY",
+            "python3 - <<'PY'\nopen('x.ps1', 'w').write('x; Remove-Item -Recurse -Force ~/x')\nPY\npwsh x.ps1",
+        ] {
+            for host_is_windows in [false, true] {
+                assert!(
+                    command_is_windows_shell_payload_on_host(command, host_is_windows),
+                    "{command:?} (windows host: {host_is_windows})"
+                );
+            }
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+        }
+
+        // Commands with no Windows shape at all stay what they were.
+        for command in [
+            "python3 - <<'PY'\nprint('hello')\nPY",
+            "python3 - <<'PY'\nprint('pwsh.exe is mentioned, nothing is shaped')\nPY",
+        ] {
+            for host_is_windows in [false, true] {
+                assert!(
+                    !command_is_windows_shell_payload_on_host(command, host_is_windows),
+                    "{command:?}"
+                );
+            }
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix
+            );
         }
     }
 
