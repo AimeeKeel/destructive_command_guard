@@ -567,6 +567,9 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
 
     for caps in sink_regex.captures_iter(code) {
         let Some(m) = caps.get(0) else { continue };
+        let Some((call_start, sink)) = exec_sink_call(&caps) else {
+            continue;
+        };
 
         // Scan the sink call's full argument region — not just its first string
         // literal — so a destructive payload nested inside a list/tuple literal
@@ -574,7 +577,7 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         // first literal (`"sh"`) is inert (#136). The region spans from the
         // opening paren of this match to the balanced close paren (bounded to the
         // remainder of the source), descending into bracketed list elements.
-        let arg_region = exec_sink_arg_region(code, m.start());
+        let arg_region = exec_sink_arg_region(code, call_start);
         let Some(hit) = detect_destructive_in_args(arg_region, language) else {
             continue;
         };
@@ -605,7 +608,7 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         }
         let severity = hit.severity;
 
-        let sink = caps.name("sink").map_or("exec", |s| s.as_str());
+        let sink = if sink.is_empty() { "exec" } else { sink };
         let lang_id = match language {
             ScriptLanguage::JavaScript => "javascript",
             ScriptLanguage::TypeScript => "typescript",
@@ -615,13 +618,13 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
             ScriptLanguage::Php => "php",
             _ => "unknown",
         };
-        let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+        let line_number = newline_positions.partition_point(|&idx| idx < call_start) + 1;
 
         out.push(PatternMatch {
             rule_id: format!("heredoc.{lang_id}.exec_sink.{}", hit.rule_suffix),
             reason: format!("{} via {sink}() exec sink", hit.reason),
-            matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
-            start: m.start(),
+            matched_text_preview: truncate_preview(code.get(call_start..m.end()).unwrap_or(""), 60),
+            start: call_start,
             end: m.end(),
             line_number,
             severity,
@@ -651,6 +654,11 @@ pub struct ReconstructedCommand {
 /// offset before excluding the call's arguments, because regex-looking text
 /// inside a string or comment is not an executing sink. `None` reports a
 /// bounded scan that did not finish enumerating its candidates.
+///
+/// A `$` tagged template (#570) is never claimed. The literal pass already
+/// reads a tag's unescaped template as the command it may run (#544), and
+/// claiming the call would only take that reading away from it; the
+/// reconstruction judges the same text beside it.
 pub(crate) fn literal_exec_sink_starts(
     code: &str,
     language: ScriptLanguage,
@@ -662,14 +670,19 @@ pub(crate) fn literal_exec_sink_starts(
         _ => return Some(Vec::new()),
     };
     let mut starts = Vec::new();
-    for (index, caps) in sink_regex.captures_iter(code).enumerate() {
-        if index >= max_calls {
+    let mut calls = 0_usize;
+    for caps in sink_regex.captures_iter(code) {
+        if caps.name("tag").is_some() {
+            continue;
+        }
+        if calls >= max_calls {
             return None;
         }
-        let Some(matched) = caps.get(0) else {
+        calls += 1;
+        let Some((call_start, _)) = exec_sink_call(&caps) else {
             continue;
         };
-        let region = exec_sink_arg_region(code, matched.start());
+        let region = exec_sink_arg_region(code, call_start);
         let argv = exec_argv_operands(region, language);
         if !argv.unverified
             && !argv.values.is_empty()
@@ -678,7 +691,7 @@ pub(crate) fn literal_exec_sink_starts(
                 .iter()
                 .all(|value| !value.contains(RUNTIME_VALUE))
         {
-            starts.push(matched.start());
+            starts.push(call_start);
         }
     }
     Some(starts)
@@ -744,7 +757,10 @@ pub fn exec_sink_reconstructed_commands(
     let mut out = Vec::new();
     for caps in sink_regex.captures_iter(haystack) {
         let Some(m) = caps.get(0) else { continue };
-        let region = exec_sink_arg_region(haystack, m.start());
+        let Some((call_start, sink)) = exec_sink_call(&caps) else {
+            continue;
+        };
+        let region = exec_sink_arg_region(haystack, call_start);
         // A call the rm/git backstop owns (any `detect_destructive_in_args`
         // hit) is left to it, so an allowlisted `rm`/`git` is not re-denied
         // here under a pack rule id.
@@ -763,15 +779,7 @@ pub fn exec_sink_reconstructed_commands(
             [] => continue,
             // One string handed to a shell (#512): see below.
             [script] => {
-                if !single_string_sink_runs_shell(
-                    language,
-                    caps.name("sink")
-                        .or_else(|| caps.name("call"))
-                        .map_or("", |s| s.as_str()),
-                    haystack,
-                    m.start(),
-                    region,
-                ) {
+                if !single_string_sink_runs_shell(language, sink, haystack, call_start, region) {
                     continue;
                 }
                 script.to_string()
@@ -792,7 +800,7 @@ pub fn exec_sink_reconstructed_commands(
         };
         out.push(ReconstructedCommand {
             command,
-            start: m.start(),
+            start: call_start,
             end: m.end(),
         });
     }
@@ -843,10 +851,11 @@ pub fn exec_sink_reconstructed_commands(
 /// - PHP `shell_exec`/`passthru`/`system`/`exec`/`popen`/`proc_open` as plain
 ///   functions (`$pdo->exec("…")` runs SQL, not a shell);
 /// - JavaScript `execSync`, `exec` on `child_process` (not `RegExp.exec` or a
-///   database handle's `exec`), and `spawn`/`execFile` family with
-///   `shell: true`.
+///   database handle's `exec`), `spawn`/`execFile` family with
+///   `shell: true`, and a `$` tagged template (Bun Shell, zx, execa).
 ///
-/// Go's `exec.Command` never uses a shell, so it answers false.
+/// Go's `exec.Command`, Deno's `Command`/`run` and Bun's `spawn` never use a
+/// shell, so they answer false.
 fn single_string_sink_runs_shell(
     language: ScriptLanguage,
     sink: &str,
@@ -895,6 +904,9 @@ fn single_string_sink_runs_shell(
                 "spawn" | "spawnSync" | "execFile" | "execFileSync" => {
                     child_process_receiver && JS_SHELL_TRUE.is_match(region)
                 }
+                // A `$` tagged template (Bun Shell, zx, execa) is a command
+                // line whatever its receiver.
+                "$" => true,
                 _ => false,
             }
         }
@@ -1449,11 +1461,62 @@ static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // first literal (`"sh"`) is inert (#136). Longer names precede their prefixes
     // (`execFileSync` before `execFile` before `exec`; `spawnSync` before `spawn`)
     // so the alternation picks the full sink.
-    Regex::new(
-        r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
+    //
+    // Deno and Bun start processes through their own APIs, which were in no
+    // alternative here, so `deno eval 'new Deno.Command("git", {args: ["reset",
+    // "--hard"]}).outputSync()'` and `bun -e 'Bun.spawnSync(["git", "reset",
+    // "--hard"])'` were ALLOWED while the `child_process` twin of each denied
+    // (#570). They are sinks of the same two kinds, so they feed the same argv
+    // reconstruction (`exec_argv_operands`) and shell-string evaluation:
+    //
+    // - `Deno.Command(program, {args: [...]})` and `Deno.run({cmd: [...]})`;
+    // - `spawn`/`spawnSync` whose first argument is an argv array or a
+    //   `{cmd: [...]}` object. That is Bun's signature (`Bun.spawnSync([...])`,
+    //   or destructured from "bun"); Node's takes a string, the first
+    //   alternative;
+    // - a `$` tagged template, which hands its text to a shell: Bun's `Bun.$`
+    //   and imported `$`, zx's `$` and `$.sync`, execa's `$`, with or without an
+    //   options object first (`` $({cwd})`…` ``). The options form must open
+    //   with `({`, so a shell substitution inside a template (`` $`echo
+    //   $(date)` ``) is not mistaken for one.
+    //
+    // These name their call through `deno`/`bun`/`tag` instead of `sink`, whose
+    // match starts at a receiver or a preceding character; `exec_sink_call`
+    // gives every consumer the sink name's own offset.
+    Regex::new(concat!(
+        r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)"#,
+        r#"\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+        r"|\bDeno\s*\.\s*(?P<deno>Command|run)\s*\(",
+        r"|\b(?P<bun>spawnSync|spawn)\s*\(\s*[\[{]",
+        r"|(?:^|[^A-Za-z0-9_$\\])(?P<tag>\$)(?:\.sync)?\s*(?:`|\(\s*\{)",
+    ))
     .expect("js exec sink literal regex compiles")
 });
+
+/// The offset and sink name of one exec-sink regex match.
+///
+/// Every sink regex but JavaScript's runtime-native alternatives starts at the
+/// call it found, so the match's own start is the call's (and Go's includes
+/// its receiver). `Deno.Command(`, `Bun.spawnSync([` and `` $`…` `` are
+/// anchored on a receiver or a preceding character instead, so their call
+/// starts at the named group: the region and receiver logic then see the
+/// same `name(…)` text as for any other sink, and the offset is the callee
+/// name the AST layer reports for that call.
+fn exec_sink_call<'h>(caps: &regex::Captures<'h>) -> Option<(usize, &'h str)> {
+    let whole = caps.get(0)?;
+    if let Some(native) = caps
+        .name("deno")
+        .or_else(|| caps.name("bun"))
+        .or_else(|| caps.name("tag"))
+    {
+        return Some((native.start(), native.as_str()));
+    }
+    let name = caps
+        .name("sink")
+        .or_else(|| caps.name("call"))
+        .map_or("", |name| name.as_str());
+    Some((whole.start(), name))
+}
 
 /// Only a veto for a structurally verified Python directory producer.
 /// The established name-based producer exception withheld its allowance when
@@ -3907,7 +3970,16 @@ static ANY_STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 /// an argument — `lc('/tmp/x')` in `system 'rm', '-rf', lc('/tmp/x'),
 /// './build'` — and drop every operand after it. [`exec_argv_region`] then
 /// finds where such a list really ends (`;`, `or die …`, `if …`).
+///
+/// A JavaScript `$` tagged template (#570) has no argument list: its region
+/// runs through the template's closing backtick, however many lines and
+/// `${…}` interpolations it spans. Without a template the tag runs nothing,
+/// and its region is the `$` alone rather than the rest of the line.
 fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
+    if code[match_start..].starts_with('$') {
+        let end = js_shell_template(&code[match_start..]).map_or(1, |(end, _)| end);
+        return &code[match_start..match_start + end];
+    }
     let after_name = code[match_start..]
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.' | ':')))
         .map_or(code.len(), |offset| match_start + offset);
@@ -3996,7 +4068,16 @@ fn detect_destructive_in_args(
     // not a scalar literal, such as a conditional choosing between "rm" and
     // "echo". This fragment view can only add a blocking result. It cannot
     // reconstruct a command, justify a temp exemption, or shift Git's options.
-    let fragments = literal_fragment_operands(exec_argv_region(call_text));
+    //
+    // Deno's and Bun's object-argv calls and `$` templates (#570) have no such
+    // prior evidence, and their argv is read structurally. A template's quoted
+    // fragments are not argv words either: `` $`echo 'rm -rf /'` `` only
+    // prints its `'rm -rf /'`.
+    let fragments = if js_native_sink(call_text, language).is_some() {
+        Vec::new()
+    } else {
+        literal_fragment_operands(exec_argv_region(call_text))
+    };
     let fragment_words: Vec<&str> = fragments.iter().map(Cow::as_ref).collect();
     let mut fragment_hit = None;
     for fragment in &fragment_words {
@@ -4056,6 +4137,9 @@ const MAX_EXEC_ARGV_OPERANDS: usize = 1_024;
 /// contributes one unknown value; neither its nested literal nor its comma
 /// is an argv element. Only the list that actually supplies argv is flattened.
 fn exec_argv_operands(call_text: &str, language: ScriptLanguage) -> ExecArgv<'_> {
+    if let Some(kind) = js_native_sink(call_text, language) {
+        return js_native_exec_argv(call_text, kind, language);
+    }
     let region = exec_argv_region(call_text);
     let Some(arguments) = split_exec_operands(region, b",", language) else {
         return unverified_exec_argv(region, language);
@@ -4187,6 +4271,381 @@ fn unverified_exec_argv(region: &str, language: ScriptLanguage) -> ExecArgv<'_> 
     ExecArgv {
         values: vec![value],
         unverified: true,
+    }
+}
+
+/// A Deno or Bun process API whose argv [`exec_argv_region`] cannot see (#570).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsNativeSink {
+    /// `` $`…` ``: Bun Shell, zx and execa run the template as a command line.
+    ShellTemplate,
+    /// `Deno.Command(program, {args: […]})`.
+    DenoCommand,
+    /// `Deno.run({cmd: […]})`, or Bun's `spawn`/`spawnSync({cmd: […]})`.
+    CmdOption,
+}
+
+/// Which [`JsNativeSink`] a JavaScript exec-sink call is, if any.
+///
+/// Only `JS_EXEC_SINK_LITERAL` hands these call texts over: `Command` and
+/// `run` come from its `Deno.` alternative alone, and a `spawn` whose first
+/// argument is an object is Bun's signature. Bun's argv-array form
+/// (`Bun.spawnSync(["git", …])`) is not one, because a leading list argument
+/// already IS the argv for [`exec_argv_operands`].
+fn js_native_sink(call_text: &str, language: ScriptLanguage) -> Option<JsNativeSink> {
+    if !matches!(
+        language,
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+    ) {
+        return None;
+    }
+    if call_text.starts_with('$') {
+        return Some(JsNativeSink::ShellTemplate);
+    }
+    let (name, arguments) = call_text.split_once('(')?;
+    match name.trim_end() {
+        "Command" => Some(JsNativeSink::DenoCommand),
+        "run" => Some(JsNativeSink::CmdOption),
+        "spawn" | "spawnSync" if skip_exec_trivia(arguments, language).starts_with('{') => {
+            Some(JsNativeSink::CmdOption)
+        }
+        _ => None,
+    }
+}
+
+/// The argv a Deno or Bun process API runs (#570).
+///
+/// [`exec_argv_region`] ends a call's argv at its first `{…}` argument,
+/// because for `child_process` that is an options object. For these APIs the
+/// object is where the argv is: `new Deno.Command("git", {args: ["reset",
+/// "--hard"]})`, `Deno.run({cmd: ["git", "reset", "--hard"]})`,
+/// `Bun.spawn({cmd: […]})`. So the one property that supplies argv is read
+/// out of it, and every other property (`cwd`, `env`, `stdout`) stays out, as
+/// options do for every other sink. A `$` template is one command line.
+///
+/// What cannot be read fails closed the way an unreadable `child_process`
+/// argv does: a spread, a computed key, an options value that is not an
+/// object literal, or an `args`/`cmd` that is not an array literal marks the
+/// vector unverified. With the program visible that is the `argv_unverified`
+/// finding, exactly as for `spawnSync("git", flags)`; with it hidden, the
+/// existing posture for an opaque executable.
+fn js_native_exec_argv(
+    call_text: &str,
+    kind: JsNativeSink,
+    language: ScriptLanguage,
+) -> ExecArgv<'_> {
+    let mut argv = ExecArgv {
+        values: Vec::new(),
+        unverified: false,
+    };
+    if kind == JsNativeSink::ShellTemplate {
+        // A `$({…})` call with no template after it runs nothing.
+        if let Some((_, script)) = js_shell_template(call_text) {
+            argv.values.push(Cow::Owned(script));
+        }
+        return argv;
+    }
+    let Some(open) = call_text.find('(') else {
+        return argv;
+    };
+    let after_open = &call_text[open + 1..];
+    let Some(arguments) = after_open
+        .strip_suffix(')')
+        .and_then(|inner| split_exec_operands(inner, b",", language))
+    else {
+        // An argument list this reader cannot delimit. Keep a literal
+        // program for the conservative finding, as for any other sink.
+        if kind == JsNativeSink::DenoCommand {
+            return unverified_exec_argv(after_open, language);
+        }
+        argv.unverified = true;
+        return argv;
+    };
+    let mut arguments = arguments
+        .into_iter()
+        .filter(|argument| !skip_exec_trivia(argument, language).trim_end().is_empty());
+    let key = if kind == JsNativeSink::DenoCommand {
+        let Some(program) = arguments.next() else {
+            return argv;
+        };
+        push_exec_operand(&mut argv, program, language);
+        "args"
+    } else {
+        "cmd"
+    };
+    let Some(options) = arguments.next() else {
+        return argv;
+    };
+    let (value, uncertain) = js_object_property(options, key, language);
+    if let Some(value) = value {
+        push_js_argv_list(&mut argv, value, language);
+    }
+    argv.unverified |= uncertain;
+    argv
+}
+
+/// Push an `args`/`cmd` value's elements. Only an array literal is a fixed
+/// argv; any other expression (`flags`, `base.concat(extra)`, a list behind a
+/// TypeScript assertion) supplies an unknown number of words.
+fn push_js_argv_list<'a>(argv: &mut ExecArgv<'a>, value: &'a str, language: ScriptLanguage) {
+    let elements = ungroup_exec_operand(value, language)
+        .and_then(|list| list.strip_prefix('['))
+        .and_then(|list| list.strip_suffix(']'))
+        .and_then(|inner| split_exec_operands(inner, b",", language));
+    let Some(elements) = elements else {
+        argv.unverified = true;
+        return;
+    };
+    for element in elements {
+        if !skip_exec_trivia(element, language).trim_end().is_empty() {
+            push_exec_operand(argv, element, language);
+        }
+    }
+}
+
+/// The value of `key` in a JavaScript object literal, and whether something
+/// else in the object may define it instead.
+///
+/// Read the way JavaScript evaluates the literal: a later property overrides
+/// an earlier one. So a spread, a computed key, a shorthand `{ args }` or an
+/// accessor makes the answer uncertain until a plain `key: value` follows it,
+/// and a plain value before one of those is kept but no longer certain. A
+/// value that is not an object literal at all is wholly uncertain.
+fn js_object_property<'a>(
+    object: &'a str,
+    key: &str,
+    language: ScriptLanguage,
+) -> (Option<&'a str>, bool) {
+    let properties = ungroup_exec_operand(object, language)
+        .and_then(|object| object.strip_prefix('{'))
+        .and_then(|object| object.strip_suffix('}'))
+        .and_then(|inner| split_exec_operands(inner, b",", language));
+    let Some(properties) = properties else {
+        return (None, true);
+    };
+    let mut value = None;
+    let mut uncertain = false;
+    for property in properties {
+        let property = skip_exec_trivia(property, language).trim_end();
+        if property.is_empty() {
+            continue;
+        }
+        let Some((name, rest)) = js_property_name(property, language) else {
+            // A spread or computed key may define any property.
+            uncertain = true;
+            continue;
+        };
+        let rest = skip_exec_trivia(rest, language);
+        if let Some(found) = rest.strip_prefix(':') {
+            if name == key {
+                value = Some(found);
+                uncertain = false;
+            }
+        } else if name == key {
+            // `{ args }` names a variable; `args() {…}` and `get args()`
+            // compute the value.
+            value = None;
+            uncertain = true;
+        } else if !(rest.is_empty() || rest.starts_with('(')) {
+            // Neither shorthand nor a method of another name.
+            uncertain = true;
+        }
+    }
+    (value, uncertain)
+}
+
+/// An object literal property's key and the text after it, or `None` for a
+/// spread or computed key. A `get`/`set`/`async` modifier is skipped, so
+/// `get args() {…}` names `args`.
+fn js_property_name(property: &str, language: ScriptLanguage) -> Option<(Cow<'_, str>, &str)> {
+    if let Some(end) = exec_literal_end(property) {
+        return Some((
+            exec_literal_operand(&property[..end], language)?,
+            &property[end..],
+        ));
+    }
+    let identifier_len = |text: &str| {
+        text.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$')))
+            .unwrap_or(text.len())
+    };
+    let len = identifier_len(property);
+    if len == 0 {
+        return None;
+    }
+    let (name, rest) = property.split_at(len);
+    if matches!(name, "get" | "set" | "async") && rest.starts_with(char::is_whitespace) {
+        let rest = rest.trim_start().trim_start_matches('*').trim_start();
+        let len = identifier_len(rest);
+        return (len > 0).then(|| (Cow::Borrowed(&rest[..len]), &rest[len..]));
+    }
+    Some((Cow::Borrowed(name), rest))
+}
+
+/// A `$` tag's template literal (#570): where it ends in `text`, which starts
+/// at the `$`, and the command line it spells.
+///
+/// The tag may be zx's `$.sync`, or be called with options first
+/// (`` $({cwd: dir})`…` ``, zx and execa). Each `${…}` interpolation is one
+/// runtime value, which is how these libraries pass it (one escaped
+/// argument), so `` $`rm -rf ${dir}` `` reads like `rm -rf "$dir"`. `None`
+/// when no template follows the tag, or it never closes.
+fn js_shell_template(text: &str) -> Option<(usize, String)> {
+    let bytes = text.as_bytes();
+    let skip_space = |mut i: usize| {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = 1;
+    if text[i..].starts_with(".sync") {
+        i += ".sync".len();
+    }
+    i = skip_space(i);
+    if bytes.get(i) == Some(&b'(') {
+        i = skip_space(js_balanced_end(text, i, 0)?);
+    }
+    if bytes.get(i) != Some(&b'`') {
+        return None;
+    }
+    i += 1;
+    let mut command = String::new();
+    let mut literal = i;
+    loop {
+        match *bytes.get(i)? {
+            b'`' => {
+                push_js_template_text(&mut command, &text[literal..i]);
+                return Some((i + 1, command));
+            }
+            b'\\' => i += 2,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                push_js_template_text(&mut command, &text[literal..i]);
+                if !command.ends_with(RUNTIME_VALUE) {
+                    command.push_str(RUNTIME_VALUE);
+                }
+                i = js_balanced_end(text, i + 1, 0)?;
+                literal = i;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// Template text as the tag receives it, cooked: zx hands the cooked string
+/// to bash, so `` $`\x72m -rf /` `` runs `rm`. An escape this reader does not
+/// model is kept as a runtime value rather than guessed.
+fn push_js_template_text(command: &mut String, raw: &str) {
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            command.push(ch);
+            continue;
+        }
+        let decoded = match chars.next() {
+            Some(escaped @ ('\\' | '`' | '$' | '\'' | '"')) => Some(escaped),
+            Some('n') => Some('\n'),
+            Some('r') => Some('\r'),
+            Some('t') => Some('\t'),
+            Some('\n') => continue,
+            Some('x') => {
+                let digits: String = chars.by_ref().take(2).collect();
+                u32::from_str_radix(&digits, 16)
+                    .ok()
+                    .filter(|_| digits.len() == 2)
+                    .and_then(char::from_u32)
+            }
+            Some('u') => {
+                let rest = chars.as_str();
+                let (digits, consumed) = match rest.strip_prefix('{') {
+                    Some(braced) => braced
+                        .find('}')
+                        .map_or(("", 0), |end| (&braced[..end], end + 2)),
+                    None => (rest.get(..4).unwrap_or(""), 4),
+                };
+                let value = u32::from_str_radix(digits, 16)
+                    .ok()
+                    .filter(|_| digits.len() <= 6)
+                    .and_then(char::from_u32);
+                if value.is_some() {
+                    chars = rest[consumed..].chars();
+                }
+                value
+            }
+            _ => None,
+        };
+        match decoded {
+            Some(decoded) => command.push(decoded),
+            None => command.push_str(RUNTIME_VALUE),
+        }
+    }
+}
+
+/// Index just past the bracket closing the one at `open` in JavaScript
+/// source, skipping strings, comments and templates with their own `${…}`.
+/// `None` when it never closes or nests past [`MAX_EXEC_ARGV_DEPTH`].
+fn js_balanced_end(text: &str, open: usize, depth: usize) -> Option<usize> {
+    if depth >= MAX_EXEC_ARGV_DEPTH {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut stack = vec![*bytes.get(open)?];
+    let mut i = open + 1;
+    while let Some(&byte) = bytes.get(i) {
+        match byte {
+            b'\'' | b'"' => {
+                i += exec_literal_end(&text[i..])?;
+                continue;
+            }
+            b'`' => {
+                i = js_template_end(text, i, depth + 1)?;
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |n| i + n);
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += memchr::memmem::find(&bytes[i + 2..], b"*/")? + 4;
+                continue;
+            }
+            b'(' | b'[' | b'{' => {
+                if stack.len() == MAX_EXEC_ARGV_DEPTH {
+                    return None;
+                }
+                stack.push(byte);
+            }
+            b')' | b']' | b'}' => {
+                let opener = stack.pop()?;
+                if !matches!((opener, byte), (b'(', b')') | (b'[', b']') | (b'{', b'}')) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index just past the backtick closing the template literal at `open`.
+fn js_template_end(text: &str, open: usize, depth: usize) -> Option<usize> {
+    if depth >= MAX_EXEC_ARGV_DEPTH {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut i = open + 1;
+    loop {
+        match *bytes.get(i)? {
+            b'`' => return Some(i + 1),
+            b'\\' => i += 2,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                i = js_balanced_end(text, i + 1, depth + 1)?;
+            }
+            _ => i += 1,
+        }
     }
 }
 
@@ -11293,6 +11752,338 @@ def cleanup():
             ] {
                 assert!(commands(code, language).is_empty(), "{code:?}");
             }
+        }
+    }
+
+    /// #570: Deno's and Bun's own process APIs, and the `$` template tag of
+    /// Bun Shell, zx and execa, are exec sinks of the two kinds
+    /// `child_process` has, judged by the same argv and shell-string reading.
+    mod deno_and_bun_process_apis {
+        use super::*;
+
+        const JS_LANGUAGES: [(ScriptLanguage, &str); 2] = [
+            (ScriptLanguage::TypeScript, "typescript"),
+            (ScriptLanguage::JavaScript, "javascript"),
+        ];
+
+        fn blocking_rules(code: &str, language: ScriptLanguage) -> Vec<String> {
+            scan_executing_sink_matches(code, language)
+                .into_iter()
+                .filter(|m| m.severity.blocks_by_default())
+                .map(|m| m.rule_id)
+                .collect()
+        }
+
+        fn commands(code: &str, language: ScriptLanguage) -> Vec<String> {
+            exec_sink_reconstructed_commands(code, language)
+                .into_iter()
+                .map(|c| c.command)
+                .collect()
+        }
+
+        #[test]
+        fn issue_570_repros_block_under_the_exec_sink_rules() {
+            for (code, suffix) in [
+                // The issue's rows, verbatim.
+                (
+                    r#"new Deno.Command("git", {args: ["reset", "--hard"]}).outputSync()"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"await new Deno.Command("rm", {args: ["-rf", "/etc"]}).output()"#,
+                    "rm_rf_catastrophic",
+                ),
+                (
+                    r#"new Deno.Command("sh", {args: ["-c", "git reset --hard"]}).spawn()"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Deno.run({cmd: ["git", "reset", "--hard"]})"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawnSync(["git", "reset", "--hard"])"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawn({cmd: ["git", "reset", "--hard"]})"#,
+                    "git_reset_hard",
+                ),
+                ("await Bun.$`git reset --hard`", "git_reset_hard"),
+                (
+                    "import { $ } from \"bun\"; await $`git reset --hard`",
+                    "git_reset_hard",
+                ),
+                (
+                    "const {$} = require(\"zx\"); $`git reset --hard`",
+                    "git_reset_hard",
+                ),
+                // Spacing, line breaks, property order, quoted keys and other
+                // options do not hide the argv.
+                (
+                    "new Deno . Command(\n  \"git\",\n  { cwd: \"/repo\", \"args\": [\"reset\", \"--hard\"], },\n).outputSync()",
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawnSync({ stdout: "pipe", cmd: ["git", "reset", "--hard"] })"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawn({ cmd: ["rm", "-rf", "/etc"], onExit(proc) { console.log(proc) } })"#,
+                    "rm_rf_catastrophic",
+                ),
+                (
+                    r#"Bun.spawnSync(["git", "reset", "--hard"], { cwd: "/repo" })"#,
+                    "git_reset_hard",
+                ),
+                // A spread before the argv is overridden by it.
+                (
+                    r#"new Deno.Command("git", {...base, args: ["reset", "--hard"]})"#,
+                    "git_reset_hard",
+                ),
+                // Destructured from Bun, as with `child_process`.
+                (
+                    r#"const { spawnSync } = Bun; spawnSync(["rm", "-rf", "/etc"])"#,
+                    "rm_rf_catastrophic",
+                ),
+                // zx's `$.sync`, an options call first, a multi-line template.
+                ("$.sync`git reset --hard`", "git_reset_hard"),
+                (
+                    "await $({ cwd: \"/repo\" })`git reset --hard`",
+                    "git_reset_hard",
+                ),
+                ("await $`git status\ngit reset --hard`", "git_reset_hard"),
+                // An interpolation is one runtime value, never a temp target.
+                ("await $`rm -rf ${dir}`", "rm_rf"),
+                ("await Bun.$`rm -rf /tmp/${name}`", "rm_rf"),
+                // zx runs the cooked template, so escapes spell the command.
+                ("await $`\\x72m -rf /etc`", "rm_rf_catastrophic"),
+                ("await $`\\u0072m -rf /etc`", "rm_rf_catastrophic"),
+                ("await $`\\u{72}m -rf /etc`", "rm_rf_catastrophic"),
+            ] {
+                for (language, lang_id) in JS_LANGUAGES {
+                    let expected = format!("heredoc.{lang_id}.exec_sink.{suffix}");
+                    let rules = blocking_rules(code, language);
+                    assert!(
+                        rules.contains(&expected),
+                        "{language:?}: {code:?} must block as {expected}; got {rules:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn benign_calls_and_non_tags_stay_allowed() {
+            for code in [
+                r#"new Deno.Command("ls").outputSync()"#,
+                r#"new Deno.Command("git", {args: ["status"]}).outputSync()"#,
+                r#"Deno.run({cmd: ["git", "log", "-1"]})"#,
+                r#"Bun.spawnSync(["echo", "hi"])"#,
+                r#"Bun.spawn({cmd: ["ls", "-la"], cwd: "/"})"#,
+                "await Bun.$`ls -la`",
+                "await $`git status`",
+                // The temp carve-out holds as for `spawnSync`, and an options
+                // object's `cwd: "/"` is not an operand.
+                r#"new Deno.Command("rm", {args: ["-rf", "/tmp/build"], cwd: "/"}).outputSync()"#,
+                r#"Bun.spawnSync(["rm", "-rf", "/tmp/build"], {cwd: "/"})"#,
+                // A shell-quoted string the template only prints.
+                "await $`echo 'rm -rf /'`",
+                // `$` that tags no template.
+                r##"$("#id").hide()"##,
+                "const price = `$${amount}`;",
+                "console.log(`cost: $` + total)",
+                // A `spawn` whose object has no `cmd` runs no command.
+                r#"spawn({ name: "worker" })"#,
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert_eq!(
+                        blocking_rules(code, language),
+                        Vec::<String>::new(),
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+        }
+
+        /// An argv that cannot be read fails closed exactly as the
+        /// `child_process` twin does: a visible program with an unknown
+        /// argument list is `argv_unverified`, and a wholly opaque program
+        /// keeps the existing posture.
+        #[test]
+        fn unreadable_argv_fails_closed_like_child_process() {
+            for (language, lang_id) in JS_LANGUAGES {
+                let expected = format!("heredoc.{lang_id}.exec_sink.argv_unverified");
+                assert!(
+                    blocking_rules(r#"cp.spawnSync("git", flags)"#, language).contains(&expected),
+                    "the child_process baseline this mirrors"
+                );
+                for code in [
+                    r#"new Deno.Command("git", {args: flags}).outputSync()"#,
+                    r#"new Deno.Command("git", {args}).outputSync()"#,
+                    r#"new Deno.Command("git", opts).outputSync()"#,
+                    r#"new Deno.Command("git", {args: ["status"], ...opts})"#,
+                    r#"new Deno.Command("git", {[key]: ["reset", "--hard"]})"#,
+                    r#"new Deno.Command("git", {args: ["-C", ...dirs, "status"]})"#,
+                    r#"new Deno.Command("git", {args: base.concat(["status"])})"#,
+                    r#"new Deno.Command("git", {args: ["status"] as string[]})"#,
+                    r#"Deno.run({cmd: ["git", ...flags]})"#,
+                    r#"Bun.spawnSync(["git", ...flags])"#,
+                    r#"Bun.spawn({cmd: ["git", "status"], ...opts})"#,
+                ] {
+                    let rules = blocking_rules(code, language);
+                    assert!(
+                        rules.contains(&expected),
+                        "{language:?}: {code:?} must block as {expected}; got {rules:?}"
+                    );
+                    assert!(
+                        commands(code, language).is_empty(),
+                        "unknown cardinality is never a fixed command line: {code:?}"
+                    );
+                }
+                for code in [
+                    "Deno.run({cmd})",
+                    "Deno.run(options)",
+                    "Bun.spawnSync({cmd: argv})",
+                    r#"Bun.spawn({cmd: ["git", "status"], get cmd() { return argv; }})"#,
+                    "new Deno.Command(program, {args: flags})",
+                    "await $`${command}`",
+                ] {
+                    assert_eq!(
+                        blocking_rules(code, language),
+                        Vec::<String>::new(),
+                        "{language:?}: a wholly opaque program keeps the existing posture: {code:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn argv_is_read_structurally() {
+            for (call, expected) in [
+                (
+                    r#"Command("git", {cwd: "/", args: ["reset", "--hard"], env: {A: "b"}})"#,
+                    vec!["git", "reset", "--hard"],
+                ),
+                (
+                    r#"Command("git", {args: ["status"], args: ["reset", "--hard"]})"#,
+                    vec!["git", "reset", "--hard"],
+                ),
+                (r#"Command("ls")"#, vec!["ls"]),
+                (
+                    r#"run({cmd: ["git", "status"], cwd: "/"})"#,
+                    vec!["git", "status"],
+                ),
+                (r#"spawnSync({cmd: ["ls"]})"#, vec!["ls"]),
+                ("$`git reset --hard`", vec!["git reset --hard"]),
+                ("$.sync`git status`", vec!["git status"]),
+                (
+                    "$({ cwd: \"/x\" })`ls ${dir}`",
+                    vec!["ls ${dcg_runtime_value}"],
+                ),
+                (
+                    "$`echo ${`nested ${x}`} \\` \\$HOME`",
+                    vec!["echo ${dcg_runtime_value} ` $HOME"],
+                ),
+            ] {
+                let argv = exec_argv_operands(call, ScriptLanguage::TypeScript);
+                assert!(!argv.unverified, "{call}");
+                assert_eq!(
+                    argv.values.iter().map(Cow::as_ref).collect::<Vec<_>>(),
+                    expected,
+                    "{call}"
+                );
+            }
+            // A template that never closes, or `$(…)` with none after it,
+            // runs nothing.
+            for call in ["$`git reset --hard", "$({ cwd: \"/\" }).x"] {
+                let argv = exec_argv_operands(call, ScriptLanguage::TypeScript);
+                assert!(argv.values.is_empty() && !argv.unverified, "{call}");
+            }
+        }
+
+        /// Destructive verbs only the packs know reach them through the same
+        /// reconstruction as `spawnSync`, and argv[0] stays the program.
+        #[test]
+        fn pack_only_verbs_are_reconstructed_for_the_packs() {
+            for (code, expected) in [
+                (
+                    r#"new Deno.Command("dd", {args: ["if=/dev/zero", "of=/dev/sda"]}).outputSync()"#,
+                    "dd 'if=/dev/zero' 'of=/dev/sda'",
+                ),
+                (
+                    r#"Deno.run({cmd: ["wipefs", "-a", "/dev/sda"]})"#,
+                    "wipefs -a /dev/sda",
+                ),
+                (
+                    r#"Bun.spawnSync(["wipefs", "-a", "/dev/sda"])"#,
+                    "wipefs -a /dev/sda",
+                ),
+                (
+                    r#"Bun.spawn({cmd: ["wipefs", "-a", "/dev/sda"]})"#,
+                    "wipefs -a /dev/sda",
+                ),
+                (
+                    "await Bun.$`dd if=/dev/zero of=/dev/sda`",
+                    "dd if=/dev/zero of=/dev/sda",
+                ),
+                (
+                    "await $`git push --force origin main`",
+                    "git push --force origin main",
+                ),
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert_eq!(
+                        commands(code, language),
+                        vec![expected.to_string()],
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+            for code in [
+                // A program name with no shell, as for `spawnSync('dd if=…')`.
+                r#"new Deno.Command("dd if=/dev/zero of=/dev/sda").outputSync()"#,
+                // The rm/git backstop owns these, so its rule id stays the one
+                // to allowlist.
+                r#"new Deno.Command("git", {args: ["reset", "--hard"]}).outputSync()"#,
+                "await Bun.$`git reset --hard`",
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert!(
+                        commands(code, language).is_empty(),
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+        }
+
+        /// The offsets handed to the interpreter literal pass are the callee
+        /// names the AST reports, as for every other sink, and a `$` template
+        /// stays with that pass (#544), which reads it as a command already.
+        #[test]
+        fn owned_call_starts_are_the_callee_names() {
+            for (code, start) in [
+                (r#"Bun.spawnSync(["echo", "hi"])"#, 4),
+                (r#"Deno.run({cmd: ["ls"]})"#, 5),
+            ] {
+                assert_eq!(
+                    literal_exec_sink_starts(code, ScriptLanguage::JavaScript, 8),
+                    Some(vec![start]),
+                    "{code:?}"
+                );
+            }
+            for code in ["await Bun.$`ls -la`", "await $`ls ${dir}`"] {
+                assert_eq!(
+                    literal_exec_sink_starts(code, ScriptLanguage::JavaScript, 8),
+                    Some(Vec::new()),
+                    "{code:?}"
+                );
+            }
+            // Templates do not use up the bounded candidate count either.
+            let many = "await $`ls`;\n".repeat(16);
+            assert_eq!(
+                literal_exec_sink_starts(&many, ScriptLanguage::JavaScript, 8),
+                Some(Vec::new())
+            );
         }
     }
 }

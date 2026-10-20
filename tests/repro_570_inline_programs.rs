@@ -236,64 +236,85 @@ fn unresolved_or_malformed_words_are_not_reported_as_complete() {
 
 fn decision(source: &str, expected: &str, strict: bool) {
     for hook in [false, true] {
-        let temp = tempfile::tempdir().expect("isolated working directory");
-        let home = temp.path().join("home");
-        std::fs::create_dir(&home).expect("isolated home");
-        let config = temp.path().join("config.toml");
-        std::fs::write(
-            &config,
-            format!(
-                "[heredoc]\ntimeout_ms = 5000\nfallback_on_parse_error = {}\n",
-                !strict
-            ),
-        )
-        .expect("explicit test configuration");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
-        let input = if hook {
-            command.args(["hook", "--batch"]);
-            serde_json::json!({
-                "hook_event_name": "PreToolUse", "tool_name": "Bash",
-                "tool_input": {"command": source},
-            })
-            .to_string()
-        } else {
-            command.args(["test", "--stdin", "--dialect", "posix", "--format", "json"]);
-            source.to_string()
-        };
-        let mut child = command
-            .env_clear()
-            .env("HOME", &home)
-            .env("USERPROFILE", &home)
-            .env("DCG_CONFIG", &config)
-            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
-            .env("DCG_NO_SELF_HEAL", "1")
-            .env("DCG_HISTORY_ENABLED", "false")
-            .env("DCG_HOOK_TIMEOUT_MS", "5000")
-            .env("DCG_AST_TIMEOUT_MS", "5000")
-            .current_dir(temp.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn DCG, never the fixture");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let verdict: serde_json::Value = serde_json::from_str(&stdout)
-            .unwrap_or_else(|error| panic!("{error}: stdout={stdout}; stderr={stderr}"));
+        let (verdict, context) = run_dcg(source, hook, strict);
         assert_eq!(
             verdict["decision"].as_str(),
             Some(expected),
-            "hook={hook}, strict={strict}, source={source:?}, status={}, verdict={verdict}, stderr={stderr}",
-            output.status
+            "{context}, verdict={verdict}"
         );
     }
+}
+
+/// Denied in CLI and hook mode, by exactly `rule`.
+fn denied_by(source: &str, rule: &str) {
+    for hook in [false, true] {
+        let (verdict, context) = run_dcg(source, hook, false);
+        assert_eq!(
+            (verdict["decision"].as_str(), verdict["rule_id"].as_str()),
+            (Some("deny"), Some(rule)),
+            "{context}, verdict={verdict}"
+        );
+    }
+}
+
+/// One DCG verdict, and a description of the run for assertion messages.
+fn run_dcg(source: &str, hook: bool, strict: bool) -> (serde_json::Value, String) {
+    let temp = tempfile::tempdir().expect("isolated working directory");
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).expect("isolated home");
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[heredoc]\ntimeout_ms = 5000\nfallback_on_parse_error = {}\n",
+            !strict
+        ),
+    )
+    .expect("explicit test configuration");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
+    let input = if hook {
+        command.args(["hook", "--batch"]);
+        serde_json::json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": source},
+        })
+        .to_string()
+    } else {
+        command.args(["test", "--stdin", "--dialect", "posix", "--format", "json"]);
+        source.to_string()
+    };
+    let mut child = command
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("DCG_CONFIG", &config)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_NO_SELF_HEAL", "1")
+        .env("DCG_HISTORY_ENABLED", "false")
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
+        .env("DCG_AST_TIMEOUT_MS", "5000")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn DCG, never the fixture");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let verdict: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("{error}: stdout={stdout}; stderr={stderr}"));
+    let context = format!(
+        "hook={hook}, strict={strict}, source={source:?}, status={}, stderr={stderr}",
+        output.status
+    );
+    (verdict, context)
 }
 
 #[test]
@@ -411,4 +432,140 @@ fn uncertainty_obeys_the_existing_configured_policy() {
         false,
     );
     decision("bash -c 'echo unterminated", "deny", true);
+}
+
+/// The issue's second gap: Deno's and Bun's own process APIs, and zx's `$`,
+/// were allowed while the `child_process` twin of each denied. They deny
+/// under the same exec-sink rules now, in every quoting style.
+#[test]
+fn deno_bun_and_zx_process_apis_deny_like_child_process() {
+    const GIT_TS: &str = "heredoc.typescript:exec_sink.git_reset_hard";
+    const GIT_JS: &str = "heredoc.javascript:exec_sink.git_reset_hard";
+    const UNVERIFIED_TS: &str = "heredoc.typescript:exec_sink.argv_unverified";
+    for (launcher, code, rule) in [
+        (
+            "deno eval",
+            r#"new Deno.Command("git", {args: ["reset", "--hard"]}).outputSync()"#,
+            GIT_TS,
+        ),
+        (
+            "deno eval",
+            r#"await new Deno.Command("rm", {args: ["-rf", "/etc"]}).output()"#,
+            "heredoc.typescript:exec_sink.rm_rf_catastrophic",
+        ),
+        (
+            "deno eval",
+            r#"new Deno.Command("sh", {args: ["-c", "git reset --hard"]}).spawn()"#,
+            GIT_TS,
+        ),
+        (
+            "deno eval",
+            r#"Deno.run({cmd: ["git", "reset", "--hard"]})"#,
+            GIT_TS,
+        ),
+        (
+            "bun -e",
+            r#"Bun.spawnSync(["git", "reset", "--hard"])"#,
+            GIT_TS,
+        ),
+        (
+            "bun -e",
+            r#"Bun.spawn({cmd: ["git", "reset", "--hard"]})"#,
+            GIT_TS,
+        ),
+        ("bun -e", "await Bun.$`git reset --hard`", GIT_TS),
+        (
+            "bun -e",
+            r#"import { $ } from "bun"; await $`git reset --hard`"#,
+            GIT_TS,
+        ),
+        (
+            "node -e",
+            r#"const {$} = require("zx"); $`git reset --hard`"#,
+            GIT_JS,
+        ),
+        // The child_process twin these now match.
+        (
+            "node -e",
+            r#"require("child_process").spawnSync("git", ["reset", "--hard"])"#,
+            GIT_JS,
+        ),
+        // An argv that cannot be read fails closed, as `spawnSync("git",
+        // flags)` does.
+        (
+            "deno eval",
+            r#"new Deno.Command("git", {args: flags}).outputSync()"#,
+            UNVERIFIED_TS,
+        ),
+        (
+            "bun -e",
+            r#"Bun.spawnSync(["git", ...flags])"#,
+            UNVERIFIED_TS,
+        ),
+        // Verbs only the packs know reach them through the same argv
+        // reconstruction as an argv-split `spawnSync`.
+        (
+            "deno eval",
+            r#"new Deno.Command("dd", {args: ["if=/dev/zero", "of=/dev/sda"]}).outputSync()"#,
+            "system.disk:dd-device",
+        ),
+        (
+            "bun -e",
+            r#"Bun.spawnSync(["wipefs", "-a", "/dev/sda"])"#,
+            "system.disk:wipefs",
+        ),
+        (
+            "bun -e",
+            "await Bun.$`dd if=/dev/zero of=/dev/sda`",
+            "system.disk:dd-device",
+        ),
+    ] {
+        for style in 0..3 {
+            denied_by(&format!("{launcher} {}", quote(code, style)), rule);
+        }
+    }
+}
+
+#[test]
+fn benign_deno_bun_and_zx_process_calls_stay_allowed() {
+    for (launcher, code) in [
+        ("deno eval", r#"new Deno.Command("ls").outputSync()"#),
+        (
+            "deno eval",
+            r#"new Deno.Command("git", {args: ["status"]}).outputSync()"#,
+        ),
+        ("deno eval", r#"Deno.run({cmd: ["git", "log", "-1"]})"#),
+        ("bun -e", r#"Bun.spawnSync(["echo", "hi"])"#),
+        ("bun -e", r#"Bun.spawn({cmd: ["ls", "-la"], cwd: "/"})"#),
+        ("bun -e", "await Bun.$`ls -la`"),
+        ("bun -e", r#"import { $ } from "bun"; await $`git status`"#),
+        (
+            "node -e",
+            r#"const {$} = require("zx"); await $`git status`"#,
+        ),
+        // The temp carve-out holds as it does for `spawnSync`.
+        (
+            "deno eval",
+            r#"new Deno.Command("rm", {args: ["-rf", "/tmp/build"]}).outputSync()"#,
+        ),
+    ] {
+        for style in 0..3 {
+            decision(
+                &format!("{launcher} {}", quote(code, style)),
+                "allow",
+                false,
+            );
+        }
+    }
+    // A shell-quoted string the template only prints. Single-quoted styles
+    // only: in the double-quoted one the outer word carries `\``, and the
+    // outer shell scan judges that text on its own (`source: pack`), before
+    // and apart from any interpreter analysis.
+    for style in 0..2 {
+        decision(
+            &format!("bun -e {}", quote("await Bun.$`echo 'rm -rf /'`", style)),
+            "allow",
+            false,
+        );
+    }
 }
