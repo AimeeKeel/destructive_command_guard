@@ -609,3 +609,209 @@ fn template_literal_arguments_deny_like_quoted_ones() {
         }
     }
 }
+
+/// `(surface, decision, rule id)` from every evaluation surface for one
+/// command: the CLI (`dcg test --stdin --dialect posix`), a Claude PreToolUse
+/// payload on the hook's stdin, and `dcg hook --batch`. They must agree. The
+/// budgets are generous so a loaded test host reports the verdict, not an
+/// exhausted deadline.
+fn surface_verdicts(source: &str) -> Vec<(&'static str, String, String)> {
+    let mut verdicts = Vec::new();
+    for surface in ["cli", "hook", "batch"] {
+        let temp = tempfile::tempdir().expect("isolated working directory");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).expect("isolated home");
+        let config = temp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[heredoc]\ntimeout_ms = 5000\n\n[history]\nenabled = false\n",
+        )
+        .expect("explicit test configuration");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
+        let input = if surface == "cli" {
+            command.args(["test", "--stdin", "--dialect", "posix", "--format", "json"]);
+            source.to_string()
+        } else {
+            if surface == "batch" {
+                command.args(["hook", "--batch"]);
+            }
+            serde_json::json!({
+                "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": source},
+            })
+            .to_string()
+        };
+        let mut child = command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("DCG_CONFIG", &config)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_HISTORY_ENABLED", "false")
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .env("DCG_AST_TIMEOUT_MS", "5000")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn DCG, never the fixture");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if surface == "hook" && stdout.trim().is_empty() {
+            verdicts.push((surface, "allow".to_string(), String::new()));
+            continue;
+        }
+        let verdict: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+            panic!(
+                "{surface}: {error}: stdout={stdout}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        let (decision, rule) = if surface == "hook" {
+            let result = &verdict["hookSpecificOutput"];
+            (&result["permissionDecision"], &result["ruleId"])
+        } else {
+            (&verdict["decision"], &verdict["rule_id"])
+        };
+        verdicts.push((
+            surface,
+            decision.as_str().unwrap_or_default().to_string(),
+            rule.as_str().unwrap_or_default().to_string(),
+        ));
+    }
+    verdicts
+}
+
+/// Escapes (`"… \$(…) …"`) and quote concatenation (`'…'\''…'`) decode an
+/// inline program word without changing the program, so they must not skip
+/// the #544 recovery of shell commands carried through host-language
+/// literals. Every decoded spelling here was ALLOWED by the CLI, the hook and
+/// `hook --batch` alike, while the plain single-quoted spelling denied:
+/// recovery took its source identity only from the exact content span, which
+/// #570 leaves empty once decoding changes the bytes.
+#[test]
+fn decoded_inline_programs_keep_interpreter_literal_recovery() {
+    for (launcher, body, rule) in [
+        (
+            "python3 -c",
+            "import os; s = 'echo $(git reset --hard)'; os.system(s)",
+            "core.git:reset-hard",
+        ),
+        (
+            "python3 -c",
+            "from helper import run; s = 'echo $(git reset --hard)'; run(s)",
+            "core.git:reset-hard",
+        ),
+        (
+            "python3 -c",
+            "import os; s = 'echo `git branch -D main`'; os.system(s)",
+            "core.git:branch-force-delete",
+        ),
+        (
+            "node -e",
+            "const cp = require('child_process'); const s = 'echo $(git reset --hard)'; cp.execSync(s);",
+            "core.git:reset-hard",
+        ),
+        (
+            "node -e",
+            "const run = require('./helper'); const s = 'echo $(git reset --hard)'; run(s);",
+            "core.git:reset-hard",
+        ),
+        (
+            "node -e",
+            "tag`echo $(git reset --hard)`",
+            "core.git:reset-hard",
+        ),
+    ] {
+        for style in 0..3 {
+            for suffix in ["", " && true", " > /dev/null"] {
+                let source = format!("{launcher} {}{suffix}", quote(body, style));
+                for (surface, decision, denying_rule) in surface_verdicts(&source) {
+                    assert_eq!(
+                        (decision.as_str(), denying_rule.as_str()),
+                        ("deny", rule),
+                        "{surface}: {source}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The decoded spellings keep the single-quoted spelling's allows too: an
+/// isolated program that only prints command-like text, and argv data a
+/// proven static spawn never hands to a shell.
+#[test]
+fn decoded_inline_documentation_and_argv_data_stay_allowed() {
+    for (launcher, body) in [
+        ("python3 -c", "s = 'run `git branch -d x` later'; print(s)"),
+        (
+            "node -e",
+            "const s = 'run `git branch -d x` later'; console.log(s);",
+        ),
+        ("python3 -c", "print('use $(git reset --hard) with care')"),
+        (
+            "node -e",
+            r"const s = String.raw`echo \`git branch -d x\``; require('child_process').execSync(s);",
+        ),
+    ] {
+        for style in 0..3 {
+            let source = format!("{launcher} {}", quote(body, style));
+            for (surface, decision, rule) in surface_verdicts(&source) {
+                assert_eq!(decision, "allow", "{surface}: {source}: {rule}");
+            }
+        }
+    }
+    for (launcher, body) in [
+        (
+            "python3 -c",
+            "import subprocess; subprocess.run(['printf', '%s', '$(git reset --hard)'])",
+        ),
+        (
+            "node -e",
+            "const cp = require('child_process'); cp.spawnSync('printf', ['%s', '$(git reset --hard)']);",
+        ),
+    ] {
+        for style in 0..3 {
+            for suffix in ["", " && true"] {
+                let source = format!("{launcher} {}{suffix}", quote(body, style));
+                for (surface, decision, rule) in surface_verdicts(&source) {
+                    assert_eq!(decision, "allow", "{surface}: {source}: {rule}");
+                }
+            }
+        }
+    }
+}
+
+/// The decoded word gets the same Node option-ownership proof as the exact
+/// one (#544): a later `-e` replaces the first program, and an option stop
+/// keeps it active.
+#[test]
+fn decoded_node_programs_keep_option_ownership() {
+    let body = "const cp = require('child_process'); const s = 'echo $(git reset --hard)'; cp.execSync(s);";
+    for style in 0..3 {
+        let program = quote(body, style);
+        let replaced = format!("node -e {program} -e 'console.log(1)'");
+        for (surface, decision, rule) in surface_verdicts(&replaced) {
+            assert_eq!(decision, "allow", "{surface}: {replaced}: {rule}");
+        }
+        let stopped = format!("node -e {program} -- -e 'console.log(1)'");
+        for (surface, decision, rule) in surface_verdicts(&stopped) {
+            assert_eq!(
+                (decision.as_str(), rule.as_str()),
+                ("deny", "core.git:reset-hard"),
+                "{surface}: {stopped}"
+            );
+        }
+    }
+}

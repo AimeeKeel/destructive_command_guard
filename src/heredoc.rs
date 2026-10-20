@@ -1259,6 +1259,14 @@ pub struct ExtractedContent {
     /// For heredoc bodies, this represents the raw body range (may not map
     /// cleanly if indentation or CRLF normalization occurred).
     pub content_range: Option<std::ops::Range<usize>>,
+    /// For a `-c`/`-e` inline program read as one complete static shell word:
+    /// the span of that word in the original command, quotes included.
+    ///
+    /// `content` is then exactly the word's quote-removed value, even when
+    /// escapes or quote concatenation leave no `content_range`. `None` for
+    /// heredoc bodies, for words that could not be statically resolved
+    /// (partial or dynamic programs), and for other extractors.
+    pub word_range: Option<std::ops::Range<usize>>,
     /// Whether the delimiter was quoted (suppresses expansion).
     pub quoted: bool,
     /// Type of heredoc (if applicable).
@@ -2417,6 +2425,7 @@ fn extract_inline_scripts(
                 delimiter: None,
                 byte_range: full_match.start()..full_match.end().max(program.word_range.end),
                 content_range: program.content_range,
+                word_range: program.resolved.then_some(program.word_range),
                 quoted: true, // -c/-e content is always in quotes
                 heredoc_type: None,
                 target_command: Some(cmd_name.to_string()), // -c/-e content is executed by the interpreter
@@ -2773,6 +2782,7 @@ fn push_windows_inner(
         delimiter: None,
         byte_range: full,
         content_range,
+        word_range: None,
         quoted: true,
         heredoc_type: None,
         target_command: Some(target.to_string()),
@@ -3656,6 +3666,7 @@ fn extract_deno_eval_inline_scripts(
             delimiter: None,
             byte_range: payload.full,
             content_range: program.content_range,
+            word_range: None,
             quoted: true,
             heredoc_type: None,
             target_command: Some("deno".to_string()),
@@ -7040,6 +7051,7 @@ fn extract_herestrings(
                 delimiter: None,
                 byte_range: full_match.start()..operand_range.end,
                 content_range,
+                word_range: None,
                 quoted: is_quoted,
                 heredoc_type: Some(HeredocType::HereString),
                 target_command: target_cmd,
@@ -7344,6 +7356,7 @@ fn extract_heredocs(
                     delimiter: Some(delimiter.clone()),
                     byte_range: full_match.start()..end_pos.min(command.len()),
                     content_range: Some(body_start_abs..body_end_abs),
+                    word_range: None,
                     quoted,
                     heredoc_type: Some(heredoc_type),
                     target_command: target_cmd,
@@ -8952,6 +8965,60 @@ pub(crate) fn inline_interpreter_source_proof(
     }
 
     let quoted_range = range.start.checked_sub(1)?..range.end.checked_add(1)?;
+    inline_interpreter_word_source_proof(
+        command,
+        &quoted_range,
+        command.get(range.clone())?,
+        language,
+        false,
+    )
+}
+
+/// [`inline_interpreter_source_proof`] for a program whose complete shell
+/// word was decoded: escapes or quote concatenation (`"… \$(…) …"`,
+/// `'…'\''…'`, `$'…'`) change its bytes, so the extractor reports no
+/// contiguous `content_range` and only the word's span ([`ExtractedContent::word_range`]).
+///
+/// Without this, the interpreter literal recovery (#544) skipped every such
+/// program, and `python3 -c "import os; s = 'echo \$(git reset --hard)';
+/// os.system(s)"` was ALLOWED while its single-quoted spelling denied.
+/// `program` must be the word's exact quote-removed value; the same decoder
+/// the extractor used re-derives it from the source here. The outcomes are
+/// those of the exact proof: `Some(true)` for an isolated `interpreter -c
+/// WORD` invocation, `Some(false)` for a complete program with other shell
+/// consumers, `None` for anything not provably that program.
+pub(crate) fn decoded_inline_interpreter_source_proof(
+    command: &str,
+    word: &Range<usize>,
+    program: &str,
+    language: ScriptLanguage,
+) -> Option<bool> {
+    if word.start >= word.end
+        || program.is_empty()
+        || command.get(word.clone()).is_none()
+        || !matches!(
+            language,
+            ScriptLanguage::Python | ScriptLanguage::JavaScript
+        )
+        || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+    {
+        return None;
+    }
+    inline_interpreter_word_source_proof(command, word, program, language, true)
+}
+
+/// Shared argv ownership proof for one inline program word. `decoded`
+/// selects how the word's value is read: POSIX quote removal for a decoded
+/// word, which also reports the isolated-invocation exemption from the same
+/// parse, or the exact quoted bytes for [`inline_interpreter_source_proof`],
+/// whose caller has already tried that exemption.
+fn inline_interpreter_word_source_proof(
+    command: &str,
+    word: &Range<usize>,
+    source_text: &str,
+    language: ScriptLanguage,
+    decoded: bool,
+) -> Option<bool> {
     let ast = try_parse_shell_ast(command).ok()?;
     let root = ast.root();
     let root = root.get_inner_node();
@@ -8960,8 +9027,13 @@ pub(crate) fn inline_interpreter_source_proof(
     }
     // Locate the precise shell word by its range, without scanning every
     // statement preceding it or borrowing a quote inside another data word.
-    let payload = root.named_descendant_for_byte_range(quoted_range.start, quoted_range.end)?;
-    if payload.byte_range() != quoted_range || !matches!(payload.kind(), "raw_string" | "string") {
+    let payload = root.named_descendant_for_byte_range(word.start, word.end)?;
+    let word_kind = match payload.kind() {
+        "raw_string" | "string" => true,
+        "concatenation" | "ansi_c_string" | "word" => decoded,
+        _ => false,
+    };
+    if payload.byte_range() != *word || !word_kind {
         return None;
     }
     let grammar = root.language();
@@ -8974,7 +9046,7 @@ pub(crate) fn inline_interpreter_source_proof(
     // program until an operand or -- ends option parsing, even after a redirect.
     let flag = arguments.first()?;
     let source = arguments.get(1)?;
-    if program.kind() != "command_name" || source.byte_range() != quoted_range {
+    if program.kind() != "command_name" || source.byte_range() != *word {
         return None;
     }
     if language == ScriptLanguage::JavaScript
@@ -9000,12 +9072,49 @@ pub(crate) fn inline_interpreter_source_proof(
     if !literal_inline_interpreter_command_matches(program, flag, language) {
         return None;
     }
-    let words = shell_words::split(command.get(quoted_range)?).ok()?;
-    if !matches!(words.as_slice(), [source] if command.get(range.clone()) == Some(source.as_str()))
-    {
+    let word_text = command.get(word.clone())?;
+    if decoded {
+        // The extractor's own decoder: the value analysed is the value the
+        // shell passes. It returns `None` for any expansion, pattern, brace
+        // or tilde, so only a fully literal word can match.
+        if crate::normalize::decode_posix_literal_word(word_text).as_deref() != Some(source_text) {
+            return None;
+        }
+    } else {
+        let words = shell_words::split(word_text).ok()?;
+        if !matches!(words.as_slice(), [source] if source == source_text) {
+            return None;
+        }
+    }
+    if !literal_inline_interpreter_payload_is_static(&payload) {
         return None;
     }
-    literal_inline_interpreter_payload_is_static(&payload).then_some(false)
+    Some(decoded && inline_interpreter_invocation_is_isolated(&root, &payload))
+}
+
+/// The structural half of [`range_is_literal_inline_interpreter_source`] for
+/// a word the caller has already proved to be the interpreter's literal
+/// program: the whole input is that one simple command, with no environment
+/// assignment, redirect, extra argument, background operator or other
+/// statement that could change what the program's output or builtins mean.
+fn inline_interpreter_invocation_is_isolated<'tree, N: ast_grep_core::source::SgNode<'tree>>(
+    root: &N,
+    payload: &N,
+) -> bool {
+    if root.children().any(|child| child.kind().as_ref() == "&") {
+        return false;
+    }
+    let mut statements = root
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+    let (Some(statement), None) = (statements.next(), statements.next()) else {
+        return false;
+    };
+    statement.kind().as_ref() == "command"
+        && statement.named_children().count() == 3
+        && payload
+            .parent()
+            .is_some_and(|parent| parent.node_id() == statement.node_id())
 }
 
 /// The `>` bytes that JavaScript itself parses as arrow operators in a
@@ -17616,6 +17725,169 @@ mod tests {
                 None,
                 "the outer-source byte bound remains enforced"
             );
+        }
+
+        /// POSIX double quotes with the four escapes that change bytes.
+        fn double_quoted_word(body: &str) -> String {
+            let mut word = String::from("\"");
+            for ch in body.chars() {
+                if matches!(ch, '\\' | '"' | '$' | '`') {
+                    word.push('\\');
+                }
+                word.push(ch);
+            }
+            word.push('"');
+            word
+        }
+
+        #[test]
+        fn decoded_inline_words_keep_their_complete_source_proof() {
+            for (program, flag, language, body) in [
+                (
+                    "python3",
+                    "-c",
+                    ScriptLanguage::Python,
+                    "import os; s = 'echo $(git reset --hard)'; os.system(s)",
+                ),
+                (
+                    "node",
+                    "-e",
+                    ScriptLanguage::JavaScript,
+                    "const s = 'echo `git branch -d x`'; require('child_process').execSync(s);",
+                ),
+            ] {
+                for word in [
+                    double_quoted_word(body),
+                    format!("'{}'", body.replace('\'', r"'\''")),
+                    format!("'{}'", body.replace('\'', r#"'"'"'"#)),
+                    format!("$'{}'", body.replace('\\', r"\\").replace('\'', r"\'")),
+                ] {
+                    let invocation = format!("{program} {flag} {word}");
+                    let range = invocation.len() - word.len()..invocation.len();
+                    assert_eq!(
+                        decoded_inline_interpreter_source_proof(
+                            &invocation,
+                            &range,
+                            body,
+                            language
+                        ),
+                        Some(true),
+                        "an isolated decoded program has the exact proof's outcome: {invocation}"
+                    );
+                    let ExtractionResult::Extracted(contents) =
+                        extract_content(&invocation, &ExtractionLimits::structural_scan())
+                    else {
+                        panic!("expected complete inline extraction: {invocation}");
+                    };
+                    assert!(
+                        contents.iter().any(|content| content.language == language
+                            && content.content == body
+                            && content.content_range.is_none()
+                            && content.word_range.as_ref() == Some(&range)),
+                        "the extractor reports the decoded word: {invocation}: {contents:?}"
+                    );
+                    for command in [
+                        format!("{invocation} && true"),
+                        format!("true; {invocation}"),
+                        format!("{invocation} | cat"),
+                        format!("{invocation} > /dev/null"),
+                        format!("{invocation} extra_argument"),
+                        format!("PYTHONPATH=/tmp/plugins {invocation}"),
+                    ] {
+                        let start = command.find(&word).unwrap();
+                        assert_eq!(
+                            decoded_inline_interpreter_source_proof(
+                                &command,
+                                &(start..start + word.len()),
+                                body,
+                                language
+                            ),
+                            Some(false),
+                            "other consumers keep recovery without the exemption: {command}"
+                        );
+                    }
+                    for (range, value) in [
+                        (range.clone(), "print(1)"),
+                        (range.start + 1..range.end, body),
+                        (range.start..range.end - 1, body),
+                        (range.start - 1..range.end, body),
+                        (range.start..range.start, body),
+                        (range.clone(), ""),
+                    ] {
+                        assert_eq!(
+                            decoded_inline_interpreter_source_proof(
+                                &invocation,
+                                &range,
+                                value,
+                                language
+                            ),
+                            None,
+                            "only the complete word and its exact value qualify: {range:?} {value:?}"
+                        );
+                    }
+                }
+            }
+            // A live expansion is not a static program, the wrong executable
+            // does not own the word, and a later Node `-e` replaces it.
+            for (command, word, body, language, expected) in [
+                (
+                    r#"python3 -c "s = 'echo \$(git reset --hard)'; print('$VALUE')""#,
+                    r#""s = 'echo \$(git reset --hard)'; print('$VALUE')""#,
+                    "s = 'echo $(git reset --hard)'; print('$VALUE')",
+                    ScriptLanguage::Python,
+                    None,
+                ),
+                (
+                    r#"echo -c "s = 'echo \$(git reset --hard)'""#,
+                    r#""s = 'echo \$(git reset --hard)'""#,
+                    "s = 'echo $(git reset --hard)'",
+                    ScriptLanguage::Python,
+                    None,
+                ),
+                (
+                    r#"/tmp/python3 -c "s = 'echo \$(git reset --hard)'""#,
+                    r#""s = 'echo \$(git reset --hard)'""#,
+                    "s = 'echo $(git reset --hard)'",
+                    ScriptLanguage::Python,
+                    None,
+                ),
+                (
+                    r#"node -e "const s = 'echo \$(git reset --hard)';" -e 'console.log(1)'"#,
+                    r#""const s = 'echo \$(git reset --hard)';""#,
+                    "const s = 'echo $(git reset --hard)';",
+                    ScriptLanguage::JavaScript,
+                    None,
+                ),
+                (
+                    r#"node -e "const s = 'echo \$(git reset --hard)';" -- -e 'console.log(1)'"#,
+                    r#""const s = 'echo \$(git reset --hard)';""#,
+                    "const s = 'echo $(git reset --hard)';",
+                    ScriptLanguage::JavaScript,
+                    Some(false),
+                ),
+            ] {
+                let start = command.find(word).unwrap();
+                assert_eq!(
+                    decoded_inline_interpreter_source_proof(
+                        command,
+                        &(start..start + word.len()),
+                        body,
+                        language
+                    ),
+                    expected,
+                    "{command}"
+                );
+            }
+            // An unresolved word has no complete program to prove.
+            let extracted = match extract_content(
+                r#"python3 -c 'print('"$VALUE"')'"#,
+                &ExtractionLimits::structural_scan(),
+            ) {
+                ExtractionResult::Partial { extracted, .. } => extracted,
+                ExtractionResult::Skipped(_) => Vec::new(),
+                other => panic!("a dynamic inline word is never complete: {other:?}"),
+            };
+            assert!(extracted.iter().all(|content| content.word_range.is_none()));
         }
 
         #[test]

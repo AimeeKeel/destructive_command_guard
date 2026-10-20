@@ -32449,11 +32449,22 @@ fn exec_sink_pack_verdict(
     // The outer Bash parse belongs under the same wall-clock bound as the
     // language parse. Only copy a source small enough to supply this proof.
     let inline = content.heredoc_type.is_none();
+    // An inline program whose word was decoded (`"… \$(…) …"`, `'…'\''…'`)
+    // has no contiguous content span, only the complete word it came from.
+    // Its decoded content is still exactly the program the interpreter runs,
+    // so the same ownership proof applies to that word; skipping it let
+    // every escaped spelling of a #544 recovery through.
+    let decoded_program = match (&content.content_range, &content.word_range) {
+        (None, Some(word)) if inline => Some((word.clone(), content.content.clone())),
+        _ => None,
+    };
     let source_identity = content
         .content_range
-        .as_ref()
+        .clone()
+        .map(|range| (range, None))
+        .or_else(|| decoded_program.map(|(word, program)| (word, Some(program))))
         .filter(|_| command.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
-        .map(|range| (command.to_owned(), range.clone(), content.language));
+        .map(|(range, program)| (command.to_owned(), range, program, content.language));
     let mut budget = crate::ast_matcher::protected_scan_budget();
     if let Some(deadline) = context.deadline {
         let Some(remaining) = deadline.remaining() else {
@@ -32465,10 +32476,17 @@ fn exec_sink_pack_verdict(
         &content.content,
         content.language,
         move || {
-            let Some((source, range, language)) = source_identity else {
+            let Some((source, range, decoded_program, language)) = source_identity else {
                 return (!inline).then_some(false);
             };
-            if inline {
+            if let Some(program) = decoded_program {
+                // The complete word, decoded by the extractor's own lexer.
+                // An unresolved (partial or dynamic) word carries no
+                // `word_range` and never reaches this proof.
+                crate::heredoc::decoded_inline_interpreter_source_proof(
+                    &source, &range, &program, language,
+                )
+            } else if inline {
                 // The existing inline extractor can return a partial raw
                 // fragment when shell quotes are escaped. Only extend it
                 // when the extracted bytes are exactly the complete program.
@@ -35000,6 +35018,11 @@ mod tests {
             "find . -name unlink -print",
             "git ls-files | xargs grep -n unlink src",
             "find . -name '*.log' | xargs wc -l",
+            // An `-I` placeholder template is judged by the command it runs.
+            "find . -name '*.log' | xargs -I{} grep -n unlink {}",
+            "xargs -I{} echo unlink {}",
+            "cat list | xargs -I {} wc -l {}",
+            "xargs -I{} sh -c 'echo {}'",
             "watch -n 5 ls /etc",
             "git checkout -b fix-mv-handling /home/user/repo",
             "tool x-mv /home/user/repo",
@@ -35032,6 +35055,22 @@ mod tests {
             "xargs -0 unlink",
             "cat list | xargs -n1 unlink",
             "xargs -n1 /usr/bin/unlink /tmp/x",
+            // The `-I` placeholder is the word that ends xargs' options. The
+            // sanitizer used to blank it, so every parser read `unlink` as the
+            // placeholder value and these were ALLOWED.
+            "xargs -I{} unlink {}",
+            "xargs -I {} unlink {}",
+            "xargs -I{} unlink {} < list",
+            "cat list | xargs -I{} unlink {}",
+            "find . -name '*.tmp' | xargs -I{} unlink {}",
+            "xargs -I% unlink %",
+            "xargs -I % unlink %",
+            "xargs -I{} unlink ./{}",
+            "xargs -I {} -P 4 unlink {}",
+            "xargs -0 -I{} unlink {}",
+            "xargs -I{} /usr/bin/unlink {}",
+            "xargs -i unlink {}",
+            "xargs --replace={} unlink {}",
             "parallel ::: 'unlink /etc/passwd'",
             "flock /tmp/l -c 'unlink /etc/passwd'",
             "sudo find / -name passwd -exec unlink {} \\;",
@@ -35056,6 +35095,47 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// An `xargs -I` placeholder must survive sanitization: blanking it made
+    /// every executable-scoped rule read the child command as the placeholder
+    /// value, so `xargs -I{} chmod 777 {}` was allowed and the harmless
+    /// `xargs -I{} echo chmod 777 {}` was the one attributed to chmod.
+    #[test]
+    fn xargs_placeholder_templates_keep_executable_scoped_rules() {
+        for command in [
+            "xargs -I{} chmod 777 {}",
+            "find . -type f | xargs -I {} chmod 777 {}",
+            "xargs -I% chmod 777 %",
+            "xargs chmod 777",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "the template runs chmod: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "xargs -I{} echo chmod 777 {}",
+            "xargs -I {} printf '%s\\n' chmod 777 {}",
+            "xargs -I{} ls -l {}",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "the template runs no chmod: {command:?}: {:?}",
                 result.pattern_info
             );
         }
@@ -49869,6 +49949,7 @@ mod tests {
                 delimiter: Some("PY".to_string()),
                 byte_range: 0..0,
                 content_range: None,
+                word_range: None,
                 quoted: true,
                 heredoc_type: Some(crate::heredoc::HeredocType::Standard),
                 target_command: Some("python3".to_string()),

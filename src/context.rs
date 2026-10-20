@@ -1017,8 +1017,13 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         // kubectl - annotations and labels are metadata
         SafeFlagEntry::long("kubectl", "--annotation"),
         SafeFlagEntry::both("kubectl", "-l", "--label"),
-        // xargs - placeholder string is literal
-        SafeFlagEntry::short("xargs", "-I"),
+        // No `xargs -I`: its placeholder is not data to hide but the argv
+        // word that ends xargs' options. Blanking it (`xargs -I{} unlink {}`
+        // became `xargs -I   unlink {}`) made every option parser on the
+        // sanitized view read the CHILD COMMAND as the placeholder, so an
+        // executed `unlink`, `chmod`, ... never reached its rule and was
+        // allowed.
+        // The placeholder reappears unmasked in the child argv anyway.
         // Cargo/npm - package descriptions
         SafeFlagEntry::long("cargo", "--message"),
         SafeFlagEntry::long("npm", "--message"),
@@ -1036,7 +1041,7 @@ static SAFE_COMMANDS_MATCHER: LazyLock<AhoCorasick> = LazyLock::new(|| {
         // all_args_data commands
         "echo", "printf", // Commands from flag_data_pairs
         "git", "bd", "br", "grep", "rg", "ag", "ack", "sed", "gh", "curl", "jq", "docker",
-        "kubectl", "xargs", "cargo", "npm",
+        "kubectl", "cargo", "npm",
         // Special built-in: `command -v/-V` queries mask their arguments
         "command",
     ];
@@ -4607,8 +4612,22 @@ mod tests {
 
     #[test]
     fn test_registry_xargs_placeholder_flag() {
-        // xargs -I sets a placeholder string
-        assert!(SAFE_STRING_REGISTRY.is_flag_data("xargs", "-I"));
+        // The `-I` placeholder is the word that ends xargs' options. Masking
+        // it left `xargs -I   unlink {}`, where every option parser reads the
+        // child command as the placeholder and the executed `unlink` vanished.
+        assert!(!SAFE_STRING_REGISTRY.is_flag_data("xargs", "-I"));
+        for command in [
+            "xargs -I{} unlink {}",
+            "xargs -I {} unlink {}",
+            "cat list | xargs -I{} mv {} /tmp/x",
+            "xargs -I% unlink %",
+        ] {
+            assert_eq!(
+                sanitize_for_pattern_matching(command),
+                command,
+                "the xargs placeholder must stay in the sanitized argv: {command:?}"
+            );
+        }
         // Counterexample: xargs itself can execute commands
         assert!(!SAFE_STRING_REGISTRY.is_all_args_data("xargs"));
     }
