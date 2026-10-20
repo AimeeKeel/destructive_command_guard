@@ -38,12 +38,52 @@ fn assert_decision(source: &str, allowed: bool, rule: Option<&str>) {
     assert_decision_with_grant(source, allowed, rule, None);
 }
 
+/// `allowed` means a plain `Result: ALLOWED`: no rule fired. A command the
+/// isolated grant lets through is checked by [`assert_allowed_by_grant`]
+/// instead, because only that report proves the grant was loaded.
 fn assert_decision_with_grant(
     source: &str,
     allowed: bool,
     rule: Option<&str>,
     grant: Option<&str>,
 ) {
+    assert_verdict(
+        source,
+        if allowed {
+            Verdict::Allowed
+        } else {
+            Verdict::Blocked
+        },
+        rule,
+        grant,
+    );
+}
+
+/// A grant control must be denied by the granted rule without the grant and
+/// reported as allowlisted with it. A control allowed for any other reason
+/// (an unprotected path, an unloaded allowlist that nothing needed) cannot
+/// show that the grant was in effect for the commands checked after it.
+fn assert_allowed_by_grant(control: &str, grant: &str) {
+    assert_verdict(control, Verdict::Blocked, Some(grant), None);
+    assert_verdict(control, Verdict::AllowedByGrant, None, Some(grant));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// `Result: ALLOWED`, with no allowlist involved.
+    Allowed,
+    /// `Result: ALLOWED (allowlisted by user)` with the isolated grant's
+    /// reason: a rule fired and the user-layer grant waived it.
+    AllowedByGrant,
+    Blocked,
+}
+
+fn assert_verdict(source: &str, verdict: Verdict, rule: Option<&str>, grant: Option<&str>) {
+    assert!(
+        verdict != Verdict::AllowedByGrant || grant.is_some(),
+        "an allowlisted verdict needs a grant: {source}"
+    );
+    let allowed = verdict != Verdict::Blocked;
     let temp = tempfile::tempdir().expect("tempdir");
     if let Some(grant) = grant {
         let allowlist = format!(
@@ -70,7 +110,17 @@ fn assert_decision_with_grant(
             .map(str::trim)
     };
     let result = field("Result:").unwrap_or_default();
-    if allowed {
+    if verdict == Verdict::AllowedByGrant {
+        assert_eq!(
+            result, "ALLOWED (allowlisted by user)",
+            "{source}: {stdout}\n{stderr}"
+        );
+        assert_eq!(
+            field("Allowlist reason:"),
+            Some("isolated single-family regression grant"),
+            "{source}: {stdout}\n{stderr}"
+        );
+    } else if allowed {
         assert_eq!(result, "ALLOWED", "{source}: {stdout}\n{stderr}");
     } else {
         assert!(
@@ -128,24 +178,30 @@ fn assert_decision_with_grant(
     }
 }
 
+/// Every protected destination below is in the shared native table. The
+/// #558 vectors first named /etc/profile, which that table has never listed
+/// (00ffdb6 leaves unlisted /etc files to the ordinary truncation rules):
+/// `tee /etc/profile` is allowed, so those vectors proved nothing either way.
 #[test]
 fn split_destinations_reach_native_credential_policy_without_custom_packs() {
     for source in [
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; echo x | tee $S",
-        "IFS=@; S=/tmp/scratch/a@/etc/profile; echo x | tee $S",
-        "S=/tmp/scratch/a@/etc/profile IFS=@; echo x | tee $S",
-        "IFS=@ S=/tmp/scratch/a@/etc/profile; echo x | tee ${S}",
-        "S=/tmp/scratch/a@/etc/profile; IFS+=@; echo x | tee $S",
-        "S=/tmp/scratch/a@/etc/profile; export IFS=@; echo x | tee $S",
-        "export S=/tmp/scratch/a@/etc/profile IFS=@; echo x | tee $S",
-        "S=/etc/profile@/tmp/scratch/a; IFS=@; tee $S",
-        "S=/tmp/scratch/a@/tmp/scratch/b@/etc/profile; IFS=@; tee $S",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; command tee -- $S",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; /usr/bin/tee $S",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; tee -a $S",
-        "S=/tmp/source@/etc/profile; IFS=@; cp $S",
-        "S=/tmp/source@/etc/profile; IFS=@; mv $S",
-        "S=if=/tmp/source@of=/etc/profile; IFS=@; dd $S",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; echo x | tee $S",
+        "IFS=@; S=/tmp/scratch/a@/etc/shadow; echo x | tee $S",
+        "S=/tmp/scratch/a@/etc/shadow IFS=@; echo x | tee $S",
+        "IFS=@ S=/tmp/scratch/a@/etc/shadow; echo x | tee ${S}",
+        "S=/tmp/scratch/a@/etc/shadow; IFS+=@; echo x | tee $S",
+        "S=/tmp/scratch/a@/etc/shadow; export IFS=@; echo x | tee $S",
+        "export S=/tmp/scratch/a@/etc/shadow IFS=@; echo x | tee $S",
+        "S=/etc/shadow@/tmp/scratch/a; IFS=@; tee $S",
+        "S=/tmp/scratch/a@/tmp/scratch/b@/etc/shadow; IFS=@; tee $S",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; command tee -- $S",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; /usr/bin/tee $S",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; tee -a $S",
+        "S=/tmp/scratch/a@/etc/passwd; IFS=@; echo x | tee $S",
+        "S=/tmp/scratch/a@/home/example/.bashrc; IFS=@; echo x | tee $S",
+        "S=/tmp/source@/etc/shadow; IFS=@; cp $S",
+        "S=/tmp/source@/etc/shadow; IFS=@; mv $S",
+        "S=if=/tmp/source@of=/etc/shadow; IFS=@; dd $S",
     ] {
         assert_decision(source, false, Some("core.filesystem:credential-file-write"));
     }
@@ -185,18 +241,19 @@ fn unverified_splitting_and_mutations_cannot_pass_native_protection() {
 fn quoting_safe_destinations_and_read_idioms_remain_allowed() {
     for source in [
         "S=/tmp/scratch/a@/tmp/scratch/b; IFS=@; echo x | tee $S",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; tee \"$S\"",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; tee \"${S}\"",
-        "S=/tmp/scratch/a@/etc/profile; IFS=; tee $S",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; tee '$S'",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; tee \\$S",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; printf '%s' \"$S\"",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@; echo 'tee $S'",
-        "S=/tmp/scratch/a@/etc/profile; IFS=@",
+        // A protected split field, so each allowed control is not vacuous.
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; tee \"$S\"",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; tee \"${S}\"",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=; tee $S",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; tee '$S'",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; tee \\$S",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; printf '%s' \"$S\"",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@; echo 'tee $S'",
+        "S=/tmp/scratch/a@/etc/shadow; IFS=@",
         "OIFS=$IFS",
         "while IFS= read -r l; do :; done < /etc/hostname",
         "IFS=, read a b <<< 'x,y'",
-        "S=/tmp/safe; IFS=@; S=/tmp/scratch/a@/etc/profile IFS=: tee $S",
+        "S=/tmp/safe; IFS=@; S=/tmp/scratch/a@/etc/shadow IFS=: tee $S",
         "IFS=@; S=/tmp/scratch/a@/tmp/scratch/b; tee $S; tee /tmp/other",
     ] {
         assert_decision(source, true, None);
@@ -213,6 +270,11 @@ fn quoted_positional_and_indirect_lists_require_native_review() {
         r#"IFS=@; A=(/tmp/a /etc/profile); S='A[@]'; tee "${!S}""#,
         r#"IFS=@; A=(/tmp/a /etc/profile); tee "${A[@]:0:2}""#,
         r#"set -- /tmp/a /etc/profile; IFS=@; tee "${S:-"$@"}""#,
+        // #565: tree-sitter reads this `$@` as plain operator text, and
+        // single quotes inside a double-quoted operator word are literal.
+        r#"set -- /tmp/a /etc/passwd; S=x; IFS=@; echo x | tee "${S:+$@}""#,
+        r#"set -- /tmp/a /etc/passwd; IFS=@; echo x | tee "${S:-$@}""#,
+        r#"set -- /tmp/a /etc/passwd x; S=x; IFS=@; tee "${S:+'$@'}""#,
     ] {
         assert_decision(source, false, Some("core.filesystem:credential-file-write"));
     }
@@ -221,9 +283,9 @@ fn quoted_positional_and_indirect_lists_require_native_review() {
 #[test]
 fn late_tee_options_cannot_hide_or_downgrade_native_destination_checks() {
     for source in [
-        "S=/tmp/a@/etc/profile@--help; IFS=@; POSIXLY_CORRECT=1 tee $S",
-        "S=/tmp/a@/etc/profile@--version; IFS=@; env POSIXLY_CORRECT=1 tee $S",
-        "S=/tmp/a@/etc/profile@--help; IFS=@; tee $S",
+        "S=/tmp/a@/etc/shadow@--help; IFS=@; POSIXLY_CORRECT=1 tee $S",
+        "S=/tmp/a@/etc/shadow@--version; IFS=@; env POSIXLY_CORRECT=1 tee $S",
+        "S=/tmp/a@/etc/shadow@--help; IFS=@; tee $S",
         "S=/home/example/.ssh/known_hosts@-a; IFS=@; POSIXLY_CORRECT=1 tee $S",
         "S=/home/example/.ssh/known_hosts@--append; IFS=@; tee $S",
     ] {
@@ -248,6 +310,7 @@ fn quoted_scalar_results_and_literal_list_text_remain_data() {
         r#"IFS=@; A=(/tmp/a /tmp/b); tee "${A[*]}""#,
         r#"set -- /tmp/a /tmp/b; IFS=@; tee "$*""#,
         r#"IFS=@; tee "$(printf '%s' "$@")""#,
+        r#"IFS=@; S=x; tee "${S:+\$@}""#,
     ] {
         assert_decision(source, true, None);
     }
@@ -280,12 +343,12 @@ fn quoted_and_expanded_assignment_builtins_cannot_hide_later_writes() {
 #[test]
 fn printf_option_text_after_the_format_preserves_harmless_bindings() {
     for source in [
-        "S=/tmp/safe; IFS=@; printf '%s' '-v' S /tmp/a@/etc/profile; tee $S",
-        "S=/tmp/safe; IFS=@; printf -- '-v' S /tmp/a@/etc/profile; tee $S",
-        "S=/tmp/safe; IFS=@; printf '' '-v' S /tmp/a@/etc/profile; tee $S",
-        r#"S=/tmp/safe; IFS=@; F=%s; printf "$F" '-v' S /tmp/a@/etc/profile; tee $S"#,
-        r#"S=/tmp/safe; IFS=@; E=; printf "$E" -v S /tmp/a@/etc/profile; tee $S"#,
-        "S=/tmp/safe; IFS=@; printf '%s' '$@' '-v' S /tmp/a@/etc/profile; tee $S",
+        "S=/tmp/safe; IFS=@; printf '%s' '-v' S /tmp/a@/etc/shadow; tee $S",
+        "S=/tmp/safe; IFS=@; printf -- '-v' S /tmp/a@/etc/shadow; tee $S",
+        "S=/tmp/safe; IFS=@; printf '' '-v' S /tmp/a@/etc/shadow; tee $S",
+        r#"S=/tmp/safe; IFS=@; F=%s; printf "$F" '-v' S /tmp/a@/etc/shadow; tee $S"#,
+        r#"S=/tmp/safe; IFS=@; E=; printf "$E" -v S /tmp/a@/etc/shadow; tee $S"#,
+        "S=/tmp/safe; IFS=@; printf '%s' '$@' '-v' S /tmp/a@/etc/shadow; tee $S",
         "IFS=@; export S=/tmp/a@/tmp/b; tee $S",
         "export IFS=@ S=/tmp/a@/tmp/b; tee $S",
     ] {
@@ -298,7 +361,7 @@ fn stale_binding_refusal_keeps_native_allowlist_families_independent() {
     for (grant, control, remaining) in [
         (
             "core.filesystem:credential-file-write",
-            "tee /etc/profile",
+            "tee /etc/shadow",
             "core.filesystem:git-internals-write",
         ),
         (
@@ -309,7 +372,10 @@ fn stale_binding_refusal_keeps_native_allowlist_families_independent() {
     ] {
         // Prove the grant was loaded, rather than mistaking an ignored
         // allowlist for evidence that the other family stayed protected.
-        assert_decision_with_grant(control, true, None, Some(grant));
+        // The control is denied by the granted rule alone and is reported
+        // as allowlisted once granted (`tee /etc/profile` was allowed with
+        // no grant at all: that path is not in the native table).
+        assert_allowed_by_grant(control, grant);
         for source in [
             "S=/tmp/safe; IFS=@; ex''port S=/tmp/a@.git/config; tee $S",
             "S=/tmp/safe; IFS=@; printf '-v' S %s /tmp/a@/etc/profile; tee $S",
@@ -392,7 +458,8 @@ fn printf_count_shaped_data_and_time_formats_remain_allowed() {
         r#"F=%%n; printf "$F" SEP"#,
         r#"E=; printf "$E" 'abcde%n' SEP"#,
     ] {
-        let source = format!("SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S");
+        // A wrong SEP=5 would split out /etc/shadow: not a vacuous allow.
+        let source = format!("SEP=@; IFS=@; S=/tmp/a5/etc/shadow; {printing}; IFS=$SEP; tee $S");
         assert_decision(&source, true, None);
     }
 }
@@ -455,8 +522,7 @@ fn scalar_path_uncertainty_preserves_independent_rule_grants_566() {
     ] {
         // Both sides of the control prove that this grant is effective.
         // An unknown destination may still name the other protected family.
-        assert_decision(control, false, Some(grant));
-        assert_decision_with_grant(control, true, None, Some(grant));
+        assert_allowed_by_grant(control, grant);
         assert_decision_with_grant(
             "IFS=; tee ${UNRESOLVED}/file",
             false,

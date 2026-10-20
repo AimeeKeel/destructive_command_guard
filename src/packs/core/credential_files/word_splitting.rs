@@ -190,6 +190,54 @@ fn parameter_can_produce_multiple_fields(raw: &str) -> bool {
     operator.starts_with("[@]") || indirect && !matches!(operator, "[*]" | "*")
 }
 
+/// Bash expands the word of a double-quoted `"${S:+word}"` (likewise
+/// `"${S:-word}"`) in that quoted context: `$@` there still yields one field
+/// per positional parameter, and single quotes are literal characters, not
+/// quoting. After `set -- /tmp/a /etc/passwd`, `tee "${S:+$@}"` hands tee
+/// `/etc/passwd` as its own argument; after `set -- /tmp/a /etc/passwd x`,
+/// so does `tee "${S:+'$@'}"` (fields `'/tmp/a`, `/etc/passwd`, `x'`). The
+/// parser's expansion-word token swallows such a `$@` as plain text, and it
+/// reads `'…'` there as a raw string, so the AST children cannot show either
+/// one. Read the expansion's own text instead: only a backslash makes a `$`
+/// literal here. Any list-capable read counts, even under an operator whose
+/// result is one field (`${S#$@}`, `${S=$@}`) and inside a nested
+/// substitution: this only selects the bounded analysis, which fails closed.
+fn expansion_text_may_read_a_list(raw: &str) -> bool {
+    let Some(inner) = raw.strip_prefix("${") else {
+        return false;
+    };
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next();
+            }
+            '$' => match chars.peek() {
+                Some('@') => return true,
+                Some('{') => {
+                    chars.next();
+                    if chars.next_if(|next| matches!(next, '@' | '!')).is_some() {
+                        return true;
+                    }
+                    while chars
+                        .next_if(|next| next.is_ascii_alphanumeric() || *next == '_')
+                        .is_some()
+                    {}
+                    if chars.next_if_eq(&'[').is_some()
+                        && chars.next_if_eq(&'@').is_some()
+                        && chars.next_if_eq(&']').is_some()
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Preserve the parser's quoting and execution boundaries. A `$@` inside
 /// `"$(printf '%s' "$@")"` belongs to the nested command, not the outer argv;
 /// its quoted output is one scalar. Nested commands are scanned separately.
@@ -213,11 +261,15 @@ fn argv_needs_field_analysis(node: Node<'_, StrDoc<SupportLang>>) -> bool {
                 }
             }
             "simple_expansion" | "expansion" => {
-                if !quoted || parameter_can_produce_multiple_fields(part.text().as_ref()) {
+                let raw = part.text();
+                if !quoted
+                    || parameter_can_produce_multiple_fields(raw.as_ref())
+                    || expansion_text_may_read_a_list(raw.as_ref())
+                {
                     return true;
                 }
                 // An operator's replacement can itself contain a live list,
-                // e.g. "${S:+$@}". Do not stop at the scalar parameter name.
+                // e.g. "${S:+"$@"}". Do not stop at the scalar parameter name.
                 pending.extend(part.children().map(|child| (child, quoted)));
             }
             _ => pending.extend(part.children().map(|child| (child, quoted))),
@@ -1013,8 +1065,8 @@ mod tests {
     #[test]
     fn resolved_scalar_paths_reach_native_writers_with_original_spans_566() {
         // Use destinations present in the shared native policy. In
-        // particular, /etc/profile is not yet in that policy's table;
-        // the pre-existing #558 vectors for it exercise a separate gap.
+        // particular, /etc/profile is not in that policy's table, so a
+        // resolved /etc/profile field proves nothing about recovery.
         for (source, rule) in [
             (
                 "S=/etc; IFS=; tee $S/shadow",
@@ -1191,22 +1243,27 @@ mod tests {
         }
     }
 
+    /// The #558 vectors name a destination the shared native policy actually
+    /// protects. They first used /etc/profile, which that table has never
+    /// listed (00ffdb6 leaves every unlisted /etc file to the ordinary
+    /// truncation rules), so a plain `tee /etc/profile` is allowed and those
+    /// vectors could not show the split field reaching the policy.
     #[test]
     fn native_policy_sees_every_rebound_ifs_destination() {
         for source in [
-            "S=/tmp/a@/etc/profile; IFS=@; echo x | tee $S",
-            "IFS=@; S=/tmp/a@/etc/profile; tee $S",
-            "S=/tmp/a@/etc/profile IFS=@; tee $S",
-            "IFS=@ S=/tmp/a@/etc/profile; tee ${S}",
-            "IFS=' '; S=/tmp/a@/etc/profile; IFS+=@; tee $S",
-            "S=/tmp/a@/etc/profile; export IFS=@; tee $S",
-            "export S=/tmp/a@/etc/profile IFS=@; tee $S",
-            "S=/etc/profile@/tmp/a; IFS=@; tee $S",
-            "S=/tmp/a@/tmp/b@/etc/profile; IFS=@; tee $S",
-            "S=/tmp/a@/etc/profile; IFS=@; command tee -- $S",
-            "S=/tmp/a@/etc/profile; IFS=@; /usr/bin/tee $S",
-            "S=/tmp/a@/etc/profile; IFS=@; gtee $S",
-            "S=/tmp/a@/etc/profile; IFS=@; tee -a $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; echo x | tee $S",
+            "IFS=@; S=/tmp/a@/etc/shadow; tee $S",
+            "S=/tmp/a@/etc/shadow IFS=@; tee $S",
+            "IFS=@ S=/tmp/a@/etc/shadow; tee ${S}",
+            "IFS=' '; S=/tmp/a@/etc/shadow; IFS+=@; tee $S",
+            "S=/tmp/a@/etc/shadow; export IFS=@; tee $S",
+            "export S=/tmp/a@/etc/shadow IFS=@; tee $S",
+            "S=/etc/shadow@/tmp/a; IFS=@; tee $S",
+            "S=/tmp/a@/tmp/b@/etc/shadow; IFS=@; tee $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; command tee -- $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; /usr/bin/tee $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; gtee $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; tee -a $S",
         ] {
             let hits = scan(source, ShellDialect::Posix);
             assert!(
@@ -1227,7 +1284,7 @@ mod tests {
 
     #[test]
     fn each_native_rule_family_survives_the_same_tee_invocation() {
-        let source = "S=/tmp/a@/etc/profile@.git/config; IFS=@; tee $S";
+        let source = "S=/tmp/a@/etc/shadow@.git/config; IFS=@; tee $S";
         let hits = scan(source, ShellDialect::Posix);
         assert!(
             hits.iter()
@@ -1243,17 +1300,18 @@ mod tests {
     fn quoted_scalars_read_idioms_and_safe_paths_remain_harmless() {
         for source in [
             "S=/tmp/scratch/a@/tmp/scratch/b; IFS=@; echo x | tee $S",
-            "S=/tmp/a@/etc/profile; IFS=@; tee \"$S\"",
-            "S=/tmp/a@/etc/profile; IFS=@; tee \"${S}\"",
-            "S=/tmp/a@/etc/profile; IFS=; tee $S",
-            "S=/tmp/a@/etc/profile; IFS=@; tee '$S'",
-            "S=/tmp/a@/etc/profile; IFS=@; printf '%s' \"$S\"",
-            "S=/tmp/a@/etc/profile; IFS=@; echo 'tee $S'",
-            "S=/tmp/a@/etc/profile; IFS=@",
+            // A protected split field, so each control is not vacuous.
+            "S=/tmp/a@/etc/shadow; IFS=@; tee \"$S\"",
+            "S=/tmp/a@/etc/shadow; IFS=@; tee \"${S}\"",
+            "S=/tmp/a@/etc/shadow; IFS=; tee $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; tee '$S'",
+            "S=/tmp/a@/etc/shadow; IFS=@; printf '%s' \"$S\"",
+            "S=/tmp/a@/etc/shadow; IFS=@; echo 'tee $S'",
+            "S=/tmp/a@/etc/shadow; IFS=@",
             "OIFS=$IFS",
             "while IFS= read -r l; do :; done < /etc/hostname",
             "IFS=, read a b <<< 'x,y'",
-            "S=/tmp/safe; IFS=@; S=/tmp/a@/etc/profile IFS=: tee $S",
+            "S=/tmp/safe; IFS=@; S=/tmp/a@/etc/shadow IFS=: tee $S",
             "IFS=@; S=/tmp/a@/tmp/b; tee $S; tee /tmp/other",
         ] {
             assert!(scan(source, ShellDialect::Posix).is_empty(), "{source}");
@@ -1287,9 +1345,9 @@ mod tests {
     #[test]
     fn writer_arguments_are_not_limited_to_tee() {
         for source in [
-            "S=/tmp/source@/etc/profile; IFS=@; cp $S",
-            "S=/tmp/source@/etc/profile; IFS=@; mv $S",
-            "S=if=/tmp/source@of=/etc/profile; IFS=@; dd $S",
+            "S=/tmp/source@/etc/shadow; IFS=@; cp $S",
+            "S=/tmp/source@/etc/shadow; IFS=@; mv $S",
+            "S=if=/tmp/source@of=/etc/shadow; IFS=@; dd $S",
         ] {
             let hits = scan(source, ShellDialect::Posix);
             assert!(
@@ -1434,8 +1492,10 @@ mod tests {
             r#"F=%%n; printf "$F" SEP"#,
             r#"E=; printf "$E" 'abcde%n' SEP"#,
         ] {
+            // If SEP were wrongly taken to be 5, /etc/shadow would be split
+            // out and denied: this negative control is not vacuous.
             let source =
-                format!("SEP=@; IFS=@; S=/tmp/a5/etc/profile; {printing}; IFS=$SEP; tee $S");
+                format!("SEP=@; IFS=@; S=/tmp/a5/etc/shadow; {printing}; IFS=$SEP; tee $S");
             assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
         }
     }
@@ -1525,12 +1585,12 @@ mod tests {
     #[test]
     fn printf_data_arguments_do_not_invalidate_safe_destination_bindings() {
         for printing in [
-            "printf '%s' '-v' S /tmp/a@/etc/profile",
-            "printf -- '-v' S /tmp/a@/etc/profile",
-            "printf '' '-v' S /tmp/a@/etc/profile",
-            r#"F=%s; printf "$F" '-v' S /tmp/a@/etc/profile"#,
-            r#"E=; printf "$E" -v S /tmp/a@/etc/profile"#,
-            "printf '%s' '$@' '-v' S /tmp/a@/etc/profile",
+            "printf '%s' '-v' S /tmp/a@/etc/shadow",
+            "printf -- '-v' S /tmp/a@/etc/shadow",
+            "printf '' '-v' S /tmp/a@/etc/shadow",
+            r#"F=%s; printf "$F" '-v' S /tmp/a@/etc/shadow"#,
+            r#"E=; printf "$E" -v S /tmp/a@/etc/shadow"#,
+            "printf '%s' '$@' '-v' S /tmp/a@/etc/shadow",
         ] {
             let source = format!("S=/tmp/safe; IFS=@; {printing}; tee $S");
             assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
@@ -1556,7 +1616,7 @@ mod tests {
 
     #[test]
     fn candidate_gate_and_original_source_entry_point_do_not_lose_bindings() {
-        let source = "S=/tmp/a@/etc/profile; IFS=@; tee $S";
+        let source = "S=/tmp/a@/etc/shadow; IFS=@; tee $S";
         let hits = super::super::classify_embedded_credential_file_writes(
             source,
             ShellDialect::Posix,
@@ -1615,6 +1675,12 @@ mod tests {
             (r#""${@:1}""#, true),
             (r#""${!S}""#, true),
             (r#""${S:+$@}""#, true),
+            (r#""${S:-$@}""#, true),
+            (r#""${S:+x$@}""#, true),
+            (r#""${S:+'$@'}""#, true),
+            (r#""${S:+'${A[@]}'}""#, true),
+            (r#""${S:+'${!T}'}""#, true),
+            (r#""${S:+'${@:1}'}""#, true),
             (r#""${S:-"$@"}""#, true),
             (r#""${S[@]:0:2}""#, true),
             (r#"é"${@:1}"ø"#, true),
@@ -1625,6 +1691,10 @@ mod tests {
             (r"'${@:1}'", false),
             (r"$'${@:1}'", false),
             (r#""${#@}""#, false),
+            (r#""${S:+\$@}""#, false),
+            (r#""${S:+/tmp/a}""#, false),
+            (r#""${S:-'/tmp/a'}""#, false),
+            (r#""${S:+${#A[@]}}""#, false),
             (r#""${#S[@]}""#, false),
             (r#""${S[*]}""#, false),
             (r#""${!S[*]}""#, false),
@@ -1648,6 +1718,10 @@ mod tests {
             r#"IFS=@; A=(/tmp/a /etc/profile); S='A[@]'; tee "${!S}""#,
             r#"IFS=@; A=(/tmp/a /etc/profile); tee "${A[@]:0:2}""#,
             r#"set -- /tmp/a /etc/profile; IFS=@; tee "${S:-"$@"}""#,
+            // #565: the parser hides these `$@` reads inside the operator.
+            r#"set -- /tmp/a /etc/passwd; S=x; IFS=@; echo x | tee "${S:+$@}""#,
+            r#"set -- /tmp/a /etc/passwd; IFS=@; echo x | tee "${S:-$@}""#,
+            r#"set -- /tmp/a /etc/passwd x; S=x; IFS=@; tee "${S:+'$@'}""#,
         ] {
             let hits = scan(source, ShellDialect::Posix);
             for rule in [
@@ -1674,6 +1748,8 @@ mod tests {
             r#"IFS=@; tee "${#A[@]}""#,
             r#"IFS=@; tee "${A[*]}""#,
             r#"IFS=@; tee "$(printf '%s' "$@")""#,
+            r#"IFS=@; S=x; tee "${S:+\$@}""#,
+            r#"IFS=@; S=x; tee "${S:+/tmp/a}""#,
         ] {
             assert!(scan(source, ShellDialect::Posix).is_empty(), "{source}");
         }
@@ -1682,9 +1758,9 @@ mod tests {
     #[test]
     fn later_tee_options_cannot_exempt_earlier_destinations() {
         for source in [
-            "S=/tmp/a@/etc/profile@--help; IFS=@; POSIXLY_CORRECT=1 tee $S",
-            "S=/tmp/a@/etc/profile@--version; IFS=@; env POSIXLY_CORRECT=1 tee $S",
-            "S=/tmp/a@/etc/profile@--help; IFS=@; tee $S",
+            "S=/tmp/a@/etc/shadow@--help; IFS=@; POSIXLY_CORRECT=1 tee $S",
+            "S=/tmp/a@/etc/shadow@--version; IFS=@; env POSIXLY_CORRECT=1 tee $S",
+            "S=/tmp/a@/etc/shadow@--help; IFS=@; tee $S",
             "S=/home/example/.ssh/known_hosts@-a; IFS=@; POSIXLY_CORRECT=1 tee $S",
             "S=/home/example/.ssh/known_hosts@--append; IFS=@; tee $S",
         ] {
@@ -1697,8 +1773,8 @@ mod tests {
             );
         }
         for argv in [
-            vec!["tee", "--help", "/etc/profile"],
-            vec!["tee", "--version", "/etc/profile"],
+            vec!["tee", "--help", "/etc/shadow"],
+            vec!["tee", "--version", "/etc/shadow"],
             vec!["tee", "-a", "/home/example/.ssh/known_hosts"],
             vec!["tee", "--append", "/home/example/.ssh/known_hosts"],
         ] {
