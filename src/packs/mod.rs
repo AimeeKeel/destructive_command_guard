@@ -922,6 +922,16 @@ impl Pack {
             }
             pattern.matches_command(cmd)
         });
+        // The same add-only masked pass the evaluator gives core.filesystem
+        // (#552 follow-up); the unlink proof above already read the operands.
+        let found = found.or_else(|| {
+            let masked = self.core_filesystem_separator_masked_view(cmd)?;
+            self.destructive_patterns.iter().find(|pattern| {
+                !(crate::packs::core::filesystem::is_unlink_rule(pattern.name)
+                    && unlink_command.is_some())
+                    && pattern.matches_command(&masked)
+            })
+        });
         // #509: the `branch-force-delete` regex is the fallback for a branch
         // command the parser could not read; a readable merge-checked
         // deletion is reported as `branch-delete`, as the parser would.
@@ -951,16 +961,38 @@ impl Pack {
         cmd: &str,
         predicate: impl Fn(Option<&'static str>) -> bool,
     ) -> Option<DestructiveMatch> {
-        self.destructive_patterns
-            .iter()
-            .filter(|p| predicate(p.name))
-            .find(|p| p.matches_command(cmd))
+        let find = |text: &str| {
+            self.destructive_patterns
+                .iter()
+                .filter(|p| predicate(p.name))
+                .find(|p| p.matches_command(text))
+        };
+        find(cmd)
+            .or_else(|| {
+                self.core_filesystem_separator_masked_view(cmd)
+                    .and_then(|masked| find(&masked))
+            })
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,
                 severity: p.severity,
                 explanation: p.explanation,
             })
+    }
+
+    /// For `core.filesystem`, `cmd` with its quoted and escaped `;`, `|` and
+    /// `&` masked, when it has any: the view the evaluator's add-only second
+    /// destructive pass matches (see
+    /// [`crate::packs::mask_quoted_shell_separators`]). Destructive matching
+    /// only; safe patterns never see it.
+    fn core_filesystem_separator_masked_view(&self, cmd: &str) -> Option<String> {
+        if self.id != "core.filesystem" {
+            return None;
+        }
+        match crate::packs::mask_quoted_shell_separators(cmd) {
+            std::borrow::Cow::Owned(masked) => Some(masked),
+            std::borrow::Cow::Borrowed(_) => None,
+        }
     }
 
     fn destructive_match_by_name(&self, name: &str, cmd: &str) -> Option<DestructiveMatch> {
@@ -4160,6 +4192,146 @@ fn collect_command_segments<'a>(
     }
 }
 
+/// The byte a data `;`, `|` or `&` becomes in [`mask_quoted_shell_separators`].
+///
+/// A word byte, so it neither ends a `[^|;&]*` scan nor reads as whitespace,
+/// a quote, a path separator, or an expansion.
+pub(crate) const MASKED_SHELL_SEPARATOR: u8 = b'_';
+
+/// Byte offsets of every `;`, `|` and `&` in `cmd` that POSIX shell reads as
+/// data: inside single or double quotes, or escaped by a backslash.
+///
+/// The scan is [`collect_command_segments`]'s, byte for byte: the same quote
+/// toggles, the same backslash skip outside single quotes, and the same
+/// command, process and arithmetic substitution bodies. A body is scanned in
+/// its own quoting context, because there its unquoted separators are real
+/// and split its own segments. So an offset returned here is never one the
+/// segmenter splits on, while every separator byte it declined to split on
+/// for quoting or escaping is returned. Redirection syntax (`2>&1`, `&>`,
+/// `>|`) is not quoting and is not returned.
+#[must_use]
+pub(crate) fn quoted_shell_separator_offsets(cmd: &str) -> Vec<usize> {
+    let bytes = cmd.as_bytes();
+    let mut offsets = Vec::new();
+    if bytes.iter().any(|byte| matches!(byte, b';' | b'|' | b'&'))
+        && bytes
+            .iter()
+            .any(|byte| matches!(byte, b'\'' | b'"' | b'\\'))
+    {
+        collect_quoted_shell_separator_offsets(cmd, 0, cmd.len(), 0, &mut offsets);
+        // The scan visits bodies in place, so this is already ordered; callers
+        // binary-search it.
+        offsets.sort_unstable();
+    }
+    offsets
+}
+
+/// `cmd` with each offset from [`quoted_shell_separator_offsets`] replaced by
+/// [`MASKED_SHELL_SEPARATOR`]; length and every other byte are unchanged.
+///
+/// Regex rules that stay inside one command with `[^|;&]*` stop at the first
+/// `;`, `|` or `&` even when it is quoted, so a quoted separator in an earlier
+/// operand hid every later operand from them: `mv "a;b" ~/Documents /tmp/x`
+/// and `find "a;b" / -delete` were allowed (GitHub #552 follow-up). Matching
+/// this view lets those scans read the whole command the shell runs.
+#[must_use]
+pub(crate) fn mask_quoted_shell_separators(cmd: &str) -> std::borrow::Cow<'_, str> {
+    let offsets = quoted_shell_separator_offsets(cmd);
+    if offsets.is_empty() {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let mut bytes = cmd.as_bytes().to_vec();
+    for offset in offsets {
+        bytes[offset] = MASKED_SHELL_SEPARATOR;
+    }
+    std::borrow::Cow::Owned(
+        String::from_utf8(bytes).expect("replacing ASCII bytes with ASCII keeps UTF-8 valid"),
+    )
+}
+
+fn collect_quoted_shell_separator_offsets(
+    cmd: &str,
+    start: usize,
+    end: usize,
+    recursion_depth: usize,
+    offsets: &mut Vec<usize>,
+) {
+    if recursion_depth > MAX_SEGMENT_RECURSION {
+        return;
+    }
+    let bytes = cmd.as_bytes();
+    let mut i = start;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < end {
+        let b = bytes[i];
+
+        if b == b'\\' && !in_single && i + 1 < end {
+            if matches!(bytes[i + 1], b';' | b'|' | b'&') {
+                offsets.push(i + 1);
+            }
+            i += 2;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+
+        if !in_single
+            && b == b'$'
+            && i + 2 < end
+            && bytes[i + 1] == b'('
+            && bytes[i + 2] == b'('
+            && let Some(close) = find_matching_arithmetic_expansion(cmd, i + 3, end)
+        {
+            collect_quoted_shell_separator_offsets(cmd, i + 3, close, recursion_depth + 1, offsets);
+            i = close + 2;
+            continue;
+        }
+        // `$(…)` anywhere outside single quotes; `<(…)` / `>(…)` unquoted.
+        let opens_substitution = i + 1 < end
+            && bytes[i + 1] == b'('
+            && ((!in_single && b == b'$')
+                || (!in_single && !in_double && matches!(b, b'<' | b'>')));
+        if opens_substitution {
+            // An unclosed body runs to `end`, exactly as the segmenter reads it.
+            let body = i + 2;
+            let close = find_matching_command_substitution(cmd, body, end);
+            let body_end = close.unwrap_or(end);
+            collect_quoted_shell_separator_offsets(
+                cmd,
+                body,
+                body_end,
+                recursion_depth + 1,
+                offsets,
+            );
+            i = close.map_or(end, |close| close + 1);
+            continue;
+        }
+        if !in_single
+            && b == b'`'
+            && let Some(close) = find_matching_backtick(cmd, i + 1, end)
+        {
+            collect_quoted_shell_separator_offsets(cmd, i + 1, close, recursion_depth + 1, offsets);
+            i = close + 1;
+            continue;
+        }
+
+        if (in_single || in_double) && matches!(b, b';' | b'|' | b'&') {
+            offsets.push(i);
+        }
+        i += 1;
+    }
+}
+
 fn push_trimmed_segment<'a>(cmd: &'a str, start: usize, end: usize, segments: &mut Vec<&'a str>) {
     let segment = cmd[start..end].trim();
     if !segment.is_empty() {
@@ -5278,6 +5450,71 @@ destructive_patterns:
         assert_eq!(split_command_segments(r"echo a\; b"), vec![r"echo a\; b"]);
         assert_eq!(split_command_segments(r"echo a\| b"), vec![r"echo a\| b"]);
         assert_eq!(split_command_segments(r"echo a\& b"), vec![r"echo a\& b"]);
+    }
+
+    #[test]
+    fn quoted_shell_separators_are_masked_exactly_where_the_segmenter_declines_to_split() {
+        // Quoted and escaped separators are data; each becomes `_` in place.
+        for (command, masked) in [
+            (r#"mv "a & b" /etc /tmp/x"#, r#"mv "a _ b" /etc /tmp/x"#),
+            ("mv 'a;b|c' ~ /tmp/x", "mv 'a_b_c' ~ /tmp/x"),
+            (r"find a\;b / -delete", r"find a\_b / -delete"),
+            (r#"echo "a\;b""#, r#"echo "a\_b""#),
+            // Real separators stay, so a command never runs into the next.
+            (
+                r#"mv "a;b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+                r#"mv "a_b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+            ),
+            (r#"a "x|y" && b 'p&q' || c"#, r#"a "x_y" && b 'p_q' || c"#),
+            // A substitution body has its own quoting: its bare `;` is real
+            // even inside double quotes, while a quoted one inside it is data.
+            (
+                r#"echo "$(cd /; ls "a;b")" '$(x;y)'"#,
+                r#"echo "$(cd /; ls "a_b")" '$(x_y)'"#,
+            ),
+            ("echo `a; b \"c;d\"`", "echo `a; b \"c_d\"`"),
+            (r#"diff <(sort "a|b"; ls) y"#, r#"diff <(sort "a_b"; ls) y"#),
+            // A single quote inside double quotes is a byte, and the reverse.
+            (r#"echo "it's; ok" x"#, r#"echo "it's_ ok" x"#),
+            (r#"echo 'say "a;b"' x"#, r#"echo 'say "a_b"' x"#),
+        ] {
+            let actual = mask_quoted_shell_separators(command);
+            assert_eq!(actual, masked, "{command}");
+            assert_eq!(actual.len(), command.len(), "{command}");
+        }
+        // Nothing to mask: borrowed, and redirection syntax is not quoting.
+        for command in [
+            "cp -a /etc /tmp/x && rm -rf /tmp/x",
+            "make 2>&1 | tee log",
+            "cmd &> out; echo >| f",
+            r#"echo "no separators here""#,
+            "mv a b; rm c",
+        ] {
+            assert!(
+                matches!(
+                    mask_quoted_shell_separators(command),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{command}"
+            );
+        }
+        // An unbalanced quote keeps the segmenter's reading: the rest of the
+        // text is one quoted segment, so its separators are data to both.
+        let unbalanced = r#"echo "a; b"#;
+        assert_eq!(split_command_segments(unbalanced), vec![unbalanced]);
+        assert_eq!(mask_quoted_shell_separators(unbalanced), r#"echo "a_ b"#);
+        // The offsets agree with the segmenter on every listed command: no
+        // masked byte is ever a place it splits.
+        for command in [
+            r#"mv "a;b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+            r#"echo "$(cd /; ls "a;b")" && x 'p|q' | y"#,
+            r"a\;b; c\|d | e\&f & g",
+        ] {
+            let masked = mask_quoted_shell_separators(command);
+            let segments = split_command_segments(command);
+            let masked_segments = split_command_segments(&masked);
+            assert_eq!(segments.len(), masked_segments.len(), "{command}");
+        }
     }
 
     #[test]

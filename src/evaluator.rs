@@ -29059,25 +29059,44 @@ fn evaluate_core_filesystem_pack(
     inherited_automated_stdin: bool,
     heredoc_settings: Option<&crate::config::HeredocSettings>,
 ) -> Option<EvaluationResult> {
+    // The quoted and escaped `;`, `|`, `&` of this command, in its own
+    // coordinates, for the add-only masked pass every destructive pass below
+    // gets (see `evaluate_view_then_separator_masked`). Only POSIX grammar
+    // has a quoting rule to apply, and it is also the only grammar these
+    // segment ranges come from.
+    let masked_separator_offsets =
+        if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            crate::packs::quoted_shell_separator_offsets(command_for_packs)
+        } else {
+            Vec::new()
+        };
+
     // These rules intentionally span shell separators (the propagation
     // chains and the fork bomb). Evaluate them once against the complete
     // command before any safe per-invocation rm decision can hide them.
     if segment_ranges.len() > 1 {
-        if let Some(result) = evaluate_pack_destructive_patterns(
-            pack_id,
-            pack,
+        if let Some(result) = evaluate_view_then_separator_masked(
             command_for_packs,
-            shell_dialect,
             0,
-            original_command,
-            normalized_offset,
-            original_len,
-            allowlists,
-            project_path,
-            first_allowlist_hit,
-            deadline,
-            &[],
-            Some(filesystem_cross_segment_pattern),
+            &masked_separator_offsets,
+            |view| {
+                evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    view,
+                    shell_dialect,
+                    0,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut *first_allowlist_hit,
+                    deadline,
+                    &[],
+                    Some(filesystem_cross_segment_pattern),
+                )
+            },
         ) {
             return Some(result);
         }
@@ -29351,21 +29370,28 @@ fn evaluate_core_filesystem_pack(
         // quoted-span guard below can distinguish `psql -c
         // 'SELECT a>/etc/x'` from a real redirect (issue #225).
         if shell_dialect == ShellDialect::Unknown && segment_for_match.contains('>') {
-            if let Some(result) = evaluate_pack_destructive_patterns(
-                pack_id,
-                pack,
+            if let Some(result) = evaluate_view_then_separator_masked(
                 segment_for_match,
-                shell_dialect,
                 segment_start,
-                original_command,
-                normalized_offset,
-                original_len,
-                allowlists,
-                project_path,
-                first_allowlist_hit,
-                deadline,
-                &nested_segment_ranges,
-                Some(redirect_filter),
+                &masked_separator_offsets,
+                |view| {
+                    evaluate_pack_destructive_patterns(
+                        pack_id,
+                        pack,
+                        view,
+                        shell_dialect,
+                        segment_start,
+                        original_command,
+                        normalized_offset,
+                        original_len,
+                        allowlists,
+                        project_path,
+                        &mut *first_allowlist_hit,
+                        deadline,
+                        &nested_segment_ranges,
+                        Some(redirect_filter),
+                    )
+                },
             ) {
                 return Some(result);
             }
@@ -29376,21 +29402,28 @@ fn evaluate_core_filesystem_pack(
         } else if first_unquoted_output_redirect(dialect_segment, shell_dialect).is_some() {
             let redirect_view =
                 filesystem_redirection_matching_view(dialect_segment, shell_dialect);
-            if let Some(result) = evaluate_pack_destructive_patterns(
-                pack_id,
-                pack,
+            if let Some(result) = evaluate_view_then_separator_masked(
                 redirect_view.as_ref(),
-                shell_dialect,
                 segment_start,
-                original_command,
-                normalized_offset,
-                original_len,
-                allowlists,
-                project_path,
-                first_allowlist_hit,
-                deadline,
-                &nested_segment_ranges,
-                Some(redirect_filter),
+                &masked_separator_offsets,
+                |view| {
+                    evaluate_pack_destructive_patterns(
+                        pack_id,
+                        pack,
+                        view,
+                        shell_dialect,
+                        segment_start,
+                        original_command,
+                        normalized_offset,
+                        original_len,
+                        allowlists,
+                        project_path,
+                        &mut *first_allowlist_hit,
+                        deadline,
+                        &nested_segment_ranges,
+                        Some(redirect_filter),
+                    )
+                },
             ) {
                 return Some(result);
             }
@@ -29519,21 +29552,28 @@ fn evaluate_core_filesystem_pack(
             // data, not another filesystem command. Redirect syntax was
             // handled independently above; nested executable constructs have
             // their own ranges and are evaluated independently.
-        } else if let Some(result) = evaluate_pack_destructive_patterns(
-            pack_id,
-            pack,
+        } else if let Some(result) = evaluate_view_then_separator_masked(
             segment_for_match,
-            shell_dialect,
             segment_start,
-            original_command,
-            normalized_offset,
-            original_len,
-            allowlists,
-            project_path,
-            first_allowlist_hit,
-            deadline,
-            &nested_segment_ranges,
-            Some(pre_rm_filter),
+            &masked_separator_offsets,
+            |view| {
+                evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    view,
+                    shell_dialect,
+                    segment_start,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut *first_allowlist_hit,
+                    deadline,
+                    &nested_segment_ranges,
+                    Some(pre_rm_filter),
+                )
+            },
         ) {
             return Some(result);
         }
@@ -29652,27 +29692,94 @@ fn evaluate_core_filesystem_pack(
             filesystem_non_pre_rm_non_redirect_pattern
         };
 
-        if let Some(result) = evaluate_pack_destructive_patterns(
-            pack_id,
-            pack,
+        if let Some(result) = evaluate_view_then_separator_masked(
             segment_for_match,
-            shell_dialect,
             segment_start,
-            original_command,
-            normalized_offset,
-            original_len,
-            allowlists,
-            project_path,
-            first_allowlist_hit,
-            deadline,
-            &nested_segment_ranges,
-            Some(final_filter),
+            &masked_separator_offsets,
+            |view| {
+                evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    view,
+                    shell_dialect,
+                    segment_start,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut *first_allowlist_hit,
+                    deadline,
+                    &nested_segment_ranges,
+                    Some(final_filter),
+                )
+            },
         ) {
             return Some(result);
         }
     }
 
     None
+}
+
+/// `view`, a byte-aligned slice of a pack's command that starts at
+/// `view_offset`, with the quoted and escaped separators at `offsets` (from
+/// [`crate::packs::quoted_shell_separator_offsets`] over that command)
+/// replaced by [`crate::packs::MASKED_SHELL_SEPARATOR`]. `None` when no such
+/// separator survives in the view. Only a byte that is still `;`, `|` or `&`
+/// in `view` is replaced, so a view that already blanked it (sanitized
+/// argument data, the redirect-only view) gets no new text.
+fn mask_separator_offsets_in_view(
+    view: &str,
+    view_offset: usize,
+    offsets: &[usize],
+) -> Option<String> {
+    let view_end = view_offset.checked_add(view.len())?;
+    let first = offsets.partition_point(|&offset| offset < view_offset);
+    let mut masked: Option<Vec<u8>> = None;
+    for &offset in offsets[first..]
+        .iter()
+        .take_while(|&&offset| offset < view_end)
+    {
+        let local = offset - view_offset;
+        if matches!(view.as_bytes()[local], b';' | b'|' | b'&') {
+            masked.get_or_insert_with(|| view.as_bytes().to_vec())[local] =
+                crate::packs::MASKED_SHELL_SEPARATOR;
+        }
+    }
+    masked.map(|bytes| {
+        String::from_utf8(bytes).expect("replacing ASCII bytes with ASCII keeps UTF-8 valid")
+    })
+}
+
+/// Run one `core.filesystem` destructive pass over `view`, and when it decides
+/// nothing, once more over the same view with its quoted and escaped `;`, `|`
+/// and `&` masked (GitHub #552 follow-up).
+///
+/// Rules that must stay inside one command scan with `[^|;&]*`, and that scan
+/// stopped at a separator byte even when the shell reads it as data. So a
+/// quoted separator in an earlier operand hid every later operand: `mv "a;b"
+/// ~/Documents /tmp/x; rm -rf /tmp/x`, `find "a;b" / -delete` and
+/// `rsync -a --delete "a & b" /tmp/src/ /etc/` were all allowed while the same
+/// commands with a quoted space were denied.
+///
+/// The second pass is add-only. The unmasked pass runs first and unchanged, so
+/// a rule that keys on a separator byte (a find `\;` terminator, a propagation
+/// chain's `&&`) keeps every match it had, and the masked view never touches a
+/// real separator, so a scan still cannot leave its command. Spans map 1:1
+/// because the view has the same length. Safe patterns are deliberately not
+/// given this view: they must keep reading only what they were written for.
+fn evaluate_view_then_separator_masked(
+    view: &str,
+    view_offset: usize,
+    masked_separator_offsets: &[usize],
+    mut evaluate: impl FnMut(&str) -> Option<EvaluationResult>,
+) -> Option<EvaluationResult> {
+    if let Some(result) = evaluate(view) {
+        return Some(result);
+    }
+    let masked = mask_separator_offsets_in_view(view, view_offset, masked_separator_offsets)?;
+    evaluate(&masked)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -52104,6 +52211,120 @@ mod tests {
             "a quoted brace is literal file-name data: {:?}",
             result.pattern_info
         );
+    }
+
+    /// A quoted or escaped separator in an earlier operand hid every later
+    /// operand from the `core.filesystem` rules that scan one command with
+    /// `[^|;&]*` (#552 follow-up). The masked destructive pass reads past it
+    /// in both POSIX-grammar dialects; real separators still split.
+    #[test]
+    fn quoted_separator_cannot_hide_a_later_operand_end_to_end() {
+        let deny_cases: [(&str, &[&str]); 14] = [
+            (
+                r#"mv "a;b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"mv "a & b" /etc /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"mv "a & b" /home/tester /tmp/x && rm -rf /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"sudo mv "a & b" /etc /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"mv 'a|b' "$HOME" /tmp/x"#,
+                &["mv-sensitive-source-root-home", "mv-dynamic-path"],
+            ),
+            (r#"mv "a & b" $X /tmp/y"#, &["mv-dynamic-path"]),
+            (
+                r#"find "a;b" / -delete"#,
+                &["find-delete-root-home", "find-delete-general"],
+            ),
+            (
+                r#"find "a;b" ~ -delete"#,
+                &["find-delete-root-home", "find-delete-general"],
+            ),
+            (
+                r"find a\;b / -delete",
+                &["find-delete-root-home", "find-delete-general"],
+            ),
+            (
+                r#"cp -a "a & b" /etc /tmp/x && rm -rf /tmp/x"#,
+                &["cp-sensitive-then-delete"],
+            ),
+            (
+                r#"ln -s "a & b" /etc /tmp/x && rm -rf /tmp/x/."#,
+                &["ln-symlink-sensitive-then-delete"],
+            ),
+            (
+                r#"rsync -a "a;b" /etc/ /tmp/d/ && rm -rf /tmp/d"#,
+                &["rsync-sensitive-then-delete"],
+            ),
+            (
+                r#"rsync -a --delete "a & b" /tmp/src/ /etc/"#,
+                &["rsync-delete-sensitive-dest"],
+            ),
+            (
+                r#"dd "if=a&b" of=/etc/hosts"#,
+                &["dd-overwrite-root-home", "dd-overwrite-general"],
+            ),
+        ];
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (command, expected_rules) in deny_cases {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    command,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "a quoted separator must not hide a later operand ({dialect:?}): \
+                     {command:?}: {:?}",
+                    result.pattern_info
+                );
+                let name = result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref())
+                    .unwrap_or("<none>");
+                assert!(
+                    expected_rules.contains(&name),
+                    "unexpected deny rule for {command:?} ({dialect:?}): {name} \
+                     (expected one of {expected_rules:?})"
+                );
+            }
+        }
+
+        for command in [
+            r#"mv "a & b" c"#,
+            r#"mv "a;b" /tmp/x/"#,
+            r#"mv "/home/tester/Documents/a & b" ~/Documents/x ~/Documents/y"#,
+            r#"mv "a & b" /home/tester/Documents/y"#,
+            r#"cp -a "a & b" /tmp/x && rm -rf /tmp/x"#,
+            r#"rsync -a "a & b" /tmp/dst/"#,
+            r#"find . -name "a;b" -print"#,
+            r#"grep "a|b" file"#,
+            r#"echo "x;y" > /tmp/out"#,
+            r#"git commit -m "mv a; rm -rf /""#,
+            r"find /tmp/build -name x -exec rm {} \;",
+            r#"echo "$(cd /tmp; ls "a;b")""#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "a quoted separator in a harmless command must stay data: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
     }
 
     #[test]

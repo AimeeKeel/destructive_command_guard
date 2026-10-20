@@ -8810,6 +8810,73 @@ mod tests {
     }
 
     #[test]
+    fn quoted_separator_cannot_hide_a_later_operand_issue_552_follow_up() {
+        // Rules that stay inside one command scan with `[^|;&]*`, which
+        // stopped at a quoted or escaped separator: every operand after it was
+        // invisible, so the canonical relocate-then-delete bypass and
+        // `find / -delete` were allowed whenever an earlier operand was named
+        // `a;b`. Each command below is denied with a quoted space instead.
+        let pack = create_pack();
+        for (cmd, rule) in [
+            (r#"mv "a & b" /etc /tmp/x"#, "mv-sensitive-source-root-home"),
+            (r#"mv "a & b" /etc/hosts"#, "mv-sensitive-source-root-home"),
+            (
+                r#"mv "a;b" ~/Documents /tmp/x"#,
+                "mv-sensitive-source-root-home",
+            ),
+            (
+                r#"mv -- "a & b" /home/tester /tmp/x"#,
+                "mv-sensitive-source-root-home",
+            ),
+            (r#"mv "a & b" $X /tmp/y"#, "mv-dynamic-path"),
+            (r#"find "a;b" / -delete"#, "find-delete-root-home"),
+            (
+                r#"find "a|b" /home/tester -delete"#,
+                "find-delete-root-home",
+            ),
+            (r"find a\;b / -delete", "find-delete-root-home"),
+            (
+                r#"cp -a "a & b" /etc /tmp/x && rm -rf /tmp/x"#,
+                "cp-sensitive-then-delete",
+            ),
+            (
+                r#"ln -s "a & b" /etc /tmp/x && rm -rf /tmp/x/."#,
+                "ln-symlink-sensitive-then-delete",
+            ),
+            (
+                r#"rsync -a "a;b" /etc/ /tmp/d/ && rm -rf /tmp/d"#,
+                "rsync-sensitive-then-delete",
+            ),
+            (
+                r#"rsync -a --delete "a & b" /tmp/src/ /etc/"#,
+                "rsync-delete-sensitive-dest",
+            ),
+            (r#"dd "if=a&b" of=/etc/hosts"#, "dd-overwrite-root-home"),
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, rule);
+        }
+        // Harmless commands carrying the same quoted separators stay allowed:
+        // the masked view only lets a scan read its own command further.
+        for cmd in [
+            r#"mv "a & b" c"#,
+            r#"mv "a;b" /tmp/x/"#,
+            r#"mv "/home/tester/Documents/a & b" ~/Documents/x ~/Documents/y"#,
+            r#"mv "a & b" /home/tester/Documents/y"#,
+            r#"cp -a "a & b" /tmp/x && rm -rf /tmp/x"#,
+            r#"rsync -a "a & b" /tmp/dst/"#,
+            r#"find . -name "a;b" -print"#,
+            r#"grep "a|b" file"#,
+            r#"echo "x;y" > /tmp/out"#,
+            r"find /tmp/build -name x -exec rm {} \;",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator in a harmless command must stay data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
     fn globbed_rm_under_home_is_blocked() {
         // Regression for #247: the glob IS the recursion. `rm -f ~/x/*`
         // destroys approximately the same file set as `rm -rf ~/x`, but only
