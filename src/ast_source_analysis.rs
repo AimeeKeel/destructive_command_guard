@@ -1336,10 +1336,14 @@ fn static_interpreter_literal<D: ast_grep_core::Doc>(
                     .field("arguments")
                     .is_some_and(|arguments| arguments.range() == node.range())
         })
+        && node.text().contains('\\')
     {
         // A tag receives raw and cooked pieces and chooses the result itself.
         // In particular String.raw retains escaped backticks; cooking its
         // template here would invent shell substitutions that never execute.
+        // Without an escape the two readings are the same text, so there is
+        // nothing to choose: the tag (zx's or Bun's `$`, for one) is called
+        // with exactly these bytes and may run them as a shell command.
         return None;
     }
     let raw = node.text();
@@ -2076,6 +2080,27 @@ mod tests {
                 "# Unicode source: élève\ns = 'echo ' '`git branch -d x`'\nrun(s)",
                 "'echo ' '`git branch -d x`'",
                 "echo `git branch -d x`",
+            ),
+            // A tag is called with the template's pieces. Without an escape
+            // its raw and cooked pieces are the same bytes (zx's and Bun's `$`
+            // run them as a shell command), so there is no reading to invent.
+            (
+                ScriptLanguage::JavaScript,
+                "tag`echo $(git reset --hard)`;",
+                "`echo $(git reset --hard)`",
+                "echo $(git reset --hard)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const {$} = require('zx'); $`echo $(git reset --hard)`;",
+                "`echo $(git reset --hard)`",
+                "echo $(git reset --hard)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "String.raw`echo $(git reset --hard)`;",
+                "`echo $(git reset --hard)`",
+                "echo $(git reset --hard)",
             ),
         ] {
             let commands = interpreter_literal_shell_commands_inner(source, language, true)

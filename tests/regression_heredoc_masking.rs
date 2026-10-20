@@ -1031,14 +1031,23 @@ EOF";
 
     #[test]
     fn issue_544_tagged_templates_do_not_invent_cooked_shell_commands() {
-        for (body, expected) in [
+        for (body, expected, denying_rule) in [
             (
                 r"const s = String.raw`echo \`git branch -d x\``; require('child_process').execSync(s);",
                 "allow",
+                "",
             ),
             (
                 r"const s = `echo \`git branch -d x\``; require('child_process').execSync(s);",
                 "deny",
+                "core.git:branch-delete",
+            ),
+            // Without an escape a tag's raw and cooked pieces are identical,
+            // and a shell tag (zx's or Bun's `$`) runs exactly those bytes.
+            (
+                "const {$} = require('zx'); $`echo $(git reset --hard)`;",
+                "deny",
+                "core.git:reset-hard",
             ),
         ] {
             let command = format!("node - <<'JS'\n{body}\nJS");
@@ -1048,7 +1057,33 @@ EOF";
                 "raw and ordinary templates produce different shell values: {command:?}: {rule}"
             );
             if expected == "deny" {
-                assert_eq!(rule, "core.git:branch-delete", "{command:?}");
+                assert_eq!(rule, denying_rule, "{command:?}");
+            }
+        }
+        // The inline program reaches only this recovery: the outer shell sees
+        // one single-quoted word. Both denials were ALLOWED while every
+        // tagged template was skipped, escaped or not.
+        for (command, expected, denying_rule) in [
+            (
+                r#"node -e 'const {$} = require("zx"); $`echo $(git reset --hard)`'"#,
+                "deny",
+                "core.git:reset-hard",
+            ),
+            (
+                "node -e 'tag`echo $(git reset --hard)`'",
+                "deny",
+                "core.git:reset-hard",
+            ),
+            (
+                r#"node -e 'const s = String.raw`echo \`git branch -d x\``; require("child_process").execSync(s);'"#,
+                "allow",
+                "",
+            ),
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, expected, "{command:?}: {rule}");
+            if expected == "deny" {
+                assert_eq!(rule, denying_rule, "{command:?}");
             }
         }
     }
