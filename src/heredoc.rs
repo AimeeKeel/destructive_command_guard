@@ -2012,6 +2012,9 @@ fn inline_program_at<'a>(
     fallback: Range<usize>,
     skip_reasons: &mut Vec<SkipReason>,
 ) -> InlineProgram<'a> {
+    if let Some(program) = enclosed_inline_program(command, start) {
+        return program;
+    }
     let end = crate::normalize::consume_posix_word_token(command.as_bytes(), start, command.len());
     if end >= fallback.end
         && end > start
@@ -2073,6 +2076,167 @@ fn inline_program<'a>(
         }
     }
     inline_program_at(command, start, content, skip_reasons)
+}
+
+/// Quoted words an enclosed inline program is followed through.
+const MAX_ENCLOSING_PROGRAM_WORDS: usize = 4;
+
+/// The inline program of a launcher spelled inside another command's quoted
+/// operand: `tar -xf a.tar -I 'sh -c "git reset --hard"'`, or awk's
+/// `print … | "sh -c cat"` inside a single-quoted program.
+///
+/// [`inline_program_at`] reads the program as one complete shell word from
+/// its first byte (#570). Read from the raw command there, the operand's own
+/// closing quote looks like an opening one, so the word never ends and the
+/// program is reported unresolved. The bounded fallback then scans the whole
+/// command: the tar helper above lost its `core.git:reset-hard` attribution,
+/// and a pipe into `sh -c cat` was denied for the text awk merely prints.
+///
+/// A program that runs such an operand as a shell string lexes its decoded
+/// text, so read the program word there: decode each enclosing word (only
+/// when every byte of it is literal) and lex inside the decoded text. Only a
+/// program that extends to the end of the innermost enclosing word is taken:
+/// that is exactly the glued-to-the-closing-quote case the raw reading cannot
+/// end. A program followed by more text inside that word is already ended by
+/// the raw reading, and keeping that reading also keeps the text after it out
+/// of this path. Anything else returns `None`: an expansion or substitution,
+/// a heredoc, a pattern, an unterminated quote, or too many levels keeps the
+/// caller's raw reading, which is reported partial and fails closed.
+fn enclosed_inline_program(command: &str, start: usize) -> Option<InlineProgram<'static>> {
+    let mut text = Cow::Borrowed(command);
+    // Byte `i` of `text` came from byte `offsets[i]` of `command`.
+    let mut offsets: Option<Vec<usize>> = None;
+    let mut position = start;
+    for _ in 0..MAX_ENCLOSING_PROGRAM_WORDS {
+        // A heredoc body is not shell-quoted; its apostrophes would flip
+        // the quote walk (see `inline_launcher_is_quoted_prose`).
+        if text.contains("<<") {
+            return None;
+        }
+        let Some(open) = innermost_shell_quote_at(&text, position) else {
+            break;
+        };
+        let word = shell_word_around(&text, open)?;
+        if !word.contains(&position) {
+            return None;
+        }
+        let (decoded, inner) = literal_word_with_offsets(text.get(word.clone())?)?;
+        // The locator may land on a byte quote removal drops, such as the
+        // `'` that ends `'sh -c '` in `'sh -c '\''…'\'''`; the program then
+        // starts at the next byte the word produces.
+        let index = inner.iter().position(|at| word.start + at >= position)?;
+        let mapped = inner
+            .iter()
+            .map(|at| {
+                let at = word.start + at;
+                offsets.as_ref().map_or(at, |outer| outer[at])
+            })
+            .collect();
+        offsets = Some(mapped);
+        text = Cow::Owned(decoded);
+        position = index;
+    }
+    let offsets = offsets?;
+    if innermost_shell_quote_at(&text, position).is_some() {
+        return None;
+    }
+    let end = crate::normalize::consume_posix_word_token(text.as_bytes(), position, text.len());
+    if end <= position || end != text.len() {
+        return None;
+    }
+    let content = crate::normalize::decode_posix_literal_word(text.get(position..end)?)?;
+    let word_range = offsets[position]..offsets[end - 1] + 1;
+    let source = command.get(word_range.clone())?;
+    let inner = unquoted_payload_range(source, word_range.start);
+    let content_range = (command.get(inner.clone()) == Some(content.as_ref())).then_some(inner);
+    Some(InlineProgram {
+        content: Cow::Owned(content.into_owned()),
+        content_range,
+        word_range,
+        resolved: true,
+    })
+}
+
+/// The shell word of `text` containing byte `position`, split the way the
+/// POSIX lexer splits this level: at unquoted whitespace and operators.
+fn shell_word_around(text: &str, position: usize) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index <= position && index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let end = crate::normalize::consume_posix_word_token(bytes, index, bytes.len());
+        if end <= index {
+            // An operator byte: `|`, `;`, `&`, `(`, `)`, `<` or `>`.
+            index += 1;
+            continue;
+        }
+        if position < end {
+            return Some(index..end);
+        }
+        index = end;
+    }
+    None
+}
+
+/// Quote removal for one shell word whose bytes are all literal: single
+/// quotes, double quotes with only the POSIX backslash escapes, and unquoted
+/// bytes with backslash escapes. An expansion, substitution, ANSI-C or locale
+/// quote, pattern, brace, tilde, redirection or unterminated quote returns
+/// `None`. `offsets[i]` is the byte of `word` that produced decoded byte `i`.
+fn literal_word_with_offsets(word: &str) -> Option<(String, Vec<usize>)> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut decoded = String::with_capacity(word.len());
+    let mut offsets = Vec::with_capacity(word.len());
+    let mut push = |ch: char, at: usize| {
+        decoded.push(ch);
+        offsets.extend(at..at + ch.len_utf8());
+    };
+    let mut quote = Quote::None;
+    let mut chars = word.char_indices();
+    while let Some((at, ch)) = chars.next() {
+        match quote {
+            Quote::Single if ch == '\'' => quote = Quote::None,
+            Quote::Single => push(ch, at),
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    let (next_at, next) = chars.next()?;
+                    match next {
+                        '\n' => {}
+                        '$' | '`' | '"' | '\\' => push(next, next_at),
+                        // POSIX keeps the backslash before anything else.
+                        _ => {
+                            push('\\', at);
+                            push(next, next_at);
+                        }
+                    }
+                }
+                '$' | '`' => return None,
+                _ => push(ch, at),
+            },
+            Quote::None => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => {
+                    let (next_at, next) = chars.next()?;
+                    if next != '\n' {
+                        push(next, next_at);
+                    }
+                }
+                '$' | '`' | '*' | '?' | '[' | '{' | '~' | '<' | '>' => return None,
+                _ => push(ch, at),
+            },
+        }
+    }
+    (quote == Quote::None).then_some((decoded, offsets))
 }
 
 /// The existing interpreter/option grammar, used only to locate a SEPARATE
@@ -3640,18 +3804,22 @@ fn extract_awk_inline_scripts(
             let decoded = inline_program(command, program.clone(), skip_reasons);
             let payloads = awk_shell_payload_ranges(&decoded.content, 0);
             for payload in payloads.commands {
-                let Some(content) = decoded.content.get(payload.clone()) else {
+                let Some(literal) = decoded.content.get(payload.clone()) else {
                     continue;
                 };
+                // The shell runs the string awk built, escapes applied:
+                // `system("echo x\ngit reset --hard")` is two commands.
+                let content = decode_awk_string(literal);
                 let content_range = decoded
                     .content_range
                     .as_ref()
+                    .filter(|_| content == literal)
                     .map(|source| source.start + payload.start..source.start + payload.end);
                 if !push_windows_inner(
                     extracted,
                     skip_reasons,
                     limits,
-                    content,
+                    &content,
                     program.clone(),
                     content_range,
                     "awk",
@@ -3967,7 +4135,7 @@ fn awk_pipe_target_runs_stdin_as_script(target: &str) -> bool {
             _ if word.starts_with("--") => {}
             _ if word.starts_with(['-', '+']) => {
                 if word.contains('c') {
-                    return false;
+                    return awk_shell_command_string_runs_stdin(&normalized.normalized);
                 }
                 if word[1..].contains('s') {
                     return true;
@@ -3978,6 +4146,48 @@ fn awk_pipe_target_runs_stdin_as_script(target: &str) -> bool {
         }
     }
     true
+}
+
+/// Whether the `-c` command string of an awk pipe target runs its stdin as
+/// shell code. `sh -c cat` only copies stdin. `sh -c sh`, `sh -c 'cat | sh'`
+/// and `bash -c 'eval "$(cat)"'` execute it, exactly as they do after
+/// `echo … |`, so ask the predicate the evaluator applies to that pipeline.
+/// A command substitution (`"$(cat)"`) or a `read` whose value is expanded
+/// (`read x; $x`) can also turn stdin into code. The printed text is then
+/// judged as the script, so a harmless print stays allowed; a plain
+/// parameter such as `sort > "$HOME/out"` does not make stdin code. A target
+/// that cannot be lexed, or whose command string cannot be found, is not
+/// proven inert.
+fn awk_shell_command_string_runs_stdin(target: &str) -> bool {
+    let Ok(words) = shell_words::split(target) else {
+        return true;
+    };
+    let Some(flag) = words
+        .iter()
+        .position(|word| word.starts_with('-') && !word.starts_with("--") && word.contains('c'))
+    else {
+        return true;
+    };
+    // The command string is the first operand after the flag; shell options
+    // may sit in between (`sh -c -e 'code'`, `bash -c -o pipefail 'code'`).
+    let mut index = flag + 1;
+    let source = loop {
+        let Some(word) = words.get(index) else {
+            return true;
+        };
+        match word.as_str() {
+            "--" => break words.get(index + 1),
+            "-o" | "+o" | "-O" | "+O" => index += 2,
+            option if option.starts_with(['-', '+']) => index += 1,
+            _ => break Some(word),
+        }
+    };
+    source.is_none_or(|source| {
+        source.contains("$(")
+            || source.contains('`')
+            || (source.contains("read") && source.contains('$'))
+            || crate::evaluator::static_posix_shell_code_reads_stdin(source)
+    })
 }
 
 /// The expression printed by the `print`/`printf` statement that occupies
@@ -4125,8 +4335,28 @@ fn awk_literal_list(expression: &str) -> Option<Vec<(String, bool)>> {
 
 /// An awk string literal's value: its escape sequences decoded.
 fn decode_awk_string(literal: &str) -> String {
+    // awk's escapes, including octal and the gawk/mawk hex form, are applied
+    // before `system`, a pipe or a shell sees the text:
+    // `system("echo x\073git reset --hard")` runs `echo x;git reset --hard`.
+    // A value past one byte keeps its low byte, as awk stores bytes.
+    fn take_digits(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        radix: u32,
+        mut value: u32,
+    ) -> char {
+        for _ in 0..2 {
+            match chars.peek().and_then(|next| next.to_digit(radix)) {
+                Some(digit) => {
+                    value = value * radix + digit;
+                    chars.next();
+                }
+                None => break,
+            }
+        }
+        u8::try_from(value & 0xff).map_or('\u{fffd}', char::from)
+    }
     let mut out = String::with_capacity(literal.len());
-    let mut chars = literal.chars();
+    let mut chars = literal.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
@@ -4136,6 +4366,17 @@ fn decode_awk_string(literal: &str) -> String {
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
             Some('r') => out.push('\r'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('v') => out.push('\u{b}'),
+            Some('a') => out.push('\u{7}'),
+            Some(digit @ '0'..='7') => {
+                let value = digit.to_digit(8).unwrap_or_default();
+                out.push(take_digits(&mut chars, 8, value));
+            }
+            Some('x') if chars.peek().is_some_and(char::is_ascii_hexdigit) => {
+                out.push(take_digits(&mut chars, 16, 0));
+            }
             Some(other) => out.push(other),
             None => out.push('\\'),
         }
@@ -4351,10 +4592,10 @@ fn awk_shell_payload_ranges(program: &str, offset: usize) -> AwkShellPayloads {
                     // to a shell that runs its stdin as a script, exactly as
                     // `echo "…" | sh` does, so the printed text is a payload as
                     // well as the pipe target (#511).
-                    if program
-                        .get(literal.clone())
-                        .is_some_and(awk_pipe_target_runs_stdin_as_script)
-                    {
+                    // awk unescapes the literal (`\"`) before /bin/sh reads it.
+                    if program.get(literal.clone()).is_some_and(|target| {
+                        awk_pipe_target_runs_stdin_as_script(&decode_awk_string(target))
+                    }) {
                         printed.push(awk_printed_script(program, statement_start, index, offset));
                     }
                     index = literal.end + 1;
@@ -19764,6 +20005,69 @@ EOF";
         }
     }
 
+    /// A launcher inside another command's quoted operand has a program that
+    /// can end at that operand's closing quote. Lexed from the raw command,
+    /// that quote opened a new one, the program was never resolved, and the
+    /// bounded fallback scanned the whole command: tar's helper lost its own
+    /// rule and awk's pipe into `sh -c cat` was denied for printed text.
+    #[test]
+    fn enclosed_launchers_read_their_program_in_the_decoded_operand() {
+        // What is read, not how fast: the default 50 ms budget also pays for
+        // first-use regex compilation and failed once on a loaded worker.
+        let limits = ExtractionLimits {
+            timeout_ms: 5_000,
+            ..ExtractionLimits::default()
+        };
+        for (command, payload) in [
+            (
+                r#"tar -xf input.tar -I 'sh -c "git reset --hard"'"#,
+                "git reset --hard",
+            ),
+            (
+                r#"tmux new "bash -c 'git reset --hard'""#,
+                "git reset --hard",
+            ),
+            (r#"awk 'BEGIN{print "x" | "sh -c cat"}'"#, "cat}"),
+            (
+                r#"awk 'BEGIN{print "x" | "sh -c '\''git reset --hard'\''"}'"#,
+                "git reset --hard}",
+            ),
+            (
+                r#"ssh host 'bash -c "echo \"x\"; git reset --hard"'"#,
+                r#"echo "x"; git reset --hard"#,
+            ),
+            // The quoted text before the launcher stays the operand's data.
+            ("echo 'git reset --hard; sh -c cat'", "cat"),
+        ] {
+            let contents = match extract_content(command, &limits) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{command:?}: {other:?}"),
+            };
+            assert!(
+                contents.iter().any(|c| c.content == payload),
+                "{command:?}: {contents:?}"
+            );
+        }
+        // An expansion in the operand, or more operand text after the
+        // program, keeps the raw reading: unresolved, partial, fail closed.
+        for command in [
+            r#"tmux new "bash -c 'rm -rf $DIR'""#,
+            r#"foo 'bash -c "echo x"'"; git reset --hard""#,
+            r#"awk 'BEGIN{print "x" | "sh -c \"$(cat)\""}'"#,
+        ] {
+            assert!(
+                matches!(
+                    extract_content(command, &limits),
+                    ExtractionResult::Partial { skipped, .. }
+                        if skipped
+                            .iter()
+                            .any(|reason| matches!(reason, SkipReason::MalformedInput { .. }))
+                ),
+                "{command:?}"
+            );
+        }
+    }
+
     /// Sixth review: the redirect view blanks exactly the local redirects,
     /// never text inside quotes, a heredoc or a process substitution.
     #[test]
@@ -19965,6 +20269,16 @@ EOF";
                 "sudo sh",
                 "env bash",
                 "bash --norc",
+                // A command string that itself runs stdin as code.
+                "sh -c sh",
+                "sh -c 'cat | sh'",
+                "sh -c \"cat | sh\"",
+                "bash -c 'eval \"$(cat)\"'",
+                "sh -c '. /dev/stdin'",
+                "sh -c \"$(cat)\"",
+                "sh -c 'read x; $x'",
+                "sudo sh -c sh",
+                "sh -c -e sh",
             ] {
                 assert!(awk_pipe_target_runs_stdin_as_script(target), "{target}");
             }
@@ -19972,6 +20286,9 @@ EOF";
                 "cat",
                 "sort -u",
                 "sh -c cat",
+                "sh -c 'sort -u'",
+                "sh -c 'cat > out.txt'",
+                "sh -c 'sort > \"$HOME/out\"'",
                 "bash -ec 'x'",
                 "sh run.sh",
                 "sh -- run.sh",
@@ -19979,6 +20296,22 @@ EOF";
                 "",
             ] {
                 assert!(!awk_pipe_target_runs_stdin_as_script(target), "{target}");
+            }
+        }
+
+        /// The text awk hands to a shell has its string escapes applied.
+        #[test]
+        fn awk_string_escapes_are_applied_before_the_shell_sees_them() {
+            for (literal, expected) in [
+                (r"echo x\ngit reset --hard", "echo x\ngit reset --hard"),
+                (r"echo x\073git reset --hard", "echo x;git reset --hard"),
+                (r"echo x\x3bgit reset --hard", "echo x;git reset --hard"),
+                (r#"a\tb\\c\/d\"e"#, "a\tb\\c/d\"e"),
+                (r"\101\1018", "AA8"),
+                (r"\xg", "xg"),
+                (r"end\", "end\\"),
+            ] {
+                assert_eq!(decode_awk_string(literal), expected, "{literal}");
             }
         }
 

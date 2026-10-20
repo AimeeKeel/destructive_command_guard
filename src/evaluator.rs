@@ -8000,7 +8000,9 @@ fn is_posix_stdin_code_path(argument: &str) -> bool {
     )
 }
 
-fn static_posix_shell_code_reads_stdin(source: &str) -> bool {
+/// Whether static `-c` shell code runs the shell's own stdin as code. Also
+/// asked by the awk extractor about a `print … | "sh -c '…'"` target (#511).
+pub(crate) fn static_posix_shell_code_reads_stdin(source: &str) -> bool {
     let tokens = tokenize_for_shell_dialect(source, ShellDialect::Posix);
     let words: Vec<String> = tokens
         .iter()

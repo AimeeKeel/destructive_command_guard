@@ -351,6 +351,9 @@ fn tar_extraction_compression_and_volume_helpers_are_execution() {
     // Neither echo text nor an argv operand becomes a second command when
     // the helper is launched without a shell in decompression mode.
     assert_tar_allowed("tar -xf input.tar -I 'echo safe; git reset --hard'");
+    // The quoted helper's own `sh -c` program is read completely, so a
+    // harmless one is not left to the bounded fallback either.
+    assert_tar_allowed("tar -xf input.tar -I 'sh -c \"git status\"'");
 }
 
 #[test]
