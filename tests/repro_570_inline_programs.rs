@@ -559,13 +559,53 @@ fn benign_deno_bun_and_zx_process_calls_stay_allowed() {
     }
     // A shell-quoted string the template only prints. Single-quoted styles
     // only: in the double-quoted one the outer word carries `\``, and the
-    // outer shell scan judges that text on its own (`source: pack`), before
-    // and apart from any interpreter analysis.
+    // outer shell scan denies that text on its own (`source: pack`), exactly
+    // as it does for a program with no sink at all, ``node -e
+    // "console.log(\`echo 'rm -rf /'\`)"``.
     for style in 0..2 {
         decision(
             &format!("bun -e {}", quote("await Bun.$`echo 'rm -rf /'`", style)),
             "allow",
             false,
         );
+    }
+}
+
+/// A template literal argument is a string like a quoted one, for
+/// `child_process` and the native APIs alike.
+#[test]
+fn template_literal_arguments_deny_like_quoted_ones() {
+    for (launcher, code, rule) in [
+        (
+            "node -e",
+            r#"require("child_process").execSync(`git reset --hard`)"#,
+            "heredoc.javascript:exec_sink.git_reset_hard",
+        ),
+        (
+            "bun -e",
+            r#"Bun.spawnSync(["sh", "-c", `git reset --hard`])"#,
+            "heredoc.typescript:exec_sink.git_reset_hard",
+        ),
+        (
+            "deno eval",
+            "new Deno.Command(`git`, {args: [`reset`, `--hard`]}).outputSync()",
+            "heredoc.typescript:exec_sink.git_reset_hard",
+        ),
+    ] {
+        // The double-quoted style escapes the backticks, which the outer
+        // shell scan may judge first; it must still deny.
+        for style in 0..2 {
+            denied_by(&format!("{launcher} {}", quote(code, style)), rule);
+        }
+        decision(&format!("{launcher} {}", quote(code, 2)), "deny", false);
+    }
+    for code in [
+        r#"require("child_process").execSync(`git status`)"#,
+        r#"require("child_process").execSync(`echo it's done`)"#,
+        r#"require("child_process").spawnSync("echo", [`hi`])"#,
+    ] {
+        for style in 0..3 {
+            decision(&format!("node -e {}", quote(code, style)), "allow", false);
+        }
     }
 }

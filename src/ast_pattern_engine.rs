@@ -1483,9 +1483,17 @@ static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // These name their call through `deno`/`bun`/`tag` instead of `sink`, whose
     // match starts at a receiver or a preceding character; `exec_sink_call`
     // gives every consumer the sink name's own offset.
+    //
+    // A template literal is as much a string literal as a quoted one, so a
+    // `child_process` call whose first argument is one (``execSync(`git
+    // reset --hard`)``) is a candidate too; `exec_literal_operand` reads it.
+    // Only a template without quotes or escapes: the region scanners pair
+    // `'` and `"` but not backticks, so an apostrophe inside one
+    // (``execSync(`echo it's`)``) would leave its argument list unreadable,
+    // and that reads as an unverified argv.
     Regex::new(concat!(
         r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)"#,
-        r#"\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+        r#"\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)'|`[^`'"\\]*`)"#,
         r"|\bDeno\s*\.\s*(?P<deno>Command|run)\s*\(",
         r"|\b(?P<bun>spawnSync|spawn)\s*\(\s*[\[{]",
         r"|(?:^|[^A-Za-z0-9_$\\])(?P<tag>\$)(?:\.sync)?\s*(?:`|\(\s*\{)",
@@ -4505,23 +4513,32 @@ fn js_shell_template(text: &str) -> Option<(usize, String)> {
     if bytes.get(i) == Some(&b'(') {
         i = skip_space(js_balanced_end(text, i, 0)?);
     }
-    if bytes.get(i) != Some(&b'`') {
+    js_template_literal(text, i)
+}
+
+/// The JavaScript template literal whose opening backtick is at `open`:
+/// where it ends, and its cooked value with each `${…}` interpolation as one
+/// runtime value. `None` when `open` is no backtick or the literal never
+/// closes.
+fn js_template_literal(text: &str, open: usize) -> Option<(usize, String)> {
+    let bytes = text.as_bytes();
+    if bytes.get(open) != Some(&b'`') {
         return None;
     }
-    i += 1;
-    let mut command = String::new();
+    let mut i = open + 1;
+    let mut value = String::new();
     let mut literal = i;
     loop {
         match *bytes.get(i)? {
             b'`' => {
-                push_js_template_text(&mut command, &text[literal..i]);
-                return Some((i + 1, command));
+                push_js_template_text(&mut value, &text[literal..i]);
+                return Some((i + 1, value));
             }
             b'\\' => i += 2,
             b'$' if bytes.get(i + 1) == Some(&b'{') => {
-                push_js_template_text(&mut command, &text[literal..i]);
-                if !command.ends_with(RUNTIME_VALUE) {
-                    command.push_str(RUNTIME_VALUE);
+                push_js_template_text(&mut value, &text[literal..i]);
+                if !value.ends_with(RUNTIME_VALUE) {
+                    value.push_str(RUNTIME_VALUE);
                 }
                 i = js_balanced_end(text, i + 1, 0)?;
                 literal = i;
@@ -4823,6 +4840,22 @@ fn exec_literal_end(expression: &str) -> Option<usize> {
 
 fn exec_literal_operand(expression: &str, language: ScriptLanguage) -> Option<Cow<'_, str>> {
     let expression = skip_exec_trivia(expression, language);
+    if expression.starts_with('`')
+        && matches!(
+            language,
+            ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+        )
+    {
+        // A JavaScript template literal is a string like any other, cooked,
+        // with each `${…}` as one runtime value. Reading it as wholly dynamic
+        // hid ``execSync(`git reset --hard`)`` and ``Bun.spawnSync(["sh",
+        // "-c", `git reset --hard`])`` from every exec-sink view (#570).
+        // Ruby's and Perl's backticks run a command, so they stay no value.
+        let (end, value) = js_template_literal(expression, 0)?;
+        return skip_exec_trivia(&expression[end..], language)
+            .is_empty()
+            .then_some(Cow::Owned(value));
+    }
     let end = exec_literal_end(expression)?;
     if !skip_exec_trivia(&expression[end..], language).is_empty() {
         return None;
@@ -12084,6 +12117,94 @@ def cleanup():
                 literal_exec_sink_starts(&many, ScriptLanguage::JavaScript, 8),
                 Some(Vec::new())
             );
+        }
+
+        /// A template literal operand is a string, not an unknown value, for
+        /// `child_process` and the native APIs alike; only its `${…}` are
+        /// runtime values.
+        #[test]
+        fn template_literal_operands_are_strings() {
+            for (code, suffix) in [
+                (
+                    "require(\"child_process\").execSync(`git reset --hard`)",
+                    "git_reset_hard",
+                ),
+                ("cp.spawnSync(`rm`, [`-rf`, `/etc`])", "rm_rf_catastrophic"),
+                ("cp.execSync(`rm -rf ${dir}`)", "rm_rf"),
+                (
+                    "cp.execSync(`git status\n  git reset --hard`)",
+                    "git_reset_hard",
+                ),
+                (
+                    r#"cp.spawnSync("sh", ["-c", `git reset --hard`])"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawnSync(["sh", "-c", `git reset --hard`])"#,
+                    "git_reset_hard",
+                ),
+                (
+                    "new Deno.Command(`git`, {args: [`reset`, `--hard`]}).outputSync()",
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawn({cmd: ["rm", "-rf", `/tmp/${name}`]})"#,
+                    "rm_rf",
+                ),
+            ] {
+                for (language, lang_id) in JS_LANGUAGES {
+                    let expected = format!("heredoc.{lang_id}.exec_sink.{suffix}");
+                    let rules = blocking_rules(code, language);
+                    assert!(
+                        rules.contains(&expected),
+                        "{language:?}: {code:?} must block as {expected}; got {rules:?}"
+                    );
+                }
+            }
+            for code in [
+                "cp.execSync(`git status`)",
+                "cp.execSync(`echo ${message}`)",
+                "cp.spawnSync(`ls`, [`-la`])",
+                r#"Bun.spawnSync(["echo", `hi`])"#,
+                "cp.spawnSync(`rm`, [`-rf`, `/tmp/build`])",
+                // Quotes or escapes inside a first-argument template leave it
+                // to the existing posture rather than to an unreadable argv.
+                "cp.execSync(`echo it's done`)",
+                "cp.execSync(`echo \\`date\\``)",
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert_eq!(
+                        blocking_rules(code, language),
+                        Vec::<String>::new(),
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+            for (code, expected) in [
+                ("cp.execSync(`wipefs -a /dev/sda`)", "wipefs -a /dev/sda"),
+                (
+                    "cp.spawnSync(`dd`, [`if=/dev/zero`, `of=/dev/sda`])",
+                    "dd 'if=/dev/zero' 'of=/dev/sda'",
+                ),
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert_eq!(
+                        commands(code, language),
+                        vec![expected.to_string()],
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+            // Ruby's and Perl's backticks run a command: still no value.
+            for language in [ScriptLanguage::Ruby, ScriptLanguage::Perl] {
+                assert!(exec_literal_operand("`ls`", language).is_none());
+            }
+            assert_eq!(
+                exec_literal_operand("`a ${b} \\x63`", ScriptLanguage::JavaScript).as_deref(),
+                Some("a ${dcg_runtime_value} c")
+            );
+            // A template that does not end the operand is no literal value.
+            assert!(exec_literal_operand("`a` + b", ScriptLanguage::JavaScript).is_none());
         }
     }
 }
