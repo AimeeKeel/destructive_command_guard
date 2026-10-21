@@ -208,6 +208,64 @@ fn split_destinations_reach_native_credential_policy_without_custom_packs() {
 }
 
 #[test]
+fn background_assignment_groups_cannot_hide_inherited_native_destinations() {
+    for mutation in [
+        "S=/tmp/safe T=x &",
+        "T=x S=/tmp/safe U=y &",
+        "IFS=: T=x &",
+        "T=x IFS=: U=y &",
+        "export S=/tmp/safe T=x &",
+        "export IFS=: T=x &",
+        "S=/tmp/safe \\\n&",
+        "S=/tmp/safe T=x \\\n&",
+        "IFS=: T=x \\\n&",
+    ] {
+        let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {mutation} tee $S");
+        assert_decision(&source, false, Some("core.filesystem:credential-file-write"));
+    }
+}
+
+#[test]
+fn foreground_groups_and_unrelated_background_assignments_keep_cli_hook_precision() {
+    for source in [
+        "S=/tmp/a@/etc/shadow; IFS=@; S=/tmp/safe T=x; tee $S",
+        "S=/tmp/a@/etc/shadow; IFS=@; IFS=: T=x; tee $S",
+        "S=/tmp/safe; IFS=@; T=x U=y & tee $S",
+        "S=/tmp/safe; IFS=@; T=x U=y \\\n& tee $S",
+        "S=/tmp/a@/etc/shadow; IFS=@; S=/tmp/other T=x & S=/tmp/safe; tee $S",
+        "S=/tmp/a@/etc/shadow; IFS=@; IFS=: T=x & IFS=; tee $S",
+        "S='safe&'; IFS=@; T=x U=y; tee $S",
+        "IFS=@; S=/tmp/safe T=x &",
+    ] {
+        assert_decision(source, true, None);
+    }
+}
+
+#[test]
+fn background_assignment_uncertainty_preserves_independent_rule_grants() {
+    for (grant, control, remaining) in [
+        (
+            "core.filesystem:credential-file-write",
+            "tee /etc/shadow",
+            "core.filesystem:git-internals-write",
+        ),
+        (
+            "core.filesystem:git-internals-write",
+            "tee .git/config",
+            "core.filesystem:credential-file-write",
+        ),
+    ] {
+        assert_allowed_by_grant(control, grant);
+        for source in [
+            "S=/tmp/a@/etc/shadow; IFS=@; S=/tmp/safe T=x & tee $S",
+            "S=/tmp/a@.git/config; IFS=@; IFS=: T=x & tee $S",
+        ] {
+            assert_decision_with_grant(source, false, Some(remaining), Some(grant));
+        }
+    }
+}
+
+#[test]
 fn split_git_destinations_keep_their_separate_native_rule() {
     for source in [
         "S=/tmp/scratch/a@.git/config; IFS=@; tee $S",
