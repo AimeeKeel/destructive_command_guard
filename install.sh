@@ -1074,8 +1074,12 @@ maybe_add_shell_check() {
   # Add a shell startup check that warns if the DCG hook has been silently
   # removed from the active Claude Code settings. Silent when present, fast (ms),
   # and only runs when both dcg and jq are on PATH.
-  local snippet
-  snippet=$(cat <<'EOFSNIPPET'
+  # Read with `read -d ''`, not `$(cat <<EOF)`: bash 3.2 (macOS /bin/bash)
+  # cannot parse the snippet's `case` patterns inside a command substitution,
+  # so the whole installer failed to parse there. The trailing newline that
+  # `$(...)` used to strip is removed below, keeping the snippet byte-identical.
+  local snippet=""
+  IFS= read -r -d '' snippet <<'EOFSNIPPET' || true
 
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
@@ -1099,7 +1103,7 @@ if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
   )
 fi
 EOFSNIPPET
-  )
+  snippet="${snippet%$'\n'}"
   # The snippet minus its leading blank line: what a managed region should
   # contain, used both as the is-current test and the repair replacement.
   local body="${snippet#?}"

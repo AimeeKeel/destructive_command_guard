@@ -22,6 +22,28 @@ teardown() {
 }
 
 # ============================================================================
+# Parsing
+# ============================================================================
+
+@test "install.sh parses under every bash on the host, including macOS /bin/bash 3.2" {
+    # `curl … | bash` runs whichever bash is first on PATH; on stock macOS
+    # that is /bin/bash 3.2, which rejects a `case` inside `$(...)` that bash
+    # 5 accepts. A parse error there fails the whole install before it starts.
+    local shells=() candidate
+    for candidate in /bin/bash "$(command -v bash)"; do
+        [ -x "$candidate" ] && shells+=("$candidate")
+    done
+    [ "${#shells[@]}" -gt 0 ] || skip "no bash executable found"
+    for candidate in "${shells[@]}"; do
+        run "$candidate" -n "$INSTALL_SCRIPT"
+        [ "$status" -eq 0 ] || {
+            echo "$candidate ($("$candidate" -c 'echo "$BASH_VERSION"')): $output"
+            return 1
+        }
+    done
+}
+
+# ============================================================================
 # Platform Detection Tests
 # ============================================================================
 
