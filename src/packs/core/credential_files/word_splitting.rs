@@ -556,6 +556,24 @@ fn execution_frontend(name: &str) -> bool {
         || crate::normalize::is_posix_execution_frontend_basename(name)
 }
 
+/// Find the first argv field, not just the first source word. Unquoted
+/// empty expansions vanish: after stripping `command` from `command $E -p
+/// tee $S`, an empty E exposes `-p`, which still belongs to the wrapper.
+/// Unknown expansions stop the proof; quoted empties are real argv fields
+/// and must not be skipped. The complete argv pass retains its own bounds.
+fn first_expanded_word(arguments: &[&str], state: &State) -> Result<Option<String>, ()> {
+    for (index, raw) in arguments.iter().enumerate() {
+        if index >= MAX_FIELDS {
+            return Err(());
+        }
+        let fields = expand(raw, state)?;
+        if let Some(word) = fields.into_iter().next() {
+            return Ok(Some(word));
+        }
+    }
+    Ok(None)
+}
+
 /// A literal command -v/-V is a query, not an execution frontend. Only read
 /// options before its first operand/--, and stop at dynamic words: they can
 /// supply an operand or terminate option parsing before a later literal -v.
@@ -1038,10 +1056,9 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                     .filter(|token| token.kind == NormalizeTokenKind::Word)
                     .filter_map(|token| token.text(stripped.normalized.as_ref()))
                     .collect();
-                let name = arguments
-                    .first()
-                    .and_then(|raw| expand(raw, &state).ok())
-                    .and_then(|argv| argv.into_iter().next());
+                let expanded_name = first_expanded_word(&arguments, &state);
+                let unknown_command_name = expanded_name.is_err();
+                let name = expanded_name.ok().flatten();
                 let writer = name
                     .as_deref()
                     .map(|name| name.rsplit('/').next().unwrap_or(name))
@@ -1081,6 +1098,7 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                 if active
                     && expands
                     && (stripped.wrapper_limit_reached
+                        || unknown_command_name
                         || unresolved_frontend
                         || generated_wrapper_control
                         || unstable_prefix)
@@ -1182,6 +1200,124 @@ pub(super) fn candidate(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_selection_skips_only_proven_vanishing_fields() {
+        let mut state = State::default();
+        state.assign("IFS=@", true);
+        state.assign("E=", true);
+        state.assign("FLAGS=-p@--", true);
+        for (words, expected) in [
+            (vec![], Ok(None)),
+            (vec!["$E", "tee"], Ok(Some("tee"))),
+            (vec!["$E", "${E}${E}", "env"], Ok(Some("env"))),
+            (vec!["$E", "$E", "-p"], Ok(Some("-p"))),
+            (vec!["$E", "$FLAGS"], Ok(Some("-p"))),
+            (vec![r#""$E""#, "tee"], Ok(Some(""))),
+            (vec!["''", "tee"], Ok(Some(""))),
+            (vec!["$E", "${E}''", "tee"], Ok(Some(""))),
+            (vec!["$UNKNOWN", "tee"], Err(())),
+            (vec!["$E", "$UNKNOWN", "tee"], Err(())),
+            (vec!["$E", "'$UNKNOWN'"], Ok(Some("$UNKNOWN"))),
+        ] {
+            assert_eq!(
+                first_expanded_word(&words, &state),
+                expected.map(|name| name.map(str::to_owned)),
+                "{words:?}"
+            );
+        }
+        state.assign("E=@", true);
+        assert_eq!(
+            first_expanded_word(&["$E", "tee"], &state),
+            Ok(Some(String::new()))
+        );
+        state.assign("IFS=' '", true);
+        state.assign("E='   '", true);
+        assert_eq!(
+            first_expanded_word(&["$E", "tee"], &state),
+            Ok(Some("tee".to_owned()))
+        );
+        let mut words = vec!["$E"; MAX_FIELDS - 1];
+        words.push("tee");
+        assert_eq!(first_expanded_word(&words, &state), Ok(Some("tee".to_owned())));
+        words.insert(0, "$E");
+        assert!(first_expanded_word(&words, &state).is_err());
+        let source = format!(
+            "E=; S=/tmp/a@/etc/shadow; IFS=@; command {}-p tee $S",
+            "$E ".repeat(MAX_FIELDS + 1)
+        );
+        let hits = scan(&source, ShellDialect::Posix);
+        for rule in [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME] {
+            assert!(hits.iter().any(|hit| hit.rule == rule && hit.reason == UNCERTAIN));
+        }
+    }
+
+    #[test]
+    fn vanishing_words_cannot_hide_wrapper_options_or_assignments() {
+        for invocation in [
+            "command $E -p tee $S",
+            "command $E $E -p -- tee $S",
+            "command ${E}${E} -p tee $S",
+            "command $E $OPT tee $S",
+            "env $E DCG_X=1 tee $S",
+            "env $E $SETTING tee $S",
+            "env $E -i tee $S",
+            "env $E -- tee $S",
+            "command env $E DCG_X=1 tee $S",
+            "/usr/bin/env $E -i tee $S",
+        ] {
+            let normalized = strip_wrapper_prefixes(invocation);
+            assert!(!normalized.wrapper_limit_reached);
+            assert!(normalized.normalized.starts_with('$'), "{invocation}");
+            for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config"] {
+                let source = format!(
+                    "E=; OPT=-p; SETTING=DCG_X=1; S={value}; IFS=@; {invocation}"
+                );
+                let start = source.rfind("; ").unwrap() + 2;
+                let hits = scan(&source, ShellDialect::Posix);
+                for rule in [
+                    shell::CREDENTIAL_FILE_WRITE_NAME,
+                    shell::GIT_INTERNALS_WRITE_NAME,
+                ] {
+                    assert!(
+                        hits.iter().any(|hit| hit.rule == rule
+                            && hit.reason == UNCERTAIN
+                            && hit.span == (start..source.len())),
+                        "vanishing words cannot hide {rule}: {source}: {hits:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_surviving_writer_retains_concrete_destination_checks() {
+        for invocation in ["$E tee $S", "command $E tee $S", "env $E tee $S"] {
+            for (value, rule) in [
+                ("/tmp/a@/etc/shadow", shell::CREDENTIAL_FILE_WRITE_NAME),
+                ("/tmp/a@.git/config", shell::GIT_INTERNALS_WRITE_NAME),
+            ] {
+                let source = format!("E=; S={value}; IFS=@; {invocation}");
+                assert!(
+                    scan(&source, ShellDialect::Posix)
+                        .iter()
+                        .any(|hit| hit.rule == rule && hit.reason != UNCERTAIN),
+                    "{source}"
+                );
+            }
+            let source = format!("E=; S=/tmp/a@/tmp/b; IFS=@; {invocation}");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+        for invocation in [
+            "command $E printf '%s' $S",
+            "env $E printf '%s' $S",
+            "command -v $E tee",
+            "command -V $E tee",
+        ] {
+            let source = format!("E=; S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+    }
 
     #[test]
     fn source_continuations_preserve_single_quotes_and_escaped_backslashes() {

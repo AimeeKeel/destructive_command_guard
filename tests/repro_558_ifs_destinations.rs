@@ -325,6 +325,52 @@ fn export_brace_uncertainty_keeps_native_allowlist_families_independent() {
 }
 
 #[test]
+fn vanished_words_before_wrapper_controls_cannot_allow_protected_writes() {
+    for invocation in [
+        "command $E -p tee $S",
+        "command $E $E -p -- tee $S",
+        "command ${E}${E} -p tee $S",
+        "command $E $OPT tee $S",
+        "env $E DCG_X=1 tee $S",
+        "env $E $SETTING tee $S",
+        "env $E -i tee $S",
+        "env $E -- tee $S",
+        "command env $E DCG_X=1 tee $S",
+    ] {
+        for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config"] {
+            let source = format!("E=; OPT=-p; SETTING=DCG_X=1; S={value}; IFS=@; {invocation}");
+            // Other native launcher checks may own the first finding. No
+            // custom pack or allowlist is needed to prevent an allowance.
+            assert_decision(&source, false, None);
+        }
+    }
+}
+
+#[test]
+fn vanished_words_keep_known_writers_and_harmless_lookups_distinct() {
+    for invocation in ["command $E tee $S", "env $E tee $S"] {
+        for (value, rule) in [
+            ("/tmp/a@/etc/shadow", "core.filesystem:credential-file-write"),
+            ("/tmp/a@.git/config", "core.filesystem:git-internals-write"),
+        ] {
+            let source = format!("E=; S={value}; IFS=@; {invocation}");
+            assert_decision(&source, false, Some(rule));
+        }
+        let source = format!("E=; S=/tmp/a@/tmp/b; IFS=@; {invocation}");
+        assert_decision(&source, true, None);
+    }
+    for invocation in [
+        "command $E printf '%s' $S",
+        "env $E printf '%s' $S",
+        "command -v $E tee",
+        "command -V $E tee",
+    ] {
+        let source = format!("E=; S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+        assert_decision(&source, true, None);
+    }
+}
+
+#[test]
 fn continued_names_cannot_hide_split_destinations_from_native_cli_and_hook() {
     for (target, rule) in [
         ("/etc/shadow", "core.filesystem:credential-file-write"),
