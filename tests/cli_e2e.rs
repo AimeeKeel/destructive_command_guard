@@ -2688,6 +2688,267 @@ mod config_tests {
         );
     }
 
+    #[test]
+    fn grok_hook_policy_force_preserves_block_across_duplicate_repair_and_repeat() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        let created = run_hook_policy_install(home.path(), &["install", "--grok"]);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let fresh: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+        let desired = fresh["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+        assert_eq!(desired["timeout"], 5, "new installs keep Grok's default");
+        let original = serde_json::json!({
+            "description": "Operator-managed Grok safety hooks",
+            "operator": {"team": "security"},
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "label": "canonical", "hooks": [
+                        {"type": "command", "command": desired["command"]},
+                        {"type": "command", "command": "bash-audit"}
+                    ]},
+                    {"matcher": "run_terminal_cmd", "label": "keep this scope", "hooks": [
+                        {"type": "command", "command": "\"C:\\old tools\\dcg.exe\"", "onFailure": "block", "timeout": 15, "future": {"enabled": true}},
+                        {"type": "command", "command": "terminal-audit"}
+                    ]},
+                    {"matcher": "Write", "hooks": [
+                        {"type": "command", "command": "/older/dcg", "statusMessage": "Checking safety"}
+                    ]}
+                ],
+                "PostToolUse": [{"matcher": "*", "hooks": [{"command": "after-audit"}]}]
+            }
+        });
+        std::fs::write(&hook_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        let repaired = run_hook_policy_install(home.path(), &["install", "--grok", "--force"]);
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        let installed_bytes = std::fs::read(&hook_path).unwrap();
+        let installed: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+        let entries = installed["hooks"]["PreToolUse"].as_array().unwrap();
+        let hook = &entries[0]["hooks"][0];
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(hook["timeout"], 15);
+        assert_eq!(hook["future"], serde_json::json!({"enabled": true}));
+        assert_eq!(hook["statusMessage"], "Checking safety");
+        for key in ["type", "command", "shell"] {
+            assert_eq!(hook.get(key), desired.get(key));
+        }
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["matcher"], "Bash");
+        assert_eq!(entries[0]["label"], "canonical");
+        assert_eq!(
+            entries[0]["hooks"][1],
+            original["hooks"]["PreToolUse"][0]["hooks"][1]
+        );
+        assert_eq!(entries[1]["matcher"], "run_terminal_cmd");
+        assert_eq!(entries[1]["label"], "keep this scope");
+        assert_eq!(
+            entries[1]["hooks"],
+            serde_json::json!([{"type": "command", "command": "terminal-audit"}])
+        );
+        assert_eq!(installed["description"], original["description"]);
+        assert_eq!(installed["operator"], original["operator"]);
+        assert_eq!(
+            installed["hooks"]["PostToolUse"],
+            original["hooks"]["PostToolUse"]
+        );
+
+        for args in [
+            &["install", "--grok", "--force"][..],
+            &["install", "--grok"][..],
+        ] {
+            let repeated = run_hook_policy_install(home.path(), args);
+            assert!(
+                repeated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&repeated.stderr)
+            );
+            assert_eq!(std::fs::read(&hook_path).unwrap(), installed_bytes);
+        }
+    }
+
+    #[test]
+    fn grok_hook_policy_nonforce_repairs_a_stale_command_and_legacy_matcher() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook_path,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "run_terminal_cmd", "hooks": [{
+                    "type": "command", "command": "/retired/dcg", "timeout": 15, "onFailure": "block"
+                }]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let output = run_hook_policy_install(home.path(), &["install", "--grok"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let installed_bytes = std::fs::read(&hook_path).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["matcher"], "Bash");
+        let hook = &entries[0]["hooks"][0];
+        assert_ne!(hook["command"], "/retired/dcg");
+        assert_eq!(hook["timeout"], 15);
+        assert_eq!(hook["onFailure"], "block");
+
+        let repeated = run_hook_policy_install(home.path(), &["install", "--grok"]);
+        assert!(repeated.status.success());
+        assert_eq!(std::fs::read(&hook_path).unwrap(), installed_bytes);
+    }
+
+    #[test]
+    fn grok_hook_policy_repair_preserves_other_programs_with_dcg_path_arguments() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        let audit = serde_json::json!({
+            "matcher": "Read", "label": "unrelated audit scope", "hooks": [
+                {"type": "command", "command": "/usr/bin/logger /opt/dcg"}
+            ]
+        });
+        let original = serde_json::json!({
+            "hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "/retired/dcg", "timeout": 15, "onFailure": "block"
+                }]},
+                audit.clone()
+            ]}
+        });
+        std::fs::write(&hook_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        let repaired = run_hook_policy_install(home.path(), &["install", "--grok"]);
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        let installed_bytes = std::fs::read(&hook_path).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "a dcg argument does not make logger a guard"
+        );
+        assert_eq!(entries[1], audit, "unrelated audit hook keeps its scope");
+        let guard = &entries[0]["hooks"][0];
+        assert_ne!(guard["command"], "/retired/dcg");
+        assert_eq!(guard["timeout"], 15);
+        assert_eq!(guard["onFailure"], "block");
+
+        for args in [
+            &["install", "--grok", "--force"][..],
+            &["install", "--grok"][..],
+        ] {
+            let repeated = run_hook_policy_install(home.path(), args);
+            assert!(
+                repeated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&repeated.stderr)
+            );
+            assert_eq!(std::fs::read(&hook_path).unwrap(), installed_bytes);
+        }
+    }
+
+    #[test]
+    fn grok_hook_policy_rejects_invalid_files_and_conflicts_without_rewriting() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        let fixtures = [
+            b"{\"hooks\": ".to_vec(),
+            b" ".to_vec(),
+            serde_json::to_vec(&serde_json::json!([])).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"hooks": []})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"hooks": {"PreToolUse": {}}})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": null}
+            ]}}))
+            .unwrap(),
+            serde_json::to_vec(&serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"command": "dcg", "onFailure": "block"}]},
+                {"matcher": "Write", "hooks": [{"command": "/old/dcg", "onFailure": "continue"}]}
+            ]}}))
+            .unwrap(),
+        ];
+        for original in fixtures {
+            std::fs::write(&hook_path, &original).unwrap();
+            for args in [
+                &["install", "--grok"][..],
+                &["install", "--grok", "--force"][..],
+            ] {
+                let output = run_hook_policy_install(home.path(), args);
+                assert!(
+                    !output.status.success(),
+                    "invalid or conflicting settings must fail for {args:?}"
+                );
+                assert_eq!(std::fs::read(&hook_path).unwrap(), original);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_hook_policy_install_keeps_managed_symlink_and_private_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        let target = home.path().join("managed-grok.json");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"
+                }]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &hook_path).unwrap();
+
+        let output = run_hook_policy_install(home.path(), &["install", "--grok", "--force"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::fs::symlink_metadata(&hook_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+            "block"
+        );
+    }
+
     /// The machine-wide config file the binary always reads
     /// (`system_config_dir()` in `src/config.rs`).
     fn machine_config_path() -> std::path::PathBuf {

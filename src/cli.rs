@@ -13614,10 +13614,12 @@ fn quoted_hook_program(command: &str) -> Option<String> {
     None
 }
 
-fn command_token_looks_like_path(token: &str) -> bool {
-    token.starts_with(['/', '\\'])
-        || token.as_bytes().get(1).is_some_and(|byte| *byte == b':')
-        || token.contains(['/', '\\'])
+fn command_token_is_windows_drive_path(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
 }
 
 fn is_dcg_program_basename(program: &str) -> bool {
@@ -13665,7 +13667,16 @@ fn dcg_command_program(cmd: &str) -> Option<String> {
     }
 
     let first = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    if command_token_looks_like_path(first) {
+    if is_dcg_program_basename(first) {
+        return Some(first.to_string());
+    }
+
+    // Recover the old unquoted Windows drive-path form, where spaces can be
+    // part of a directory name. Never apply that heuristic to Unix commands:
+    // `/usr/bin/logger /opt/dcg` runs logger, and its hook must remain untouched.
+    // Another rooted path, executable, option, or shell operator before the
+    // dcg leaf is command syntax rather than one legacy executable path.
+    if command_token_is_windows_drive_path(first) {
         let leaf_start = trimmed
             .rfind(['/', '\\'])
             .map_or(0, |separator| separator + 1);
@@ -13673,20 +13684,27 @@ fn dcg_command_program(cmd: &str) -> Option<String> {
         let leaf_program = leaf.split_whitespace().next().unwrap_or(leaf);
         if is_dcg_program_basename(leaf_program) {
             let prefix = &trimmed[..leaf_start];
-            let has_prior_executable = prefix.split_whitespace().any(|token| {
-                let normalized = token.trim_matches(['\'', '"']).to_ascii_lowercase();
-                [".exe", ".cmd", ".bat", ".ps1"]
-                    .iter()
-                    .any(|extension| normalized.ends_with(extension))
-            });
-            if !has_prior_executable {
+            let has_command_syntax =
+                prefix.contains([
+                    '\'', '"', ';', '|', '&', '<', '>', '$', '`', '\n', '\r', '\t',
+                ]) || prefix.split_whitespace().enumerate().any(|(index, token)| {
+                    let normalized = token.to_ascii_lowercase();
+                    [".exe", ".com", ".cmd", ".bat", ".ps1", ".sh", ".py", ".js"]
+                        .iter()
+                        .any(|extension| normalized.ends_with(extension))
+                        || (index > 0
+                            && (command_token_is_windows_drive_path(token)
+                                || token.starts_with(['/', '\\', '-'])
+                                || token.contains('=')))
+                });
+            if !has_command_syntax {
                 let end = leaf_start + leaf_program.len();
                 return Some(trimmed[..end].to_string());
             }
         }
     }
 
-    is_dcg_program_basename(first).then(|| first.to_string())
+    None
 }
 
 fn is_dcg_command(cmd: &str) -> bool {
@@ -14226,6 +14244,53 @@ fn build_grok_hook_config() -> std::io::Result<serde_json::Value> {
     }))
 }
 
+/// Repair Grok's Claude-compatible hook registration without replacing the
+/// operator's failure policy, timeout, or other hook and file settings.
+fn install_grok_hook_into_settings(
+    settings: &mut serde_json::Value,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let defaults = build_grok_hook_config()?;
+    let changed = install_dcg_hook_for_matcher(
+        settings,
+        force,
+        "Bash",
+        &["run_terminal_cmd"],
+        defaults["hooks"]["PreToolUse"][0]["hooks"][0].clone(),
+    )?;
+
+    // Add file metadata only after validation succeeds. Existing descriptions
+    // belong to the operator, just like the shared merger's hook defaults.
+    if settings.get("description").is_none() {
+        settings["description"] = defaults["description"].clone();
+        return Ok(true);
+    }
+    Ok(changed)
+}
+
+fn install_grok_hook_at(
+    hook_path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut settings = match std::fs::read_to_string(hook_path) {
+        Ok(content) => serde_json::from_str(&content)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !hook_path.is_symlink() => {
+            serde_json::json!({})
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let changed = install_grok_hook_into_settings(&mut settings, force)?;
+    if changed {
+        let content = serde_json::to_string_pretty(&settings)?;
+        if let Some(parent) = hook_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_installer_hook_settings(hook_path, &content)?;
+    }
+    Ok(changed)
+}
+
 /// Install the dcg hook into Grok's hook directory.
 ///
 /// Writes a self-contained `dcg.json` to `~/.grok/hooks/` (user-level) or
@@ -14233,8 +14298,11 @@ fn build_grok_hook_config() -> std::io::Result<serde_json::Value> {
 /// `*.json` in those directories and merges them at session start, so we
 /// don't touch `user-settings.json` or `settings.json`.
 ///
-/// Returns `Err` if the file cannot be written or, for project installs, if
-/// the current directory is not inside a git repository.
+/// Existing files are merged even without `--force`; force never discards
+/// operator-owned settings or overrides conflicting failure policies.
+///
+/// Returns `Err` if the file cannot be read, parsed, merged, or written or,
+/// for project installs, if the current directory is not inside a git repository.
 fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -14244,7 +14312,7 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
         grok_user_hook_path()
     };
 
-    if hook_path.exists() && !force {
+    if !install_grok_hook_at(&hook_path, force)? {
         println!(
             "{} Grok hook already exists at {}",
             "Hook already installed!".yellow(),
@@ -14253,14 +14321,6 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
         println!("Use --force to reinstall");
         return Ok(());
     }
-
-    if let Some(parent) = hook_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let body = build_grok_hook_config()?;
-    let content = serde_json::to_string_pretty(&body)?;
-    std::fs::write(&hook_path, content)?;
 
     let level = if project { "project" } else { "user" };
     println!("{}", "Grok hook installed successfully!".green().bold());
@@ -19574,9 +19634,9 @@ fn try_acquire_self_heal_lock(
 ///   manager). Renaming over the link would orphan the managed target and
 ///   silently detach the file from the user's source of truth, so the write
 ///   resolves the link first and replaces the real file.
-/// - **Unix mode bits are preserved.** settings.json can hold API keys in `env`
-///   blocks; a `chmod 600` file must not come back world-readable 0644 just
-///   because dcg repaired a hook entry.
+/// - **Unix ownership and mode bits are preserved.** settings.json can hold API
+///   keys in `env` blocks; a `chmod 600` file must remain private and readable by
+///   its original owner even when a different user repairs its hook entry.
 fn write_settings_atomic(
     path: &std::path::Path,
     content: &str,
@@ -19624,9 +19684,9 @@ fn write_settings_atomic(
     write_result
 }
 
-/// Copy `from`'s permission bits onto `to` so an atomic temp+rename replace
+/// Copy `from`'s Unix ownership and permission bits onto `to` so an atomic replace
 /// does not silently widen a restrictive mode (e.g. a `chmod 600`
-/// settings.json or allowlist).
+/// settings.json or allowlist) or make it unreadable to its existing owner.
 ///
 /// A missing/unreadable source is not an error: there is nothing to preserve,
 /// and the temp file's default mode is the correct outcome. On non-Unix this
@@ -19638,7 +19698,14 @@ fn copy_file_permissions(
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::{MetadataExt, chown};
+
         if let Ok(metadata) = std::fs::metadata(from) {
+            let staged = std::fs::metadata(to)?;
+            if (metadata.uid(), metadata.gid()) != (staged.uid(), staged.gid()) {
+                chown(to, Some(metadata.uid()), Some(metadata.gid()))?;
+            }
+            // Changing ownership can clear mode bits, so restore them last.
             std::fs::set_permissions(to, metadata.permissions())?;
         }
     }
@@ -23582,6 +23649,196 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         assert_ne!(command, "dcg");
     }
 
+    #[test]
+    fn grok_hook_policy_install_preserves_duplicate_fields_and_unrelated_settings() {
+        let mut settings = serde_json::json!({
+            "description": "Operator-managed safety hooks",
+            "operator": {"team": "security"},
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "label": "canonical", "hooks": [
+                        {"type": "command", "command": "bash-audit", "timeout": 7},
+                        {"type": "command", "command": "/old/dcg", "timeout": 15, "shell": "stale"}
+                    ]},
+                    {"matcher": "run_terminal_cmd", "label": "keep this scope", "hooks": [
+                        {"type": "command", "command": "\"C:\\old tools\\dcg.exe\"", "onFailure": "block", "future": {"enabled": true}},
+                        {"type": "command", "command": "terminal-audit"}
+                    ]},
+                    {"matcher": "Write", "hooks": [
+                        {"type": "command", "command": "dcg", "statusMessage": "Checking safety"}
+                    ]}
+                ],
+                "PostToolUse": [{"matcher": "*", "hooks": [{"command": "after-audit"}]}]
+            }
+        });
+        let original = settings.clone();
+        assert!(install_grok_hook_into_settings(&mut settings, false).unwrap());
+
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "only one dcg registration remains");
+        assert_eq!(entries[0]["matcher"], "Bash");
+        assert_eq!(entries[0]["label"], "canonical");
+        let hook = &entries[0]["hooks"][0];
+        let defaults = build_grok_hook_config().unwrap();
+        assert!(hook_has_dcg_identity(
+            hook,
+            &defaults["hooks"]["PreToolUse"][0]["hooks"][0]
+        ));
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(
+            hook["timeout"], 15,
+            "operator timeout overrides the default"
+        );
+        assert_eq!(hook["future"], serde_json::json!({"enabled": true}));
+        assert_eq!(hook["statusMessage"], "Checking safety");
+        assert_eq!(
+            entries[0]["hooks"][1],
+            original["hooks"]["PreToolUse"][0]["hooks"][0]
+        );
+        assert_eq!(entries[1]["matcher"], "run_terminal_cmd");
+        assert_eq!(entries[1]["label"], "keep this scope");
+        assert_eq!(
+            entries[1]["hooks"],
+            serde_json::json!([{"type": "command", "command": "terminal-audit"}])
+        );
+        assert_eq!(settings["description"], original["description"]);
+        assert_eq!(settings["operator"], original["operator"]);
+        assert_eq!(
+            settings["hooks"]["PostToolUse"],
+            original["hooks"]["PostToolUse"]
+        );
+
+        let repaired = settings.clone();
+        for force in [false, true, false] {
+            assert_eq!(
+                install_grok_hook_into_settings(&mut settings, force).unwrap(),
+                force
+            );
+            assert_eq!(settings, repaired);
+        }
+    }
+
+    #[test]
+    fn grok_hook_policy_install_uses_defaults_for_a_new_file() {
+        let mut settings = serde_json::json!({});
+        assert!(install_grok_hook_into_settings(&mut settings, false).unwrap());
+        assert_eq!(settings, build_grok_hook_config().unwrap());
+        assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 5);
+        assert!(!install_grok_hook_into_settings(&mut settings, false).unwrap());
+    }
+
+    #[test]
+    fn grok_hook_policy_install_refuses_conflicts_and_malformed_settings_without_mutation() {
+        let fixtures = [
+            serde_json::json!([]),
+            serde_json::json!({"hooks": []}),
+            serde_json::json!({"hooks": {"PreToolUse": {}}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash"}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": "invalid"}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "run_terminal_cmd", "hooks": null}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"command": "dcg", "onFailure": "block"}]},
+                {"matcher": "run_terminal_cmd", "hooks": [{"command": "/old/dcg", "onFailure": "continue"}]}
+            ]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"command": "dcg", "timeout": 15}]},
+                {"matcher": "Write", "hooks": [{"command": "/old/dcg", "timeout": 5}]}
+            ]}}),
+        ];
+        for fixture in fixtures {
+            for force in [false, true] {
+                let mut settings = fixture.clone();
+                assert!(install_grok_hook_into_settings(&mut settings, force).is_err());
+                assert_eq!(
+                    settings, fixture,
+                    "failed repair must leave settings intact"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_hook_policy_failed_staging_preserves_the_blocking_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        let original = serde_json::to_vec(&serde_json::json!({
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                "type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"
+            }]}]}
+        }))
+        .unwrap();
+        std::fs::write(&hook_path, &original).unwrap();
+        let stage_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::write(&stage_path, b"foreign staged content").unwrap();
+
+        for force in [false, true] {
+            assert!(install_grok_hook_at(&hook_path, force).is_err());
+            assert_eq!(std::fs::read(&hook_path).unwrap(), original);
+            assert_eq!(
+                std::fs::read(&stage_path).unwrap(),
+                b"foreign staged content"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_hook_policy_install_preserves_unix_owner_and_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        std::fs::write(
+            &hook_path,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"
+                }]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        if std::fs::metadata(&hook_path).unwrap().uid() == 0 {
+            match chown(&hook_path, Some(65534), Some(65534)) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::InvalidInput
+                            | std::io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    eprintln!(
+                        "cross-owner fixture unavailable: {error}; checking same-owner preservation"
+                    );
+                }
+                Err(error) => panic!("prepare cross-owner Grok fixture: {error}"),
+            }
+        } else {
+            eprintln!("cross-owner fixture requires root; checking same-owner preservation");
+        }
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let original = std::fs::metadata(&hook_path).unwrap();
+
+        for force in [false, true] {
+            assert!(install_grok_hook_at(&hook_path, force).unwrap());
+            let installed = std::fs::metadata(&hook_path).unwrap();
+            assert_eq!(installed.uid(), original.uid());
+            assert_eq!(installed.gid(), original.gid());
+            assert_eq!(installed.permissions().mode() & 0o777, 0o640);
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+            assert_eq!(
+                settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+                "block"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn posix_hook_quoting_round_trips_shell_metacharacters() {
@@ -23619,6 +23876,34 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
             "dcg used as another executable's argument is not a dcg-owned hook"
         );
         assert!(!is_dcg_command(r"& 'C:\unterminated\dcg.exe"));
+    }
+
+    #[test]
+    fn dcg_hook_command_parser_preserves_other_programs_with_dcg_path_arguments() {
+        for command in [
+            "/usr/bin/logger /opt/dcg",
+            "/usr/bin/logger relative/dcg",
+            "/usr/bin/logger -- /opt/dcg",
+            "logger /opt/dcg",
+            "/usr/bin/logger; /opt/dcg",
+            r"C:\tools\logger C:\opt\dcg.exe",
+            r"C:\tools\logger.exe relative\dcg.exe",
+            r"C:\tools\logger --config relative\dcg.exe",
+            r"C:\tools\logger & relative\dcg.exe",
+        ] {
+            assert!(
+                !is_dcg_command(command),
+                "a dcg path argument does not make the hook DCG-owned: {command}"
+            );
+        }
+        assert_eq!(
+            dcg_command_program("/opt/dcg --log /other/dcg"),
+            Some("/opt/dcg".to_string())
+        );
+        assert_eq!(
+            dcg_command_program(r"C:\tools\dcg.exe --log C:\other\dcg.exe"),
+            Some(r"C:\tools\dcg.exe".to_string())
+        );
     }
 
     // ---- Crush installer (#388) -------------------------------------------
