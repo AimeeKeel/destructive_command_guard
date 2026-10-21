@@ -701,6 +701,54 @@ fn has_async_terminator(node: &Node<'_, StrDoc<SupportLang>>) -> bool {
         .is_some_and(|sibling| sibling.kind() == "&")
 }
 
+/// Declaration arguments can undergo brace expansion even though an ordinary
+/// scalar assignment does not: `export S={one,two}` assigns S twice in Bash.
+/// A comma list or range-shaped brace pair therefore cannot establish one
+/// literal value. Keep quoted/escaped braces and commas as data. This bounded
+/// lexical check never enumerates alternatives (which can grow exponentially)
+/// and deliberately treats malformed range candidates as uncertain too.
+fn declaration_may_expand_braces(raw: &str) -> bool {
+    let mut quote = None;
+    let mut braces = Vec::new();
+    let mut previous_dot = false;
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {}
+            (None, '\'' | '"') => quote = Some(ch),
+            (_, '\\') => {
+                // Line continuation disappears before brace expansion, so
+                // two dots separated by it still introduce a range.
+                if chars.next() == Some('\n') {
+                    continue;
+                }
+            }
+            (None, '{') => braces.push(false),
+            (None, ',') => {
+                if let Some(expands) = braces.last_mut() {
+                    *expands = true;
+                }
+            }
+            (None, '.') => {
+                if let Some(expands) = braces.last_mut() {
+                    *expands |= previous_dot;
+                }
+                previous_dot = true;
+                continue;
+            }
+            (None, '}') => {
+                if braces.pop() == Some(true) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        previous_dot = false;
+    }
+    false
+}
+
 /// Scan the original source, before segmentation discards earlier bindings.
 /// Unsupported control flow removes facts instead of preserving stale paths.
 pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
@@ -811,7 +859,12 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                         .skip(1)
                         .filter(|word| assignment(word).is_some())
                     {
-                        state.assign(word, certain);
+                        // Every generated argument still starts with the same
+                        // literal NAME= (or NAME+=). Only that binding becomes
+                        // unknown; unrelated values and later explicit scalar
+                        // rebindings retain their proofs. Ordinary assignment
+                        // statements must not use this declaration-only rule.
+                        state.assign(word, certain && !declaration_may_expand_braces(word));
                     }
                 } else {
                     state.forget();
@@ -973,6 +1026,88 @@ pub(super) fn candidate(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_braces_preserve_quote_and_escape_provenance() {
+        for raw in [
+            "S={one,two}",
+            "S+=prefix{one,two}",
+            "S={1..3}",
+            "S={a..z..2}",
+            "S={a.\\\n.z}",
+            "S=outer{inner{one,two}}",
+            "S=\"prefix\"{one,'two'}",
+            "S={one,\"two\"}",
+        ] {
+            assert!(declaration_may_expand_braces(raw), "{raw}");
+        }
+        for raw in [
+            "S=one,two",
+            "S={literal}",
+            "S=unclosed{one,two",
+            "S='{one,two}'",
+            r#"S="{one,two}""#,
+            r"S=\{one,two\}",
+            r"S={one\,two}",
+            "S={one','two}",
+            "S='{1..3}'",
+            r"S=\{1..3\}",
+            "S=/tmp/*",
+            "IFS=*",
+        ] {
+            assert!(!declaration_may_expand_braces(raw), "{raw}");
+        }
+    }
+
+    #[test]
+    fn brace_expanded_exports_cannot_establish_false_literal_destinations() {
+        for declaration in [
+            "export S={/tmp/safe,/tmp/a@/etc/shadow}",
+            "export S=/tmp/{safe,a@/etc/shadow}",
+            "export S=/tmp/{safe,{other,a@/etc/shadow}}",
+            "export S=/tmp/a@/etc/{s..s}hadow",
+            "export S=/tmp/a@/etc/{s.\\\n.s}hadow",
+            "export S+={,\"@/etc/shadow\"}",
+            "export IFS={d..f}; S=/tmp/af/etc/shadow",
+        ] {
+            let source = format!("S=/tmp/safe; IFS=@; {declaration}; tee $S");
+            let hits = scan(&source, ShellDialect::Posix);
+            for rule in [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ] {
+                assert!(
+                    hits.iter()
+                        .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                    "{source}: missing {rule}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_braces_do_not_erase_unrelated_or_reestablished_facts() {
+        for source in [
+            "IFS=@; export S='/tmp/{safe,a@/etc/shadow}'; tee $S",
+            r#"IFS=@; export S="/tmp/{safe,a@/etc/shadow}"; tee $S"#,
+            r"IFS=@; export S=/tmp/\{safe,a@/etc/shadow\}; tee $S",
+            "IFS=@; S=/tmp/{safe,a@/etc/shadow}; tee $S",
+            "IFS=@; export S=/tmp/{literal}; tee $S",
+            "S=/tmp/safe; IFS=@; export T={one,two}; tee $S",
+            "IFS=@; export S={one,two} S=/tmp/safe; tee $S",
+            "IFS=@; export S={one,two}; S=/tmp/safe; tee $S",
+            "export IFS={d..f}; IFS=@; S=/tmp/a@/tmp/b; tee $S",
+            "export IFS=*; S='/tmp/a*/tmp/b'; tee $S",
+            "IFS=@; export S={/tmp/safe,/etc/shadow}",
+        ] {
+            assert!(scan(source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+        // Losing the brace-affected value must not poison future proofs.
+        let source = "IFS=@; export S={one,two}; S=/tmp/a@/etc/shadow; tee $S";
+        assert!(scan(source, ShellDialect::Posix).iter().any(|hit| {
+            hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME && hit.reason != UNCERTAIN
+        }));
+    }
 
     #[test]
     fn async_terminators_use_statement_syntax_not_assignment_suffixes() {
