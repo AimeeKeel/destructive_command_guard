@@ -4,6 +4,54 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[test]
+fn generated_frontend_options_cannot_allow_split_native_destinations() {
+    for (setup, invocation) in [
+        ("OPT=-n", "nice $OPT 0 tee $S"),
+        ("E=", "nice $E -n 0 tee $S"),
+        ("E=", "nice ${E}${E} --adjustment=0 tee $S"),
+        ("E=", "nice $E -- tee $S"),
+        ("OPT=--adjustment=0", r#"/usr/bin/nice "$OPT" tee $S"#),
+        ("OPT=-oL", "stdbuf $OPT tee $S"),
+        ("E=", "stdbuf -oL $E -eL tee $S"),
+        ("E=", "/usr/bin/time $E -p tee $S"),
+        ("E=", "nohup $E -- tee $S"),
+        ("OPT=-w", "setsid $OPT tee $S"),
+        ("E=", "ionice $E -c 2 tee $S"),
+    ] {
+        for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config"] {
+            let source = format!("S={value}; IFS=@; {setup}; {invocation}");
+            // Another native launcher rule may own the first finding.
+            // Neither CLI nor hook may allow a hidden protected write.
+            assert_decision(&source, false, None);
+        }
+    }
+}
+
+#[test]
+fn literal_frontend_options_keep_concrete_native_checks_and_harmless_reads() {
+    for prefix in [
+        "nice -n 0 ",
+        "stdbuf -oL ",
+        "nohup -- ",
+        "/usr/bin/time -p ",
+        "setsid -w ",
+        "ionice -c 2 ",
+    ] {
+        for (value, rule) in [
+            ("/tmp/a@/etc/shadow", "core.filesystem:credential-file-write"),
+            ("/tmp/a@.git/config", "core.filesystem:git-internals-write"),
+        ] {
+            let source = format!("S={value}; IFS=@; {prefix}tee $S");
+            assert_decision(&source, false, Some(rule));
+        }
+        let source = format!("S=/tmp/a@/tmp/b; IFS=@; {prefix}tee $S");
+        assert_decision(&source, true, None);
+        let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {prefix}printf '%s' '-n' $S");
+        assert_decision(&source, true, None);
+    }
+}
+
 fn isolated_dcg(temp: &tempfile::TempDir) -> Command {
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("isolated home");

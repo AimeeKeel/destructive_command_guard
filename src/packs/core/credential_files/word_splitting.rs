@@ -593,6 +593,20 @@ fn first_expanded_word(arguments: &[&str], state: &State) -> Result<Option<Strin
     Ok(None)
 }
 
+/// A dynamically supplied word at the normalizer's command boundary can
+/// still be an option of the removed execution wrapper. This applies to
+/// nice/stdbuf/exec and the other frontends, not only command and env.
+/// Assignment and backslash normalization are shell syntax, not option
+/// parsers. Environment assignments retain the existing command/env handling.
+/// This is a conservative ownership check, not another utility option parser.
+fn wrapper_may_own_generated_control(wrapper_type: &str, word: &str) -> bool {
+    match wrapper_type {
+        "assignment" | "backslash" => false,
+        "command" | "env" => word.starts_with('-') || word.contains('='),
+        _ => word.starts_with('-'),
+    }
+}
+
 /// A literal command -v/-V is a query, not an execution frontend. Only read
 /// options before its first operand/--, and stop at dynamic words: they can
 /// supply an operand or terminate option parsing before a later literal -v.
@@ -1086,20 +1100,18 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                     .as_deref()
                     .is_some_and(execution_frontend)
                     && !command_queries_only(&arguments);
-                // A stripped wrapper's dynamic next word can still belong
-                // to that wrapper: command $OPT tee ... with OPT=-p, or
-                // env $SETTING tee ... with SETTING=NAME=value. Such fields
-                // are options/assignments, not proof of a harmless argv0.
+                // Expansion can expose wrapper controls at a boundary that
+                // normalization chose from raw source. This includes nice
+                // $E -n 0 tee ... when E vanishes, and stdbuf $OPT tee ...
+                // when OPT=-oL. Such fields do not prove a harmless argv0.
                 let generated_wrapper_control = arguments
                     .first()
                     .is_some_and(|word| literal(word).is_none())
-                    && name
-                        .as_deref()
-                        .is_some_and(|word| word.starts_with('-') || word.contains('='))
-                    && stripped
-                        .stripped_wrappers
-                        .iter()
-                        .any(|wrapper| matches!(wrapper.wrapper_type, "command" | "env"));
+                    && name.as_deref().is_some_and(|word| {
+                        stripped.stripped_wrappers.iter().any(|wrapper| {
+                            wrapper_may_own_generated_control(wrapper.wrapper_type, word)
+                        })
+                    });
                 let active = state.changed
                     || prefix_ifs
                     || words
@@ -1325,6 +1337,143 @@ mod tests {
                     "an executable frontend must not be mistaken for a non-writer: {source}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn generated_options_belong_to_all_execution_wrappers_not_shell_syntax() {
+        for wrapper in [
+            "sudo",
+            "env",
+            "command",
+            "exec",
+            "nohup",
+            "time",
+            "nice",
+            "ionice",
+            "setsid",
+            "timeout",
+            "stdbuf",
+            "chrt",
+            "busybox",
+            "mise-exec",
+        ] {
+            for word in ["-n", "--", "-oL", "--adjustment=0"] {
+                assert!(
+                    wrapper_may_own_generated_control(wrapper, word),
+                    "{wrapper}: {word}"
+                );
+            }
+            for word in ["tee", "printf", "/tmp/safe-option-like-name"] {
+                assert!(
+                    !wrapper_may_own_generated_control(wrapper, word),
+                    "{wrapper}: {word}"
+                );
+            }
+        }
+        for wrapper in ["assignment", "backslash"] {
+            for word in ["-n", "--", "NAME=value"] {
+                assert!(
+                    !wrapper_may_own_generated_control(wrapper, word),
+                    "{wrapper}: {word}"
+                );
+            }
+        }
+        for wrapper in ["command", "env"] {
+            assert!(wrapper_may_own_generated_control(wrapper, "NAME=value"));
+        }
+        for wrapper in ["nice", "stdbuf", "exec", "nohup"] {
+            assert!(!wrapper_may_own_generated_control(wrapper, "NAME=value"));
+        }
+    }
+
+    #[test]
+    fn generated_frontend_options_cannot_hide_native_writer_destinations() {
+        for (setup, invocation, wrapper) in [
+            ("OPT=-n", "nice $OPT 0 tee $S", "nice"),
+            ("E=", "nice $E -n 0 tee $S", "nice"),
+            ("E=", "nice ${E}${E} --adjustment=0 tee $S", "nice"),
+            ("E=", "nice $E -- tee $S", "nice"),
+            ("OPT=--adjustment=0", r#"/usr/bin/nice "$OPT" tee $S"#, "nice"),
+            ("OPT=-oL", "stdbuf $OPT tee $S", "stdbuf"),
+            ("E=", "stdbuf -oL $E -eL tee $S", "stdbuf"),
+            ("E=", "/usr/bin/time $E -p tee $S", "time"),
+            ("E=", "nohup $E -- tee $S", "nohup"),
+            ("OPT=-w", "setsid $OPT tee $S", "setsid"),
+            ("E=", "ionice $E -c 2 tee $S", "ionice"),
+            ("E=", "exec $E -a label tee $S", "exec"),
+            ("E=", "sudo $E -u root tee $S", "sudo"),
+        ] {
+            let normalized = strip_wrapper_prefixes(invocation);
+            assert!(!normalized.wrapper_limit_reached);
+            assert!(
+                normalized
+                    .stripped_wrappers
+                    .iter()
+                    .any(|item| item.wrapper_type == wrapper),
+                "the raw-source command boundary must be exercised: {invocation}"
+            );
+            for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config"] {
+                let source = format!("S={value}; IFS=@; {setup}; {invocation}");
+                let ast = AstGrep::try_new(source.as_str(), SupportLang::Bash).unwrap();
+                assert!(!ast.root().get_inner_node().has_error(), "{source}");
+                let start = source.rfind("; ").unwrap() + 2;
+                let hits = scan(&source, ShellDialect::Posix);
+                for rule in [
+                    shell::CREDENTIAL_FILE_WRITE_NAME,
+                    shell::GIT_INTERNALS_WRITE_NAME,
+                ] {
+                    assert!(
+                        hits.iter().any(|hit| hit.rule == rule
+                            && hit.reason == UNCERTAIN
+                            && hit.span == (start..source.len())),
+                        "generated options cannot waive {rule}: {source}: {hits:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_frontends_and_literal_empty_arguments_keep_their_roles() {
+        for prefix in [
+            "nice -n 0 ",
+            "stdbuf -oL ",
+            "nohup -- ",
+            "/usr/bin/time -p ",
+            "setsid -w ",
+            "ionice -c 2 ",
+        ] {
+            for (value, rule) in [
+                ("/tmp/a@/etc/shadow", shell::CREDENTIAL_FILE_WRITE_NAME),
+                ("/tmp/a@.git/config", shell::GIT_INTERNALS_WRITE_NAME),
+            ] {
+                let source = format!("S={value}; IFS=@; {prefix}tee $S");
+                assert!(
+                    scan(&source, ShellDialect::Posix)
+                        .iter()
+                        .any(|hit| hit.rule == rule && hit.reason != UNCERTAIN),
+                    "resolved wrappers must keep concrete attribution: {source}"
+                );
+            }
+            let source = format!("S=/tmp/a@/tmp/b; IFS=@; {prefix}tee $S");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+            let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {prefix}printf '%s' '-n' $S");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+        for invocation in [r#"nice "$E" -n 0 tee $S"#, r#"nohup "$E" -- tee $S"#] {
+            let source = format!("E=; S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+            // A quoted empty executable is not removed by the shell, so it
+            // cannot expose these later words as options to the wrapper.
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+        for invocation in [
+            "nice $E printf '%s' $S",
+            "stdbuf -oL $E printf '%s' $S",
+            "nohup $E printf '%s' $S",
+        ] {
+            let source = format!("E=; S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
         }
     }
 
