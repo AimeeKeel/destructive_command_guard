@@ -266,7 +266,8 @@ function Test-DcgHookCommand {
     $command = $prop.Value
   }
 
-  $name = Get-DcgCommandName ([string]$command)
+  if ($command -isnot [string]) { return $false }
+  $name = Get-DcgCommandName $command
   $name -eq "dcg" -or $name -eq "dcg.exe"
 }
 
@@ -321,6 +322,43 @@ function Test-JsonObject {
   $null -ne $Value -and $Value.GetType() -eq [System.Management.Automation.PSCustomObject]
 }
 
+# Compare JSON values without PowerShell's string/boolean/number coercions.
+# Object property order is immaterial, but names, strings and array order are
+# significant. Used both for duplicate policy conflicts and lossless writes.
+function Test-JsonValueEqual {
+  param([object]$Left, [object]$Right)
+
+  if ($null -eq $Left -or $null -eq $Right) {
+    return $null -eq $Left -and $null -eq $Right
+  }
+  if ((Test-JsonArray $Left) -or (Test-JsonArray $Right)) {
+    if (-not (Test-JsonArray $Left) -or -not (Test-JsonArray $Right) -or
+        $Left.Count -ne $Right.Count) { return $false }
+    for ($i = 0; $i -lt $Left.Count; $i++) {
+      if (-not (Test-JsonValueEqual $Left[$i] $Right[$i])) { return $false }
+    }
+    return $true
+  }
+  if ((Test-JsonObject $Left) -or (Test-JsonObject $Right)) {
+    if (-not (Test-JsonObject $Left) -or -not (Test-JsonObject $Right) -or
+        @($Left.PSObject.Properties).Count -ne @($Right.PSObject.Properties).Count) {
+      return $false
+    }
+    foreach ($prop in $Left.PSObject.Properties) {
+      $other = $Right.PSObject.Properties[$prop.Name]
+      if ($null -eq $other -or $other.Name -cne $prop.Name -or
+          -not (Test-JsonValueEqual $prop.Value $other.Value)) { return $false }
+    }
+    return $true
+  }
+  if (($Left -is [string]) -ne ($Right -is [string]) -or
+      ($Left -is [bool]) -ne ($Right -is [bool])) { return $false }
+  # JSON numbers may be Int32 in a fresh hook and Int64 after parsing. Compare
+  # their JSON representation, which still distinguishes false, 0 and "0".
+  (ConvertTo-Json -InputObject $Left -Compress -Depth 100) -ceq
+    (ConvertTo-Json -InputObject $Right -Compress -Depth 100)
+}
+
 function Test-UserPathContains {
   param([string]$PathValue, [string]$PathToFind)
 
@@ -341,21 +379,30 @@ function Test-UserPathContains {
 }
 
 # Generic: true when the config already has exactly one dcg hook anywhere under
-# the given $Event, installed under $Matcher, equal to $DcgHook, and first.
+# the given $Event, installed under $Matcher, with the desired command identity,
+# and first. All other fields belong to the operator/host (#345, #582).
 # $OwnedMatchers identifies legacy matcher entries whose malformed hook arrays
 # must be rejected during migrations.
 function Test-HookMatchesDesired {
   param([object]$Actual, [object]$Desired)
 
   if (-not (Test-JsonObject $Actual) -or -not (Test-JsonObject $Desired)) { return $false }
-  if (@($Actual.PSObject.Properties).Count -ne @($Desired.PSObject.Properties).Count) {
-    return $false
+  foreach ($name in @('type', 'command', 'shell')) {
+    $actualProp = $Actual.PSObject.Properties[$name]
+    $desiredProp = $Desired.PSObject.Properties[$name]
+    if ($null -eq $desiredProp) {
+      if ($null -ne $actualProp) { return $false }
+    } elseif ($null -eq $actualProp -or $actualProp.Name -cne $desiredProp.Name -or
+        -not (Test-JsonValueEqual $actualProp.Value $desiredProp.Value)) { return $false }
   }
   foreach ($prop in $Desired.PSObject.Properties) {
-    $actualProp = $Actual.PSObject.Properties[$prop.Name]
-    if ($null -eq $actualProp -or $actualProp.Value -ne $prop.Value) {
-      return $false
-    }
+    # Host defaults (e.g. Gemini/Posit timeout) are filled only when absent.
+    if (-not (Test-ObjectPropertyExists $Actual $prop.Name)) { return $false }
+  }
+  $async = Get-ObjectPropertyValue $Actual 'async'
+  if ((Test-ObjectPropertyExists $Actual 'async') -and
+      ($async -isnot [bool] -or $async)) {
+    return $false # An asynchronous hook cannot block a destructive command.
   }
   $true
 }
@@ -398,35 +445,85 @@ function Test-AgentHookCurrent {
   if (-not (Test-JsonArray $firstEntryHooksValue)) { return $false }
   $firstEntryHooks = @(Get-JsonArray $firstEntryHooksValue)
   $dcgHooks.Count -eq 1 -and
-    (Get-ObjectPropertyValue $firstEntry "matcher") -eq $Matcher -and
+    (Get-ObjectPropertyValue $firstEntry "matcher") -ceq $Matcher -and
     $firstEntryHooks.Count -gt 0 -and
     (Test-HookMatchesDesired $firstEntryHooks[0] $DcgHook)
 }
 
-# Atomically write $Object as JSON to $Path as UTF-8 WITHOUT a BOM. The BOM is
+# Write $Object as JSON to $Path as UTF-8 WITHOUT a BOM. The BOM is
 # omitted because strict JSON parsers (e.g. Codex) reject the leading EF BB BF
 # ("expected value at line 1 column 1" — #125), and Windows PowerShell 5.1 lacks
-# `-Encoding UTF8NoBOM`. The write is atomic (temp file in the same directory +
-# Move-Item -Force) so a concurrent reader (an agent reading its settings) never
-# sees a half-written file.
+# `-Encoding UTF8NoBOM`. Stage in the same directory and replace with a backup;
+# Move-Item -Force can delete the destination before its replacement succeeds.
 function Write-JsonFileNoBom {
   param([string]$Path, [object]$Object)
 
-  $json = $Object | ConvertTo-Json -Depth 20
+  $json = ConvertTo-Json -InputObject $Object -Depth 100 -WarningAction Stop
+  # Windows PowerShell 5.1 does not warn when ConvertTo-Json truncates deep
+  # objects. Refuse a lossy serialization before touching the settings file.
+  if (-not (Test-JsonValueEqual $Object (ConvertFrom-Json -InputObject $json))) {
+    throw "Cannot serialize settings without changing their values; leaving unchanged: $Path"
+  }
   $dir = Split-Path -Parent $Path
+  if ([string]::IsNullOrEmpty($dir)) { $dir = '.' }
+  $dir = (Get-Item -Force -LiteralPath $dir -ErrorAction Stop).FullName
+  $Path = Join-Path $dir (Split-Path -Leaf $Path)
+  $existing = Get-Item -Force -LiteralPath $Path -ErrorAction SilentlyContinue
+  if ($null -ne $existing) {
+    if ($existing.PSIsContainer -or
+        ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      throw "Cannot safely replace a directory or linked settings file; leaving unchanged: $Path"
+    }
+    if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+      throw "Cannot safely replace existing settings in ConstrainedLanguage; leaving unchanged: $Path"
+    }
+  }
   $tmp = Join-Path $dir (".dcg-tmp-" + [System.Guid]::NewGuid().ToString("N"))
-  Write-Utf8NoBomText -Path $tmp -Text $json
-  Move-Item -Force -LiteralPath $tmp -Destination $Path
+  $backup = $Path + '.bak.' + [System.Guid]::NewGuid().ToString('N')
+  try {
+    if ($null -ne $existing) {
+      # Copying first retains restrictive Unix file modes on the staged file.
+      # File.Replace preserves the destination's Windows access controls.
+      Copy-Item -LiteralPath $Path -Destination $tmp -ErrorAction Stop
+    }
+    Write-Utf8NoBomText -Path $tmp -Text $json
+    if ($null -ne $existing) {
+      [System.IO.File]::Replace($tmp, $Path, $backup)
+    } else {
+      # Rename without Force refuses a raced file OR directory at the target.
+      Rename-Item -LiteralPath $tmp -NewName (Split-Path -Leaf $Path) -ErrorAction Stop
+    }
+  } catch {
+    # ReplaceFile on Windows can move the old file to its backup before a
+    # failure. Recover that file without overwriting a concurrent writer.
+    if (-not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath $backup -PathType Leaf)) {
+      try {
+        Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $Path) -ErrorAction Stop
+      } catch {
+        throw "Settings replacement failed; previous settings are preserved at: $backup. $_"
+      }
+    }
+    if (Test-Path -LiteralPath $backup -PathType Leaf) {
+      throw "Settings replacement failed; previous settings are preserved at: $backup. $_"
+    }
+    throw
+  } finally {
+    if (Test-Path -LiteralPath $tmp -PathType Leaf) {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+  }
 }
 
 # Shared create-or-merge for a Claude-Code-style hooks file. Ensures
 # `hooks.<Event>` has an entry with `matcher: <Matcher>` containing exactly one
-# dcg hook ($DcgHook), hoisted first, with any other hooks/entries preserved.
+# dcg hook, hoisted first, with operator-owned fields and other hooks preserved.
 # Stale dcg hooks are removed from every matcher entry so an earlier
 # misinstallation cannot leave an executable but ineffective duplicate.
 # $OwnedMatchers identifies legacy matcher values whose malformed hook arrays
 # must be rejected. Coexisting hooks are never widened. Idempotent. Refuses to
-# touch invalid JSON / malformed owned shapes (throws with $Label).
+# touch invalid JSON / malformed owned shapes or conflicting duplicate policies
+# (throws with $Label). Only type/command/shell are dcg-owned; all other desired
+# fields are defaults for a fresh hook, matching the Rust installer (#345).
 # Returns "created" | "already" | "merged".
 function Merge-AgentHookFile {
   param(
@@ -449,7 +546,7 @@ function Merge-AgentHookFile {
   }
 
   try {
-    $config = Get-Content -Raw -LiteralPath $HooksFile | ConvertFrom-Json
+    $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $HooksFile | ConvertFrom-Json
   } catch {
     throw "$Label is invalid JSON; leaving it unchanged: $HooksFile"
   }
@@ -476,6 +573,48 @@ function Merge-AgentHookFile {
     return "already"
   }
 
+  # Collect metadata before removing any registration. A later duplicate can
+  # carry the only fail-closed policy; choosing just the first hook loses it.
+  $mergedHook = [pscustomobject][ordered]@{}
+  $removedAsync = $false
+  foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
+    $entryMatcher = Get-ObjectPropertyValue $entry 'matcher'
+    $entryHooks = Get-ObjectPropertyValue $entry 'hooks'
+    if ($entryMatcher -in $OwnedMatchers -and
+        (Test-ObjectPropertyExists $entry 'hooks') -and -not (Test-JsonArray $entryHooks)) {
+      throw "$Label $entryMatcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
+    }
+    if (-not (Test-JsonArray $entryHooks)) { continue }
+    foreach ($hook in $entryHooks) {
+      if (-not (Test-DcgHookCommand $hook)) { continue }
+      foreach ($prop in $hook.PSObject.Properties) {
+        if ($prop.Name -in @('type', 'command', 'shell')) { continue }
+        if ($prop.Name -eq 'async') {
+          if ($prop.Value -isnot [bool]) {
+            throw "$Label dcg hook async must be a boolean; leaving it unchanged: $HooksFile"
+          }
+          if ($prop.Value) {
+            $removedAsync = $true
+            continue
+          }
+        }
+        $previous = $mergedHook.PSObject.Properties[$prop.Name]
+        if ($null -ne $previous -and
+            ($previous.Name -cne $prop.Name -or
+             -not (Test-JsonValueEqual $previous.Value $prop.Value))) {
+          throw "$Label has conflicting dcg hook field '$($prop.Name)'; leaving it unchanged: $HooksFile"
+        }
+        Set-ObjectPropertyValue $mergedHook $prop.Name $prop.Value
+      }
+    }
+  }
+  foreach ($prop in $DcgHook.PSObject.Properties) {
+    if ($prop.Name -in @('type', 'command', 'shell') -or
+        -not (Test-ObjectPropertyExists $mergedHook $prop.Name)) {
+      Set-ObjectPropertyValue $mergedHook $prop.Name $prop.Value
+    }
+  }
+
   if (-not $hooksExists) {
     $hooks = [pscustomobject][ordered]@{}
     Set-ObjectPropertyValue $config "hooks" $hooks
@@ -486,7 +625,7 @@ function Merge-AgentHookFile {
 
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
     $entryMatcher = Get-ObjectPropertyValue $entry "matcher"
-    if ($entryMatcher -eq $Matcher) {
+    if ($entryMatcher -ceq $Matcher) {
       $entryHooks = Get-ObjectPropertyValue $entry "hooks"
       if ($null -ne $entryHooks -and -not (Test-JsonArray $entryHooks)) {
         throw "$Label $Matcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
@@ -541,12 +680,15 @@ function Merge-AgentHookFile {
       hooks = @()
     }
   }
-  $canonicalHooks = @($DcgHook) + @(Get-JsonArray (Get-ObjectPropertyValue $canonicalEntry "hooks"))
+  $canonicalHooks = @($mergedHook) + @(Get-JsonArray (Get-ObjectPropertyValue $canonicalEntry "hooks"))
   Set-ObjectPropertyValue $canonicalEntry "hooks" $canonicalHooks
   $newEventEntries = @($canonicalEntry) + $newEventEntries
 
   Set-ObjectPropertyValue $hooks $Event $newEventEntries
   Write-JsonFileNoBom -Path $HooksFile -Object $config
+  if ($removedAsync) {
+    Write-Warn "${Label}: removed async=true from the dcg hook so destructive commands can be blocked."
+  }
   "merged"
 }
 

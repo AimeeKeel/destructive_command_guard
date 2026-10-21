@@ -7,12 +7,14 @@
 # and predecessor migration. The functions take a -HomeDir
 # param so a temp home can be injected ($HOME is read-only in PowerShell).
 
+param([string]$InstallScript = '')
+
 $ErrorActionPreference = 'Stop'
 $savedClaudeConfigDir = $env:CLAUDE_CONFIG_DIR
 $env:CLAUDE_CONFIG_DIR = $null
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$installPs1 = Join-Path $repoRoot 'install.ps1'
+$installPs1 = if ($InstallScript) { $InstallScript } else { Join-Path $repoRoot 'install.ps1' }
 . $installPs1 -LoadFunctionsOnly
 
 $script:failures = 0
@@ -384,6 +386,269 @@ try {
 } finally {
     $env:PATH = $savedPath11
     Remove-Item -Recurse -Force -LiteralPath $h11 -ErrorAction SilentlyContinue
+}
+
+# #582: all four callers share the preservation and publication path. Keep
+# these fixtures here so the existing CI-discovered suite exercises that path
+# through the real integration functions, without running the installer body.
+$env:CLAUDE_CONFIG_DIR = $null
+function Write-PreservationSettings([string]$Path, [object]$Settings) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    $json = ConvertTo-Json -InputObject $Settings -Depth 100 -Compress
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding $false))
+}
+function Get-PreservationBytes([string]$Path) {
+    [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path))
+}
+function Invoke-PreservationIntegration([object]$Agent, [string]$FixtureHome) {
+    $arguments = @{ DcgPath = $dcgPath; HomeDir = $FixtureHome }
+    if ($Agent.Name -ne 'Codex') { $arguments.Force = $true }
+    & $Agent.Configure @arguments
+}
+$preservationAgents = @(
+    [pscustomobject]@{ Name = 'Claude'; Configure = 'Configure-ClaudeHook'; Path = '.claude/settings.json'; Event = 'PreToolUse'; Matcher = 'Bash|PowerShell|Monitor'; Command = "& '$dcgPath'"; Shell = 'powershell' },
+    [pscustomobject]@{ Name = 'Gemini'; Configure = 'Configure-GeminiHook'; Path = '.gemini/settings.json'; Event = 'BeforeTool'; Matcher = 'run_shell_command'; Command = $dcgPath; Shell = $null },
+    [pscustomobject]@{ Name = 'Posit'; Configure = 'Configure-PositAssistantHook'; Path = '.posit/assistant/settings.json'; Event = 'PreToolUse'; Matcher = 'bash|powershell'; Command = ('"' + $dcgPath + '"'); Shell = $null },
+    [pscustomobject]@{ Name = 'Codex'; Configure = 'Configure-CodexHook'; Path = '.codex/hooks.json'; Event = 'PreToolUse'; Matcher = 'Bash'; Command = $dcgPath; Shell = $null }
+)
+foreach ($agent in $preservationAgents) {
+    Write-Host "Test 12: $($agent.Name) preserves operator fields across repair and repeat updates (#582)"
+    $fixtureHome = New-TempHome
+    try {
+        $settings = Join-Path $fixtureHome $agent.Path
+        $operatorMessage = 'Checking ' + [char]0x5B89 + [char]0x5168 + ' caf' + [char]0xE9
+        $oldHook = [ordered]@{
+            type = 'prompt'; command = '"C:\old installation\dcg.exe"'; shell = 'foreign-shell'
+            name = 'operator guard'; timeout = 15; onFailure = 'block'; statusMessage = $operatorMessage
+            async = $false; optional = $null; disabled = $false; retries = 0; empty = @()
+            future = [ordered]@{ policy = 'Strict'; values = @($null, $false, 0, @()); emptyObject = [ordered]@{} }
+        }
+        $legacyMatcher = if ($agent.Name -eq 'Claude') { 'Bash|PowerShell' } else { 'Write' }
+        $eventHooks = [ordered]@{
+            SessionStart = @(@{ hooks = @(@{ type = 'command'; command = 'other-event' }) })
+        }
+        $eventHooks[$agent.Event] = @(
+            @{ matcher = $legacyMatcher; customField = 'legacy metadata'; hooks = @($oldHook, @{ type = 'command'; command = 'legacy-audit'; timeout = 7 }) },
+            @{ matcher = $agent.Matcher; customField = 'canonical metadata'; hooks = @(@{ type = 'command'; command = 'canonical-audit' }) },
+            @{ matcher = 'Read'; hooks = @(@{ type = 'command'; command = 'dcg-helper' }, @{ type = 'command'; command = @('dcg') }) }
+        )
+        Write-PreservationSettings $settings ([ordered]@{ theme = 'dark'; hooks = $eventHooks })
+        $originalBytes = Get-PreservationBytes $settings
+        $status = Invoke-PreservationIntegration $agent $fixtureHome
+        Check ($status -eq 'merged') "$($agent.Name): stale quoted path is repaired"
+        $backups = @(Get-ChildItem -LiteralPath (Split-Path -Parent $settings) -Filter ((Split-Path -Leaf $settings) + '.bak.*') -File)
+        Check ($backups.Count -eq 1) "$($agent.Name): repair keeps one recovery backup"
+        Check ($backups.Count -eq 1 -and (Get-PreservationBytes $backups[0].FullName) -ceq $originalBytes) "$($agent.Name): recovery backup contains exact previous bytes"
+        $parsed = Get-Content -Raw -Encoding UTF8 -LiteralPath $settings | ConvertFrom-Json
+        $entries = @($parsed.hooks.($agent.Event))
+        $hook = $entries[0].hooks[0]
+        Check ($entries[0].matcher -ceq $agent.Matcher) "$($agent.Name): canonical matcher is first"
+        Check ($hook.type -ceq 'command' -and $hook.command -ceq $agent.Command) "$($agent.Name): only DCG command identity is refreshed"
+        if ($null -eq $agent.Shell) {
+            Check ($null -eq $hook.PSObject.Properties['shell']) "$($agent.Name): foreign shell is removed"
+        } else {
+            Check ($hook.shell -ceq $agent.Shell) "$($agent.Name): platform shell is refreshed"
+        }
+        Check ($hook.timeout -eq 15 -and $hook.onFailure -ceq 'block') "$($agent.Name): timeout and fail-closed behavior survive"
+        Check ($hook.name -ceq 'operator guard' -and $hook.statusMessage -ceq $operatorMessage) "$($agent.Name): operator name and non-ASCII status message survive"
+        Check ($null -ne $hook.PSObject.Properties['optional'] -and $null -eq $hook.optional) "$($agent.Name): explicit null survives"
+        Check ($hook.async -is [bool] -and -not $hook.async -and $hook.disabled -is [bool] -and -not $hook.disabled) "$($agent.Name): false values survive as booleans"
+        Check (($hook.retries -is [int] -or $hook.retries -is [long]) -and $hook.retries -eq 0) "$($agent.Name): zero survives as a number"
+        Check ($hook.empty -is [array] -and $hook.empty.Count -eq 0) "$($agent.Name): empty array survives"
+        Check ($hook.future.policy -ceq 'Strict' -and $hook.future.values.Count -eq 4 -and $hook.future.values[3] -is [array]) "$($agent.Name): nested operator JSON survives"
+        Check ($entries[0].customField -ceq 'canonical metadata' -and $entries[0].hooks[1].command -ceq 'canonical-audit') "$($agent.Name): canonical entry metadata and sibling survive"
+        $legacy = @($entries | Where-Object { $_.matcher -ceq $legacyMatcher })[0]
+        Check ($legacy.customField -ceq 'legacy metadata' -and $legacy.hooks.Count -eq 1 -and $legacy.hooks[0].timeout -eq 7) "$($agent.Name): unrelated legacy hook keeps its scope and metadata"
+        Check ($parsed.theme -ceq 'dark' -and $parsed.hooks.SessionStart[0].hooks[0].command -ceq 'other-event') "$($agent.Name): unrelated settings and events survive"
+        Check ($entries[2].hooks[0].command -ceq 'dcg-helper') "$($agent.Name): lookalike hook survives"
+        Check ($entries[2].hooks.Count -eq 2 -and $entries[2].hooks[1].command -is [array] -and $entries[2].hooks[1].command[0] -ceq 'dcg') "$($agent.Name): opaque non-string command is not treated as DCG"
+        $before = Get-PreservationBytes $settings
+        Check ((Invoke-PreservationIntegration $agent $fixtureHome) -eq 'already') "$($agent.Name): operator metadata does not mark the repaired hook stale"
+        Check ((Get-PreservationBytes $settings) -ceq $before) "$($agent.Name): repeated update leaves exact bytes unchanged"
+        Check (@(Get-ChildItem -LiteralPath (Split-Path -Parent $settings) -Filter ((Split-Path -Leaf $settings) + '.bak.*') -File).Count -eq 1) "$($agent.Name): repeated update creates no extra backup"
+        Check (Test-NoBom $settings) "$($agent.Name): repaired file remains UTF-8 without BOM"
+    } finally { Remove-Item -Recurse -Force -LiteralPath $fixtureHome -ErrorAction SilentlyContinue }
+}
+
+Write-Host 'Test 13: Gemini and Posit supply defaults only when absent (#582)'
+foreach ($agent in @($preservationAgents | Where-Object { $_.Name -in @('Gemini', 'Posit') })) {
+    $fixtureHome = New-TempHome
+    try {
+        $settings = Join-Path $fixtureHome $agent.Path
+        $events = @{}
+        $events[$agent.Event] = @(@{ matcher = $agent.Matcher; hooks = @(@{ type = 'command'; command = 'C:\old\dcg.exe'; onFailure = 'block' }) })
+        Write-PreservationSettings $settings @{ hooks = $events }
+        Check ((Invoke-PreservationIntegration $agent $fixtureHome) -eq 'merged') "$($agent.Name): missing default fields are repaired"
+        $parsed = Get-Content -Raw -Encoding UTF8 -LiteralPath $settings | ConvertFrom-Json
+        $hook = $parsed.hooks.($agent.Event)[0].hooks[0]
+        $expectedTimeout = if ($agent.Name -eq 'Gemini') { 5000 } else { 10 }
+        Check ($hook.timeout -eq $expectedTimeout -and $hook.onFailure -ceq 'block') "$($agent.Name): timeout default fills the gap without dropping onFailure"
+        if ($agent.Name -eq 'Gemini') { Check ($hook.name -ceq 'dcg') 'Gemini: missing name gets its default' }
+        $before = Get-PreservationBytes $settings
+        Check ((Invoke-PreservationIntegration $agent $fixtureHome) -eq 'already') "$($agent.Name): default completion is idempotent"
+        Check ((Get-PreservationBytes $settings) -ceq $before) "$($agent.Name): repeat default completion is byte-identical"
+    } finally { Remove-Item -Recurse -Force -LiteralPath $fixtureHome -ErrorAction SilentlyContinue }
+}
+
+Write-Host 'Test 14: compatible duplicate metadata is combined structurally (#582)'
+$fixtureHome = New-TempHome
+try {
+    $settings = Join-Path $fixtureHome '.claude/settings.json'
+    Write-PreservationSettings $settings @{ hooks = @{ PreToolUse = @(
+        @{ matcher = 'Bash|PowerShell|Monitor'; customField = 'keep'; hooks = @(@{ type = 'command'; command = "& '$dcgPath'"; shell = 'powershell'; timeout = 15; future = [ordered]@{ first = $false; second = @($null, 0, @()) } }) },
+        @{ matcher = 'Bash'; hooks = @(@{ type = 'command'; command = 'dcg'; onFailure = 'block'; future = [ordered]@{ second = @($null, 0, @()); first = $false } }) },
+        @{ matcher = 'Write'; hooks = @(@{ type = 'command'; command = 'C:\old\dcg.exe'; statusMessage = 'operator'; async = $false }, @{ command = 'write-audit'; timeout = 9 }) }
+    ) } }
+    Check ((Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome) -eq 'merged') 'compatible duplicates merge despite nested object key order'
+    $parsed = Get-Content -Raw -Encoding UTF8 -LiteralPath $settings | ConvertFrom-Json
+    $entries = @($parsed.hooks.PreToolUse)
+    $hook = $entries[0].hooks[0]
+    Check ($entries.Count -eq 2 -and $entries[0].customField -ceq 'keep') 'duplicate registrations collapse and canonical metadata survives'
+    Check ($hook.timeout -eq 15 -and $hook.onFailure -ceq 'block' -and $hook.statusMessage -ceq 'operator') 'fields from every duplicate survive together'
+    Check ($hook.async -is [bool] -and -not $hook.async -and $hook.future.second.Count -eq 3) 'false and nested arrays survive duplicate consolidation'
+    Check ($entries[1].matcher -ceq 'Write' -and $entries[1].hooks[0].command -ceq 'write-audit') 'wrong-matcher sibling retains its scope'
+    $before = Get-PreservationBytes $settings
+    Check ((Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome) -eq 'already') 'merged duplicates settle after one repair'
+    Check ((Get-PreservationBytes $settings) -ceq $before) 'settled duplicate merge leaves exact bytes unchanged'
+    # Claude tool names are case-sensitive even though PowerShell -eq is not.
+    $parsed.hooks.PreToolUse[0].matcher = 'bash|powershell|monitor'
+    Write-PreservationSettings $settings $parsed
+    Check ((Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome) -eq 'merged') 'lowercase matcher with the current command still requires repair'
+    $repaired = Get-Content -Raw -Encoding UTF8 -LiteralPath $settings | ConvertFrom-Json
+    Check ($repaired.hooks.PreToolUse[0].matcher -ceq 'Bash|PowerShell|Monitor') 'repaired matcher uses the exact Claude tool-name case'
+    Check ($repaired.hooks.PreToolUse[0].hooks[0].onFailure -ceq 'block') 'case-sensitive matcher repair preserves the blocking policy'
+} finally { Remove-Item -Recurse -Force -LiteralPath $fixtureHome -ErrorAction SilentlyContinue }
+
+Write-Host 'Test 15: conflicting duplicate JSON values never replace valid settings (#582)'
+$conflicts = @(
+    @('failure policy', '"block"', '"continue"'), @('case', '"block"', '"Block"'),
+    @('numeric type', 'false', '0'), @('null', 'null', '0'), @('array shape', '[]', '{}'),
+    @('nested value', '{"policy":"Strict"}', '{"policy":"strict"}'),
+    @('property case', '{"Name":1}', '{"name":1}'), @('array order', '[1,2]', '[2,1]')
+)
+foreach ($conflict in $conflicts) {
+    $fixtureHome = New-TempHome
+    try {
+        $settings = Join-Path $fixtureHome '.claude/settings.json'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $settings) | Out-Null
+        $conflictKey = if ($conflict[0] -eq 'failure policy') { 'onFailure' } else { 'operatorField' }
+        $policy = if ($conflictKey -eq 'onFailure') { '' } else { ',"onFailure":"block"' }
+        $original = '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":[{"type":"command","command":"dcg"' + $policy + ',"' + $conflictKey + '":' + $conflict[1] + '}]},{"matcher":"Write","hooks":[{"type":"command","command":"/old/dcg","' + $conflictKey + '":' + $conflict[2] + '}]}]}}'
+        [System.IO.File]::WriteAllText($settings, $original)
+        $before = Get-PreservationBytes $settings
+        $threw = $false
+        try { Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome | Out-Null } catch { $threw = $true }
+        Check $threw "duplicate $($conflict[0]) conflict is reported"
+        Check ((Get-PreservationBytes $settings) -ceq $before) "duplicate $($conflict[0]) conflict leaves original bytes unchanged"
+    } finally { Remove-Item -Recurse -Force -LiteralPath $fixtureHome -ErrorAction SilentlyContinue }
+}
+
+Write-Host 'Test 16: malformed owned shapes remain untouched (#582)'
+foreach ($original in @(
+    '[]', '{"hooks":[]}', '{"hooks":{"PreToolUse":{}}}',
+    '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":{}}]}}',
+    '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell","hooks":42}]}}',
+    '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":null}]}}',
+    '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell","hooks":null}]}}',
+    '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg","onFailure":"block","async":"true"}]}]}}',
+    '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg","onFailure":"block","async":1}]}]}}',
+    '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg","onFailure":"block","async":null}]}]}}'
+)) {
+    $fixtureHome = New-TempHome
+    try {
+        $settings = Join-Path $fixtureHome '.claude/settings.json'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $settings) | Out-Null
+        [System.IO.File]::WriteAllText($settings, $original)
+        $before = Get-PreservationBytes $settings
+        $threw = $false
+        try { Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome | Out-Null } catch { $threw = $true }
+        Check $threw 'malformed hook shape is rejected'
+        Check ((Get-PreservationBytes $settings) -ceq $before) 'malformed hook shape is preserved byte-for-byte'
+    } finally { Remove-Item -Recurse -Force -LiteralPath $fixtureHome -ErrorAction SilentlyContinue }
+}
+
+Write-Host 'Test 17: nested operator JSON is lossless; excessive depth is rejected (#582)'
+foreach ($depth in @(35, 110)) {
+    $fixtureHome = New-TempHome
+    try {
+        $settings = Join-Path $fixtureHome '.claude/settings.json'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $settings) | Out-Null
+        $nested = ('{"child":' * $depth) + '{"policy":"Strict","values":[null,false,0,[]]}' + ('}' * $depth)
+        $original = '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg","timeout":15,"onFailure":"block","future":' + $nested + '}]}]}}'
+        [System.IO.File]::WriteAllText($settings, $original)
+        $unixPermissions = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
+        if ($unixPermissions) { & chmod 600 $settings }
+        $before = Get-PreservationBytes $settings
+        $threw = $false
+        try { $status = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome } catch { $threw = $true }
+        if ($depth -eq 35) {
+            Check (-not $threw -and $status -eq 'merged') 'operator JSON deeper than twenty levels is repaired losslessly'
+            $parsed = Get-Content -Raw -Encoding UTF8 -LiteralPath $settings | ConvertFrom-Json
+            $hook = $parsed.hooks.PreToolUse[0].hooks[0]
+            $leaf = $hook.future
+            for ($level = 0; $level -lt $depth; $level++) { $leaf = $leaf.child }
+            Check ($leaf.policy -ceq 'Strict' -and $leaf.values.Count -eq 4 -and $leaf.values[3] -is [array]) 'deepest object and array retain their exact JSON shape'
+            Check ($hook.timeout -eq 15 -and $hook.onFailure -ceq 'block') 'deep metadata repair preserves the blocking policy'
+            if ($unixPermissions) {
+                Check (([int][System.IO.File]::GetUnixFileMode($settings)) -eq 384) 'atomic replacement preserves restrictive Unix mode 0600'
+            }
+            $before = Get-PreservationBytes $settings
+            Check ((Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome) -eq 'already') 'deep preserved metadata does not cause repeated rewrites'
+            Check ((Get-PreservationBytes $settings) -ceq $before) 'deep metadata repeat is byte-identical'
+        } else {
+            Check $threw 'metadata exceeding supported serialization depth fails visibly'
+            Check ((Get-PreservationBytes $settings) -ceq $before) 'excessive depth never replaces the original valid JSON'
+        }
+    } finally { Remove-Item -Recurse -Force -LiteralPath $fixtureHome -ErrorAction SilentlyContinue }
+}
+
+Write-Host 'Test 18: async true is visibly repaired while other operator fields survive (#582)'
+$fixtureHome = New-TempHome
+try {
+    $settings = Join-Path $fixtureHome '.claude/settings.json'
+    Write-PreservationSettings $settings @{ hooks = @{ PreToolUse = @(@{ matcher = 'Bash'; hooks = @(@{ type = 'command'; command = 'dcg'; async = $true; timeout = 15; onFailure = 'block' }) }) } }
+    $messages = @(Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome 3>&1 6>&1)
+    Check (@($messages | Where-Object { "$_" -match '(?i)async|synchronous' }).Count -gt 0) 'unsafe async true repair emits a visible diagnostic'
+    $parsed = Get-Content -Raw -Encoding UTF8 -LiteralPath $settings | ConvertFrom-Json
+    $hook = $parsed.hooks.PreToolUse[0].hooks[0]
+    Check ($null -eq $hook.PSObject.Properties['async']) 'blocking hook no longer carries async true'
+    Check ($hook.timeout -eq 15 -and $hook.onFailure -ceq 'block') 'async repair retains timeout and fail-closed behavior'
+} finally { Remove-Item -Recurse -Force -LiteralPath $fixtureHome -ErrorAction SilentlyContinue }
+
+Write-Host 'Test 19: staging and atomic replacement failures preserve the old valid file (#582)'
+$savedFixtureWriter = (Get-Command Write-Utf8NoBomText).ScriptBlock
+foreach ($failureMode in @('write', 'replace', 'recover')) {
+    $fixtureHome = New-TempHome
+    try {
+        $settings = Join-Path $fixtureHome '.claude/settings.json'
+        Write-PreservationSettings $settings @{ hooks = @{ PreToolUse = @(@{ matcher = 'Bash'; hooks = @(@{ type = 'command'; command = 'dcg'; timeout = 15; onFailure = 'block' }) }) } }
+        $before = Get-PreservationBytes $settings
+        function Write-Utf8NoBomText {
+            param([string]$Path, [string]$Text)
+            if ($failureMode -eq 'write') { throw 'injected JSON staging failure' }
+            & $savedFixtureWriter -Path $Path -Text $Text
+            # Withhold only the newly staged file: the real replacement must
+            # fail on missing source, without touching the valid destination.
+            Move-Item -LiteralPath $Path -Destination ($Path + '.withheld')
+            if ($failureMode -eq 'recover') {
+                # Model native ReplaceFile moving the old destination to its
+                # backup before failing. The dynamic caller owns $backup;
+                # the fallback lets the unchanged baseline expose its loss.
+                $nativeBackup = if ($backup) { $backup } else { $settings + '.simulated-backup' }
+                Move-Item -LiteralPath $settings -Destination $nativeBackup
+            }
+        }
+        $threw = $false
+        try { Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $fixtureHome | Out-Null } catch { $threw = $true }
+        Check $threw "$failureMode failure is reported"
+        $preserved = Test-Path -LiteralPath $settings -PathType Leaf
+        Check ($preserved -and (Get-PreservationBytes $settings) -ceq $before) "$failureMode failure preserves exact previous bytes"
+        $parsed = if ($preserved) { Get-Content -Raw -Encoding UTF8 -LiteralPath $settings | ConvertFrom-Json } else { $null }
+        Check ($preserved -and $parsed.hooks.PreToolUse[0].hooks[0].onFailure -ceq 'block') "$failureMode failure retains a valid blocking hook"
+    } finally {
+        Set-Item -LiteralPath Function:Write-Utf8NoBomText -Value $savedFixtureWriter
+        Remove-Item -Recurse -Force -LiteralPath $fixtureHome -ErrorAction SilentlyContinue
+    }
 }
 
 } finally { $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
