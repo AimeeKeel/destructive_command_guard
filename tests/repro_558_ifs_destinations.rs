@@ -325,6 +325,70 @@ fn export_brace_uncertainty_keeps_native_allowlist_families_independent() {
 }
 
 #[test]
+fn split_wrapper_options_cannot_turn_apparent_readers_into_hidden_writers() {
+    for (setup, invocation) in [
+        ("N=DCG_UNUSED@tee", "env -u $N echo $S"),
+        ("N=DCG_UNUSED@tee", "env --unset=$N echo $S"),
+        ("D=1@tee", "timeout $D echo $S"),
+        ("P=0@tee", "nice -n $P echo $S"),
+        ("B=L@tee", "stdbuf -o $B echo $S"),
+        ("U=root@tee", "sudo -u $U echo $S"),
+        ("W=env", "$W tee $S"),
+        ("OPT=-p", "command $OPT tee $S"),
+        ("SETTING=DCG_X=1", "env $SETTING tee $S"),
+        ("E=; N=DCG_UNUSED", r#"$E env -u "$N" tee $S"#),
+        ("N=DCG_UNUSED", r#""env" -u "$N" tee $S"#),
+    ] {
+        for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config"] {
+            let source = format!("S={value}; IFS=@; {setup}; {invocation}");
+            // Existing launcher checks may own the denial. The native hook
+            // and CLI must not allow the command regardless of attribution.
+            assert_decision(&source, false, None);
+        }
+    }
+}
+
+#[test]
+fn single_field_wrapper_options_preserve_concrete_destination_checks() {
+    for invocation in [
+        "env -u $N tee $S",
+        r#"env -u "$N" tee $S"#,
+        r#"env --unset="$N" tee $S"#,
+        r#"timeout "$D" tee $S"#,
+        r#"nice -n "$P" tee $S"#,
+        r#"stdbuf -o "$B" tee $S"#,
+        r"\tee $S",
+    ] {
+        for (value, rule) in [
+            ("/tmp/a@/etc/shadow", "core.filesystem:credential-file-write"),
+            ("/tmp/a@.git/config", "core.filesystem:git-internals-write"),
+        ] {
+            let source = format!("N=DCG_UNUSED; D=1; P=0; B=L; S={value}; IFS=@; {invocation}");
+            assert_decision(&source, false, Some(rule));
+        }
+        let source = format!("N=DCG_UNUSED; D=1; P=0; B=L; S=/tmp/a@/tmp/b; IFS=@; {invocation}");
+        assert_decision(&source, true, None);
+    }
+}
+
+#[test]
+fn literal_command_queries_and_quoted_wrapper_operands_remain_harmless() {
+    for invocation in [
+        "command -v tee $S",
+        "command -p -V tee $S",
+        "command -pv tee $S",
+        "env -u DCG_UNUSED printf '%s' $S",
+        r#"env -u "$N" echo $S"#,
+        r#"env -u "$UNKNOWN" printf '%s' $S"#,
+        "timeout 1 printf '%s' $S",
+        "printf '%s' 'env' $S",
+    ] {
+        let source = format!("N=DCG_UNUSED@tee; S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+        assert_decision(&source, true, None);
+    }
+}
+
+#[test]
 fn background_assignment_groups_cannot_hide_inherited_native_destinations() {
     for mutation in [
         "S=/tmp/safe T=x &",

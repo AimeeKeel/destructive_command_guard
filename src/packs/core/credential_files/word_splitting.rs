@@ -497,11 +497,73 @@ fn render(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// An execution frontend left in argv0 is not evidence of a non-writer.
+/// Normalization can stop on a dynamic option even in a single wrapper, or
+/// an expansion can supply the wrapper name after normalization has run.
+fn execution_frontend(name: &str) -> bool {
+    matches!(name, "sudo" | "env" | "command" | "builtin")
+        || crate::normalize::is_posix_execution_frontend_basename(name)
+}
+
+/// A literal command -v/-V is a query, not an execution frontend. Only read
+/// options before its first operand/--, and stop at dynamic words: they can
+/// supply an operand or terminate option parsing before a later literal -v.
+/// This exempts this argv pass only, never the original command's checks.
+fn command_queries_only(arguments: &[&str]) -> bool {
+    if arguments.first().and_then(|word| literal(word)).as_deref() != Some("command") {
+        return false;
+    }
+    for raw in arguments.iter().skip(1) {
+        let Some(word) = literal(raw) else {
+            return false;
+        };
+        let Some(flags) = word.strip_prefix('-') else {
+            return false;
+        };
+        if flags.is_empty() || !flags.chars().all(|ch| matches!(ch, 'p' | 'v' | 'V')) {
+            return false;
+        }
+        if flags.contains(['v', 'V']) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Removing a wrapper prefix assumes each source word occupies one argv slot.
+/// An unquoted option value can split into extra words (or disappear), making
+/// one of those words the real executable. Check the discarded words against
+/// the caller's state before trusting the normalizer's command boundary.
+fn wrapper_prefix_preserves_fields(prefix: &str, state: &State) -> bool {
+    let tokens = crate::normalize::tokenize_for_shell_dialect(prefix, ShellDialect::Posix);
+    tokens.len() <= MAX_FIELDS
+        && tokens.iter().all(|token| {
+            if token.kind != NormalizeTokenKind::Word {
+                return false;
+            }
+            let Some(raw) = token.text(prefix) else {
+                return false;
+            };
+            // Quoted scalar pieces stay in one argument even if their
+            // values are unknown. Lists, operators and substitutions do not
+            // qualify, and an implicit empty word must not count as present.
+            scalar_word(raw, |_, quoted| quoted.then(String::new))
+                .is_some_and(|(_, present)| present)
+                || expand(raw, state).is_ok_and(|fields| fields.len() == 1)
+        })
+}
+
 fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWrite>, ()> {
     let Some(name) = argv.first() else {
         return Ok(Vec::new());
     };
     let basename = name.rsplit('/').next().unwrap_or(name);
+    // Empty unquoted leading words may disappear and expose a frontend that
+    // was not in the pre-expansion argv0 slot. Do not hand an unresolved
+    // frontend to the destination classifier as if it were the final writer.
+    if execution_frontend(basename) {
+        return Err(());
+    }
     let mut hits = Vec::new();
     if matches!(basename, "tee" | "gtee") {
         let mut append = false;
@@ -933,15 +995,47 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                     .as_deref()
                     .map(|name| name.rsplit('/').next().unwrap_or(name))
                     .is_none_or(shell::is_credential_writer);
+                let unresolved_frontend = name
+                    .as_deref()
+                    .map(|name| name.rsplit('/').next().unwrap_or(name))
+                    .is_some_and(execution_frontend)
+                    && !command_queries_only(&arguments);
+                // A stripped wrapper's dynamic next word can still belong
+                // to that wrapper: command $OPT tee ... with OPT=-p, or
+                // env $SETTING tee ... with SETTING=NAME=value. Such fields
+                // are options/assignments, not proof of a harmless argv0.
+                let generated_wrapper_control = arguments
+                    .first()
+                    .is_some_and(|word| literal(word).is_none())
+                    && name
+                        .as_deref()
+                        .is_some_and(|word| word.starts_with('-') || word.contains('='))
+                    && stripped
+                        .stripped_wrappers
+                        .iter()
+                        .any(|wrapper| matches!(wrapper.wrapper_type, "command" | "env"));
                 let active = state.changed
                     || prefix_ifs
                     || words
                         .iter()
                         .any(|word| assignment(word).is_some_and(|(name, _, _)| name == "IFS"));
                 let expands = argv_needs_field_analysis(node.clone());
-                if active && expands && stripped.wrapper_limit_reached {
+                let unstable_prefix = active
+                    && expands
+                    && stripped.stripped_wrappers.iter().any(|wrapper| {
+                        // Alias-bypass backslashes are syntax, not argv slots.
+                        wrapper.wrapper_type != "backslash"
+                            && !wrapper_prefix_preserves_fields(&wrapper.stripped_text, &state)
+                    });
+                if active
+                    && expands
+                    && (stripped.wrapper_limit_reached
+                        || unresolved_frontend
+                        || generated_wrapper_control
+                        || unstable_prefix)
+                {
                     // The remaining argv0 may be another execution wrapper,
-                    // not the eventual utility. A bounded normalization stop
+                    // not the eventual utility. An incomplete normalization
                     // cannot prove that this is a non-writer, nor can passing
                     // its incomplete argv to the path classifier prove safety.
                     // Preserve both native rule families and keep processing
@@ -1034,6 +1128,155 @@ pub(super) fn candidate(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_query_proof_requires_literal_options_before_operands() {
+        for (words, expected) in [
+            (vec!["command", "-v", "$S"], true),
+            (vec!["command", "-V", "$S"], true),
+            (vec!["command", "-p", "'-v'", "$S"], true),
+            (vec!["c'om'mand", "-pV", "$S"], true),
+            (vec!["command", "-vp", "$S"], true),
+            (vec!["command", "--", "-v", "$S"], false),
+            (vec!["command", "$OPT", "-v", "$S"], false),
+            (vec!["command", "tee", "-v", "$S"], false),
+            (vec!["command", "-p", "tee", "$S"], false),
+            (vec!["command", "-", "-v", "$S"], false),
+            (vec!["command", "-xv", "$S"], false),
+            (vec!["$TOOL", "-v", "$S"], false),
+            (vec!["env", "-v", "$S"], false),
+        ] {
+            assert_eq!(command_queries_only(&words), expected, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn short_unresolved_frontends_cannot_hide_split_destinations() {
+        for (setup, invocation) in [
+            ("N=DCG_UNUSED@tee", "env -u $N echo $S"),
+            ("N=DCG_UNUSED@tee", "env --unset=$N echo $S"),
+            ("N=", "env -u $N tee $S"),
+            ("D=1@tee", "timeout $D echo $S"),
+            ("P=0@tee", "nice -n $P echo $S"),
+            ("B=L@tee", "stdbuf -o $B echo $S"),
+            ("U=root@tee", "sudo -u $U echo $S"),
+            ("W=env", "$W tee $S"),
+            ("OPT=-p", "command $OPT tee $S"),
+            ("SETTING=DCG_X=1", "env $SETTING tee $S"),
+            ("E=; N=DCG_UNUSED", r#"$E env -u "$N" tee $S"#),
+            ("N=DCG_UNUSED", r#""env" -u "$N" tee $S"#),
+            ("W=env", "command $W tee $S"),
+            ("N=DCG_UNUSED@tee", "/usr/bin/env -u $N echo $S"),
+            ("OPT=-p", "builtin command $OPT tee $S"),
+        ] {
+            let normalized = strip_wrapper_prefixes(invocation);
+            assert!(!normalized.wrapper_limit_reached);
+            if invocation.ends_with("echo $S") {
+                assert_eq!(normalized.normalized.as_ref(), "echo $S", "{invocation}");
+            }
+            for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config"] {
+                let source = format!("S={value}; IFS=@; {setup}; {invocation}");
+                let ast = AstGrep::try_new(source.as_str(), SupportLang::Bash).unwrap();
+                assert!(!ast.root().get_inner_node().has_error(), "{source}");
+                let start = source.rfind("; ").unwrap() + 2;
+                let hits = scan(&source, ShellDialect::Posix);
+                for rule in [
+                    shell::CREDENTIAL_FILE_WRITE_NAME,
+                    shell::GIT_INTERNALS_WRITE_NAME,
+                ] {
+                    assert!(
+                        hits.iter().any(|hit| hit.rule == rule
+                            && hit.reason == UNCERTAIN
+                            && hit.span == (start..source.len())),
+                        "incomplete frontend proof cannot waive {rule}: {source}: {hits:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_frontend_options_and_command_queries_keep_their_roles() {
+        for invocation in [
+            "command -v tee $S",
+            "command -p -V tee $S",
+            "command -pv tee $S",
+            "command -- printf '%s' $S",
+            "env -u DCG_UNUSED printf '%s' $S",
+            "timeout 1 printf '%s' $S",
+            "nice -n 0 printf '%s' $S",
+            "printf '%s' 'env' $S",
+            r#"env -u "$UNKNOWN" printf '%s' $S"#,
+        ] {
+            let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+        for prefix in ["env -u DCG_UNUSED ", "timeout 1 ", "nice -n 0 "] {
+            for (value, rule) in [
+                ("/tmp/a@/etc/shadow", shell::CREDENTIAL_FILE_WRITE_NAME),
+                ("/tmp/a@.git/config", shell::GIT_INTERNALS_WRITE_NAME),
+            ] {
+                let source = format!("S={value}; IFS=@; {prefix}tee $S");
+                assert!(
+                    scan(&source, ShellDialect::Posix)
+                        .iter()
+                        .any(|hit| hit.rule == rule && hit.reason != UNCERTAIN),
+                    "{source}"
+                );
+            }
+            let source = format!("S=/tmp/a@/tmp/b; IFS=@; {prefix}tee $S");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+        for invocation in [
+            "env -u $N tee $S",
+            r#"env -u "$N" tee $S"#,
+            r#"env --unset="$N" tee $S"#,
+            r#"env -u "$UNKNOWN" tee $S"#,
+            r#"timeout "$D" tee $S"#,
+            r#"nice -n "$P" tee $S"#,
+            r#"stdbuf -o "$B" tee $S"#,
+            r"\tee $S",
+        ] {
+            let source = format!("N=DCG_UNUSED; D=1; P=0; B=L; S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+            assert!(
+                scan(&source, ShellDialect::Posix).iter().any(|hit| {
+                    hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME && hit.reason != UNCERTAIN
+                }),
+                "{source}"
+            );
+        }
+        // Quoting the option value prevents an extra command word, even
+        // when that value contains IFS separators or cannot be resolved.
+        let source = r#"N=DCG_UNUSED@tee; S=/tmp/a@/etc/shadow; IFS=@; env -u "$N" echo $S"#;
+        assert!(scan(source, ShellDialect::Posix).is_empty());
+    }
+
+    #[test]
+    fn discarded_wrapper_words_need_single_field_proofs() {
+        let mut state = State::default();
+        state.assign("IFS=@", true);
+        state.assign("N=DCG_UNUSED@tee", true);
+        state.assign("E=", true);
+        for prefix in ["env -u $N", "env --unset=$N", "env -u $E", "env -u *"] {
+            assert!(!wrapper_prefix_preserves_fields(prefix, &state), "{prefix}");
+        }
+        for prefix in [
+            r#"env -u "$N""#,
+            r#"env -u "$UNKNOWN""#,
+            r#"env --unset="$UNKNOWN""#,
+            "env -u DCG_UNUSED",
+            "command -p",
+            "env -u '$N'",
+        ] {
+            assert!(wrapper_prefix_preserves_fields(prefix, &state), "{prefix}");
+        }
+        state.assign("N=DCG_UNUSED", true);
+        assert!(wrapper_prefix_preserves_fields("env -u $N", &state));
+        assert!(!wrapper_prefix_preserves_fields(
+            &"command ".repeat(MAX_FIELDS + 1),
+            &state
+        ));
+    }
 
     #[test]
     fn wrapper_exhaustion_cannot_skip_ifs_destination_analysis() {
