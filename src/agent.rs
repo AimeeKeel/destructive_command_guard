@@ -44,6 +44,8 @@
 //! - Muse Code (Meta): runs hooks in a cleared environment, so `dcg install
 //!   --muse` writes the explicit `--agent muse` flag into the hook command
 //!   (#572). It is deliberately not inferred from a parent process name.
+//! - Amp: the generated plugin (`dcg install --amp`) passes `--agent amp`
+//!   (#577). No process name is consulted (`amp` is also an editor's name).
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
 //! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
@@ -142,6 +144,10 @@ pub enum Agent {
     /// `"exec_command"`) to the hook. Muse clears the hook environment, so the
     /// installer writes `--agent muse` into the hook command (#572).
     Muse,
+    /// Amp (<https://ampcode.com>). Guarded through a dcg-generated plugin
+    /// (`dcg install --amp`) whose `tool.call` handler runs `dcg --agent amp`
+    /// for every shell command (#577).
+    Amp,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -174,6 +180,7 @@ impl Agent {
             Self::Crush => "crush",
             Self::Reasonix => "reasonix",
             Self::Muse => "muse",
+            Self::Amp => "amp",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -202,6 +209,7 @@ impl Agent {
                 | Self::Crush
                 | Self::Reasonix
                 | Self::Muse
+                | Self::Amp
         )
     }
 
@@ -229,6 +237,7 @@ impl Agent {
     /// - `"crush"`, `"charm-crush"` -> `Crush`
     /// - `"reasonix"`, `"deepseek-reasonix"` -> `Reasonix`
     /// - `"muse"`, `"muse-code"` -> `Muse`
+    /// - `"amp"`, `"ampcode"` -> `Amp`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -253,6 +262,7 @@ impl Agent {
             "crush" | "charmcrush" | "crushcli" => Self::Crush,
             "reasonix" | "deepseekreasonix" => Self::Reasonix,
             "muse" | "musecode" | "metamuse" => Self::Muse,
+            "amp" | "ampcode" => Self::Amp,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -280,6 +290,7 @@ impl fmt::Display for Agent {
             Self::Crush => write!(f, "Crush"),
             Self::Reasonix => write!(f, "Reasonix"),
             Self::Muse => write!(f, "Muse Code"),
+            Self::Amp => write!(f, "Amp"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -1758,6 +1769,23 @@ mod env_tests {
         );
         assert_eq!(agent_from_process_name("muse"), None);
         assert_eq!(agent_from_process_name("/home/u/.local/bin/muse"), None);
+    }
+
+    /// #577: dcg's Amp plugin passes `--agent amp`, which selects `[agents.amp]`.
+    #[test]
+    fn test_amp_identity_mappings() {
+        assert_eq!(Agent::Amp.config_key(), "amp");
+        assert!(Agent::Amp.is_known());
+        for name in ["amp", "Amp", "ampcode", "AMP"] {
+            assert_eq!(Agent::from_name(name), Agent::Amp, "{name}");
+        }
+        assert_eq!(format!("{}", Agent::Amp), "Amp");
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "amp"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Amp
+        );
+        assert_eq!(agent_from_process_name("amp"), None);
     }
 
     #[test]

@@ -312,8 +312,8 @@ pub enum Command {
     },
 
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, `--reasonix`, or
-    /// `--muse`)
+    /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, `--reasonix`,
+    /// `--muse`, or `--amp`)
     ///
     /// Claude user settings honor CLAUDE_CONFIG_DIR when non-empty, otherwise
     /// ~/.claude/settings.json is used.
@@ -333,7 +333,10 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush", "reasonix", "muse"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["agy", "opencode", "omp", "crush", "reasonix", "muse", "amp"]
+        )]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -341,7 +344,10 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush", "reasonix", "muse"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "opencode", "omp", "crush", "reasonix", "muse", "amp"]
+        )]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -351,7 +357,10 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush", "reasonix", "muse"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "omp", "crush", "reasonix", "muse", "amp"]
+        )]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -360,7 +369,10 @@ pub enum Command {
         /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
         /// extension discovery is cwd-only and does not walk Git ancestors.
         /// Every OMP bash tool call is routed through dcg before execution.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush", "reasonix", "muse"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "crush", "reasonix", "muse", "amp"]
+        )]
         omp: bool,
 
         /// Install the dcg PreToolUse hook for Charm Crush by merging a
@@ -369,7 +381,10 @@ pub enum Command {
         /// and `CRUSH_GLOBAL_CONFIG`) or the repo's `crush.json` (with
         /// `--project`). Crush pipes every bash tool call to dcg's stdin and
         /// blocks the call when dcg answers `{"decision":"deny"}`.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "reasonix", "muse"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "reasonix", "muse", "amp"]
+        )]
         crush: bool,
 
         /// Install the dcg PreToolUse hook for Reasonix by merging a
@@ -379,7 +394,10 @@ pub enum Command {
         /// `.reasonix/settings.json` (with `--project`). Reasonix pipes every
         /// shell tool call to dcg's stdin and blocks it when dcg exits 2.
         /// Restart Reasonix afterwards: hooks load when a session is built.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "muse"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "muse", "amp"]
+        )]
         reasonix: bool,
 
         /// Install the dcg PreToolUse hook for Muse Code (Meta) by merging a
@@ -391,9 +409,22 @@ pub enum Command {
         /// Start a new Muse session afterwards: hooks load at session start.
         #[arg(
             long,
-            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "reasonix", "project"]
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "reasonix", "project", "amp"]
         )]
         muse: bool,
+
+        /// Install a native Amp plugin at
+        /// `${XDG_CONFIG_HOME:-~/.config}/amp/plugins/dcg-guard.js` (a system
+        /// plugin, covering every project) or `<repo>/.amp/plugins/dcg-guard.js`
+        /// (with `--project`). Its `tool.call` handler runs every Amp shell
+        /// command through `dcg --agent amp` and rejects the call on a deny,
+        /// on a declined review, and whenever dcg gives no verdict. Reload
+        /// Amp's plugins afterwards (#577).
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "reasonix", "muse"]
+        )]
+        amp: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -417,7 +448,7 @@ pub enum Command {
     },
 
     /// Remove the hook from Claude Code settings (or from Crush with `--crush`,
-    /// Reasonix with `--reasonix`, Muse Code with `--muse`)
+    /// Reasonix with `--reasonix`, Muse Code with `--muse`, Amp with `--amp`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
@@ -426,19 +457,25 @@ pub enum Command {
 
         /// Remove the dcg hook entry from `~/.config/crush/crush.json` instead
         /// of Claude Code settings
-        #[arg(long, conflicts_with_all = ["purge", "reasonix", "muse"])]
+        #[arg(long, conflicts_with_all = ["purge", "reasonix", "muse", "amp"])]
         crush: bool,
 
         /// Remove the dcg hook entry from `<Reasonix home>/settings.json`
         /// instead of Claude Code settings
-        #[arg(long, conflicts_with_all = ["purge", "muse"])]
+        #[arg(long, conflicts_with_all = ["purge", "muse", "amp"])]
         reasonix: bool,
 
         /// Remove dcg's hook from Muse Code's
         /// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json` instead of
         /// Claude Code settings
-        #[arg(long, conflicts_with = "purge")]
+        #[arg(long, conflicts_with_all = ["purge", "amp"])]
         muse: bool,
+
+        /// Remove the user-level Amp plugin dcg wrote
+        /// (`${XDG_CONFIG_HOME:-~/.config}/amp/plugins/dcg-guard.js`) instead
+        /// of touching Claude Code settings; a file dcg did not write is kept
+        #[arg(long, conflicts_with = "purge")]
+        amp: bool,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -2533,8 +2570,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             crush,
             reasonix,
             muse,
+            amp,
         }) => {
-            if muse {
+            if amp {
+                install_amp_plugin(force, project)?;
+            } else if muse {
                 install_muse_hook(force)?;
             } else if grok {
                 install_grok_hook(force, project)?;
@@ -2564,8 +2604,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             crush,
             reasonix,
             muse,
+            amp,
         }) => {
-            if muse {
+            if amp {
+                uninstall_amp_plugin()?;
+            } else if muse {
                 uninstall_muse_hook()?;
             } else if crush {
                 uninstall_crush_hook()?;
@@ -11420,6 +11463,44 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
+    // Check 3b1d: Amp plugin registration (#577). Amp runs no hooks; its
+    // plugin is the only guard. `collect_doctor_report` carries the same
+    // check (id `amp_plugin`).
+    if amp_appears_in_use() {
+        print!("Checking Amp plugin registration... ");
+        let plugin_path = amp_system_plugin_path();
+        match probe_amp_plugin(&plugin_path) {
+            AmpPluginProbe::Current => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", plugin_path.display());
+            }
+            probe @ (AmpPluginProbe::OwnedStale | AmpPluginProbe::MissingOrUnowned) => {
+                if probe == AmpPluginProbe::OwnedStale {
+                    println!("{}", "STALE".yellow());
+                    println!(
+                        "  {} is dcg-owned but differs from what this dcg writes",
+                        plugin_path.display()
+                    );
+                } else {
+                    println!("{}", "NOT INSTALLED".yellow());
+                }
+                issues += 1;
+                if fix {
+                    println!("  Attempting install...");
+                    if install_amp_plugin_at(&plugin_path, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!("  → Run 'dcg install --amp' to write the plugin");
+                    println!("    (Amp shell commands are NOT guarded until it is installed)");
+                }
+            }
+        }
+    }
+
     // Check 3b2: Codex hook registration AND enablement (#368). Codex loads
     // PreToolUse hooks from ~/.codex/hooks.json but only RUNS a hook the user
     // has approved: a `[hooks.state."<file>:pre_tool_use:<i>:<j>"]` entry in
@@ -12966,6 +13047,59 @@ fn collect_doctor_report(
             message,
             remediation,
             fixed: muse_fixed,
+        });
+    }
+
+    // Amp plugin registration (#577). Mirrored in `doctor_pretty`.
+    if amp_appears_in_use() {
+        let mut amp_fixed = false;
+        let plugin_path = amp_system_plugin_path();
+        let probe = probe_amp_plugin(&plugin_path);
+        let (status, message, remediation) = if probe == AmpPluginProbe::Current {
+            (
+                DoctorCheckStatus::Ok,
+                format!("Amp dcg plugin found at {}", plugin_path.display()),
+                None,
+            )
+        } else {
+            issues += 1;
+            if fix && install_amp_plugin_at(&plugin_path, false).is_ok() {
+                fixed += 1;
+                amp_fixed = true;
+                (
+                    DoctorCheckStatus::Ok,
+                    format!("Wrote Amp dcg plugin at {}", plugin_path.display()),
+                    None,
+                )
+            } else if probe == AmpPluginProbe::OwnedStale {
+                (
+                    DoctorCheckStatus::Warning,
+                    format!(
+                        "Amp plugin at {} is dcg-owned but differs from what this dcg writes \
+                         (edited, or written by another dcg version)",
+                        plugin_path.display()
+                    ),
+                    Some("Run 'dcg install --amp'".to_string()),
+                )
+            } else {
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "Amp is in use but {} is not dcg's plugin — its shell commands are \
+                         not guarded",
+                        plugin_path.display()
+                    ),
+                    Some("Run 'dcg install --amp'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "amp_plugin",
+            name: "Amp plugin registration",
+            status,
+            message,
+            remediation,
+            fixed: amp_fixed,
         });
     }
 
@@ -15356,6 +15490,439 @@ fn probe_muse_user_settings() -> Result<MuseHookProbe, String> {
 /// `muse` executable is on `PATH`.
 fn muse_appears_in_use() -> bool {
     muse_config_dir().is_dir() || which_executable("muse").is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Amp (ampcode.com) plugin (#577)
+// ---------------------------------------------------------------------------
+//
+// Amp does not ask before running tools; its documented way to control tool
+// use is a plugin (https://ampcode.com/docs/tools, "Permissions"). Amp loads
+// system plugins from `$XDG_CONFIG_HOME/amp/plugins/` (else
+// `~/.config/amp/plugins/`, `%USERPROFILE%\.config\amp\plugins\` on Windows)
+// and project plugins from `<project root>/.amp/plugins/`, runs them with
+// Bun, and calls each plugin's `tool.call` handler before a tool runs; a
+// `reject-and-continue` result blocks the call and shows its message to the
+// agent (https://ampcode.com/docs/customize/plugins,
+// https://ampcode.com/docs/plugin-api). Amp's older `amp.permissions`
+// delegate helper is no longer in its settings schema, so the plugin is the
+// integration point.
+
+/// Ownership marker embedded in the generated Amp plugin (#577). The installer
+/// refuses to overwrite a plugin file without it, and the uninstaller removes
+/// only a file that carries it.
+pub(crate) const AMP_PLUGIN_MARKER: &str = "dcg-amp-plugin";
+
+/// The plugin's file name in an Amp plugin directory.
+const AMP_PLUGIN_FILE_NAME: &str = "dcg-guard.js";
+
+/// Placeholder in [`AMP_PLUGIN_TEMPLATE`] for the dcg path, written as a JSON
+/// string literal (also a JavaScript one; the plugin spawns dcg without a
+/// shell).
+const AMP_PLUGIN_DCG_BIN_PLACEHOLDER: &str = "@DCG_BIN@";
+
+/// The generated Amp plugin. Its handler never throws: Amp does not document
+/// what a throwing `tool.call` handler means, so every path, including a dcg
+/// that gives no verdict, returns `allow` or `reject-and-continue`, and every
+/// failure rejects unless `DCG_BRIDGE_CRASH_DECISION=allow`.
+const AMP_PLUGIN_TEMPLATE: &str = r#"// dcg-amp-plugin: generated by `dcg install --amp`; do not edit.
+// Routes Amp shell tool calls through dcg (Destructive Command Guard) before
+// they run. Remove with `dcg uninstall --amp`.
+// Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+//
+// Amp calls a plugin's `tool.call` handler before every tool call and blocks
+// the call when the handler returns `reject-and-continue`
+// (https://ampcode.com/docs/plugin-api). Amp does not document what a
+// throwing handler means, so this handler never throws: every path, including
+// a dcg that fails, returns a verdict, and a failure blocks.
+import { spawnSync } from "node:child_process";
+import { statSync } from "node:fs";
+
+export const description = "dcg (Destructive Command Guard): checks every shell command with dcg before Amp runs it, and blocks destructive ones.";
+
+const DCG_BIN = @DCG_BIN@;
+
+// Amp's shell tools; `shellCommandFromToolCall` recognizes "a Bash or
+// shell_command tool call". The names are checked too, so a missing or
+// failing helper cannot turn a shell call into an unchecked one.
+const SHELL_TOOLS = new Set(["Bash", "shell_command"]);
+
+const ALLOW = { action: "allow" };
+
+function reject(message) {
+  return { action: "reject-and-continue", message };
+}
+
+function log(amp, message) {
+  try {
+    amp.logger.log(message);
+  } catch {
+    try {
+      console.error(message);
+    } catch {}
+  }
+}
+
+// dcg's own boolean spelling for environment flags.
+function envFlag(name) {
+  const value = process.env[name];
+  return typeof value === "string" && ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
+}
+
+// dcg could not give a verdict: it could not be started, was killed (a
+// signal, or this plugin's timeout), exited non-zero, or printed something
+// that is not a verdict. That is not an allow. Block, unless the operator
+// opted out with DCG_BRIDGE_CRASH_DECISION=allow.
+function noVerdict(amp, detail) {
+  const setting = process.env.DCG_BRIDGE_CRASH_DECISION;
+  if (typeof setting === "string" && setting.trim().toLowerCase() === "allow") {
+    log(amp, `[dcg] Amp guard got no verdict from dcg (${detail}); allowed because DCG_BRIDGE_CRASH_DECISION=allow`);
+    return ALLOW;
+  }
+  log(amp, `[dcg] Amp guard got no verdict from dcg (${detail}); blocking`);
+  return reject(`Blocked by dcg: the command could not be verified because dcg gave no verdict (${detail}). Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`);
+}
+
+function isDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// The shell call in `event`, or null when the tool is not a shell tool.
+// Every command-bearing string is collected: the helper's command and the
+// raw `cmd` / `command` inputs, so one cannot hide another.
+function shellCall(amp, event) {
+  const tool = typeof event?.tool === "string" ? event.tool : "";
+  const input = event?.input !== null && typeof event?.input === "object" ? event.input : {};
+  let shell = SHELL_TOOLS.has(tool);
+  const commands = [];
+  let dir;
+  let helped = null;
+  try {
+    helped = amp?.helpers?.shellCommandFromToolCall?.(event) ?? null;
+  } catch (err) {
+    log(amp, `[dcg] shellCommandFromToolCall failed for ${JSON.stringify(tool)}: ${err}`);
+  }
+  if (helped !== null && typeof helped === "object") {
+    shell = true;
+    if (typeof helped.command === "string" && helped.command.length > 0) commands.push(helped.command);
+    if (typeof helped.dir === "string" && helped.dir.length > 0) dir = helped.dir;
+  }
+  for (const key of ["cmd", "command"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.length > 0 && !commands.includes(value)) commands.push(value);
+  }
+  if (!shell && commands.length > 0) {
+    log(amp, `[dcg] Unrecognized command-bearing Amp tool ${JSON.stringify(tool)}; checking its command instead of skipping protection`);
+    shell = true;
+  }
+  if (!shell) return null;
+  if (dir === undefined && typeof input.cwd === "string" && input.cwd.length > 0) dir = input.cwd;
+  return { tool, commands, dir };
+}
+
+// The tool name dcg judges the command under. On macOS/Linux Amp's shell is
+// POSIX. On Windows the shell behind the tool is not documented, so the
+// generic `shell` name makes dcg evaluate the command under every dialect.
+const DCG_TOOL_NAME = process.platform === "win32" ? "shell" : "Bash";
+
+// Ask dcg about one command. Returns { verdict: "allow" | "deny" | "ask",
+// reason } or { failure } when dcg gave no verdict.
+function askDcg(command, dir) {
+  const options = {
+    input: JSON.stringify({ tool_name: DCG_TOOL_NAME, tool_input: { command }, dcg_explicit_verdict: true }),
+    encoding: "utf8",
+    env: { ...process.env },
+    timeout: 10000,
+    maxBuffer: 4 * 1024 * 1024,
+  };
+  if (dir !== undefined && isDirectory(dir)) options.cwd = dir;
+  let result;
+  try {
+    result = spawnSync(process.env.DCG_BIN || DCG_BIN, ["--agent", "amp"], options);
+  } catch (err) {
+    return { failure: `dcg could not be started: ${err}` };
+  }
+  if (!result) return { failure: "dcg could not be started: no result" };
+  // Never started: Node reports status null, Bun leaves it undefined.
+  if (result.error && result.status == null && !result.signal) {
+    return { failure: `dcg could not be started: ${result.error}` };
+  }
+
+  const text = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  let decision = null;
+  if (text) {
+    try {
+      decision = JSON.parse(text);
+    } catch {
+      decision = null;
+    }
+  }
+  const specific = decision !== null && typeof decision === "object" ? decision.hookSpecificOutput : undefined;
+  const verdict = specific !== null && typeof specific === "object" ? specific.permissionDecision : undefined;
+  // A blocking verdict stands whatever happened to the process afterwards.
+  if (verdict === "deny" || verdict === "ask") {
+    const reason = typeof specific.permissionDecisionReason === "string" && specific.permissionDecisionReason.length > 0
+      ? specific.permissionDecisionReason
+      : "Blocked by dcg";
+    return { verdict, reason };
+  }
+
+  const stderr = typeof result.stderr === "string" ? result.stderr.trim().slice(-500) : "";
+  const tail = stderr ? `: ${stderr}` : "";
+  if (result.signal) {
+    const timedOut = result.error && result.error.code === "ETIMEDOUT" ? ", timed out" : "";
+    return { failure: `dcg was killed by ${result.signal}${timedOut}${tail}` };
+  }
+  if (result.status !== 0) return { failure: `dcg exited ${result.status}${tail}` };
+  if (!text) return { failure: `dcg exited 0 with nothing on stdout${tail}` };
+  if (decision !== null && typeof decision === "object" && decision.dcg_verdict === "allow") return { verdict: "allow" };
+  return { failure: "dcg stdout was not a verdict" };
+}
+
+// dcg asked for review: Amp's confirmation dialog is that review. A dialog
+// that cannot be shown (no UI, e.g. `amp -x`) or is dismissed is a refusal.
+async function review(ctx, command, reason) {
+  let confirmed = false;
+  try {
+    confirmed = await ctx.ui.confirm({
+      title: "dcg: review this command",
+      message: `${command}\n\n${reason}`,
+      confirmButtonText: "Run",
+    });
+  } catch (err) {
+    return reject(`${reason}\n(dcg asked for review and no one could answer: ${err?.message ?? err})`);
+  }
+  return confirmed === true ? ALLOW : reject(`${reason}\n(declined in review)`);
+}
+
+async function guard(amp, event, ctx) {
+  // dcg's escape hatch: dcg itself exits before reading its input.
+  if (envFlag("DCG_BYPASS")) return ALLOW;
+  const call = shellCall(amp, event);
+  if (call === null) return ALLOW;
+  if (call.commands.length === 0) {
+    return reject(`Blocked by dcg: this Amp ${call.tool || "shell"} call carries no command string dcg can read, so it was not verified. Check Amp/dcg compatibility.`);
+  }
+  let pending = null;
+  for (const command of call.commands) {
+    const answer = askDcg(command, call.dir);
+    if (answer.failure !== undefined) {
+      const outcome = noVerdict(amp, answer.failure);
+      if (outcome.action !== "allow") return outcome;
+      continue;
+    }
+    if (answer.verdict === "deny") return reject(answer.reason);
+    if (answer.verdict === "ask" && pending === null) pending = { command, reason: answer.reason };
+  }
+  return pending === null ? ALLOW : review(ctx, pending.command, pending.reason);
+}
+
+export default function (amp) {
+  // Fail to load, visibly, rather than load without a guard.
+  if (typeof amp?.on !== "function") {
+    throw new Error("[dcg] Incompatible Amp plugin API (no amp.on); shell command protection could not be activated.");
+  }
+  amp.on("tool.call", async (event, ctx) => {
+    try {
+      return await guard(amp, event, ctx);
+    } catch (err) {
+      return noVerdict(amp, `the dcg Amp plugin failed: ${err}`);
+    }
+  });
+}
+"#;
+
+/// Amp's system plugin path: `$XDG_CONFIG_HOME/amp/plugins/dcg-guard.js` when
+/// `XDG_CONFIG_HOME` is set, else `~/.config/amp/plugins/dcg-guard.js` on
+/// every platform (Amp documents `%USERPROFILE%\.config\amp\plugins` on
+/// Windows).
+fn amp_system_plugin_path() -> std::path::PathBuf {
+    amp_system_plugin_path_for(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        &crate::config::home_dir().unwrap_or_default(),
+    )
+}
+
+fn amp_system_plugin_path_for(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    xdg_config_home
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join(".config"), std::path::PathBuf::from)
+        .join("amp")
+        .join("plugins")
+        .join(AMP_PLUGIN_FILE_NAME)
+}
+
+/// Amp's project plugin path: `<repo root>/.amp/plugins/dcg-guard.js`.
+fn project_amp_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    Ok(repo_root
+        .join(".amp")
+        .join("plugins")
+        .join(AMP_PLUGIN_FILE_NAME))
+}
+
+/// The plugin source for `executable`.
+fn build_amp_plugin_source(executable: &std::path::Path) -> std::io::Result<String> {
+    let path_literal = executable_javascript_literal(executable)?;
+    Ok(AMP_PLUGIN_TEMPLATE.replacen(AMP_PLUGIN_DCG_BIN_PLACEHOLDER, &path_literal, 1))
+}
+
+/// Fidelity of an installed Amp plugin against what this dcg would write.
+#[derive(Debug, PartialEq, Eq)]
+enum AmpPluginProbe {
+    /// No file, unreadable, or not dcg-owned (no marker).
+    MissingOrUnowned,
+    /// dcg-owned and byte-identical to the canonical source for the dcg path
+    /// the plugin itself embeds.
+    Current,
+    /// dcg-owned but different: edited, stubbed, or written by another dcg
+    /// version.
+    OwnedStale,
+}
+
+/// Compare an installed Amp plugin with the canonical source, rebuilt around
+/// the dcg path the plugin embeds (so a plugin installed from another dcg
+/// location is not flagged for the path alone).
+fn probe_amp_plugin(path: &std::path::Path) -> AmpPluginProbe {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return AmpPluginProbe::MissingOrUnowned;
+    };
+    if !content.contains(AMP_PLUGIN_MARKER) {
+        return AmpPluginProbe::MissingOrUnowned;
+    }
+    let embedded_path = content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("const DCG_BIN = ")
+            .and_then(|rest| rest.strip_suffix(';'))
+            .and_then(|literal| serde_json::from_str::<String>(literal).ok())
+    });
+    match embedded_path {
+        Some(dcg_path) => match build_amp_plugin_source(std::path::Path::new(&dcg_path)) {
+            Ok(canonical) if canonical == content => AmpPluginProbe::Current,
+            _ => AmpPluginProbe::OwnedStale,
+        },
+        None => AmpPluginProbe::OwnedStale,
+    }
+}
+
+/// Write dcg's plugin to `path` without printing (shared by `dcg install
+/// --amp` and `dcg doctor --fix`). Returns `Ok(true)` when the file was
+/// written: always with `force`, otherwise only when it was missing or
+/// differed. A file without dcg's marker is never overwritten.
+fn install_amp_plugin_at(
+    path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let source = build_amp_plugin_source(&current_dcg_executable()?)?;
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            if !existing.contains(AMP_PLUGIN_MARKER) {
+                return Err(format!(
+                    "{} exists but was not generated by dcg (missing the '{AMP_PLUGIN_MARKER}' \
+                     marker). Refusing to overwrite a user-owned plugin — move it aside or merge \
+                     the dcg guard into it manually.",
+                    path.display()
+                )
+                .into());
+            }
+            if existing == source && !force {
+                return Ok(false);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("cannot read {}: {error}", path.display()).into());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_settings_atomic(path, &source)?;
+    Ok(true)
+}
+
+/// Install the native Amp plugin (#577).
+fn install_amp_plugin(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = if project {
+        project_amp_plugin_path()?
+    } else {
+        amp_system_plugin_path()
+    };
+    if !install_amp_plugin_at(&path, force)? {
+        println!("{}", "Plugin already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+    let level = if project { "project" } else { "user" };
+    println!("{}", "Amp plugin installed successfully!".green().bold());
+    println!("Plugin written ({level}): {}", path.display());
+    println!();
+    println!(
+        "{}",
+        "Reload Amp's plugins (Ctrl+O, then `plugins: reload`) or restart Amp; \
+         `amp plugins list` shows whether it loaded."
+            .yellow()
+    );
+    Ok(())
+}
+
+/// Remove the user-level Amp plugin, but only a file dcg wrote (#577).
+fn uninstall_amp_plugin() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = amp_system_plugin_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "{} {}",
+                "No dcg Amp plugin found at".yellow(),
+                path.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display()).into()),
+    };
+    if !content.contains(AMP_PLUGIN_MARKER) {
+        return Err(format!(
+            "{} was not generated by dcg (missing the '{AMP_PLUGIN_MARKER}' marker); \
+             leaving it in place",
+            path.display()
+        )
+        .into());
+    }
+    std::fs::remove_file(&path)?;
+    println!("{}", "Amp plugin removed successfully!".green().bold());
+    println!("Removed: {}", path.display());
+    if let Ok(project_path) = project_amp_plugin_path() {
+        if project_path.is_file() {
+            println!(
+                "A project copy remains at {}; delete it there if you no longer want it.",
+                project_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether Amp is plausibly in use: its config directory exists or an `amp`
+/// executable is on `PATH`.
+fn amp_appears_in_use() -> bool {
+    amp_system_plugin_path()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .is_some_and(std::path::Path::is_dir)
+        || which_executable("amp").is_some()
 }
 
 /// Ownership marker embedded in the generated OpenCode plugin (#318).
@@ -23617,6 +24184,60 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         assert_eq!(unversioned["model"], "m");
     }
 
+    // ---- #577: Amp plugin --------------------------------------------------
+
+    #[test]
+    fn amp_plugin_path_follows_xdg_config_home() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            amp_system_plugin_path_for(None, home),
+            std::path::PathBuf::from("/home/u/.config/amp/plugins/dcg-guard.js")
+        );
+        assert_eq!(
+            amp_system_plugin_path_for(Some(std::ffi::OsStr::new("")), home),
+            std::path::PathBuf::from("/home/u/.config/amp/plugins/dcg-guard.js"),
+            "an empty XDG_CONFIG_HOME is unset"
+        );
+        assert_eq!(
+            amp_system_plugin_path_for(Some(std::ffi::OsStr::new("/xdg")), home),
+            std::path::PathBuf::from("/xdg/amp/plugins/dcg-guard.js")
+        );
+    }
+
+    #[test]
+    fn amp_plugin_source_embeds_the_dcg_path_once_and_probes_current() {
+        let exe = std::path::Path::new("/opt/my \"tools\"/dcg");
+        let source = build_amp_plugin_source(exe).unwrap();
+        assert!(source.starts_with(&format!("// {AMP_PLUGIN_MARKER}:")));
+        assert!(!source.contains(AMP_PLUGIN_DCG_BIN_PLACEHOLDER));
+        assert_eq!(
+            source.matches("const DCG_BIN = ").count(),
+            1,
+            "exactly one embedded path"
+        );
+        assert!(source.contains(r#"const DCG_BIN = "/opt/my \"tools\"/dcg";"#));
+        assert!(source.contains("amp.on(\"tool.call\""));
+        let description = source
+            .lines()
+            .find_map(|line| line.strip_prefix("export const description = \""))
+            .and_then(|rest| rest.strip_suffix("\";"))
+            .expect("a one-line static description");
+        assert!(
+            description.chars().count() <= 300,
+            "Amp ignores longer descriptions"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dcg-guard.js");
+        assert_eq!(probe_amp_plugin(&path), AmpPluginProbe::MissingOrUnowned);
+        std::fs::write(&path, &source).unwrap();
+        assert_eq!(probe_amp_plugin(&path), AmpPluginProbe::Current);
+        std::fs::write(&path, source.replace("timeout: 10000", "timeout: 1")).unwrap();
+        assert_eq!(probe_amp_plugin(&path), AmpPluginProbe::OwnedStale);
+        std::fs::write(&path, "export default function (amp) {}\n").unwrap();
+        assert_eq!(probe_amp_plugin(&path), AmpPluginProbe::MissingOrUnowned);
+    }
+
     #[test]
     fn install_into_settings_creates_structure() {
         let mut settings = serde_json::json!({});
@@ -24572,6 +25193,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24599,6 +25221,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(force);
@@ -24626,6 +25249,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24653,6 +25277,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24680,6 +25305,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24707,6 +25333,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24734,6 +25361,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24761,6 +25389,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(force);
@@ -24788,6 +25417,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(force);
@@ -24815,6 +25445,7 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix: _,
             muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(force);
@@ -24898,17 +25529,63 @@ if ($errors.Count -ne 0) {
             crush,
             reasonix,
             muse,
+            amp,
         }) = cli.command
         {
             assert!(muse);
-            assert!(!purge && !crush && !reasonix);
+            assert!(!purge && !crush && !reasonix && !amp);
         } else {
             unreachable!("Expected Uninstall command");
         }
-        for other in ["--purge", "--crush", "--reasonix"] {
+        for other in ["--purge", "--crush", "--reasonix", "--amp"] {
             assert!(
                 Cli::try_parse_from(["dcg", "uninstall", "--muse", other]).is_err(),
                 "uninstall --muse must reject {other}"
+            );
+        }
+    }
+
+    /// #577: `--amp` parses on install (with or without `--project`) and on
+    /// uninstall, and conflicts with every other target.
+    #[test]
+    fn test_cli_parse_install_and_uninstall_amp() {
+        let cli = Cli::parse_from(["dcg", "install", "--amp", "--project", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            amp,
+            muse,
+            ..
+        }) = cli.command
+        {
+            assert!(force && project && amp && !muse);
+        } else {
+            unreachable!("Expected Install command");
+        }
+        for other in [
+            "--grok",
+            "--agy",
+            "--opencode",
+            "--omp",
+            "--crush",
+            "--reasonix",
+            "--muse",
+        ] {
+            assert!(
+                Cli::try_parse_from(["dcg", "install", "--amp", other]).is_err(),
+                "install --amp must reject {other}"
+            );
+        }
+        let cli = Cli::parse_from(["dcg", "uninstall", "--amp"]);
+        if let Some(Command::Uninstall { amp, purge, .. }) = cli.command {
+            assert!(amp && !purge);
+        } else {
+            unreachable!("Expected Uninstall command");
+        }
+        for other in ["--purge", "--crush", "--reasonix", "--muse"] {
+            assert!(
+                Cli::try_parse_from(["dcg", "uninstall", "--amp", other]).is_err(),
+                "uninstall --amp must reject {other}"
             );
         }
     }
