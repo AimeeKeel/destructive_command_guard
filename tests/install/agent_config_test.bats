@@ -1185,6 +1185,458 @@ EOF
 }
 
 # ============================================================================
+# Shared Gemini, Codex, and Posit Assistant Hook Policy Regressions
+# ============================================================================
+
+setup_json_policy_host() {
+    JSON_POLICY_HOST="$1"
+    case "$JSON_POLICY_HOST" in
+        gemini)
+            JSON_POLICY_SETTINGS="$HOME/.gemini/settings.json"
+            JSON_POLICY_EVENT="BeforeTool"
+            JSON_POLICY_MATCHER="run_shell_command"
+            ;;
+        codex)
+            JSON_POLICY_SETTINGS="$HOME/.codex/hooks.json"
+            JSON_POLICY_EVENT="PreToolUse"
+            JSON_POLICY_MATCHER="Bash"
+            ;;
+        posit)
+            JSON_POLICY_SETTINGS="$HOME/.posit/assistant/settings.json"
+            JSON_POLICY_EVENT="PreToolUse"
+            JSON_POLICY_MATCHER="bash|powershell"
+            ;;
+    esac
+    if [ -n "${2:-}" ]; then
+        JSON_POLICY_SETTINGS="${JSON_POLICY_SETTINGS%.json}-$2.json"
+    fi
+    mkdir -p "$(dirname "$JSON_POLICY_SETTINGS")"
+    case "$JSON_POLICY_HOST" in
+        gemini) GEMINI_SETTINGS="$JSON_POLICY_SETTINGS" ;;
+        codex) CODEX_SETTINGS="$JSON_POLICY_SETTINGS" ;;
+        posit) POSIT_ASSISTANT_SETTINGS="$JSON_POLICY_SETTINGS" ;;
+    esac
+}
+
+configure_json_policy_host() {
+    AUTO_CONFIGURED=0
+    JSON_POLICY_RETURN=0
+    case "$JSON_POLICY_HOST" in
+        gemini)
+            configure_gemini "$JSON_POLICY_SETTINGS" || JSON_POLICY_RETURN=$?
+            JSON_POLICY_STATUS="$GEMINI_STATUS"
+            JSON_POLICY_BACKUP="${GEMINI_BACKUP:-}"
+            JSON_POLICY_FAILURE_REASON="${GEMINI_FAILURE_REASON:-}"
+            ;;
+        codex)
+            configure_codex || JSON_POLICY_RETURN=$?
+            JSON_POLICY_STATUS="$CODEX_STATUS"
+            JSON_POLICY_BACKUP="${CODEX_BACKUP:-}"
+            JSON_POLICY_FAILURE_REASON="${CODEX_FAILURE_REASON:-}"
+            ;;
+        posit)
+            configure_posit_assistant || JSON_POLICY_RETURN=$?
+            JSON_POLICY_STATUS="$POSIT_ASSISTANT_STATUS"
+            JSON_POLICY_BACKUP="${POSIT_ASSISTANT_BACKUP:-}"
+            JSON_POLICY_FAILURE_REASON="${POSIT_ASSISTANT_FAILURE_REASON:-}"
+            ;;
+    esac
+    log_test "$JSON_POLICY_HOST: status=$JSON_POLICY_STATUS rc=$JSON_POLICY_RETURN reason=$JSON_POLICY_FAILURE_REASON"
+}
+
+write_json_policy_fixture() {
+    python3 - "$JSON_POLICY_SETTINGS" "$JSON_POLICY_EVENT" "$JSON_POLICY_MATCHER" "$JSON_POLICY_HOST" <<'PY'
+import json
+import sys
+
+path, event, matcher, host = sys.argv[1:]
+guard = {
+    "type": "prompt", "command": "'/retired installation/dcg.exe'", "shell": "powershell",
+    "timeout": 15, "onFailure": "block", "statusMessage": "operator guard", "async": False,
+    "futureField": {"enabled": False, "count": 0, "optional": None, "labels": ["one", "two"]},
+}
+if host == "gemini":
+    guard["name"] = "operator guard"
+canonical = {
+    "matcher": matcher, "label": "canonical metadata",
+    "hooks": [{"type": "command", "command": "shell-audit", "timeout": 7}, guard],
+}
+if host == "gemini":
+    canonical["sequential"] = True
+settings = {
+    "theme": "dark",
+    "hooks": {
+        event: [
+            {"matcher": "read", "label": "unrelated scope", "hooks": [
+                {"type": "command", "command": "/opt/dcgrep/bin/scan", "timeout": 3}
+            ]},
+            canonical,
+            {"matcher": "never", "hooks": []},
+        ],
+        "AfterTool" if host == "gemini" else "PostToolUse": [
+            {"matcher": matcher, "hooks": [{"type": "command", "command": "/other-event/dcg"}]}
+        ],
+    },
+}
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PY
+    chmod 600 "$JSON_POLICY_SETTINGS"
+}
+
+assert_json_policy_fixture() {
+    python3 - "$JSON_POLICY_SETTINGS" "$1" "$2" "$JSON_POLICY_EVENT" <<'PY'
+import json
+import os
+import shlex
+import stat
+import sys
+
+path, original, executable, event = sys.argv[1:]
+with open(path) as f:
+    actual = json.load(f)
+with open(original) as f:
+    expected = json.load(f)
+canonical = expected["hooks"][event].pop(1)
+guard = canonical["hooks"].pop(1)
+command = actual["hooks"][event][0]["hooks"][0]["command"]
+assert shlex.split(command) == [executable], command
+guard.update(type="command", command=command)
+guard.pop("shell")
+canonical["hooks"].insert(0, guard)
+expected["hooks"][event].insert(0, canonical)
+assert actual == expected, actual
+assert actual["hooks"][event][0]["hooks"][0]["onFailure"] == "block"
+assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+PY
+}
+
+@test "JSON hook policy: easy-mode repairs all three hosts and retains fail-closed settings across updates" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    make_claude_installer_artifact
+    local host pass
+    for host in gemini codex posit; do
+        setup_json_policy_host "$host"
+        write_json_policy_fixture
+        cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-original.json"
+    done
+
+    for pass in repair forced installed; do
+        case "$pass" in
+            repair) run_claude_fixture_installer --easy-mode ;;
+            forced) run_claude_fixture_installer --easy-mode --force ;;
+            installed) run_claude_fixture_installer --easy-mode --artifact-url "file://$TEST_TMPDIR/not-an-artifact" ;;
+        esac
+        [ "$status" -eq 0 ]
+        for host in gemini codex posit; do
+            setup_json_policy_host "$host"
+            assert_json_policy_fixture "$TEST_TMPDIR/$host-original.json" "$HOME/.local/bin/dcg"
+            if [ "$pass" = repair ]; then
+                cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-repaired.json"
+            else
+                cmp -s "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-repaired.json"
+            fi
+        done
+    done
+}
+
+@test "JSON hook policy: repair preserves operator fields group metadata and unrelated scope" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    local host
+    for host in gemini codex posit; do
+        setup_json_policy_host "$host"
+        write_json_policy_fixture
+        cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-original.json"
+        configure_json_policy_host
+        [ "$JSON_POLICY_STATUS" = merged ]
+        [ "$AUTO_CONFIGURED" -eq 1 ]
+        assert_json_policy_fixture "$TEST_TMPDIR/$host-original.json" "$DEST/dcg"
+        [ -f "$JSON_POLICY_BACKUP" ]
+        cmp -s "$JSON_POLICY_BACKUP" "$TEST_TMPDIR/$host-original.json"
+        cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-repaired.json"
+        configure_json_policy_host
+        [ "$JSON_POLICY_STATUS" = already ]
+        [ -z "$JSON_POLICY_BACKUP" ]
+        cmp -s "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-repaired.json"
+    done
+}
+
+@test "JSON hook policy: compatible global duplicates retain scope and later Gemini sequential ordering" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    local host order
+    for host in gemini codex posit; do
+        setup_json_policy_host "$host"
+        for order in forward reverse; do
+            python3 - "$JSON_POLICY_SETTINGS" "$JSON_POLICY_EVENT" "$JSON_POLICY_MATCHER" "$host" "$DEST/dcg" "$order" <<'PY'
+import json
+import sys
+
+path, event, matcher, host, executable, order = sys.argv[1:]
+command = '"' + executable + '"' if host == "posit" else executable
+canonical = {"matcher": matcher, "label": "keep canonical", "hooks": [
+    {"type": "command", "command": command, "futureField": {"enabled": False}},
+    {"type": "command", "command": "canonical-audit"},
+]}
+legacy = {"matcher": "legacy", "label": "keep legacy", "hooks": [
+    {"type": "command", "command": "/retired/dcg", "timeout": 15, "onFailure": "block"},
+    {"type": "command", "command": "legacy-audit"},
+]}
+duplicate = {"matcher": "old-shell", "hooks": [
+    {"type": "command", "command": "'/old installation/dcg.exe'", "statusMessage": "operator guard",
+     "futureField": {"enabled": False}},
+]}
+if host == "gemini":
+    canonical["sequential"] = False
+    duplicate["sequential"] = True
+sources = [legacy, duplicate] if order == "forward" else [duplicate, legacy]
+with open(path, "w") as f:
+    json.dump({"hooks": {event: [canonical] + sources}}, f)
+PY
+            configure_json_policy_host
+            [ "$JSON_POLICY_STATUS" = merged ]
+            python3 - "$JSON_POLICY_SETTINGS" "$JSON_POLICY_EVENT" "$JSON_POLICY_MATCHER" "$host" "$DEST/dcg" <<'PY'
+import json
+import shlex
+import sys
+
+path, event, matcher, host, executable = sys.argv[1:]
+with open(path) as f:
+    entries = json.load(f)["hooks"][event]
+guard = entries[0]["hooks"][0]
+assert shlex.split(guard["command"]) == [executable]
+expected_guard = {
+    "type": "command", "command": guard["command"], "timeout": 15, "onFailure": "block",
+    "statusMessage": "operator guard", "futureField": {"enabled": False},
+}
+if host == "gemini":
+    expected_guard["name"] = "dcg"
+canonical = {"matcher": matcher, "label": "keep canonical", "hooks": [
+    expected_guard, {"type": "command", "command": "canonical-audit"},
+]}
+if host == "gemini":
+    canonical["sequential"] = True
+assert entries == [canonical, {"matcher": "legacy", "label": "keep legacy", "hooks": [
+    {"type": "command", "command": "legacy-audit"},
+]}], entries
+PY
+            cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-repaired.json"
+            configure_json_policy_host
+            [ "$JSON_POLICY_STATUS" = already ]
+            cmp -s "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-repaired.json"
+        done
+    done
+}
+
+@test "JSON hook policy: conflicting duplicate policies refuse repair without changing bytes" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    local host conflict
+    for host in gemini codex posit; do
+        setup_json_policy_host "$host"
+        for conflict in onFailure timeout typed-value; do
+            python3 - "$JSON_POLICY_SETTINGS" "$JSON_POLICY_EVENT" "$JSON_POLICY_MATCHER" "$host" "$DEST/dcg" "$conflict" <<'PY'
+import json
+import sys
+
+path, event, matcher, host, executable, conflict = sys.argv[1:]
+first = {"type": "command", "command": '"' + executable + '"' if host == "posit" else executable,
+         "timeout": 15, "onFailure": "block", "futureField": {"enabled": False}}
+second = dict(first, command="/old/dcg")
+if conflict == "onFailure":
+    second["onFailure"] = "continue"
+elif conflict == "timeout":
+    second["timeout"] = 30
+else:
+    second["futureField"] = {"enabled": 0}
+with open(path, "w") as f:
+    json.dump({"hooks": {event: [
+        {"matcher": matcher, "hooks": [first]},
+        {"matcher": "legacy", "hooks": [second]},
+    ]}}, f)
+    f.write("\n")
+PY
+            cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-conflict.json"
+            configure_json_policy_host
+            [ "$JSON_POLICY_STATUS" = failed ]
+            [ "$AUTO_CONFIGURED" -eq 0 ]
+            [ -n "$JSON_POLICY_FAILURE_REASON" ]
+            cmp -s "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-conflict.json"
+        done
+    done
+}
+
+@test "JSON hook policy: strict parsing rejects ambiguous JSON and malformed groups unchanged" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    local host malformed
+    for host in gemini codex posit; do
+        setup_json_policy_host "$host"
+        for malformed in duplicate-key nonfinite invalid-utf8 malformed-group; do
+            python3 - "$JSON_POLICY_SETTINGS" "$JSON_POLICY_EVENT" "$JSON_POLICY_MATCHER" "$host" "$DEST/dcg" "$malformed" <<'PY'
+import json
+import sys
+
+path, event, matcher, host, executable, malformed = sys.argv[1:]
+guard = {"type": "command", "command": '"' + executable + '"' if host == "posit" else executable,
+         "timeout": 15, "onFailure": "block"}
+entries = [{"matcher": matcher, "hooks": [guard]}]
+if malformed == "malformed-group":
+    entries.append({"matcher": "legacy", "hooks": None})
+if malformed == "nonfinite":
+    guard["futureField"] = float("nan")
+raw = json.dumps({"hooks": {event: entries}})
+if malformed == "duplicate-key":
+    raw = raw.replace('"onFailure": "block"', '"onFailure": "block", "onFailure": "continue"')
+with open(path, "wb") as f:
+    f.write(raw.encode("utf-8"))
+    if malformed == "invalid-utf8":
+        f.write(b"\xff")
+PY
+            cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-malformed.json"
+            configure_json_policy_host
+            [ "$JSON_POLICY_STATUS" = failed ]
+            [ "$AUTO_CONFIGURED" -eq 0 ]
+            [ -n "$JSON_POLICY_FAILURE_REASON" ]
+            cmp -s "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-malformed.json"
+        done
+    done
+}
+
+@test "JSON hook policy: atomic repair preserves managed symlinks file permissions and backup bytes" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    local host target
+    for host in gemini codex posit; do
+        setup_json_policy_host "$host"
+        write_json_policy_fixture
+        target="$TEST_TMPDIR/$host-managed.json"
+        mv "$JSON_POLICY_SETTINGS" "$target"
+        ln -s "$target" "$JSON_POLICY_SETTINGS"
+        cp "$target" "$TEST_TMPDIR/$host-original.json"
+        configure_json_policy_host
+        [ "$JSON_POLICY_STATUS" = merged ]
+        [ -L "$JSON_POLICY_SETTINGS" ]
+        [ "$(readlink "$JSON_POLICY_SETTINGS")" = "$target" ]
+        assert_json_policy_fixture "$TEST_TMPDIR/$host-original.json" "$DEST/dcg"
+        [ -f "$JSON_POLICY_BACKUP" ]
+        cmp -s "$JSON_POLICY_BACKUP" "$TEST_TMPDIR/$host-original.json"
+        cp "$target" "$TEST_TMPDIR/$host-repaired.json"
+        configure_json_policy_host
+        [ "$JSON_POLICY_STATUS" = already ]
+        [ -L "$JSON_POLICY_SETTINGS" ]
+        cmp -s "$target" "$TEST_TMPDIR/$host-repaired.json"
+    done
+}
+
+@test "JSON hook policy: read and publication failures retain the previous valid file" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    export DCG_TEST_REAL_PYTHON
+    DCG_TEST_REAL_PYTHON="$(command -v python3)"
+    cat > "$TEST_TMPDIR/bin/python3" <<'EOF'
+#!/bin/bash
+exec "$DCG_TEST_REAL_PYTHON" -c '
+import builtins
+import os
+import sys
+sys.argv = sys.argv[1:]
+failure = os.environ.get("DCG_TEST_SETTINGS_FAILURE")
+if failure == "read":
+    real_open = builtins.open
+    def fail_read(path, mode="r", *args, **kwargs):
+        if not isinstance(path, int) and os.path.realpath(path) == os.environ["DCG_TEST_SETTINGS_TARGET"] and "r" in mode:
+            raise OSError("injected settings read failure")
+        return real_open(path, mode, *args, **kwargs)
+    builtins.open = fail_read
+elif failure == "publication":
+    def fail_replace(*args, **kwargs):
+        raise OSError("injected settings publication failure")
+    os.replace = fail_replace
+exec(compile(sys.stdin.read(), "<installer-config>", "exec"))
+' "$@"
+EOF
+    chmod +x "$TEST_TMPDIR/bin/python3"
+    hash -r
+    export DCG_TEST_SETTINGS_FAILURE DCG_TEST_SETTINGS_TARGET
+    local host failure
+    for host in gemini codex posit; do
+        DCG_TEST_SETTINGS_FAILURE=""
+        setup_json_policy_host "$host"
+        write_json_policy_fixture
+        DCG_TEST_SETTINGS_TARGET="$TEST_TMPDIR/$host-managed.json"
+        mv "$JSON_POLICY_SETTINGS" "$DCG_TEST_SETTINGS_TARGET"
+        ln -s "$DCG_TEST_SETTINGS_TARGET" "$JSON_POLICY_SETTINGS"
+        cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-original.json"
+        for failure in read publication; do
+            DCG_TEST_SETTINGS_FAILURE="$failure"
+            configure_json_policy_host
+            [ "$JSON_POLICY_STATUS" = failed ]
+            [ "$AUTO_CONFIGURED" -eq 0 ]
+            [ -n "$JSON_POLICY_FAILURE_REASON" ]
+            [ -L "$JSON_POLICY_SETTINGS" ]
+            [ "$(readlink "$JSON_POLICY_SETTINGS")" = "$DCG_TEST_SETTINGS_TARGET" ]
+            cmp -s "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-original.json"
+            "$DCG_TEST_REAL_PYTHON" - "$JSON_POLICY_SETTINGS" <<'PY'
+import os
+import stat
+import sys
+assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600
+PY
+        done
+    done
+}
+
+@test "JSON hook policy: fresh and repaired commands safely quote unusual installation paths" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    local original_dest="$DEST"
+    DEST="$TEST_TMPDIR/install with 'single' \"double\" and \$(touch escaped-command)"
+    mkdir -p "$DEST"
+    cp "$original_dest/dcg" "$DEST/dcg"
+    local host fixture
+    for host in gemini codex posit; do
+        for fixture in fresh repair; do
+            setup_json_policy_host "$host" "$fixture"
+            if [ "$fixture" = repair ]; then
+                write_json_policy_fixture
+            fi
+            configure_json_policy_host
+            if [ "$fixture" = fresh ]; then
+                [ "$JSON_POLICY_STATUS" = created ]
+            else
+                [ "$JSON_POLICY_STATUS" = merged ]
+            fi
+            python3 - "$JSON_POLICY_SETTINGS" "$JSON_POLICY_EVENT" "$JSON_POLICY_MATCHER" "$host" "$DEST/dcg" "$fixture" <<'PY'
+import json
+import subprocess
+import sys
+
+path, event, matcher, host, executable, fixture = sys.argv[1:]
+with open(path) as f:
+    entry = json.load(f)["hooks"][event][0]
+assert entry["matcher"] == matcher
+guard = entry["hooks"][0]
+# Ask the host shell to expand the generated command as arguments. Unlike
+# Python's shlex, this correctly interprets Posit's escaped dollar signs.
+arguments = subprocess.run(
+    ["/bin/sh", "-c", r"printf '%s\0' " + guard["command"]], check=True, capture_output=True
+)
+assert arguments.stdout == executable.encode() + b"\0", arguments.stdout
+result = subprocess.run(["/bin/sh", "-c", guard["command"]], check=True, capture_output=True, text=True)
+assert result.stdout == "dcg 1.0.0\n", result
+if fixture == "repair":
+    assert guard["timeout"] == 15 and guard["onFailure"] == "block", guard
+elif host == "gemini":
+    assert guard["timeout"] == 5000 and guard["name"] == "dcg", guard
+elif host == "posit":
+    assert guard["timeout"] == 10, guard
+PY
+            [ ! -e "$TEST_WORKDIR/escaped-command" ]
+            cp "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-$fixture-repaired.json"
+            configure_json_policy_host
+            [ "$JSON_POLICY_STATUS" = already ]
+            cmp -s "$JSON_POLICY_SETTINGS" "$TEST_TMPDIR/$host-$fixture-repaired.json"
+        done
+    done
+}
+
+# ============================================================================
 # Gemini CLI Configuration Tests
 # ============================================================================
 
