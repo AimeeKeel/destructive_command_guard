@@ -939,7 +939,15 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                         .iter()
                         .any(|word| assignment(word).is_some_and(|(name, _, _)| name == "IFS"));
                 let expands = argv_needs_field_analysis(node.clone());
-                if active && writer && expands {
+                if active && expands && stripped.wrapper_limit_reached {
+                    // The remaining argv0 may be another execution wrapper,
+                    // not the eventual utility. A bounded normalization stop
+                    // cannot prove that this is a non-writer, nor can passing
+                    // its incomplete argv to the path classifier prove safety.
+                    // Preserve both native rule families and keep processing
+                    // this command's state effects below.
+                    hits.extend(uncertain(span.clone()));
+                } else if active && writer && expands {
                     // Temporary prefixes do not supply this invocation's argv.
                     let mut argv = Vec::new();
                     let mut complete = true;
@@ -1026,6 +1034,61 @@ pub(super) fn candidate(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapper_exhaustion_cannot_skip_ifs_destination_analysis() {
+        for wrapper in ["command ", "command -p ", "env "] {
+            for depth in [33, 64, 96] {
+                let invocation = format!("{}tee $S", wrapper.repeat(depth));
+                assert!(strip_wrapper_prefixes(&invocation).wrapper_limit_reached);
+                for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config", "/tmp/safe"] {
+                    let source = format!("S={value}; IFS=@; {invocation}");
+                    let start = source.rfind("; ").unwrap() + 2;
+                    let hits = scan(&source, ShellDialect::Posix);
+                    for rule in [
+                        shell::CREDENTIAL_FILE_WRITE_NAME,
+                        shell::GIT_INTERNALS_WRITE_NAME,
+                    ] {
+                        assert!(
+                            hits.iter().any(|hit| hit.rule == rule
+                                && hit.reason == UNCERTAIN
+                                && hit.span == (start..source.len())),
+                            "unresolved wrapper cannot exempt either family: {source}: {hits:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_wrappers_keep_concrete_findings_and_harmless_controls() {
+        for wrapper in ["command ", "command -p ", "env "] {
+            for depth in [1, 8, 31] {
+                let prefix = wrapper.repeat(depth);
+                assert!(!strip_wrapper_prefixes(&format!("{prefix}tee $S")).wrapper_limit_reached);
+                for (value, rule) in [
+                    ("/tmp/a@/etc/shadow", shell::CREDENTIAL_FILE_WRITE_NAME),
+                    ("/tmp/a@.git/config", shell::GIT_INTERNALS_WRITE_NAME),
+                ] {
+                    let source = format!("S={value}; IFS=@; {prefix}tee $S");
+                    let hits = scan(&source, ShellDialect::Posix);
+                    assert!(hits.iter().any(|hit| hit.rule == rule && hit.reason != UNCERTAIN));
+                }
+                for invocation in ["tee $S", "printf '%s' $S", "tee \"$S\""] {
+                    let source = format!("S=/tmp/a@/tmp/b; IFS=@; {prefix}{invocation}");
+                    assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+                }
+            }
+        }
+        // No field expansion means this pass has no additional argv to check.
+        // Do not turn literal data or quoted scalars into a splitting hazard.
+        let prefix = "command ".repeat(64);
+        for invocation in ["tee /tmp/safe", "tee '$S'", "tee \"$S\""] {
+            let source = format!("S=/tmp/a@/tmp/b; IFS=@; {prefix}{invocation}");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+    }
 
     #[test]
     fn declaration_braces_preserve_quote_and_escape_provenance() {
