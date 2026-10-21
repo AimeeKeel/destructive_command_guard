@@ -325,6 +325,72 @@ fn export_brace_uncertainty_keeps_native_allowlist_families_independent() {
 }
 
 #[test]
+fn continued_names_cannot_hide_split_destinations_from_native_cli_and_hook() {
+    for (target, rule) in [
+        ("/etc/shadow", "core.filesystem:credential-file-write"),
+        (".git/config", "core.filesystem:git-internals-write"),
+    ] {
+        for (ifs, binding, read) in [
+            ("I\\\nFS=@", "TARGET", "$TARGET"),
+            ("IF\\\nS=@", "TARGET", "$TARGET"),
+            ("I\\\nF\\\nS=@", "TARGET", "$TARGET"),
+            ("IFS=@", "TA\\\nRGET", "$TARGET"),
+            ("IFS=@", "TARGET", "$TA\\\nRGET"),
+            ("IFS=@", "TARGET", "${TA\\\nRGET}"),
+        ] {
+            let source = format!("TA=/tmp/safe; {binding}=/tmp/a@{target}; {ifs}; tee {read}");
+            assert_decision(&source, false, Some(rule));
+        }
+    }
+    assert_decision(
+        "NA=DCG_UNUSED; NAME=DCG_UNUSED@tee; S=/tmp/a@/etc/shadow; IFS=@; env -u $NA\\\nME echo $S",
+        false,
+        None,
+    );
+}
+
+#[test]
+fn continued_source_keeps_quoted_data_and_benign_shell_constructs_allowed() {
+    for source in [
+        "TARGET=/tmp/a@/tmp/b; I\\\nFS=@; tee $TARGET",
+        "TARGET=/tmp/a@/etc/shadow; I\\\nFS=; tee $TARGET",
+        "TARGET=/tmp/a@/etc/shadow; I\\\nFS=@; tee \"$TARGET\"",
+        "TA=/tmp/safe; TARGET=/etc/shadow; IFS=@; tee \"$TA\"\\\nRGET",
+        "IFS=@; printf '%s' '$TA\\\nRGET'",
+        "I\\\nFS= read -r line",
+        "TA\\\nRGET=/tmp/safe",
+        "IFS=@; S='a\\\nb'; tee \"$S\"",
+        "NA=DCG_UNUSED; NAME=DCG_UNUSED@tee; S=/tmp/a@/etc/shadow; IFS=@; env -u \"$NA\\\nME\" echo $S",
+    ] {
+        assert_decision(source, true, None);
+    }
+}
+
+#[test]
+fn continued_names_keep_each_split_destination_rule_independently_protected() {
+    for (grant, control, remaining) in [
+        (
+            "core.filesystem:credential-file-write",
+            "tee /etc/shadow",
+            "core.filesystem:git-internals-write",
+        ),
+        (
+            "core.filesystem:git-internals-write",
+            "tee .git/config",
+            "core.filesystem:credential-file-write",
+        ),
+    ] {
+        assert_allowed_by_grant(control, grant);
+        for source in [
+            "TA=/tmp/safe; TARGET=/tmp/a@/etc/shadow@.git/config; IFS=@; tee $TA\\\nRGET",
+            "TARGET=/tmp/a@/etc/shadow@.git/config; I\\\nFS=@; tee $TARGET",
+        ] {
+            assert_decision_with_grant(source, false, Some(remaining), Some(grant));
+        }
+    }
+}
+
+#[test]
 fn split_wrapper_options_cannot_turn_apparent_readers_into_hidden_writers() {
     for (setup, invocation) in [
         ("N=DCG_UNUSED@tee", "env -u $N echo $S"),

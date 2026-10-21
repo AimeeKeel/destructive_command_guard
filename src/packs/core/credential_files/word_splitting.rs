@@ -7,6 +7,7 @@ use super::{CredentialFileWrite, shell};
 use crate::normalize::{NormalizeTokenKind, ShellDialect, strip_wrapper_prefixes};
 use ast_grep_core::{AstGrep, Node, tree_sitter::StrDoc};
 use ast_grep_language::SupportLang;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -43,6 +44,8 @@ impl State {
     }
 
     fn assign(&mut self, raw: &str, certain: bool) {
+        let continued = source_word_without_continuations(raw);
+        let raw = continued.as_ref();
         let Some((name, append, rhs)) = assignment(raw) else {
             self.forget();
             return;
@@ -118,6 +121,50 @@ fn assignment(raw: &str) -> Option<(&str, bool, &str)> {
     let (left, rhs) = raw.split_once('=')?;
     let name = left.strip_suffix('+').unwrap_or(left);
     identifier(name).then_some((name, left != name, rhs))
+}
+
+/// Shell line continuation happens before variable names are recognized:
+/// `$TA\` + newline + `RGET` reads TARGET, not TA followed by literal RGET.
+/// Only normalize source words, never values obtained from the environment
+/// model. Keep single-quoted data and escaped backslashes intact, and retain
+/// quotes/other escapes for the ordinary decoder. Unsupported substitutions
+/// remain unsupported; this is not a command or expanded-data reparsing step.
+fn source_word_without_continuations(raw: &str) -> Cow<'_, str> {
+    if !raw.contains("\\\n") {
+        return Cow::Borrowed(raw);
+    }
+    let mut result = String::with_capacity(raw.len());
+    let mut quote = None;
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => {
+                quote = None;
+                result.push(ch);
+            }
+            (Some('\''), _) => result.push(ch),
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                result.push(ch);
+            }
+            (_, '\\') => {
+                let next = chars.next();
+                if next == Some('\n') {
+                    continue;
+                }
+                result.push(ch);
+                if let Some(next) = next {
+                    result.push(next);
+                }
+            }
+            _ => result.push(ch),
+        }
+    }
+    if result.len() == raw.len() {
+        Cow::Borrowed(raw)
+    } else {
+        Cow::Owned(result)
+    }
 }
 
 /// A complete scalar expansion only; mixed words, arrays, parameter operators
@@ -339,6 +386,8 @@ fn fields<'a>(value: &'a str, ifs: &str) -> Result<Vec<&'a str>, ()> {
 }
 
 fn expand(raw: &str, state: &State) -> Result<Vec<String>, ()> {
+    let continued = source_word_without_continuations(raw);
+    let raw = continued.as_ref();
     if let Some((name, quoted)) = scalar(raw) {
         let value = state.value(name).ok_or(())?;
         if quoted {
@@ -389,6 +438,8 @@ fn scalar_word(
     if raw.len() > MAX_VALUE_BYTES || raw.contains('\0') {
         return None;
     }
+    let continued = source_word_without_continuations(raw);
+    let raw = continued.as_ref();
     let mut result = String::new();
     let mut present = false;
     let mut quote = None;
@@ -1108,11 +1159,14 @@ pub(super) fn candidate(command: &str) -> bool {
         return true;
     }
     // Declaration builtins also accept quote-removed names: export I'F'S=@.
-    // Ignore quote/escape characters only for this lexical superset; the AST
-    // analyzer still treats an unmodeled declaration as unknown state.
+    // Continuations can split IFS itself. Ignore these bytes only for this
+    // lexical superset; the original source and offsets still reach the AST.
+    // Quoted data may select the pass, but cannot establish a shell binding.
     let mut prefix = 0;
     for ch in command
-        .chars()
+        .split("\\\n")
+        .flat_map(|part| part.split("\\\r\n"))
+        .flat_map(str::chars)
         .filter(|ch| !matches!(*ch, '\'' | '"' | '\\'))
     {
         prefix = match (prefix, ch) {
@@ -1128,6 +1182,129 @@ pub(super) fn candidate(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_continuations_preserve_single_quotes_and_escaped_backslashes() {
+        for (raw, expected) in [
+            ("I\\\nFS=@", "IFS=@"),
+            ("$TA\\\nRGET", "$TARGET"),
+            ("${TA\\\nRGET}", "${TARGET}"),
+            ("\"$TA\\\nRGET\"", "\"$TARGET\""),
+            ("'$TA\\\nRGET'", "'$TA\\\nRGET'"),
+            ("\\$TA\\\nRGET", "\\$TARGET"),
+            ("\"$TA\"\\\nRGET", "\"$TA\"RGET"),
+            ("$TA\\\\\nRGET", "$TA\\\\\nRGET"),
+            ("S='a\\\nb'", "S='a\\\nb'"),
+            ("S=\"a\\\nb\"", "S=\"ab\""),
+            ("S='x'\\\n'y'", "S='x''y'"),
+            ("S=trailing\\", "S=trailing\\"),
+        ] {
+            assert_eq!(source_word_without_continuations(raw), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn continued_names_are_recognized_before_assignment_and_field_expansion() {
+        let mut state = State::default();
+        state.assign("TA=/tmp/safe", true);
+        state.assign("TA\\\nRGET=/tmp/a@/etc/shadow", true);
+        state.assign("I\\\nF\\\nS=@", true);
+        for raw in ["$TA\\\nRGET", "${TA\\\nRGET}"] {
+            assert_eq!(expand(raw, &state).unwrap(), ["/tmp/a", "/etc/shadow"]);
+        }
+        assert_eq!(
+            expand("\"$TA\\\nRGET\"", &state).unwrap(),
+            ["/tmp/a@/etc/shadow"]
+        );
+        assert_eq!(expand("\"$TA\"\\\nRGET", &state).unwrap(), ["/tmp/safeRGET"]);
+        state.assign("COPY=$TA\\\nRGET", true);
+        assert_eq!(state.value("COPY"), Some("/tmp/a@/etc/shadow"));
+        state.assign("TA\\\nRGET+=@.git/config", true);
+        assert_eq!(
+            expand("$TA\\\nRGET", &state).unwrap(),
+            ["/tmp/a", "/etc/shadow", ".git/config"]
+        );
+        // A continuation-shaped sequence inside a VALUE is data. It must
+        // not be removed after expansion or copied into executable syntax.
+        state.assign("VALUE='a\\\nb'", true);
+        assert_eq!(expand("\"$VALUE\"", &state).unwrap(), ["a\\\nb"]);
+        assert_eq!(expand("$VALUE", &state).unwrap(), ["a\\\nb"]);
+    }
+
+    #[test]
+    fn candidate_gate_sees_continued_ifs_without_joining_ordinary_lines() {
+        for source in [
+            "I\\\nFS=@; tee $TARGET",
+            "IF\\\nS=@; tee $TARGET",
+            "I\\\nF\\\nS=@; tee $TARGET",
+            "export I\\\nFS=@; tee $TARGET",
+            "I\\\r\nFS=@; tee $TARGET",
+            "export I'F'S=@; tee $TARGET",
+        ] {
+            assert!(candidate(source), "{source:?}");
+        }
+        for source in [
+            "I\nFS=@; echo $TARGET",
+            "IF\nS=@; echo $TARGET",
+            "I FS=@; echo $TARGET",
+            "IFS=@",
+            "tee /tmp/safe",
+        ] {
+            assert!(!candidate(source), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn continued_ifs_and_parameter_names_reach_concrete_native_policy() {
+        for (target, rule) in [
+            ("/etc/shadow", shell::CREDENTIAL_FILE_WRITE_NAME),
+            (".git/config", shell::GIT_INTERNALS_WRITE_NAME),
+        ] {
+            for (ifs, binding, read) in [
+                ("I\\\nFS=@", "TARGET", "$TARGET"),
+                ("IF\\\nS=@", "TARGET", "$TARGET"),
+                ("I\\\nF\\\nS=@", "TARGET", "$TARGET"),
+                ("IFS=@", "TA\\\nRGET", "$TARGET"),
+                ("IFS=@", "TARGET", "$TA\\\nRGET"),
+                ("IFS=@", "TARGET", "${TA\\\nRGET}"),
+            ] {
+                let source = format!("TA=/tmp/safe; {binding}=/tmp/a@{target}; {ifs}; tee {read}");
+                let start = source.rfind("; ").unwrap() + 2;
+                let hits = scan(&source, ShellDialect::Posix);
+                assert!(
+                    hits.iter().any(|hit| hit.rule == rule
+                        && hit.reason != UNCERTAIN
+                        && hit.span == (start..source.len())),
+                    "continued names cannot hide a concrete destination: {source:?}: {hits:?}"
+                );
+            }
+        }
+        let source = "NA=DCG_UNUSED; NAME=DCG_UNUSED@tee; S=/tmp/a@/etc/shadow; IFS=@; env -u $NA\\\nME echo $S";
+        let hits = scan(source, ShellDialect::Posix);
+        for rule in [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME] {
+            assert!(
+                hits.iter().any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                "continued wrapper options must not bind to a shorter name: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_continuation_data_empty_ifs_and_read_idioms_remain_harmless() {
+        for source in [
+            "TARGET=/tmp/a@/tmp/b; I\\\nFS=@; tee $TARGET",
+            "TARGET=/tmp/a@/etc/shadow; I\\\nFS=; tee $TARGET",
+            "TARGET=/tmp/a@/etc/shadow; I\\\nFS=@; tee \"$TARGET\"",
+            "TA=/tmp/safe; TARGET=/etc/shadow; IFS=@; tee \"$TA\"\\\nRGET",
+            "IFS=@; printf '%s' '$TA\\\nRGET'",
+            "I\\\nFS= read -r line",
+            "TA\\\nRGET=/tmp/safe",
+            "IFS=@; S='a\\\nb'; tee \"$S\"",
+            "NA=DCG_UNUSED; NAME=DCG_UNUSED@tee; S=/tmp/a@/etc/shadow; IFS=@; env -u \"$NA\\\nME\" echo $S",
+        ] {
+            assert!(scan(source, ShellDialect::Posix).is_empty(), "{source:?}");
+        }
+    }
 
     #[test]
     fn command_query_proof_requires_literal_options_before_operands() {
