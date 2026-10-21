@@ -692,6 +692,15 @@ fn special_builtin(name: &str) -> bool {
     )
 }
 
+/// The async terminator belongs to the whole statement, not to each
+/// assignment inside it. Ask the syntax tree so line continuations before
+/// `&`, and the distinct `&&` and `&>` operators, keep their shell meaning.
+fn has_async_terminator(node: &Node<'_, StrDoc<SupportLang>>) -> bool {
+    node.get_inner_node()
+        .next_sibling()
+        .is_some_and(|sibling| sibling.kind() == "&")
+}
+
 /// Scan the original source, before segmentation discards earlier bindings.
 /// Unsupported control flow removes facts instead of preserving stale paths.
 pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWrite> {
@@ -756,9 +765,14 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
         let raw = node.text();
         let span = node.range();
         let mut ancestor = node.parent();
-        let mut certain = true;
+        let mut certain = !has_async_terminator(&node);
         let mut straight_line = true;
         while let Some(parent) = ancestor {
+            // `S=safe T=x &` cannot change S in the parent shell. The first
+            // assignment's own suffix is `T=x`, so checking that suffix
+            // would incorrectly replace an older dangerous S with `safe`.
+            // Inherit the async boundary from every enclosing statement.
+            certain &= !has_async_terminator(&parent);
             match parent.kind().as_ref() {
                 "program" | "variable_assignments" => {}
                 // A redirection is part of command setup. If opening it fails,
@@ -774,8 +788,6 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
             }
             ancestor = parent.parent();
         }
-        let following = command[span.end..].trim_start();
-        certain &= !following.starts_with('&') || following.starts_with("&&");
         match node.kind().as_ref() {
             "variable_assignment" => state.assign(raw.as_ref(), certain),
             "declaration_command" => {
@@ -961,6 +973,113 @@ pub(super) fn candidate(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_terminators_use_statement_syntax_not_assignment_suffixes() {
+        for (source, expected) in [
+            ("S=safe T=x & echo ok", true),
+            ("S=safe T=x \\\n& echo ok", true),
+            ("S=safe \\\n& echo ok", true),
+            ("export S=safe T=x & echo ok", true),
+            ("S=safe T=x; echo ok", false),
+            ("S=safe T=x && echo ok", false),
+            ("S=safe T=x &>/tmp/out; echo ok", false),
+            ("S='safe&' T=x; echo ok", false),
+        ] {
+            let ast = AstGrep::try_new(source, SupportLang::Bash).unwrap();
+            assert!(!ast.root().get_inner_node().has_error(), "{source}");
+            let statement = ast.root().children().find(Node::is_named).unwrap();
+            assert_eq!(has_async_terminator(&statement), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn background_assignment_groups_cannot_hide_parent_destinations() {
+        for mutation in [
+            "S=/tmp/safe T=x &",
+            "T=x S=/tmp/safe U=y &",
+            "IFS=: T=x &",
+            "T=x IFS=: U=y &",
+            "export S=/tmp/safe T=x &",
+            "export IFS=: T=x &",
+            "S=/tmp/safe \\\n&",
+            "S=/tmp/safe T=x \\\n&",
+            "IFS=: T=x \\\n&",
+        ] {
+            let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {mutation} tee $S");
+            let start = source.rfind("tee $S").unwrap();
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let hits = scan(&source, dialect);
+                for rule in [
+                    shell::CREDENTIAL_FILE_WRITE_NAME,
+                    shell::GIT_INTERNALS_WRITE_NAME,
+                ] {
+                    assert!(
+                        hits.iter().any(|hit| hit.rule == rule
+                            && hit.reason == UNCERTAIN
+                            && hit.span == (start..source.len())),
+                        "{source}: missing {rule} in {dialect:?}: {hits:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_groups_and_unrelated_background_bindings_remain_precise() {
+        for source in [
+            "S=/tmp/a@/etc/shadow; IFS=@; S=/tmp/safe T=x; tee $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; IFS=: T=x; tee $S",
+            "S=/tmp/safe; IFS=@; T=x U=y & tee $S",
+            "S=/tmp/safe; IFS=@; T=x U=y \\\n& tee $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; S=/tmp/other T=x & S=/tmp/safe; tee $S",
+            "S=/tmp/a@/etc/shadow; IFS=@; IFS=: T=x & IFS=; tee $S",
+            "S='safe&'; IFS=@; T=x U=y; tee $S",
+            "IFS=@; S=/tmp/safe T=x &",
+        ] {
+            assert!(scan(source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+    }
+
+    /// Execute only fixed assignments and argv printing, never a writer.
+    /// Assert the production scan separately against the corresponding source.
+    #[test]
+    #[cfg(unix)]
+    fn background_binding_regressions_match_real_shell_argv() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for mutation in [
+                "S=/tmp/safe T=x &",
+                "T=x S=/tmp/safe U=y &",
+                "IFS=: T=x &",
+                "T=x IFS=: U=y &",
+                "S=/tmp/safe T=x \\\n&",
+                "IFS=: T=x \\\n&",
+            ] {
+                let prefix = format!("S=/tmp/a@/etc/shadow; IFS=@; {mutation}");
+                let source = format!("{prefix} tee $S");
+                assert!(
+                    scan(&source, ShellDialect::Posix)
+                        .iter()
+                        .any(|hit| hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME),
+                    "native scan lost the inherited destination: {source}"
+                );
+                let script = format!(
+                    "{prefix} set -- $S; printf '%s\\0' \"$#\"; for arg; do printf '%s\\0' \"$arg\"; done; wait"
+                );
+                let output = std::process::Command::new(shell)
+                    .args(["-c", &script])
+                    .env_clear()
+                    .output()
+                    .expect("background assignment argv probe");
+                assert!(output.status.success(), "{shell}: {output:?}");
+                assert_eq!(
+                    output.stdout,
+                    b"2\0/tmp/a\0/etc/shadow\0",
+                    "{shell}: {mutation}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn scalar_word_syntax_distinguishes_reads_from_effects_566() {
