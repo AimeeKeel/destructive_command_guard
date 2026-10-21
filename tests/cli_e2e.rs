@@ -2868,6 +2868,300 @@ mod config_tests {
         assert_eq!(settings["theme"], "dark");
     }
 
+    /// #572: `dcg install --muse` merges a `hooks.PreToolUse` matcher group
+    /// into `$XDG_CONFIG_HOME/muse/settings.json`, keeps `schema_version` and
+    /// every other key, and is idempotent. The installed command is then run
+    /// the way Muse runs it (through the shell, a Codex-shaped payload with
+    /// `turn_id` on stdin, a cleared environment): a destructive `shell` or
+    /// `exec_command` call gets the minimal `hookSpecificOutput` deny with a
+    /// non-empty reason on exit 0, which Muse enforces; a safe call gets empty
+    /// stdout, because Muse rejects a bare `allow`. `[agents.muse]` applies and
+    /// `[agents.codex-cli]` does not. A payload dcg cannot read, or a shell
+    /// call without a readable command, is blocked. `dcg uninstall --muse`
+    /// removes exactly what it added.
+    #[test]
+    fn install_muse_hook_blocks_through_the_installed_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let settings_path = xdg_config_dir.join("muse").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).expect("muse dir");
+        std::fs::write(
+            &settings_path,
+            r#"{"schema_version":1,"model":"muse-spark-1.2","hooks":{"PreToolUse":[{"matcher":"^write_file$","hooks":[{"type":"command","command":"audit-writes"}]}],"SessionStart":[{"hooks":[{"type":"command","command":"hello"}]}]}}"#,
+        )
+        .expect("seed settings.json");
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(dcg_binary())
+                .args(args)
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("APPDATA", temp.path().join("appdata"))
+                .env("LOCALAPPDATA", temp.path().join("localappdata"))
+                .current_dir(temp.path())
+                .output()
+                .expect("run dcg")
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("settings.json stays valid JSON")
+        };
+
+        let output = run(&["install", "--muse"]);
+        assert!(
+            output.status.success(),
+            "install --muse: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let settings = read();
+        assert_eq!(settings["schema_version"], 1);
+        assert_eq!(
+            settings["model"], "muse-spark-1.2",
+            "unrelated settings kept"
+        );
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "hello"
+        );
+        let groups = settings["hooks"]["PreToolUse"].as_array().expect("array");
+        assert_eq!(groups.len(), 2, "{settings}");
+        assert_eq!(groups[0]["matcher"], "^(shell|exec_command|bash)$");
+        assert_eq!(groups[1]["hooks"][0]["command"], "audit-writes");
+        let handler = groups[0]["hooks"][0].as_object().expect("handler object");
+        let mut handler_keys: Vec<&str> = handler.keys().map(String::as_str).collect();
+        handler_keys.sort_unstable();
+        assert_eq!(
+            handler_keys,
+            vec!["command", "type"],
+            "only fields Muse accepts are written"
+        );
+        assert_eq!(handler["type"], "command");
+        let mut group_keys: Vec<&str> = groups[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        group_keys.sort_unstable();
+        assert_eq!(
+            group_keys,
+            vec!["hooks", "matcher"],
+            "Muse rejects unknown group fields"
+        );
+        let command = handler["command"].as_str().expect("command").to_string();
+        assert!(command.ends_with(" --agent muse"), "{command}");
+
+        assert!(
+            String::from_utf8_lossy(&run(&["install", "--muse"]).stdout)
+                .contains("already installed")
+        );
+        assert_eq!(read(), settings, "a second install is a no-op");
+        assert!(
+            !run(&["install", "--muse", "--project"]).status.success(),
+            "Muse project hooks are not a dcg install target"
+        );
+
+        // The installed command, run the way Muse runs a hook.
+        #[cfg(unix)]
+        {
+            let dcg_config = xdg_config_dir.join("dcg").join("config.toml");
+            std::fs::create_dir_all(dcg_config.parent().unwrap()).expect("dcg config dir");
+            let hook = |payload: &str| {
+                let mut child = std::process::Command::new("sh")
+                    .args(["-c", &command])
+                    .env_clear()
+                    .env("HOME", &home_dir)
+                    .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("DCG_SELF_HEAL_HOOK", "0")
+                    .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                    .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                    .current_dir(temp.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn installed hook");
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(payload.as_bytes())
+                    .unwrap();
+                child.wait_with_output().expect("hook output")
+            };
+            let muse_payload = |tool: &str, tool_input: serde_json::Value| {
+                serde_json::json!({
+                    "cwd": temp.path(),
+                    "hook_event_name": "PreToolUse",
+                    "model": "unknown",
+                    "permission_mode": "default",
+                    "session_id": "s",
+                    "tool_input": tool_input,
+                    "tool_name": tool,
+                    "tool_use_id": "user_shell_1",
+                    "transcript_path": null,
+                    "turn_id": "t1",
+                })
+                .to_string()
+            };
+            let assert_denied = |output: &std::process::Output, label: &str| {
+                assert_eq!(output.status.code(), Some(0), "{label}: Muse reads exit 0");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let verdict: serde_json::Value = serde_json::from_str(stdout.trim())
+                    .unwrap_or_else(|e| panic!("{label}: deny JSON ({e}): {stdout}"));
+                let specific = verdict["hookSpecificOutput"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{label}: {verdict}"));
+                assert_eq!(verdict.as_object().unwrap().len(), 1, "{label}: {verdict}");
+                let mut keys: Vec<&str> = specific.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    vec![
+                        "hookEventName",
+                        "permissionDecision",
+                        "permissionDecisionReason"
+                    ],
+                    "{label}: the minimal Codex shape"
+                );
+                assert_eq!(specific["permissionDecision"], "deny", "{label}");
+                assert!(
+                    specific["permissionDecisionReason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("BLOCKED by dcg")),
+                    "{label}: Muse requires a non-empty reason: {verdict}"
+                );
+            };
+            let assert_allowed = |output: &std::process::Output, label: &str| {
+                assert_eq!(output.status.code(), Some(0), "{label}");
+                assert!(
+                    output.stdout.is_empty(),
+                    "{label}: Muse rejects a bare allow, so an allow is silent: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            };
+
+            std::fs::write(&dcg_config, "[general]\nself_heal_hook = false\n").expect("dcg config");
+            let shell_deny = hook(&muse_payload(
+                "shell",
+                serde_json::json!({"command": "git reset --hard"}),
+            ));
+            assert_denied(&shell_deny, "shell git reset --hard");
+            assert!(
+                String::from_utf8_lossy(&shell_deny.stdout).contains("core.git:reset-hard"),
+                "{}",
+                String::from_utf8_lossy(&shell_deny.stdout)
+            );
+            assert_denied(
+                &hook(&muse_payload(
+                    "exec_command",
+                    serde_json::json!({"cmd": "git reset --hard"}),
+                )),
+                "exec_command cmd",
+            );
+            assert_denied(
+                &hook(&muse_payload(
+                    "exec_command",
+                    serde_json::json!({"command": "ls", "cmd": "git reset --hard"}),
+                )),
+                "a benign command beside a destructive cmd",
+            );
+            assert_allowed(
+                &hook(&muse_payload(
+                    "shell",
+                    serde_json::json!({"command": "git status"}),
+                )),
+                "shell git status",
+            );
+            assert_allowed(
+                &hook(&muse_payload(
+                    "exec_command",
+                    serde_json::json!({"cmd": "git status"}),
+                )),
+                "exec_command git status",
+            );
+            assert_allowed(
+                &hook(&muse_payload(
+                    "read_file",
+                    serde_json::json!({"path": "README.md"}),
+                )),
+                "a non-shell tool",
+            );
+
+            // Fail closed on what dcg cannot read.
+            assert_denied(&hook("{\"tool_name\":\"shell\","), "truncated JSON");
+            assert_denied(
+                &hook(&muse_payload(
+                    "exec_command",
+                    serde_json::json!({"argv": ["git", "reset", "--hard"]}),
+                )),
+                "a shell call without a readable command",
+            );
+
+            // The [agents.muse] profile applies, [agents.codex-cli] does not.
+            let amend = muse_payload(
+                "shell",
+                serde_json::json!({"command": "git commit --amend -m x"}),
+            );
+            std::fs::write(
+                &dcg_config,
+                "[general]\nself_heal_hook = false\n[agents.codex-cli]\nextra_packs = [\"strict_git\"]\n",
+            )
+            .expect("dcg config");
+            assert_allowed(&hook(&amend), "[agents.codex-cli] does not apply to Muse");
+            std::fs::write(
+                &dcg_config,
+                "[general]\nself_heal_hook = false\n[agents.muse]\nextra_packs = [\"strict_git\"]\n",
+            )
+            .expect("dcg config");
+            assert_denied(&hook(&amend), "[agents.muse] applies");
+        }
+
+        let muse_doctor_check = |args: &[&str]| -> serde_json::Value {
+            let output = run(args);
+            let report: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                    panic!(
+                        "doctor JSON ({e}): {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    )
+                });
+            report["checks"]
+                .as_array()
+                .expect("checks")
+                .iter()
+                .find(|check| check["id"] == "muse_hook")
+                .cloned()
+                .unwrap_or_else(|| panic!("muse_hook check missing: {report}"))
+        };
+        assert_eq!(
+            muse_doctor_check(&["doctor", "--format", "json"])["status"],
+            "ok"
+        );
+
+        let output = run(&["uninstall", "--muse"]);
+        assert!(output.status.success());
+        let after = read();
+        let groups = after["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{after}");
+        assert_eq!(groups[0]["hooks"][0]["command"], "audit-writes");
+        assert_eq!(after["schema_version"], 1);
+        assert_eq!(after["model"], "muse-spark-1.2");
+
+        let missing = muse_doctor_check(&["doctor", "--format", "json"]);
+        assert_eq!(missing["status"], "error", "{missing}");
+        assert_eq!(read(), after, "doctor without --fix changes nothing");
+        let fixed = muse_doctor_check(&["doctor", "--fix", "--format", "json"]);
+        assert_eq!(fixed["fixed"], true, "{fixed}");
+        assert_eq!(
+            read()["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            command.as_str()
+        );
+    }
+
     /// #388: `dcg install --crush` merges a flat `hooks.PreToolUse` entry into
     /// Crush's user config (`$XDG_CONFIG_HOME/crush/crush.json`), preserves
     /// unrelated keys and hooks, is idempotent without --force, honors the

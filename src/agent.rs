@@ -41,6 +41,9 @@
 //! - Oh My Pi (`omp`): the generated OMP extension invokes dcg with the
 //!   explicit `--agent omp` flag (`dcg install --omp`). Exact `omp` and
 //!   `oh-my-pi` parent-process basenames are also recognized as a fallback.
+//! - Muse Code (Meta): runs hooks in a cleared environment, so `dcg install
+//!   --muse` writes the explicit `--agent muse` flag into the hook command
+//!   (#572). It is deliberately not inferred from a parent process name.
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
 //! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
@@ -132,6 +135,13 @@ pub enum Agent {
     /// "toolArgs":{"command":...}}` to the hook's stdin, and blocks on exit 2
     /// (#358). Identified from that wire shape; it sets no marker variable.
     Reasonix,
+    /// Muse Code, Meta's terminal coding agent
+    /// (<https://dev.meta.ai/docs/muse-code>). Reads `hooks.PreToolUse`
+    /// matcher groups from `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`
+    /// and pipes a Codex-shaped payload (`turn_id`, `tool_name: "shell"` or
+    /// `"exec_command"`) to the hook. Muse clears the hook environment, so the
+    /// installer writes `--agent muse` into the hook command (#572).
+    Muse,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -163,6 +173,7 @@ impl Agent {
             Self::Omp => "omp",
             Self::Crush => "crush",
             Self::Reasonix => "reasonix",
+            Self::Muse => "muse",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -190,6 +201,7 @@ impl Agent {
                 | Self::Omp
                 | Self::Crush
                 | Self::Reasonix
+                | Self::Muse
         )
     }
 
@@ -216,6 +228,7 @@ impl Agent {
     /// - `"omp"`, `"oh-my-pi"` -> `Omp`
     /// - `"crush"`, `"charm-crush"` -> `Crush`
     /// - `"reasonix"`, `"deepseek-reasonix"` -> `Reasonix`
+    /// - `"muse"`, `"muse-code"` -> `Muse`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -239,6 +252,7 @@ impl Agent {
             "omp" | "ohmypi" => Self::Omp,
             "crush" | "charmcrush" | "crushcli" => Self::Crush,
             "reasonix" | "deepseekreasonix" => Self::Reasonix,
+            "muse" | "musecode" | "metamuse" => Self::Muse,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -265,6 +279,7 @@ impl fmt::Display for Agent {
             Self::Omp => write!(f, "Oh My Pi"),
             Self::Crush => write!(f, "Crush"),
             Self::Reasonix => write!(f, "Reasonix"),
+            Self::Muse => write!(f, "Muse Code"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -912,6 +927,11 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "omp" | "oh-my-pi" => Some(Agent::Omp),
         "crush" => Some(Agent::Crush),
         "reasonix" => Some(Agent::Reasonix),
+        // No "muse" entry: Muse Code is identified only by the explicit
+        // `--agent muse` its installed hook carries (#572). That identity
+        // changes the profile and the answer shape, so it must not follow an
+        // ancestor process (a Codex session started from a Muse shell, or
+        // the unrelated MusE sequencer binary).
         // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
         // exact-match table is what keeps those from misclassifying.
         "pa" | "posit-assistant" => Some(Agent::PositAssistant),
@@ -1718,6 +1738,26 @@ mod env_tests {
             Some(Agent::Reasonix)
         );
         assert_eq!(agent_from_process_name("reasonixd"), None);
+    }
+
+    /// #572: Muse Code clears the hook environment, so the explicit
+    /// `--agent muse` is what identifies it; a process name never does.
+    #[test]
+    fn test_muse_identity_mappings() {
+        assert_eq!(Agent::Muse.config_key(), "muse");
+        assert!(Agent::Muse.is_known());
+        assert!(!Agent::Muse.is_explicit());
+        for name in ["muse", "Muse", "muse-code", "muse_code", "meta-muse"] {
+            assert_eq!(Agent::from_name(name), Agent::Muse, "{name}");
+        }
+        assert_eq!(format!("{}", Agent::Muse), "Muse Code");
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "muse"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Muse
+        );
+        assert_eq!(agent_from_process_name("muse"), None);
+        assert_eq!(agent_from_process_name("/home/u/.local/bin/muse"), None);
     }
 
     #[test]

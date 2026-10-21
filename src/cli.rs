@@ -312,7 +312,8 @@ pub enum Command {
     },
 
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, or `--reasonix`)
+    /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, `--reasonix`, or
+    /// `--muse`)
     ///
     /// Claude user settings honor CLAUDE_CONFIG_DIR when non-empty, otherwise
     /// ~/.claude/settings.json is used.
@@ -332,7 +333,7 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush", "reasonix"])]
+        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush", "reasonix", "muse"])]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -340,7 +341,7 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush", "reasonix"])]
+        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush", "reasonix", "muse"])]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -350,7 +351,7 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush", "reasonix"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush", "reasonix", "muse"])]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -359,7 +360,7 @@ pub enum Command {
         /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
         /// extension discovery is cwd-only and does not walk Git ancestors.
         /// Every OMP bash tool call is routed through dcg before execution.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush", "reasonix"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush", "reasonix", "muse"])]
         omp: bool,
 
         /// Install the dcg PreToolUse hook for Charm Crush by merging a
@@ -368,7 +369,7 @@ pub enum Command {
         /// and `CRUSH_GLOBAL_CONFIG`) or the repo's `crush.json` (with
         /// `--project`). Crush pipes every bash tool call to dcg's stdin and
         /// blocks the call when dcg answers `{"decision":"deny"}`.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "reasonix"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "reasonix", "muse"])]
         crush: bool,
 
         /// Install the dcg PreToolUse hook for Reasonix by merging a
@@ -378,8 +379,21 @@ pub enum Command {
         /// `.reasonix/settings.json` (with `--project`). Reasonix pipes every
         /// shell tool call to dcg's stdin and blocks it when dcg exits 2.
         /// Restart Reasonix afterwards: hooks load when a session is built.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "muse"])]
         reasonix: bool,
+
+        /// Install the dcg PreToolUse hook for Muse Code (Meta) by merging a
+        /// `hooks.PreToolUse` matcher group (matcher
+        /// `^(shell|exec_command|bash)$`, command `<dcg> --agent muse`) into
+        /// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, keeping
+        /// `schema_version` and every other key. Muse answers a deny by
+        /// refusing the shell call. User-level only (`--project` is refused).
+        /// Start a new Muse session afterwards: hooks load at session start.
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "reasonix", "project"]
+        )]
+        muse: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -403,7 +417,7 @@ pub enum Command {
     },
 
     /// Remove the hook from Claude Code settings (or from Crush with `--crush`,
-    /// Reasonix with `--reasonix`)
+    /// Reasonix with `--reasonix`, Muse Code with `--muse`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
@@ -412,13 +426,19 @@ pub enum Command {
 
         /// Remove the dcg hook entry from `~/.config/crush/crush.json` instead
         /// of Claude Code settings
-        #[arg(long, conflicts_with_all = ["purge", "reasonix"])]
+        #[arg(long, conflicts_with_all = ["purge", "reasonix", "muse"])]
         crush: bool,
 
         /// Remove the dcg hook entry from `<Reasonix home>/settings.json`
         /// instead of Claude Code settings
-        #[arg(long, conflicts_with = "purge")]
+        #[arg(long, conflicts_with_all = ["purge", "muse"])]
         reasonix: bool,
+
+        /// Remove dcg's hook from Muse Code's
+        /// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json` instead of
+        /// Claude Code settings
+        #[arg(long, conflicts_with = "purge")]
+        muse: bool,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -2512,8 +2532,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             omp,
             crush,
             reasonix,
+            muse,
         }) => {
-            if grok {
+            if muse {
+                install_muse_hook(force)?;
+            } else if grok {
                 install_grok_hook(force, project)?;
             } else if agy {
                 install_antigravity_hook(force, project)?;
@@ -2540,8 +2563,11 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             purge,
             crush,
             reasonix,
+            muse,
         }) => {
-            if crush {
+            if muse {
+                uninstall_muse_hook()?;
+            } else if crush {
                 uninstall_crush_hook()?;
             } else if reasonix {
                 uninstall_reasonix_hook()?;
@@ -11348,6 +11374,52 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
+    // Check 3b1c: Muse Code hook registration (#572). Muse reads hooks only
+    // from its own settings.json. `collect_doctor_report` carries the same
+    // check (id `muse_hook`).
+    if muse_appears_in_use() {
+        print!("Checking Muse Code hook registration... ");
+        let settings_path = muse_user_settings_path();
+        match probe_muse_user_settings() {
+            Ok(MuseHookProbe::Current) => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", settings_path.display());
+            }
+            Ok(probe @ (MuseHookProbe::Missing | MuseHookProbe::Stale)) => {
+                if probe == MuseHookProbe::Stale {
+                    println!("{}", "STALE".yellow());
+                    println!(
+                        "  dcg is registered without the {MUSE_SHELL_MATCHER} matcher or \
+                         --agent muse"
+                    );
+                } else {
+                    println!("{}", "NOT REGISTERED".yellow());
+                }
+                issues += 1;
+                if fix {
+                    println!("  Attempting install...");
+                    if install_muse_hook_at(&settings_path, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg install --muse' to register the hook in {}",
+                        settings_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                println!("{}", "INVALID".red());
+                issues += 1;
+                println!("  {err}");
+                println!("  → Fix the JSON by hand, then run 'dcg install --muse'");
+            }
+        }
+    }
+
     // Check 3b2: Codex hook registration AND enablement (#368). Codex loads
     // PreToolUse hooks from ~/.codex/hooks.json but only RUNS a hook the user
     // has approved: a `[hooks.state."<file>:pre_tool_use:<i>:<j>"]` entry in
@@ -12826,6 +12898,74 @@ fn collect_doctor_report(
             message,
             remediation,
             fixed: reasonix_fixed,
+        });
+    }
+
+    // Muse Code hook registration (#572). Mirrored in `doctor_pretty`.
+    if muse_appears_in_use() {
+        let mut muse_fixed = false;
+        let settings_path = muse_user_settings_path();
+        let (status, message, remediation) = match probe_muse_user_settings() {
+            Ok(MuseHookProbe::Current) => (
+                DoctorCheckStatus::Ok,
+                format!(
+                    "Muse Code dcg hook registered in {}",
+                    settings_path.display()
+                ),
+                None,
+            ),
+            Ok(probe @ (MuseHookProbe::Missing | MuseHookProbe::Stale)) => {
+                issues += 1;
+                if fix && install_muse_hook_at(&settings_path, false).is_ok() {
+                    fixed += 1;
+                    muse_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!(
+                            "Installed Muse Code dcg hook in {}",
+                            settings_path.display()
+                        ),
+                        None,
+                    )
+                } else if probe == MuseHookProbe::Stale {
+                    (
+                        DoctorCheckStatus::Warning,
+                        format!(
+                            "{} registers dcg without the {MUSE_SHELL_MATCHER} matcher or \
+                             --agent muse, so some Muse shell calls or the [agents.muse] \
+                             profile may be missed",
+                            settings_path.display()
+                        ),
+                        Some("Run 'dcg install --muse'".to_string()),
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "Muse Code is in use but {} has no dcg PreToolUse hook — its \
+                             shell tool calls are not guarded",
+                            settings_path.display()
+                        ),
+                        Some("Run 'dcg install --muse'".to_string()),
+                    )
+                }
+            }
+            Err(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    err,
+                    Some("Fix the JSON by hand, then run 'dcg install --muse'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "muse_hook",
+            name: "Muse Code hook registration",
+            status,
+            message,
+            remediation,
+            fixed: muse_fixed,
         });
     }
 
@@ -14830,6 +14970,392 @@ fn reasonix_user_settings_register_dcg() -> Result<bool, String> {
 /// settings file it reads, exists.
 fn reasonix_appears_in_use() -> bool {
     reasonix_home().is_dir() || reasonix_user_settings_path().is_file()
+}
+
+// ---------------------------------------------------------------------------
+// Muse Code (Meta) hook registration (#572)
+// ---------------------------------------------------------------------------
+//
+// Muse Code reads user hooks from the `hooks` block of
+// `${XDG_CONFIG_HOME:-$HOME/.config}/muse/settings.json`, which must carry
+// `"schema_version": 1` (an unknown version or a missing key fails every Muse
+// command at startup), and discovers them at session start
+// (https://dev.meta.ai/docs/muse-code/configuration,
+// https://dev.meta.ai/docs/muse-code/extending). A `PreToolUse` matcher group
+// is `{"matcher": <regex>, "hooks": [{"type": "command", "command": ...}]}`;
+// Muse rejects unknown matcher-group fields, so dcg writes only those keys.
+// Hook commands run in a cleared environment, which is why the command
+// carries `--agent muse` instead of relying on an environment marker.
+
+/// The settings event key Muse runs before a tool call.
+const MUSE_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
+
+/// The `matcher` (a regex) of dcg's Muse matcher group: the tool names Muse's
+/// own bundled tooling treats as shell tools.
+const MUSE_SHELL_MATCHER: &str = "^(shell|exec_command|bash)$";
+
+/// The only `settings.json` schema version Muse Code documents.
+const MUSE_SETTINGS_SCHEMA_VERSION: u64 = 1;
+
+/// Keys of dcg's Muse handler that dcg owns. Anything else an operator put on
+/// the handler (a timeout, an `onFailure` fallback) is carried across
+/// reinstalls, as for Claude Code (#345).
+const MUSE_DCG_OWNED_HANDLER_KEYS: &[&str] = &["type", "command"];
+
+/// Muse Code's config root: `$XDG_CONFIG_HOME/muse` when that is an absolute
+/// path, else `~/.config/muse` (the XDG rule Muse's own guidance states;
+/// relative values are ignored, as the XDG spec requires).
+fn muse_config_dir() -> std::path::PathBuf {
+    muse_config_dir_for(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        &crate::config::home_dir().unwrap_or_default(),
+    )
+}
+
+fn muse_config_dir_for(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    xdg_config_home
+        .map(std::path::Path::new)
+        .filter(|path| path.is_absolute())
+        .map_or_else(|| home.join(".config"), std::path::Path::to_path_buf)
+        .join("muse")
+}
+
+fn muse_user_settings_path() -> std::path::PathBuf {
+    muse_config_dir().join("settings.json")
+}
+
+/// The hook command dcg registers with Muse: the absolute dcg path (quoted
+/// only when it needs it) followed by `--agent muse`.
+fn muse_dcg_hook_command_for_executable(
+    executable: &std::path::Path,
+    windows: bool,
+) -> std::io::Result<String> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "dcg hook executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dcg hook executable path is not valid UTF-8: {}",
+                executable.display()
+            ),
+        )
+    })?;
+    let program = if !windows {
+        posix_quote_hook_program(executable)
+    } else if executable.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '\\' | '/' | ':' | '_' | '-' | '.')
+    }) {
+        executable.to_string()
+    } else {
+        format!("\"{executable}\"")
+    };
+    Ok(format!("{program} --agent muse"))
+}
+
+fn muse_handler_is_dcg(handler: &serde_json::Value) -> bool {
+    handler
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_dcg_command)
+}
+
+/// Whether a dcg handler command carries `--agent muse`, without which dcg
+/// would answer Muse as if it were Codex and ignore an `[agents.muse]` profile.
+fn muse_command_names_muse_agent(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    tokens.windows(2).any(|pair| {
+        pair[0] == "--agent" && crate::agent::Agent::from_name(pair[1]) == crate::agent::Agent::Muse
+    }) || tokens.iter().any(|token| {
+        token
+            .strip_prefix("--agent=")
+            .is_some_and(|name| crate::agent::Agent::from_name(name) == crate::agent::Agent::Muse)
+    })
+}
+
+/// Validate (and, when absent, supply) Muse's required `schema_version`.
+fn ensure_muse_schema_version(
+    settings: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match settings.get("schema_version") {
+        None => {
+            settings.insert(
+                "schema_version".to_string(),
+                serde_json::json!(MUSE_SETTINGS_SCHEMA_VERSION),
+            );
+            Ok(())
+        }
+        Some(version) if version.as_u64() == Some(MUSE_SETTINGS_SCHEMA_VERSION) => Ok(()),
+        Some(version) => Err(format!(
+            "Muse Code settings.json declares schema_version {version}; dcg only knows \
+             schema_version {MUSE_SETTINGS_SCHEMA_VERSION} and will not edit it"
+        )
+        .into()),
+    }
+}
+
+/// Remove dcg's handlers from every `PreToolUse` matcher group, dropping a
+/// group only when dcg's removal emptied it (a group the user left empty is
+/// theirs). Returns the first removed dcg handler, whose operator-owned fields
+/// a reinstall carries over.
+fn strip_dcg_from_muse_groups(
+    groups: &mut Vec<serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut previous = None;
+    let mut emptied_by_dcg = Vec::with_capacity(groups.len());
+    for group in groups.iter_mut() {
+        let emptied = group
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_array_mut)
+            .is_some_and(|handlers| {
+                if previous.is_none() {
+                    previous = handlers
+                        .iter()
+                        .find(|handler| muse_handler_is_dcg(handler))
+                        .and_then(serde_json::Value::as_object)
+                        .cloned();
+                }
+                let before = handlers.len();
+                handlers.retain(|handler| !muse_handler_is_dcg(handler));
+                handlers.len() != before && handlers.is_empty()
+            });
+        emptied_by_dcg.push(emptied);
+    }
+    let mut emptied = emptied_by_dcg.into_iter();
+    groups.retain(|_| !emptied.next().unwrap_or(false));
+    previous
+}
+
+/// Install (or refresh) dcg's matcher group in an in-memory Muse settings
+/// object. dcg's group goes first; every other group, handler and key is kept.
+/// Returns `Ok(true)` when the settings changed (always with `force`).
+///
+/// # Errors
+///
+/// A shape dcg does not understand (not an object, an unknown
+/// `schema_version`, a non-object `hooks`, a non-array `PreToolUse`) is
+/// refused untouched: dcg never rewrites what it cannot read.
+fn install_muse_hook_into_settings(
+    settings: &mut serde_json::Value,
+    force: bool,
+    command: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let original = settings.clone();
+    let settings_obj = settings
+        .as_object_mut()
+        .ok_or("Invalid Muse Code settings.json (expected a JSON object)")?;
+    ensure_muse_schema_version(settings_obj)?;
+    let groups = settings_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("Invalid hooks in Muse Code settings.json (expected a JSON object)")?
+        .entry(MUSE_PRE_TOOL_USE_EVENT)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse in Muse Code settings.json (expected a JSON array)")?;
+
+    let previous = strip_dcg_from_muse_groups(groups);
+    let mut handler = serde_json::Map::new();
+    handler.insert("type".to_string(), serde_json::json!("command"));
+    handler.insert("command".to_string(), serde_json::json!(command));
+    for (key, value) in previous.into_iter().flatten() {
+        if !MUSE_DCG_OWNED_HANDLER_KEYS.contains(&key.as_str()) {
+            handler.insert(key, value);
+        }
+    }
+    groups.insert(
+        0,
+        serde_json::json!({
+            "matcher": MUSE_SHELL_MATCHER,
+            "hooks": [serde_json::Value::Object(handler)],
+        }),
+    );
+
+    Ok(force || *settings != original)
+}
+
+/// Remove dcg's handlers from an in-memory Muse settings object. Returns
+/// `Ok(true)` when at least one was removed.
+fn uninstall_dcg_hook_from_muse_settings(
+    settings: &mut serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(groups) = settings
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut(MUSE_PRE_TOOL_USE_EVENT))
+    else {
+        return Ok(false);
+    };
+    let groups = groups
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse in Muse Code settings.json (expected a JSON array)")?;
+    Ok(strip_dcg_from_muse_groups(groups).is_some())
+}
+
+/// Read Muse's settings. An empty file reads as `{}`; anything that is not
+/// strict JSON is an error, never a fresh start.
+fn read_muse_settings(
+    path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "{} is not valid JSON ({error}); fix it by hand, then retry",
+            path.display()
+        )
+        .into()
+    })
+}
+
+/// Merge dcg's hook into the Muse settings at `path` without printing (shared
+/// by `dcg install --muse` and `dcg doctor --fix`). Returns `Ok(true)` when the
+/// file was (re)written.
+fn install_muse_hook_at(
+    path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut settings = if path.exists() {
+        read_muse_settings(path)?
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        serde_json::json!({})
+    };
+    let command = muse_dcg_hook_command_for_executable(&current_dcg_executable()?, cfg!(windows))?;
+    let changed = install_muse_hook_into_settings(&mut settings, force, &command)?;
+    if changed {
+        let mut content = serde_json::to_string_pretty(&settings)?;
+        content.push('\n');
+        write_settings_atomic(path, &content)?;
+    }
+    Ok(changed)
+}
+
+/// Install the dcg hook into Muse Code's user settings (#572).
+fn install_muse_hook(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = muse_user_settings_path();
+    if !install_muse_hook_at(&path, force)? {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+    println!(
+        "{}",
+        "Muse Code hook installed successfully!".green().bold()
+    );
+    println!("Settings updated (user): {}", path.display());
+    println!();
+    println!(
+        "{}",
+        "Start a new Muse Code session for the change to take effect (hooks are \
+         discovered at session start)."
+            .yellow()
+    );
+    Ok(())
+}
+
+/// Remove dcg's hook from Muse Code's user settings (#572).
+fn uninstall_muse_hook() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = muse_user_settings_path();
+    if !path.exists() {
+        println!(
+            "{} {}",
+            "No Muse Code settings found at".yellow(),
+            path.display()
+        );
+        return Ok(());
+    }
+    let mut settings = read_muse_settings(&path)?;
+    if uninstall_dcg_hook_from_muse_settings(&mut settings)? {
+        let mut content = serde_json::to_string_pretty(&settings)?;
+        content.push('\n');
+        write_settings_atomic(&path, &content)?;
+        println!("{}", "Muse Code hook removed successfully!".green().bold());
+        println!("Settings updated: {}", path.display());
+    } else {
+        println!("{}", "No dcg hook found in Muse Code settings.".yellow());
+    }
+    Ok(())
+}
+
+/// What `dcg doctor` finds in Muse Code's user settings.
+#[derive(Debug, PartialEq, Eq)]
+enum MuseHookProbe {
+    /// No dcg handler in any `PreToolUse` group (or no settings file).
+    Missing,
+    /// dcg's group, with the matcher and `--agent muse` dcg installs.
+    Current,
+    /// A dcg handler exists but not in the form dcg installs (another
+    /// matcher, or no `--agent muse`), so some shell calls or the Muse
+    /// profile may be missed.
+    Stale,
+}
+
+fn probe_muse_settings(settings: &serde_json::Value) -> MuseHookProbe {
+    let Some(groups) = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(MUSE_PRE_TOOL_USE_EVENT))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return MuseHookProbe::Missing;
+    };
+    let mut found = false;
+    for group in groups {
+        let matcher_is_current =
+            group.get("matcher").and_then(serde_json::Value::as_str) == Some(MUSE_SHELL_MATCHER);
+        let handlers = group
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten();
+        for handler in handlers.filter(|handler| muse_handler_is_dcg(handler)) {
+            found = true;
+            let names_muse = handler
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(muse_command_names_muse_agent);
+            if matcher_is_current && names_muse {
+                return MuseHookProbe::Current;
+            }
+        }
+    }
+    if found {
+        MuseHookProbe::Stale
+    } else {
+        MuseHookProbe::Missing
+    }
+}
+
+/// Probe the user-level Muse settings. `Err` means the file exists but cannot
+/// be read as JSON.
+fn probe_muse_user_settings() -> Result<MuseHookProbe, String> {
+    let path = muse_user_settings_path();
+    if !path.exists() {
+        return Ok(MuseHookProbe::Missing);
+    }
+    let settings = read_muse_settings(&path).map_err(|error| error.to_string())?;
+    Ok(probe_muse_settings(&settings))
+}
+
+/// Whether Muse Code is plausibly in use: its config directory exists or a
+/// `muse` executable is on `PATH`.
+fn muse_appears_in_use() -> bool {
+    muse_config_dir().is_dir() || which_executable("muse").is_some()
 }
 
 /// Ownership marker embedded in the generated OpenCode plugin (#318).
@@ -22928,6 +23454,169 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         );
     }
 
+    // ---- #572: Muse Code hook registration ---------------------------------
+
+    const MUSE_TEST_COMMAND: &str = "/opt/dcg/bin/dcg --agent muse";
+
+    #[test]
+    fn muse_config_dir_follows_absolute_xdg_config_home_only() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            muse_config_dir_for(None, home),
+            std::path::PathBuf::from("/home/u/.config/muse")
+        );
+        assert_eq!(
+            muse_config_dir_for(Some(std::ffi::OsStr::new("/xdg")), home),
+            std::path::PathBuf::from("/xdg/muse")
+        );
+        for ignored in ["", "relative/xdg"] {
+            assert_eq!(
+                muse_config_dir_for(Some(std::ffi::OsStr::new(ignored)), home),
+                std::path::PathBuf::from("/home/u/.config/muse"),
+                "XDG_CONFIG_HOME={ignored:?} is not an absolute path and is ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn muse_hook_command_names_the_agent_and_quotes_only_when_needed() {
+        let plain =
+            muse_dcg_hook_command_for_executable(std::path::Path::new("/opt/dcg/bin/dcg"), false)
+                .unwrap();
+        assert_eq!(plain, MUSE_TEST_COMMAND);
+        assert!(is_dcg_command(&plain));
+        assert!(muse_command_names_muse_agent(&plain));
+
+        let spaced =
+            muse_dcg_hook_command_for_executable(std::path::Path::new("/opt/my tools/dcg"), false)
+                .unwrap();
+        assert_eq!(spaced, "\"/opt/my tools/dcg\" --agent muse");
+        assert!(is_dcg_command(&spaced));
+
+        let windows = muse_dcg_hook_command_for_executable(
+            std::path::Path::new("/Users/Jane Doe/dcg.exe"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(windows, "\"/Users/Jane Doe/dcg.exe\" --agent muse");
+        assert!(is_dcg_command(&windows));
+
+        assert!(
+            muse_dcg_hook_command_for_executable(std::path::Path::new("dcg"), false).is_err(),
+            "a relative path is never written"
+        );
+        assert!(muse_command_names_muse_agent("/x/dcg --agent=muse-code"));
+        assert!(!muse_command_names_muse_agent("/x/dcg"));
+        assert!(!muse_command_names_muse_agent("/x/dcg --agent codex"));
+    }
+
+    #[test]
+    fn muse_install_creates_a_versioned_settings_document() {
+        let mut settings = serde_json::json!({});
+        assert!(install_muse_hook_into_settings(&mut settings, false, MUSE_TEST_COMMAND).unwrap());
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "schema_version": 1,
+                "hooks": {"PreToolUse": [{
+                    "matcher": "^(shell|exec_command|bash)$",
+                    "hooks": [{"type": "command", "command": MUSE_TEST_COMMAND}],
+                }]},
+            })
+        );
+        assert_eq!(probe_muse_settings(&settings), MuseHookProbe::Current);
+        // Idempotent without --force, rewritten with it.
+        assert!(!install_muse_hook_into_settings(&mut settings, false, MUSE_TEST_COMMAND).unwrap());
+        assert!(install_muse_hook_into_settings(&mut settings, true, MUSE_TEST_COMMAND).unwrap());
+    }
+
+    #[test]
+    fn muse_install_keeps_user_state_and_refreshes_only_dcg() {
+        let mut settings = serde_json::json!({
+            "schema_version": 1,
+            "model": "muse-spark-1.2",
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "^write_file$", "hooks": [{"type": "command", "command": "audit-writes"}]},
+                    {"matcher": "^(shell|exec_command)$", "hooks": [
+                        {"type": "command", "command": "/old/bin/dcg --agent muse", "timeout_ms": 9000},
+                        {"type": "command", "command": "shell-logger"}
+                    ]},
+                    {"matcher": "^shell$", "hooks": [{"type": "command", "command": "/old/bin/dcg"}]},
+                    {"matcher": "^empty$", "hooks": []}
+                ],
+                "SessionStart": [{"hooks": [{"type": "command", "command": "hello"}]}]
+            }
+        });
+        assert_eq!(probe_muse_settings(&settings), MuseHookProbe::Stale);
+        assert!(install_muse_hook_into_settings(&mut settings, false, MUSE_TEST_COMMAND).unwrap());
+        assert_eq!(settings["model"], "muse-spark-1.2");
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "hello"
+        );
+        let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            groups,
+            &vec![
+                serde_json::json!({"matcher": "^(shell|exec_command|bash)$", "hooks": [
+                    {"type": "command", "command": MUSE_TEST_COMMAND, "timeout_ms": 9000}
+                ]}),
+                serde_json::json!({"matcher": "^write_file$", "hooks": [
+                    {"type": "command", "command": "audit-writes"}
+                ]}),
+                // The user's handler stays in its own group; dcg's left it.
+                serde_json::json!({"matcher": "^(shell|exec_command)$", "hooks": [
+                    {"type": "command", "command": "shell-logger"}
+                ]}),
+                // A group the user left empty is not dcg's to remove.
+                serde_json::json!({"matcher": "^empty$", "hooks": []}),
+            ],
+            "{settings:#}"
+        );
+        assert_eq!(probe_muse_settings(&settings), MuseHookProbe::Current);
+
+        assert!(uninstall_dcg_hook_from_muse_settings(&mut settings).unwrap());
+        assert_eq!(probe_muse_settings(&settings), MuseHookProbe::Missing);
+        let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 3, "{settings:#}");
+        assert_eq!(settings["schema_version"], 1);
+        assert!(!uninstall_dcg_hook_from_muse_settings(&mut settings).unwrap());
+    }
+
+    #[test]
+    fn muse_install_refuses_shapes_it_cannot_read() {
+        for (label, mut settings) in [
+            ("array root", serde_json::json!([])),
+            ("future schema", serde_json::json!({"schema_version": 2})),
+            ("string schema", serde_json::json!({"schema_version": "1"})),
+            (
+                "hooks array",
+                serde_json::json!({"schema_version": 1, "hooks": []}),
+            ),
+            (
+                "PreToolUse object",
+                serde_json::json!({"schema_version": 1, "hooks": {"PreToolUse": {}}}),
+            ),
+        ] {
+            let before = settings.clone();
+            assert!(
+                install_muse_hook_into_settings(&mut settings, true, MUSE_TEST_COMMAND).is_err(),
+                "{label} must be refused"
+            );
+            if before.is_object() && before.get("schema_version").is_some() {
+                assert_eq!(settings, before, "{label} must be left untouched");
+            }
+        }
+        // A missing schema_version is supplied: Muse requires it.
+        let mut unversioned = serde_json::json!({"model": "m"});
+        assert!(
+            install_muse_hook_into_settings(&mut unversioned, false, MUSE_TEST_COMMAND).unwrap()
+        );
+        assert_eq!(unversioned["schema_version"], 1);
+        assert_eq!(unversioned["model"], "m");
+    }
+
     #[test]
     fn install_into_settings_creates_structure() {
         let mut settings = serde_json::json!({});
@@ -23882,6 +24571,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23908,6 +24598,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(force);
@@ -23934,6 +24625,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23960,6 +24652,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23986,6 +24679,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24012,6 +24706,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24038,6 +24733,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(!force);
@@ -24064,6 +24760,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(force);
@@ -24090,6 +24787,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(force);
@@ -24116,6 +24814,7 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
         }) = cli.command
         {
             assert!(force);
@@ -24157,10 +24856,59 @@ if ($errors.Count -ne 0) {
             ("--crush", "--agy"),
             ("--crush", "--opencode"),
             ("--crush", "--omp"),
+            ("--muse", "--grok"),
+            ("--muse", "--agy"),
+            ("--muse", "--opencode"),
+            ("--muse", "--omp"),
+            ("--muse", "--crush"),
+            ("--muse", "--reasonix"),
         ] {
             assert!(
                 Cli::try_parse_from(["dcg", "install", left, right]).is_err(),
                 "install must reject conflicting targets {left} and {right}"
+            );
+        }
+    }
+
+    /// #572: `--muse` parses on install and uninstall; Muse has no project
+    /// hooks target dcg writes, so `--project` is refused rather than ignored.
+    #[test]
+    fn test_cli_parse_install_and_uninstall_muse() {
+        let cli = Cli::parse_from(["dcg", "install", "--muse", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            muse,
+            reasonix,
+            ..
+        }) = cli.command
+        {
+            assert!(force);
+            assert!(!project);
+            assert!(muse);
+            assert!(!reasonix);
+        } else {
+            unreachable!("Expected Install command");
+        }
+        assert!(Cli::try_parse_from(["dcg", "install", "--muse", "--project"]).is_err());
+
+        let cli = Cli::parse_from(["dcg", "uninstall", "--muse"]);
+        if let Some(Command::Uninstall {
+            purge,
+            crush,
+            reasonix,
+            muse,
+        }) = cli.command
+        {
+            assert!(muse);
+            assert!(!purge && !crush && !reasonix);
+        } else {
+            unreachable!("Expected Uninstall command");
+        }
+        for other in ["--purge", "--crush", "--reasonix"] {
+            assert!(
+                Cli::try_parse_from(["dcg", "uninstall", "--muse", other]).is_err(),
+                "uninstall --muse must reject {other}"
             );
         }
     }

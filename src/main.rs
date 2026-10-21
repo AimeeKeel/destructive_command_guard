@@ -166,6 +166,7 @@ fn build_history_entry(
 
 fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent: &Agent) -> &str {
     match protocol {
+        hook::HookProtocol::Codex if *detected_agent == Agent::Muse => detected_agent.config_key(),
         hook::HookProtocol::Codex => Agent::CodexCli.config_key(),
         hook::HookProtocol::Gemini => Agent::GeminiCli.config_key(),
         hook::HookProtocol::Copilot => Agent::CopilotCli.config_key(),
@@ -178,11 +179,22 @@ fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent:
     }
 }
 
+/// The agent whose `[agents.<key>]` profile, history label and self-heal
+/// target apply to a request answered in `protocol`.
+///
+/// The wire protocol normally names the host, whatever the environment
+/// suggests. Muse Code (#572) is the exception: it sends Codex's payload shape
+/// (a `turn_id`) and reads Codex's minimal answer, so the protocol alone said
+/// "Codex" and an `[agents.muse]` profile never applied. Muse runs hooks in a
+/// cleared environment, so the identity comes only from the installer-written
+/// `--agent muse`; it is never inferred from the payload, so a payload cannot
+/// claim to be Muse.
 fn effective_agent_for_hook_protocol(
     protocol: hook::HookProtocol,
     detected_agent: &Agent,
 ) -> Agent {
     match protocol {
+        hook::HookProtocol::Codex if *detected_agent == Agent::Muse => Agent::Muse,
         hook::HookProtocol::Codex => Agent::CodexCli,
         hook::HookProtocol::Gemini => Agent::GeminiCli,
         hook::HookProtocol::Copilot => Agent::CopilotCli,
@@ -193,6 +205,30 @@ fn effective_agent_for_hook_protocol(
         hook::HookProtocol::Reasonix => Agent::Reasonix,
         hook::HookProtocol::ClaudeCompatible => detected_agent.clone(),
     }
+}
+
+/// The protocol dcg answers in once the payload has named its own.
+///
+/// Muse Code reads only `hookSpecificOutput.permissionDecision` and rejects
+/// shapes it does not know (a bare `allow`, a legacy `decision`), so it is
+/// answered in the minimal Codex shape it is known to enforce, including for a
+/// payload that happens to lack `turn_id` and would otherwise get Claude's
+/// extended document. Every other host keeps the protocol its payload selects.
+fn host_hook_protocol(protocol: hook::HookProtocol, detected_agent: &Agent) -> hook::HookProtocol {
+    if *detected_agent == Agent::Muse && protocol == hook::HookProtocol::ClaudeCompatible {
+        hook::HookProtocol::Codex
+    } else {
+        protocol
+    }
+}
+
+/// Hosts whose behavior when a hook cannot answer is undocumented, so dcg
+/// blocks every request it cannot read instead of failing open (#572). Muse
+/// Code documents an `onFailure` fallback for a hook that exits non-zero,
+/// times out or prints invalid output, but not what happens without one; an
+/// unreadable payload therefore blocks here rather than relying on it.
+fn host_requires_fail_closed(detected_agent: &Agent) -> bool {
+    *detected_agent == Agent::Muse
 }
 
 /// Maximum time the deny path may wait for the pending-exceptions store lock
@@ -424,6 +460,8 @@ fn hook_protocol_for_agent(agent: &Agent) -> hook::HookProtocol {
         // Reasonix reads only the exit status: the Claude-shaped fallback
         // below would exit 0 and let the command run.
         Agent::Reasonix => hook::HookProtocol::Reasonix,
+        // Muse Code enforces the minimal Codex deny (#572).
+        Agent::Muse => hook::HookProtocol::Codex,
         _ => hook::HookProtocol::ClaudeCompatible,
     }
 }
@@ -445,7 +483,11 @@ fn handle_unparseable_hook_input(
             | hook::HookReadError::InputTooLarge { .. }
             | hook::HookReadError::InvalidUtf8 { .. }
     );
-    let block = blockable && config.is_fail_closed();
+    // A host that does not document what it does when a hook cannot answer
+    // gets a block for every request dcg could not read, transient IO
+    // included: the command was not verified either way (#572).
+    let host_fail_closed = host_requires_fail_closed(detected_agent);
+    let block = (blockable && config.is_fail_closed()) || host_fail_closed;
 
     // Audit trail: record the event to history (best-effort, never fatal).
     if config.history.enabled {
@@ -530,7 +572,11 @@ fn handle_unparseable_hook_input(
         hook::HookReadError::Io(_) => None,
     };
     let protocol = payloadless_hook_protocol(detected_agent, raw_prefix);
-    let reason = if matches!(read_err, hook::HookReadError::InputTooLarge { .. }) {
+    let reason = if host_fail_closed && !(blockable && config.is_fail_closed()) {
+        "BLOCKED by dcg: the hook input was unreadable, malformed or over the size limit, \
+         so the command was not verified. dcg always fails closed for this host. Check \
+         that dcg and the agent are up to date."
+    } else if matches!(read_err, hook::HookReadError::InputTooLarge { .. }) {
         "BLOCKED by dcg: the hook input exceeds the size limit and cannot be evaluated; \
          DCG_FAIL_CLOSED is set (fail-closed mode)."
     } else {
@@ -2126,7 +2172,7 @@ fn main() {
                     }
                     return;
                 };
-                extracted.protocol
+                host_hook_protocol(extracted.protocol, &detected_agent)
             }
             Err(error) => {
                 let prefix = match error {
@@ -2274,6 +2320,34 @@ fn main() {
     let explicit_verdict = hook_input.requests_explicit_verdict();
 
     let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
+        // A shell tool call whose command dcg cannot find is a payload shape
+        // dcg does not understand, not a harmless call. Hosts that require
+        // fail-closed get a block; elsewhere this keeps the historic answer.
+        if host_requires_fail_closed(&detected_agent) && hook_input.is_shell_tool_call() {
+            let protocol = payloadless_hook_protocol(&detected_agent, None);
+            let reason = format!(
+                "BLOCKED by dcg: this {} call carries no command dcg can read (expected \
+                 tool_input.command or tool_input.cmd), so it was not verified. dcg always \
+                 fails closed for this host. Check that dcg and the agent are up to date.",
+                hook_input.tool_name.as_deref().unwrap_or("shell")
+            );
+            let delivery = hook::output_denial_for_protocol(
+                protocol,
+                "<no command in shell tool call>",
+                &reason,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+            );
+            finish_hook_mode(blocking_verdict_exit_code(protocol, delivery));
+            return;
+        }
         // Not a shell tool call: dcg has no opinion, and that is the answer.
         set_hook_panic_policy(None);
         if explicit_verdict {
@@ -2287,6 +2361,7 @@ fn main() {
         dialect: shell_dialect,
         additional_commands,
     } = extracted_command;
+    let hook_protocol = host_hook_protocol(hook_protocol, &detected_agent);
     // From here until the request is known to be allowed, a panic publishes
     // a blocking verdict instead of crashing open.
     set_hook_panic_policy(Some(HookPanicPolicy {
@@ -2830,6 +2905,53 @@ mod tests {
                 protocol,
                 "{agent:?}: planted markers must not override an identified agent"
             );
+        }
+    }
+
+    /// #572: Muse Code sends Codex-shaped payloads but is not Codex. With
+    /// `--agent muse`, the `[agents.muse]` profile and history label apply,
+    /// the answer keeps the minimal Codex shape Muse enforces (even for a
+    /// payload without `turn_id`), and unreadable input blocks. Without the
+    /// flag, nothing about Codex or Claude changes.
+    #[test]
+    fn muse_identity_selects_its_profile_and_the_codex_answer_shape() {
+        let muse = Agent::Muse;
+        assert_eq!(
+            effective_agent_for_hook_protocol(hook::HookProtocol::Codex, &muse),
+            Agent::Muse
+        );
+        assert_eq!(
+            history_agent_type_for_protocol(hook::HookProtocol::Codex, &muse),
+            "muse"
+        );
+        assert_eq!(
+            host_hook_protocol(hook::HookProtocol::ClaudeCompatible, &muse),
+            hook::HookProtocol::Codex
+        );
+        assert_eq!(
+            host_hook_protocol(hook::HookProtocol::Codex, &muse),
+            hook::HookProtocol::Codex
+        );
+        assert_eq!(hook_protocol_for_agent(&muse), hook::HookProtocol::Codex);
+        assert_eq!(
+            payloadless_hook_protocol(&muse, Some(r#"{"event":"PreToolUse","toolArgs":{"#)),
+            hook::HookProtocol::Codex,
+            "an identified Muse keeps its protocol against planted markers"
+        );
+        assert!(host_requires_fail_closed(&muse));
+
+        for other in [Agent::CodexCli, Agent::ClaudeCode, Agent::Unknown] {
+            assert_eq!(
+                effective_agent_for_hook_protocol(hook::HookProtocol::Codex, &other),
+                Agent::CodexCli,
+                "{other:?}"
+            );
+            assert_eq!(
+                host_hook_protocol(hook::HookProtocol::ClaudeCompatible, &other),
+                hook::HookProtocol::ClaudeCompatible,
+                "{other:?}"
+            );
+            assert!(!host_requires_fail_closed(&other), "{other:?}");
         }
     }
 

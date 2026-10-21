@@ -183,6 +183,13 @@ pub struct HookInput {
 pub struct ToolInput {
     /// The command string (for Bash tools).
     pub command: Option<serde_json::Value>,
+
+    /// The command string under the `cmd` key: the argument name of the
+    /// unified-exec `exec_command` tool (Codex, and Muse Code, whose own
+    /// bundled tooling reads a shell call as `cmd`, falling back to `command`
+    /// (#572)). Both keys are evaluated when both are present, so a benign
+    /// `command` cannot hide a destructive `cmd`.
+    pub cmd: Option<serde_json::Value>,
 }
 
 /// Antigravity CLI (`agy`) tool-call envelope.
@@ -1308,9 +1315,8 @@ fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value)
     match canonical {
         "tool_input" => serde_json::from_value::<ToolInput>(value.clone())
             .ok()
-            .and_then(|tool_input| extract_command_from_tool_input(&tool_input))
-            .into_iter()
-            .collect(),
+            .map(|tool_input| extract_commands_from_tool_input(&tool_input))
+            .unwrap_or_default(),
         "tool_args" => extract_commands_from_tool_args(value),
         "tool_call" => serde_json::from_value::<ToolCall>(value.clone())
             .ok()
@@ -1363,7 +1369,7 @@ fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value)
 #[must_use]
 pub fn extract_commands_from_truncated_json(prefix: &str) -> Vec<String> {
     let Some(native_commands) = native_commands_from_json_prefix(prefix) else {
-        return extract_string_values_for_key(prefix, "\"command\"");
+        return truncated_command_key_values(prefix);
     };
     if !extract_tool_names_from_truncated_json(prefix)
         .iter()
@@ -1374,8 +1380,19 @@ pub fn extract_commands_from_truncated_json(prefix: &str) -> Vec<String> {
 
     // Keep the legacy all-occurrences rule when a mixed envelope also names
     // a legacy shell tool. Neither spelling may conceal a sibling command.
-    let mut commands = extract_string_values_for_key(prefix, "\"command\"");
+    let mut commands = truncated_command_key_values(prefix);
     for command in native_commands {
+        append_recovered_command(&mut commands, command);
+    }
+    commands
+}
+
+/// Every `"command"` value in a truncated prefix, then every `"cmd"` value
+/// (the `exec_command` argument, #572) that is not already listed: the parsed
+/// path evaluates both keys, so the salvage scan must not judge fewer.
+fn truncated_command_key_values(prefix: &str) -> Vec<String> {
+    let mut commands = extract_string_values_for_key(prefix, "\"command\"");
+    for command in extract_string_values_for_key(prefix, "\"cmd\"") {
         append_recovered_command(&mut commands, command);
     }
     commands
@@ -2008,10 +2025,19 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // payload, letting the destructive command through.
     // `shell` is Cursor's name for Claude Code's `Bash` when Cursor runs the
     // `PreToolUse` hooks from `~/.claude/settings.json`; it reads the
-    // Claude-shaped answer (#518).
+    // Claude-shaped answer (#518). `exec_command` is the unified-exec tool;
+    // Muse Code sends it, and `shell`, with a Codex `turn_id` (#572).
     let is_claude_compatible_shell_tool = matches!(
         tool_name.as_str(),
-        "bash" | "monitor" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe" | "shell"
+        "bash"
+            | "monitor"
+            | "launch-process"
+            | "powershell"
+            | "pwsh"
+            | "cmd"
+            | "cmd.exe"
+            | "shell"
+            | "exec_command"
     ) || is_vscode_terminal_tool(&tool_name);
     let has_codex_turn_id = input
         .turn_id
@@ -2186,6 +2212,10 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // installed for Claude Code that did not know the name let every
             // Cursor command through unjudged (#518).
             | "shell"
+            // The unified-exec shell tool, argument `cmd` (see `ToolInput`).
+            // Muse Code exposes it next to `shell` (#572); a matched call
+            // that dcg did not recognize had no opinion, and so ran.
+            | "exec_command"
             // Hermes Agent shell tool. Distinct from Cursor's "terminal"
             // wrapper script which translates upstream to "Bash" before
             // invoking dcg, so the only path here is genuine Hermes input.
@@ -2233,6 +2263,15 @@ impl HookInput {
             self.dcg_explicit_verdict,
             Some(serde_json::Value::Bool(true))
         )
+    }
+
+    /// Whether this payload is a shell tool call by its envelope alone,
+    /// whether or not a command could be extracted from it. A host that fails
+    /// closed (#572) blocks a shell call with no readable command instead of
+    /// treating it as "not a shell call".
+    #[must_use]
+    pub fn is_shell_tool_call(&self) -> bool {
+        is_shell_hook_candidate(self)
     }
 
     /// Whether the payload declares a permission mode in which no human is
@@ -3066,11 +3105,19 @@ fn extract_commands_from_tool_call(tool_call: &ToolCall) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn extract_command_from_tool_input(tool_input: &ToolInput) -> Option<String> {
-    match tool_input.command.as_ref() {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+/// Every non-empty command string in a `tool_input` object: `command` first
+/// (the historical primary), then a distinct `cmd` (#572). Returning only the
+/// first one would let a harmless `command` answer for a destructive `cmd`.
+fn extract_commands_from_tool_input(tool_input: &ToolInput) -> Vec<String> {
+    let mut commands: Vec<String> = Vec::new();
+    for value in [tool_input.command.as_ref(), tool_input.cmd.as_ref()] {
+        if let Some(serde_json::Value::String(s)) = value {
+            if !s.is_empty() && !commands.contains(s) {
+                commands.push(s.clone());
+            }
+        }
     }
+    commands
 }
 
 /// Extract every shell command from a `toolArgs` / `toolCall.args` /
@@ -3247,13 +3294,11 @@ fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHook
             commands.push((command, entry_dialect));
         }
     }
-    if let Some(command) = input
-        .tool_input
-        .as_ref()
-        .and_then(extract_command_from_tool_input)
-    {
-        let entry_dialect = resolve(&command, labeled);
-        commands.push((command, entry_dialect));
+    if let Some(tool_input) = input.tool_input.as_ref() {
+        for command in extract_commands_from_tool_input(tool_input) {
+            let entry_dialect = resolve(&command, labeled);
+            commands.push((command, entry_dialect));
+        }
     }
     if let Some(args) = input.tool_args.as_ref() {
         for command in extract_commands_from_tool_args(args) {
@@ -5726,6 +5771,76 @@ mod tests {
             extract_command(&input),
             Some("git reset --hard".to_string())
         );
+    }
+
+    /// #572: Muse Code's `PreToolUse` payload for its `shell` tool (the field
+    /// set the issue captured from Muse 1.4.7/1.4.10), and its unified-exec
+    /// `exec_command` tool, whose argument Muse's own tooling reads as `cmd`
+    /// with `command` as the fallback. Both are shell calls answered in the
+    /// Codex shape; every command-bearing key is evaluated.
+    #[test]
+    fn test_muse_shell_and_exec_command_payloads_are_judged() {
+        let payload = |tool: &str, tool_input: &str| {
+            format!(
+                r#"{{"cwd":"/tmp/ws","hook_event_name":"PreToolUse","model":"unknown",
+                "permission_mode":"default","session_id":"s","tool_input":{tool_input},
+                "tool_name":"{tool}","tool_use_id":"user_shell_1","transcript_path":null,
+                "turn_id":"t1"}}"#
+            )
+        };
+        for (tool, tool_input, expected) in [
+            (
+                "shell",
+                r#"{"command":"git reset --hard"}"#,
+                vec!["git reset --hard"],
+            ),
+            (
+                "exec_command",
+                r#"{"cmd":"git reset --hard"}"#,
+                vec!["git reset --hard"],
+            ),
+            (
+                "exec_command",
+                r#"{"command":"git reset --hard"}"#,
+                vec!["git reset --hard"],
+            ),
+            // A benign `command` must not answer for a destructive `cmd`.
+            (
+                "exec_command",
+                r#"{"command":"ls","cmd":"git reset --hard"}"#,
+                vec!["ls", "git reset --hard"],
+            ),
+            ("exec_command", r#"{"command":"ls","cmd":"ls"}"#, vec!["ls"]),
+        ] {
+            let input = parse_hook_input(&payload(tool, tool_input)).expect("Muse payload parses");
+            assert!(input.is_shell_tool_call(), "{tool} is a shell tool");
+            let extracted = extract_command_with_context(&input).expect("command extracted");
+            assert_eq!(
+                extracted.protocol,
+                HookProtocol::Codex,
+                "{tool} {tool_input}"
+            );
+            let mut commands = vec![extracted.command.clone()];
+            commands.extend(extracted.additional_commands.iter().map(|(c, _)| c.clone()));
+            assert_eq!(commands, expected, "{tool} {tool_input}");
+        }
+
+        // A shell call with no readable command is still a shell call; a host
+        // that fails closed blocks it instead of reading it as "not shell".
+        let empty = parse_hook_input(&payload("exec_command", r#"{"cmd":""}"#)).unwrap();
+        assert!(empty.is_shell_tool_call());
+        assert!(extract_command_with_context(&empty).is_none());
+        let other = parse_hook_input(&payload("read_file", r#"{"path":"x"}"#)).unwrap();
+        assert!(!other.is_shell_tool_call());
+        assert!(extract_command_with_context(&other).is_none());
+
+        // The truncated-payload salvage scan reads `cmd` as well.
+        let prefix = r#"{"tool_name":"exec_command","tool_input":{"cmd":"git reset --hard"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["git reset --hard".to_string()]
+        );
+        assert!(shell_tool_from_truncated_json(prefix).is_some());
     }
 
     #[test]
@@ -9305,7 +9420,9 @@ mod tests {
 
     #[test]
     fn test_290_extract_no_command_key_is_none() {
-        let prefix = r#"{"tool_name":"Bash","tool_input":{"cmd":"ls"}}"#;
+        // `cmd` was this test's example of a non-command key until #572 made
+        // it one (the `exec_command` argument); any other key stays inert.
+        let prefix = r#"{"tool_name":"Bash","tool_input":{"argv":"ls","path":"x"}}"#;
         assert!(extract_commands_from_truncated_json(prefix).is_empty());
     }
 

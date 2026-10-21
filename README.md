@@ -13,7 +13,7 @@
 
 A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot CLI, VS Code Copilot Chat, Cursor, Hermes Agent, Grok (xAI), Posit Assistant, Oh My Pi, and related tools.
 
-**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Posit Assistant](https://positron.posit.co/assistant/) (Positron/RStudio extension, standalone server, and `pa` terminal client), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (native `tool.execute.before` plugin via `dcg install --opencode` — see [docs/opencode-integration.md](docs/opencode-integration.md)), [Oh My Pi (`omp`)](https://omp.sh) (native `tool_call` extension via `dcg install --omp`), [Crush](https://github.com/charmbracelet/crush) (native `hooks.PreToolUse` entry in `crush.json` via `dcg install --crush` — see [docs/crush-integration.md](docs/crush-integration.md)), [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) (native `hooks.PreToolUse` entry in `settings.json` via `dcg install --reasonix` — see [docs/reasonix-integration.md](docs/reasonix-integration.md)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
+**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Posit Assistant](https://positron.posit.co/assistant/) (Positron/RStudio extension, standalone server, and `pa` terminal client), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (native `tool.execute.before` plugin via `dcg install --opencode` — see [docs/opencode-integration.md](docs/opencode-integration.md)), [Oh My Pi (`omp`)](https://omp.sh) (native `tool_call` extension via `dcg install --omp`), [Crush](https://github.com/charmbracelet/crush) (native `hooks.PreToolUse` entry in `crush.json` via `dcg install --crush` — see [docs/crush-integration.md](docs/crush-integration.md)), [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) (native `hooks.PreToolUse` entry in `settings.json` via `dcg install --reasonix` — see [docs/reasonix-integration.md](docs/reasonix-integration.md)), [Muse Code](https://dev.meta.ai/docs/muse-code) (native `hooks.PreToolUse` matcher group in `~/.config/muse/settings.json` via `dcg install --muse` — see [docs/muse-integration.md](docs/muse-integration.md)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -1157,6 +1157,7 @@ present.
   - **OMP deadline and signal detail:** The 30.5-second observation limit is one monotonic absolute deadline, not a fresh allowance after exit. A post-exit or rejected-exit drain is `min(250 ms, remaining absolute budget)`; a hard-budget-clamped drain retains hard-deadline provenance and never kills again. A successful direct-child `kill("SIGKILL")` request is also distinct from an observed signal: diagnostics name SIGKILL only when Bun's later `signalCode` read actually exposes it. Standards-compliant Web Stream cancellation closes pending reads even if its underlying cancel algorithm rejects; dcg consumes that rejection while retaining already observed blocking frames or overflow. A non-standard synchronous cancel fault that also leaves its pending read unsettled remains outside the JavaScript boundary.
 - **Crush:** First-class hook support (#388). [Crush](https://github.com/charmbracelet/crush) runs Claude-Code-style `PreToolUse` hooks declared as flat `{name, matcher, command, timeout}` entries in the `hooks` object of its `crush.json`. `dcg install --crush` merges a `matcher: "^bash$"` entry into `~/.config/crush/crush.json` — resolved exactly as Crush does, honoring the `CRUSH_GLOBAL_CONFIG` directory override and `XDG_CONFIG_HOME`, and `~/.config` on Windows too — preserving every other key and hook (add `--project` for the repo root's `crush.json`; `dcg uninstall --crush` removes the entry). Crush pipes `{"event":"PreToolUse","tool_name":"bash","tool_input":{"command":…}}` to dcg's stdin; dcg recognizes the envelope without an `--agent` flag and answers with Crush's own `{"decision":"deny","reason":…}` on exit 0. Before this, that payload was routed to the Copilot arm and answered with a flat `permissionDecision` Crush does not read, so a block silently became "no opinion". dcg never answers `"allow"` (in Crush that pre-approves the call and skips the user's permission prompt); allowed commands stay silent, warnings travel as `context`, and review requests fail closed. Crush sets `CRUSH=1` for hook subprocesses, which is what dcg's agent detection keys on. `install.sh`/`install.ps1` configure it automatically when Crush is detected, and `dcg doctor` reports a `crush_hook` check. See [docs/crush-integration.md](docs/crush-integration.md).
 - **Reasonix:** First-class hook support (#358). [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) runs `PreToolUse` hooks declared in its `settings.json`. `dcg install --reasonix` merges a `{"match":"bash|pwsh","command":…,"timeout":5000}` entry into `<Reasonix home>/settings.json` (`$REASONIX_HOME`, else `~/.reasonix`, or `%APPDATA%\reasonix` on Windows) and keeps every other key and hook. Add `--project` to write `.reasonix/settings.json` at the repo root instead; `dcg uninstall --reasonix` removes the entry. Reasonix pipes `{"event":"PreToolUse","toolName":…,"toolArgs":{"command":…}}` to dcg and reads only the exit status. dcg blocks with exit 2 and puts the reason on stderr; a warning exits 1, which Reasonix shows without blocking. Reasonix has no "ask", so review requests block. Before this change dcg answered that payload as if it came from Copilot, with a JSON deny on exit 0, so Reasonix ran the command anyway. On Windows, a PowerShell command can arrive labeled `bash`, so dcg judges the command text rather than the label, as it does for Codex. `install.sh`/`install.ps1` configure the hook when Reasonix is detected, the uninstallers remove it, and `dcg doctor` reports a `reasonix_hook` check. See [docs/reasonix-integration.md](docs/reasonix-integration.md).
+- **Muse Code:** First-class hook support (#572). [Muse Code](https://dev.meta.ai/docs/muse-code), Meta's terminal coding agent, runs `PreToolUse` hooks from the `hooks` block of `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`. `dcg install --muse` merges a `{"matcher":"^(shell|exec_command|bash)$","hooks":[{"type":"command","command":"<dcg> --agent muse"}]}` group into that file, keeps `schema_version` (adding `1` when it is missing, refusing any other value) and every other key, and `dcg uninstall --muse` removes it. Muse sends a Codex-shaped payload (`turn_id`), with the command in `tool_input.command` (`shell`) or `tool_input.cmd` (`exec_command`); dcg evaluates both keys. It answers with the minimal `hookSpecificOutput` deny Muse enforces on exit 0, and with empty stdout for an allow, because Muse rejects a bare `allow`. Muse clears the hook environment, so `--agent muse` in the command is what selects the `[agents.muse]` profile; without it `[agents.codex-cli]` applied. With `--agent muse`, an unreadable payload or a shell call with no readable command is denied. `dcg doctor` reports a `muse_hook` check. The installers do not configure Muse yet, so run `dcg install --muse` once, then start a new Muse session. See [docs/muse-integration.md](docs/muse-integration.md).
 - **Pi:** Not auto-configured. [Pi](https://github.com/earendil-works/pi) intercepts shell commands through user-authored TypeScript extensions (`pi.on("tool_call", …)`, auto-loaded from `~/.pi/agent/extensions/*.ts` or `<repo>/.pi/extensions/*.ts`). A ready-to-use `dcg-guard.ts` extension that routes each `bash` command through `dcg --robot test` (exit 1 = deny) and blocks with the dcg reason is documented in [docs/pi-integration.md](docs/pi-integration.md).
 
 </details>
@@ -1484,6 +1485,35 @@ to dcg's stdin and reads only the exit status. dcg exits 2 to block, and
 Reasonix shows the reason from stderr. Reasonix has no "ask" answer, so
 review requests block too. See
 [docs/reasonix-integration.md](docs/reasonix-integration.md).
+
+## Muse Code Configuration
+
+`dcg install --muse` does this for you (and `dcg uninstall --muse` undoes it).
+By hand, add a matcher group to `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`,
+which must declare `"schema_version": 1`:
+
+```json
+{
+  "schema_version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(shell|exec_command|bash)$",
+        "hooks": [
+          { "type": "command", "command": "/absolute/path/to/dcg --agent muse" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Keep `--agent muse`: Muse runs hooks in a cleared environment, and the flag is
+how dcg knows the request came from Muse (it selects `[agents.muse]` and fails
+closed on payloads it cannot read). Muse refuses the call when dcg prints a
+`hookSpecificOutput` deny; dcg prints nothing for an allowed command. Start a
+new Muse session after editing the file. See
+[docs/muse-integration.md](docs/muse-integration.md).
 
 ## CLI Usage
 
@@ -3499,7 +3529,7 @@ See [Escape Hatch / Bypass](#escape-hatch--bypass). Options include `DCG_BYPASS=
 
 **Q: Does this work with other AI coding tools?**
 
-Yes. dcg natively supports Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Cursor IDE, OpenCode, Oh My Pi (`omp`), Crush, and Reasonix interception paths. Aider has limited git-hook support, and Continue is detected but cannot be auto-configured because it does not expose a pre-execution shell hook.
+Yes. dcg natively supports Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Cursor IDE, OpenCode, Oh My Pi (`omp`), Crush, Reasonix, and Muse Code interception paths. Aider has limited git-hook support, and Continue is detected but cannot be auto-configured because it does not expose a pre-execution shell hook.
 
 **Q: What about database, Docker, Kubernetes, and cloud commands?**
 
