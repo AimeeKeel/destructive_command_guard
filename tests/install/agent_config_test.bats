@@ -85,6 +85,418 @@ run_claude_fixture_installer() {
             --offline --no-verify --no-gum "$@"
 }
 
+@test "installer: easy-mode retains fail-closed hook settings through repair and updates (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    make_claude_installer_artifact
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/settings.json" <<'EOF'
+{
+  "theme": "dark",
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "shell-audit", "timeout": 7}]},
+      {
+        "matcher": "Bash|PowerShell|Monitor",
+        "customField": "canonical metadata",
+        "hooks": [{"type": "command", "command": "/retired/bin/dcg", "timeout": 15, "onFailure": "block", "statusMessage": "Checking command safety", "async": false}]
+      }
+    ],
+    "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "post-audit"}]}]
+  }
+}
+EOF
+    chmod 600 "$HOME/.claude/settings.json"
+    cp "$HOME/.claude/settings.json" "$TEST_TMPDIR/operator.snapshot"
+
+    local pass
+    for pass in repair forced installed; do
+        case "$pass" in
+            repair) run_claude_fixture_installer --easy-mode ;;
+            forced) run_claude_fixture_installer --easy-mode --force ;;
+            installed) run_claude_fixture_installer --easy-mode --artifact-url "file://$TEST_TMPDIR/not-an-artifact" ;;
+        esac
+        [ "$status" -eq 0 ]
+        python3 - "$HOME/.claude/settings.json" "$TEST_TMPDIR/operator.snapshot" "$HOME/.local/bin/dcg" <<'PY'
+import json
+import os
+import stat
+import sys
+
+settings_file, original_file, command = sys.argv[1:]
+with open(original_file) as f:
+    expected = json.load(f)
+entries = expected["hooks"]["PreToolUse"]
+guard = entries.pop(1)
+guard["hooks"][0]["command"] = command
+entries.insert(0, guard)
+with open(settings_file) as f:
+    actual = json.load(f)
+assert actual == expected, actual
+assert actual["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"] == "block"
+assert stat.S_IMODE(os.stat(settings_file).st_mode) == 0o600
+PY
+        if [ "$pass" = repair ]; then
+            cp "$HOME/.claude/settings.json" "$TEST_TMPDIR/repaired.snapshot"
+        else
+            cmp -s "$TEST_TMPDIR/repaired.snapshot" "$HOME/.claude/settings.json"
+        fi
+    done
+}
+
+@test "configure_claude_code: current operator hook fields never trigger rewriting (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    cat > "$CLAUDE_SETTINGS" <<EOF
+{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":[{"type":"command","command":"$DEST/dcg","timeout":15,"onFailure":"block","statusMessage":"operator guard","async":false,"futureField":{"enabled":false,"count":0,"optional":null,"labels":["one","two"]}}]}]}}
+EOF
+    cp "$CLAUDE_SETTINGS" "$TEST_TMPDIR/operator.snapshot"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = already ]
+    [ -z "$CLAUDE_BACKUP" ]
+    cmp -s "$TEST_TMPDIR/operator.snapshot" "$CLAUDE_SETTINGS"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = already ]
+    cmp -s "$TEST_TMPDIR/operator.snapshot" "$CLAUDE_SETTINGS"
+}
+
+@test "configure_claude_code: repair preserves host fields and refreshes only DCG identity (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    local matcher
+    for matcher in Bash 'Bash|PowerShell' 'Bash|PowerShell|Monitor'; do
+        python3 - "$CLAUDE_SETTINGS" "$matcher" "$DEST/dcg" <<'PY'
+import json
+import sys
+
+command = sys.argv[3] if sys.argv[2] == "Bash|PowerShell|Monitor" else "'/old installation/dcg.exe'"
+with open(sys.argv[1], "w") as f:
+    json.dump({"hooks": {"PreToolUse": [{
+        "matcher": sys.argv[2], "customField": "legacy metadata", "hooks": [
+            {"type": "prompt", "command": command, "shell": "powershell",
+             "timeout": 15, "onFailure": "block", "statusMessage": "operator guard",
+             "futureField": {"enabled": False, "count": 0, "optional": None, "labels": ["one", "two"]}},
+            {"type": "command", "command": "legacy-audit", "timeout": 7}
+        ]
+    }]}}, f)
+PY
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        [ "$CLAUDE_STATUS" = merged ]
+        python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" "$matcher" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    entries = json.load(f)["hooks"]["PreToolUse"]
+desired = {
+    "type": "command", "command": sys.argv[2], "timeout": 15, "onFailure": "block",
+    "statusMessage": "operator guard",
+    "futureField": {"enabled": False, "count": 0, "optional": None, "labels": ["one", "two"]}
+}
+sibling = {"type": "command", "command": "legacy-audit", "timeout": 7}
+expected = [{"matcher": "Bash|PowerShell|Monitor", "hooks": [desired]}]
+if sys.argv[3] == "Bash|PowerShell|Monitor":
+    expected[0]["customField"] = "legacy metadata"
+    expected[0]["hooks"].append(sibling)
+else:
+    expected.append({"matcher": sys.argv[3], "customField": "legacy metadata", "hooks": [sibling]})
+assert entries == expected, entries
+PY
+        cp "$CLAUDE_SETTINGS" "$TEST_TMPDIR/repaired.snapshot"
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        [ "$CLAUDE_STATUS" = already ]
+        cmp -s "$TEST_TMPDIR/repaired.snapshot" "$CLAUDE_SETTINGS"
+    done
+}
+
+@test "configure_claude_code: duplicate registrations retain all nonconflicting operator fields (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    cat > "$CLAUDE_SETTINGS" <<EOF
+{
+  "permissions": {"allow": ["Read"]},
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash|PowerShell|Monitor", "customField": "canonical metadata", "hooks": [{"type": "command", "command": "$DEST/dcg", "timeout": 15}]},
+      {"matcher": "Bash", "customField": "legacy metadata", "hooks": [{"type": "command", "command": "dcg", "onFailure": "block"}, {"type": "command", "command": "legacy-audit", "timeout": 7}]},
+      {"matcher": "Bash|PowerShell", "hooks": [{"type": "command", "command": "/old/dcg", "timeout": 15, "statusMessage": "operator guard"}]},
+      {"matcher": "Write", "customField": "custom metadata", "hooks": [{"type": "command", "command": "/other/dcg", "async": false}, {"type": "command", "command": "write-audit"}]},
+      {"matcher": "Monitor", "hooks": [{"type": "command", "command": "/opt/dcgrep/bin/scan"}, {"type": "command", "command": "dcg-helper"}, {"type": "command", "command": null}, {"type": "command", "command": 42}, {"type": "command", "command": ["opaque"]}, {"type": "command", "command": {"opaque": "keep"}}]}
+    ],
+    "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "post-audit"}]}]
+  }
+}
+EOF
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = merged ]
+    python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    actual = json.load(f)
+assert actual == {
+    "permissions": {"allow": ["Read"]},
+    "hooks": {
+        "PreToolUse": [
+            {"matcher": "Bash|PowerShell|Monitor", "customField": "canonical metadata", "hooks": [{
+                "type": "command", "command": sys.argv[2], "timeout": 15, "onFailure": "block",
+                "statusMessage": "operator guard", "async": False
+            }]},
+            {"matcher": "Bash", "customField": "legacy metadata", "hooks": [{"type": "command", "command": "legacy-audit", "timeout": 7}]},
+            {"matcher": "Write", "customField": "custom metadata", "hooks": [{"type": "command", "command": "write-audit"}]},
+            {"matcher": "Monitor", "hooks": [{"type": "command", "command": "/opt/dcgrep/bin/scan"}, {"type": "command", "command": "dcg-helper"}, {"type": "command", "command": None}, {"type": "command", "command": 42}, {"type": "command", "command": ["opaque"]}, {"type": "command", "command": {"opaque": "keep"}}]}
+        ],
+        "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "post-audit"}]}]
+    }
+}, actual
+PY
+    cp "$CLAUDE_SETTINGS" "$TEST_TMPDIR/repaired.snapshot"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = already ]
+    cmp -s "$TEST_TMPDIR/repaired.snapshot" "$CLAUDE_SETTINGS"
+}
+
+@test "configure_claude_code: conflicting duplicate policies fail without replacing valid settings (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    local conflict
+    for conflict in onFailure timeout nested boolean-number; do
+        python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" "$conflict" <<'PY'
+import json
+import sys
+
+left = {"type": "command", "command": sys.argv[2], "onFailure": "block"}
+right = {"type": "command", "command": "/stale/dcg", "onFailure": "block"}
+key, first, second = {
+    "onFailure": ("onFailure", "block", "continue"),
+    "timeout": ("timeout", 15, 30),
+    "nested": ("futureField", {"policy": "strict"}, {"policy": "relaxed"}),
+    "boolean-number": ("futureField", False, 0),
+}[sys.argv[3]]
+left[key], right[key] = first, second
+with open(sys.argv[1], "w") as f:
+    json.dump({"theme": "dark", "hooks": {"PreToolUse": [
+        {"matcher": "Bash|PowerShell|Monitor", "hooks": [left]},
+        {"matcher": "Bash", "hooks": [right]}
+    ]}}, f)
+PY
+        cp "$CLAUDE_SETTINGS" "$TEST_TMPDIR/operator.snapshot"
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        [ "$CLAUDE_STATUS" = failed ]
+        [ "$AUTO_CONFIGURED" -eq 0 ]
+        [ -n "$CLAUDE_FAILURE_REASON" ]
+        cmp -s "$TEST_TMPDIR/operator.snapshot" "$CLAUDE_SETTINGS"
+    done
+}
+
+@test "configure_claude_code: malformed owned hooks fail while preserving operator bytes (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    local shape
+    for shape in root hooks pretool canonical legacy duplicate-key nonfinite invalid-utf8; do
+        python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" "$shape" <<'PY'
+import json
+import sys
+
+if sys.argv[3] == "duplicate-key":
+    with open(sys.argv[1], "w") as f:
+        f.write('{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/old/dcg","onFailure":"block","onFailure":"continue"}]}]}}')
+    raise SystemExit(0)
+if sys.argv[3] == "nonfinite":
+    with open(sys.argv[1], "w") as f:
+        f.write('{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/old/dcg","onFailure":"block","timeout":NaN}]}]}}')
+    raise SystemExit(0)
+if sys.argv[3] == "invalid-utf8":
+    with open(sys.argv[1], "wb") as f:
+        f.write(b'{"theme":"\xff"}')
+    raise SystemExit(0)
+guard = {"matcher": "Bash|PowerShell|Monitor", "hooks": [{
+    "type": "command", "command": sys.argv[2], "timeout": 15, "onFailure": "block"
+}]}
+fixtures = {
+    "root": [],
+    "hooks": {"hooks": None},
+    "pretool": {"hooks": {"PreToolUse": {"guard": guard}}},
+    "canonical": {"hooks": {"PreToolUse": [guard, {"matcher": "Bash|PowerShell|Monitor", "hooks": None}]}},
+    "legacy": {"hooks": {"PreToolUse": [guard, {"matcher": "Bash", "hooks": {"bad": "shape"}}]}},
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(fixtures[sys.argv[3]], f)
+PY
+        cp "$CLAUDE_SETTINGS" "$TEST_TMPDIR/operator.snapshot"
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        [ "$CLAUDE_STATUS" = failed ]
+        cmp -s "$TEST_TMPDIR/operator.snapshot" "$CLAUDE_SETTINGS"
+    done
+}
+
+@test "configure_claude_code: atomic repair preserves a symlink and target permissions (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    local managed_settings="$TEST_TMPDIR/managed settings.json"
+    mkdir -p "$HOME/.claude"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/old/dcg","timeout":15,"onFailure":"block"}]}]}}' > "$managed_settings"
+    chmod 640 "$managed_settings"
+    ln -s "$managed_settings" "$CLAUDE_SETTINGS"
+    cp "$managed_settings" "$TEST_TMPDIR/operator.snapshot"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = merged ]
+    [ -L "$CLAUDE_SETTINGS" ]
+    [ "$(readlink "$CLAUDE_SETTINGS")" = "$managed_settings" ]
+    cmp -s "$TEST_TMPDIR/operator.snapshot" "$CLAUDE_BACKUP"
+    python3 - "$managed_settings" "$DEST/dcg" <<'PY'
+import json
+import os
+import stat
+import sys
+with open(sys.argv[1]) as f:
+    entries = json.load(f)["hooks"]["PreToolUse"]
+assert entries == [{"matcher": "Bash|PowerShell|Monitor", "hooks": [{
+    "type": "command", "command": sys.argv[2], "timeout": 15, "onFailure": "block"
+}]}], entries
+assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o640
+PY
+    cp "$managed_settings" "$TEST_TMPDIR/repaired.snapshot"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = already ]
+    [ -L "$CLAUDE_SETTINGS" ]
+    cmp -s "$TEST_TMPDIR/repaired.snapshot" "$managed_settings"
+
+    # An unresolved managed link is not an absent configuration to replace.
+    CLAUDE_SETTINGS="$HOME/.claude/dangling.json"
+    local missing_settings="$TEST_TMPDIR/missing operator settings.json"
+    ln -s "$missing_settings" "$CLAUDE_SETTINGS"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = failed ]
+    [ -L "$CLAUDE_SETTINGS" ]
+    [ "$(readlink "$CLAUDE_SETTINGS")" = "$missing_settings" ]
+    [ ! -e "$missing_settings" ]
+}
+
+@test "configure_claude_code: repair and creation quote an unsafe installation path (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    DEST="$TEST_TMPDIR/"'install dir "quoted" $(touch escaped-command)'
+    mkdir -p "$DEST" "$HOME/.claude"
+    local registration
+    for registration in stale exact fresh; do
+        CLAUDE_SETTINGS="$HOME/.claude/$registration.json"
+        if [ "$registration" != fresh ]; then
+            python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" "$registration" <<'PY'
+import json
+import sys
+command = sys.argv[2] if sys.argv[3] == "exact" else "/old/dcg"
+with open(sys.argv[1], "w") as f:
+    json.dump({"hooks": {"PreToolUse": [{"matcher": "Bash|PowerShell|Monitor", "hooks": [{
+        "type": "command", "command": command, "timeout": 15, "onFailure": "block"
+    }]}]}}, f)
+PY
+        fi
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        if [ "$registration" = fresh ]; then
+            [ "$CLAUDE_STATUS" = created ]
+        else
+            [ "$CLAUDE_STATUS" = merged ]
+        fi
+        python3 - "$CLAUDE_SETTINGS" "$DEST/dcg" "$registration" <<'PY'
+import json
+import shlex
+import sys
+with open(sys.argv[1]) as f:
+    entries = json.load(f)["hooks"]["PreToolUse"]
+assert len(entries) == 1, entries
+assert entries[0]["matcher"] == "Bash|PowerShell|Monitor"
+hook = entries[0]["hooks"][0]
+assert shlex.split(hook["command"]) == [sys.argv[2]], hook
+if sys.argv[3] != "fresh":
+    assert hook["onFailure"] == "block"
+    assert hook["timeout"] == 15
+PY
+        [ ! -e "$PWD/escaped-command" ]
+        cp "$CLAUDE_SETTINGS" "$TEST_TMPDIR/repaired.snapshot"
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        [ "$CLAUDE_STATUS" = already ]
+        cmp -s "$TEST_TMPDIR/repaired.snapshot" "$CLAUDE_SETTINGS"
+    done
+}
+
+@test "configure_claude_code: read and publication failures leave the previous valid file intact (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/old/dcg","timeout":15,"onFailure":"block"}]}]}}' > "$CLAUDE_SETTINGS"
+    chmod 600 "$CLAUDE_SETTINGS"
+    cp "$CLAUDE_SETTINGS" "$TEST_TMPDIR/operator.snapshot"
+    export DCG_TEST_REAL_PYTHON
+    DCG_TEST_REAL_PYTHON="$(command -v python3)"
+    cat > "$TEST_TMPDIR/bin/python3" <<'EOF'
+#!/bin/bash
+exec "$DCG_TEST_REAL_PYTHON" -c '
+import builtins
+import os
+import sys
+sys.argv = sys.argv[1:]
+if os.environ["DCG_TEST_SETTINGS_FAILURE"] == "read":
+    real_open = builtins.open
+    def fail_read(path, mode="r", *args, **kwargs):
+        if os.fspath(path) == sys.argv[1] and "r" in mode:
+            raise OSError("injected settings read failure")
+        return real_open(path, mode, *args, **kwargs)
+    builtins.open = fail_read
+else:
+    def fail_replace(*args, **kwargs):
+        raise OSError("injected settings publication failure")
+    os.replace = fail_replace
+exec(compile(sys.stdin.read(), "<installer-config>", "exec"))
+' "$@"
+EOF
+    chmod +x "$TEST_TMPDIR/bin/python3"
+    hash -r
+    export DCG_TEST_SETTINGS_FAILURE
+    for DCG_TEST_SETTINGS_FAILURE in read publication; do
+        configure_claude_code "$CLAUDE_SETTINGS" "0"
+        [ "$CLAUDE_STATUS" = failed ]
+        [ "$AUTO_CONFIGURED" -eq 0 ]
+        [ -n "$CLAUDE_FAILURE_REASON" ]
+        cmp -s "$TEST_TMPDIR/operator.snapshot" "$CLAUDE_SETTINGS"
+        "$DCG_TEST_REAL_PYTHON" - "$CLAUDE_SETTINGS" <<'PY'
+import json
+import os
+import stat
+import sys
+with open(sys.argv[1]) as f:
+    hook = json.load(f)["hooks"]["PreToolUse"][0]["hooks"][0]
+assert hook["onFailure"] == "block"
+assert hook["timeout"] == 15
+assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600
+PY
+    done
+}
+
+@test "configure_claude_code: backup failure cannot overwrite the previous valid settings (#582)" {
+    command -v python3 >/dev/null || skip "python3 not available"
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/old/dcg","timeout":15,"onFailure":"block"}]}]}}' > "$CLAUDE_SETTINGS"
+    cp "$CLAUDE_SETTINGS" "$TEST_TMPDIR/operator.snapshot"
+    cat > "$TEST_TMPDIR/bin/cp" <<'EOF'
+#!/bin/bash
+printf '%s\n' 'injected settings backup failure' >&2
+exit 1
+EOF
+    chmod +x "$TEST_TMPDIR/bin/cp"
+    hash -r
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    [ "$CLAUDE_STATUS" = failed ]
+    [ "$AUTO_CONFIGURED" -eq 0 ]
+    [ -n "$CLAUDE_FAILURE_REASON" ]
+    cmp -s "$TEST_TMPDIR/operator.snapshot" "$CLAUDE_SETTINGS"
+}
+
 @test "installer: CLAUDE_CONFIG_DIR creates active settings and reconfigures an installed version" {
     command -v python3 >/dev/null || skip "python3 not available"
     make_claude_installer_artifact

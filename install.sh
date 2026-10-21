@@ -2007,6 +2007,7 @@ configure_claude_code() {
   local settings_file="$1"
   local cleanup_predecessor="$2"
   CLAUDE_FAILURE_REASON=""
+  CLAUDE_BACKUP=""
   # Default to cleaning up predecessor if not specified or empty
   [ -z "$cleanup_predecessor" ] && cleanup_predecessor=1
   local settings_dir
@@ -2019,7 +2020,16 @@ configure_claude_code() {
 
   # Always create the config directory if it doesn't exist
   if [ ! -d "$settings_dir" ]; then
-    mkdir -p "$settings_dir"
+    if ! mkdir -p "$settings_dir"; then
+      CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="could not create settings directory"
+      return 0
+    fi
+  fi
+  if { [ -e "$settings_file" ] || [ -L "$settings_file" ]; } && [ ! -f "$settings_file" ]; then
+    CLAUDE_STATUS="failed"
+    CLAUDE_FAILURE_REASON="settings.json is not a regular file; left unchanged"
+    return 0
   fi
 
   if [ -f "$settings_file" ]; then
@@ -2028,7 +2038,7 @@ configure_claude_code() {
     # must fall through to the merge path.
     if command -v python3 >/dev/null 2>&1; then
       local claude_hook_state
-      claude_hook_state=$(python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
+      if ! claude_hook_state=$(python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
 import json
 import os
 import shlex
@@ -2036,11 +2046,26 @@ import sys
 
 settings_file = sys.argv[1]
 dcg_path = sys.argv[2]
+dcg_command = shlex.quote(dcg_path)
 cleanup_predecessor = sys.argv[3] == "1" if len(sys.argv) > 3 else True
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
 
 def is_dcg_command(cmd):
     if not isinstance(cmd, str) or not cmd:
         return False
+    # Older installers emitted this exact path without shell quoting.
+    if cmd == dcg_path:
+        return True
     try:
         tokens = shlex.split(cmd)
     except ValueError:
@@ -2053,15 +2078,16 @@ def is_dcg_command(cmd):
     return name == 'dcg'
 
 try:
-    with open(settings_file, 'r') as f:
+    with open(settings_file, 'r', encoding='utf-8') as f:
         raw_settings = f.read()
-except IOError:
-    print("merge")
+except (OSError, UnicodeError):
+    print("invalid")
     raise SystemExit(0)
 
 if raw_settings.strip():
     try:
-        settings = json.loads(raw_settings)
+        settings = json.loads(raw_settings, object_pairs_hook=unique_object,
+                              parse_constant=invalid_constant)
     except (ValueError, json.JSONDecodeError):
         print("invalid")
         raise SystemExit(0)
@@ -2094,8 +2120,6 @@ for entry in pre_tool_use:
     if not isinstance(entry, dict):
         continue
     matcher = entry.get("matcher")
-    if matcher != CANONICAL_MATCHER and matcher not in LEGACY_MATCHERS:
-        continue
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
         print("invalid")
@@ -2104,7 +2128,9 @@ for entry in pre_tool_use:
         if not isinstance(hook, dict):
             continue
         cmd = hook.get("command")
-        if isinstance(cmd, str) and "git_safety_guard" in cmd:
+        if ((matcher == CANONICAL_MATCHER or matcher in LEGACY_MATCHERS)
+                and isinstance(cmd, str) and "git_safety_guard" in cmd
+                and not is_dcg_command(cmd)):
             predecessor_present = True
         if is_dcg_command(cmd):
             dcg_commands.append(cmd)
@@ -2116,20 +2142,28 @@ if isinstance(first_entry, dict) and first_entry.get("matcher") == CANONICAL_MAT
     if isinstance(first_hooks, list) and first_hooks:
         first_hook = first_hooks[0]
         if isinstance(first_hook, dict):
-            canonical_entry_is_first = first_hook.get("command") == dcg_path
+            canonical_entry_is_first = (
+                first_hook.get("type") == "command"
+                and first_hook.get("command") == dcg_command
+                and "shell" not in first_hook
+            )
 
 if cleanup_predecessor and predecessor_present:
     print("merge")
-elif dcg_commands == [dcg_path] and canonical_entry_is_first:
+elif dcg_commands == [dcg_command] and canonical_entry_is_first:
     print("already")
 else:
     print("merge")
 PYEOF
-)
+      ); then
+        CLAUDE_STATUS="failed"
+        CLAUDE_FAILURE_REASON="could not inspect existing settings.json; left unchanged"
+        return 0
+      fi
       if [ "$claude_hook_state" = "invalid" ]; then
         CLAUDE_STATUS="failed"
-        CLAUDE_FAILURE_REASON="existing settings.json is invalid or has malformed hooks; left unchanged"
-        warn "Claude Code settings.json is invalid or has malformed hooks; leaving it unchanged: $settings_file"
+        CLAUDE_FAILURE_REASON="existing settings.json is unreadable, invalid or has malformed hooks; left unchanged"
+        warn "Claude Code settings.json is unreadable, invalid or has malformed hooks; leaving it unchanged: $settings_file"
         return 0
       fi
       if [ "$claude_hook_state" = "already" ]; then
@@ -2165,20 +2199,51 @@ PYEOF
       fi
     fi
 
-    # Settings file exists, need to merge
-    CLAUDE_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$settings_file" "$CLAUDE_BACKUP"
+    if ! command -v python3 >/dev/null 2>&1; then
+      CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="python3 required for merge"
+      return 1
+    fi
 
-    if command -v python3 >/dev/null 2>&1; then
-      if python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
+    # Keep the original before attempting a repair. A failed backup must not
+    # turn a recoverable configuration error into a destructive update.
+    local backup_base backup_suffix=0
+    backup_base="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
+    CLAUDE_BACKUP="$backup_base"
+    while [ -e "$CLAUDE_BACKUP" ] || [ -L "$CLAUDE_BACKUP" ]; do
+      backup_suffix=$((backup_suffix + 1))
+      CLAUDE_BACKUP="${backup_base}.${backup_suffix}"
+    done
+    if ! cp "$settings_file" "$CLAUDE_BACKUP"; then
+      CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="could not back up existing settings.json; left unchanged"
+      CLAUDE_BACKUP=""
+      return 0
+    fi
+
+    if python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
 import json
 import os
 import shlex
+import stat
 import sys
+import tempfile
 
 settings_file = sys.argv[1]
 dcg_path = sys.argv[2]
+dcg_command = shlex.quote(dcg_path)
 cleanup_predecessor = sys.argv[3] == "1" if len(sys.argv) > 3 else True
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
 
 def is_dcg_command(cmd):
     """True iff `cmd` invokes the dcg binary (basename match, not substring).
@@ -2189,8 +2254,12 @@ def is_dcg_command(cmd):
     causing the installer to skip merge ("dcg already there!") or, worse,
     causing the uninstaller to delete those entries on its --purge run.
     """
-    if not cmd:
+    if not isinstance(cmd, str) or not cmd:
         return False
+    # Recover fields from the unquoted path emitted by older installers,
+    # without mistaking an unrelated command's arguments for an executable.
+    if cmd == dcg_path:
+        return True
     try:
         tokens = shlex.split(cmd)
     except ValueError:
@@ -2204,16 +2273,17 @@ def is_dcg_command(cmd):
         name = name[:-4]
     return name == 'dcg'
 
-raw_settings = ""
 try:
-    with open(settings_file, 'r') as f:
+    with open(settings_file, 'r', encoding='utf-8') as f:
         raw_settings = f.read()
-except IOError:
-    settings = {}
+except (OSError, UnicodeError) as error:
+    print(f"cannot read Claude Code settings.json: {settings_file}: {error}", file=sys.stderr)
+    raise SystemExit(1)
 
 if raw_settings.strip():
     try:
-        settings = json.loads(raw_settings)
+        settings = json.loads(raw_settings, object_pairs_hook=unique_object,
+                              parse_constant=invalid_constant)
     except (ValueError, json.JSONDecodeError):
         print(f"invalid Claude Code settings.json: {settings_file}", file=sys.stderr)
         raise SystemExit(1)
@@ -2242,10 +2312,32 @@ elif not isinstance(settings['hooks']['PreToolUse'], list):
 CANONICAL_MATCHER = "Bash|PowerShell|Monitor"
 LEGACY_MATCHERS = ("Bash", "Bash|PowerShell")
 
-# First pass: strip dcg (and, when asked, its predecessor) out of every entry
-# dcg may previously have owned. Other hooks keep their own matcher so their
-# scope is never silently widened; entries emptied by the strip are dropped.
+# Match #345's ownership rule in src/cli.rs: only identity is ours. Keep all
+# other fields, including future host settings. Compatible duplicates can be
+# combined; conflicting operator choices cannot safely be guessed (#582).
+DCG_OWNED_HOOK_KEYS = {"type", "command", "shell"}
+host_owned_fields = {}
+
+def preserve_hook_fields(hook):
+    for key, value in hook.items():
+        if key in DCG_OWNED_HOOK_KEYS:
+            continue
+        if key in host_owned_fields and json.dumps(
+            host_owned_fields[key], sort_keys=True
+        ) != json.dumps(value, sort_keys=True):
+            print(
+                f"conflicting operator-owned DCG hook field {key!r}; "
+                f"reconcile duplicate registrations in {settings_file}; left unchanged",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        host_owned_fields[key] = value
+
+# Remove recognized dcg hooks under every matcher, as the Rust repair does.
+# Other hooks retain their matcher, metadata, and order. Reuse the first
+# canonical entry so its metadata stays attached to the repaired registration.
 new_pre_tool_use = []
+canonical_entry = None
 predecessor_removed = False
 
 for entry in settings['hooks']['PreToolUse']:
@@ -2253,9 +2345,6 @@ for entry in settings['hooks']['PreToolUse']:
         new_pre_tool_use.append(entry)
         continue
     matcher = entry.get('matcher')
-    if matcher != CANONICAL_MATCHER and matcher not in LEGACY_MATCHERS:
-        new_pre_tool_use.append(entry)
-        continue
     if 'hooks' not in entry:
         new_pre_tool_use.append(entry)
         continue
@@ -2263,58 +2352,121 @@ for entry in settings['hooks']['PreToolUse']:
         print(f"Claude Code {matcher} matcher hooks must contain a list: {settings_file}", file=sys.stderr)
         raise SystemExit(1)
     kept_hooks = []
+    removed = False
     for hook in entry['hooks']:
-        if isinstance(hook, dict) and 'command' in hook:
-            cmd = hook.get('command', '')
-            if 'git_safety_guard' in cmd:
-                if cleanup_predecessor:
-                    predecessor_removed = True
-                    continue  # Skip predecessor
-                kept_hooks.append(hook)  # Keep predecessor
-            elif not is_dcg_command(cmd):  # Don't duplicate dcg
-                kept_hooks.append(hook)
-        else:
-            kept_hooks.append(hook)
-    if kept_hooks:
+        if isinstance(hook, dict):
+            cmd = hook.get('command')
+            if is_dcg_command(cmd):
+                preserve_hook_fields(hook)
+                removed = True
+                continue
+            if (cleanup_predecessor
+                    and (matcher == CANONICAL_MATCHER or matcher in LEGACY_MATCHERS)
+                    and isinstance(cmd, str) and 'git_safety_guard' in cmd):
+                predecessor_removed = True
+                removed = True
+                continue
+        kept_hooks.append(hook)
+    if matcher == CANONICAL_MATCHER and canonical_entry is None:
+        entry['hooks'] = kept_hooks
+        canonical_entry = entry
+    elif kept_hooks or not removed:
         entry['hooks'] = kept_hooks
         new_pre_tool_use.append(entry)
 
 # Add exactly one current dcg hook, first, so it runs before any other hook.
 # Existing dcg hooks, including stale paths, duplicates, and both legacy
 # matcher registrations, were collapsed above.
-new_pre_tool_use.insert(0, {
-    "matcher": CANONICAL_MATCHER,
-    "hooks": [{"type": "command", "command": dcg_path}]
-})
+desired_hook = {"type": "command", "command": dcg_command}
+desired_hook.update(host_owned_fields)
+if canonical_entry is None:
+    canonical_entry = {"matcher": CANONICAL_MATCHER, "hooks": []}
+canonical_entry['hooks'].insert(0, desired_hook)
+new_pre_tool_use.insert(0, canonical_entry)
 
 settings['hooks']['PreToolUse'] = new_pre_tool_use
 
-with open(settings_file, 'w') as f:
-    json.dump(settings, f, indent=2)
+# Serialize before touching disk, then atomically publish next to the resolved
+# target. Preserve symlinks (e.g. stow/chezmoi) and the operator's file mode.
+# A read, serialization, staging, or replacement failure leaves the old file.
+serialized = json.dumps(settings, indent=2, allow_nan=False) + "\n"
+target = os.path.realpath(settings_file)
+original_stat = os.stat(target)
+fd, temporary = tempfile.mkstemp(prefix='.settings.json.', suffix='.tmp',
+                               dir=os.path.dirname(target))
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        staged_stat = os.fstat(f.fileno())
+        if (staged_stat.st_uid, staged_stat.st_gid) != (original_stat.st_uid, original_stat.st_gid):
+            os.fchown(f.fileno(), original_stat.st_uid, original_stat.st_gid)
+        os.fchmod(f.fileno(), stat.S_IMODE(original_stat.st_mode))
+        f.write(serialized)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, target)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
 
 if predecessor_removed:
     print("PREDECESSOR_CLEANED", file=sys.stderr)
 PYEOF
-      then
-        CLAUDE_STATUS="merged"
-        AUTO_CONFIGURED=1
-      else
-        mv "$CLAUDE_BACKUP" "$settings_file" 2>/dev/null || true
-        CLAUDE_STATUS="failed"
-        CLAUDE_FAILURE_REASON="merge failed; restored backup"
-        CLAUDE_BACKUP=""
-      fi
+    then
+      CLAUDE_STATUS="merged"
+      AUTO_CONFIGURED=1
     else
-      # python3 not available - remove unnecessary backup
-      rm -f "$CLAUDE_BACKUP" 2>/dev/null || true
-      CLAUDE_BACKUP=""
       CLAUDE_STATUS="failed"
-      CLAUDE_FAILURE_REASON="python3 required for merge"
-      return 1
+      CLAUDE_FAILURE_REASON="merge failed; existing settings left unchanged (see diagnostic)"
     fi
   else
-    # Create new settings file
-    cat > "$settings_file" <<EOFSET
+    # Fresh settings must use the same JSON and shell quoting as repairs.
+    if command -v python3 >/dev/null 2>&1; then
+      if python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+import tempfile
+
+settings_file = os.path.abspath(sys.argv[1])
+settings = {"hooks": {"PreToolUse": [{
+    "matcher": "Bash|PowerShell|Monitor",
+    "hooks": [{"type": "command", "command": shlex.quote(sys.argv[2])}]
+}]}}
+serialized = json.dumps(settings, indent=2) + "\n"
+fd, temporary = tempfile.mkstemp(prefix='.settings.json.', suffix='.tmp',
+                               dir=os.path.dirname(settings_file))
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(serialized)
+        f.flush()
+        os.fsync(f.fileno())
+    # Publish only if still absent; never overwrite settings created meanwhile.
+    os.link(temporary, settings_file)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PYEOF
+      then
+        CLAUDE_STATUS="created"
+        AUTO_CONFIGURED=1
+      else
+        CLAUDE_STATUS="failed"
+        CLAUDE_FAILURE_REASON="could not create settings.json; existing settings left unchanged"
+      fi
+      return 0
+    fi
+
+    # Without Python, only paths needing neither shell nor JSON escaping can
+    # be safely emitted. Existing settings are never rewritten by this path.
+    case "$DEST/dcg" in
+      *[!a-zA-Z0-9_./-]*)
+        CLAUDE_STATUS="failed"
+        CLAUDE_FAILURE_REASON="python3 required to quote the hook command"
+        return 1
+        ;;
+    esac
+    if ! (set -C; cat > "$settings_file" <<EOFSET
 {
   "hooks": {
     "PreToolUse": [
@@ -2331,6 +2483,11 @@ PYEOF
   }
 }
 EOFSET
+    ); then
+      CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="could not create settings.json; existing settings left unchanged"
+      return 0
+    fi
     CLAUDE_STATUS="created"
     AUTO_CONFIGURED=1
   fi
