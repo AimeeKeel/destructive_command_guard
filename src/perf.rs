@@ -31,7 +31,7 @@
 //! it never turns incomplete analysis into a silent allow.
 //! This ensures dcg never blocks a user's workflow indefinitely.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -201,6 +201,89 @@ thread_local! {
     // An absent collector is the whole disabled path: no clock, environment
     // lookup, lock, or allocation is performed at an instrumented call site.
     static THREAD_PROFILE: RefCell<Option<ThreadProfile>> = const { RefCell::new(None) };
+    // The innermost phase open on this thread, kept with or without a
+    // collector (one thread-local write per phase boundary, no clock), so an
+    // exhausted budget can name the phase it ran out in (#571).
+    static CURRENT_PHASE: Cell<Option<ProfilePhase>> = const { Cell::new(None) };
+    static EXHAUSTION: Cell<BudgetExhaustion> = const { Cell::new(BudgetExhaustion::NONE) };
+}
+
+/// Where this thread's evaluation ran out of budget, for the indeterminate
+/// reason (#571). Each field keeps its first observation since the last
+/// [`take_budget_exhaustion`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BudgetExhaustion {
+    /// The phase open when an expired deadline (or a remaining budget too
+    /// small for the next step) was first observed. `Some(None)` means it was
+    /// observed outside every instrumented phase.
+    pub deadline: Option<Option<ProfilePhase>>,
+    /// The first bounded analysis that could not complete (a regex search
+    /// limit or an optional proof's own budget), and the phase it ran in.
+    pub incomplete: Option<(&'static str, Option<ProfilePhase>)>,
+}
+
+impl BudgetExhaustion {
+    const NONE: Self = Self {
+        deadline: None,
+        incomplete: None,
+    };
+}
+
+/// Record that evaluation on this thread stopped for lack of time.
+pub fn note_deadline_exhausted() {
+    EXHAUSTION.with(|cell| {
+        let mut note = cell.get();
+        if note.deadline.is_none() {
+            note.deadline = Some(CURRENT_PHASE.with(Cell::get));
+            cell.set(note);
+        }
+    });
+}
+
+/// Record that a bounded analysis step (`stage`) could not complete.
+pub fn note_incomplete_analysis(stage: &'static str) {
+    EXHAUSTION.with(|cell| {
+        let mut note = cell.get();
+        if note.incomplete.is_none() {
+            note.incomplete = Some((stage, CURRENT_PHASE.with(Cell::get)));
+            cell.set(note);
+        }
+    });
+}
+
+/// Return and clear this thread's budget-exhaustion notes.
+pub fn take_budget_exhaustion() -> BudgetExhaustion {
+    EXHAUSTION.with(|cell| cell.replace(BudgetExhaustion::NONE))
+}
+
+/// The diagnostic name of a phase, as `DCG_PROFILE` reports it.
+#[must_use]
+pub fn phase_name(phase: ProfilePhase) -> &'static str {
+    PROFILE_PHASES[phase as usize].1
+}
+
+/// User plus system CPU time this process has used, where the platform
+/// reports it. Wall time alone cannot tell a slow input from a process the
+/// host barely scheduled (#571).
+#[must_use]
+pub fn process_cpu_time() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let usage =
+            nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_SELF).ok()?;
+        let micros = |time: nix::sys::time::TimeVal| {
+            u64::try_from(time.tv_sec())
+                .ok()?
+                .checked_mul(1_000_000)?
+                .checked_add(u64::try_from(time.tv_usec()).ok()?)
+        };
+        let total = micros(usage.user_time())?.checked_add(micros(usage.system_time())?)?;
+        Some(Duration::from_micros(total))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -211,13 +294,17 @@ fn duration_ns(duration: Duration) -> u64 {
 #[must_use = "dropping the guard ends the measurement"]
 pub struct PhaseGuard {
     active: Option<(Arc<Mutex<ProfileMeasurements>>, usize)>,
+    // The phase this guard's phase nested in, restored on drop.
+    outer: Option<ProfilePhase>,
     // A span must end on the thread whose stack it entered.
     _thread_bound: PhantomData<Rc<()>>,
 }
 
-/// Measure a phase only when hook profiling is active on this thread.
+/// Enter a phase: always as this thread's current phase, and as a measured
+/// span only when hook profiling is active on this thread.
 #[inline]
 pub fn phase(phase: ProfilePhase) -> PhaseGuard {
+    let outer = CURRENT_PHASE.with(|current| current.replace(Some(phase)));
     let active = THREAD_PROFILE.with(|slot| {
         let mut slot = slot.borrow_mut();
         let profile = slot.as_mut()?;
@@ -226,12 +313,14 @@ pub fn phase(phase: ProfilePhase) -> PhaseGuard {
     });
     PhaseGuard {
         active,
+        outer,
         _thread_bound: PhantomData,
     }
 }
 
 impl Drop for PhaseGuard {
     fn drop(&mut self) {
+        CURRENT_PHASE.with(|current| current.set(self.outer));
         let Some((shared, depth)) = self.active.as_ref() else {
             return;
         };
@@ -573,7 +662,11 @@ impl Deadline {
     pub fn is_exceeded(&self) -> bool {
         // `>=` so a zero-duration deadline is exceeded immediately even when
         // the monotonic clock has not advanced between construction and check.
-        self.start.elapsed() >= self.max_duration
+        let exceeded = self.start.elapsed() >= self.max_duration;
+        if exceeded {
+            note_deadline_exhausted();
+        }
+        exceeded
     }
 
     /// Get the remaining time before the deadline, or None if exceeded.
@@ -585,7 +678,12 @@ impl Deadline {
         // construction and this call (the checked_sub form returned Some(0)
         // in that window, contradicting both the doc contract and
         // `is_exceeded`, and made the zero-duration test flaky).
-        (elapsed < self.max_duration).then(|| self.max_duration.saturating_sub(elapsed))
+        let remaining =
+            (elapsed < self.max_duration).then(|| self.max_duration.saturating_sub(elapsed));
+        if remaining.is_none() {
+            note_deadline_exhausted();
+        }
+        remaining
     }
 
     /// Get the elapsed time since the deadline started.
@@ -765,6 +863,77 @@ mod tests {
             worker,
             stack: Vec::new(),
         }
+    }
+
+    #[test]
+    fn budget_exhaustion_names_the_innermost_open_phase_issue_571() {
+        // Each test runs on its own thread, so these thread-locals start clean.
+        assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
+        {
+            let _evaluation = phase(ProfilePhase::Evaluation);
+            {
+                let _rules = phase(ProfilePhase::PatternRules);
+                let _compile = phase(ProfilePhase::RegexCompile);
+                assert!(Deadline::new(Duration::ZERO).is_exceeded());
+            }
+            // Later observations do not replace the first one.
+            assert!(Deadline::new(Duration::ZERO).remaining().is_none());
+            note_incomplete_analysis("interpreter_literal_recovery");
+            note_incomplete_analysis("match");
+            assert_eq!(
+                CURRENT_PHASE.with(Cell::get),
+                Some(ProfilePhase::Evaluation)
+            );
+        }
+        assert_eq!(CURRENT_PHASE.with(Cell::get), None);
+        assert_eq!(
+            take_budget_exhaustion(),
+            BudgetExhaustion {
+                deadline: Some(Some(ProfilePhase::RegexCompile)),
+                incomplete: Some((
+                    "interpreter_literal_recovery",
+                    Some(ProfilePhase::Evaluation)
+                )),
+            }
+        );
+        // Taking clears; an expiry outside every phase is still recorded.
+        assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
+        assert!(Deadline::new(Duration::ZERO).is_exceeded());
+        assert_eq!(
+            take_budget_exhaustion(),
+            BudgetExhaustion {
+                deadline: Some(None),
+                incomplete: None,
+            }
+        );
+        // A deadline that has not passed records nothing.
+        assert!(!Deadline::new(Duration::from_secs(3600)).is_exceeded());
+        assert!(
+            Deadline::new(Duration::from_secs(3600))
+                .remaining()
+                .is_some()
+        );
+        assert_eq!(take_budget_exhaustion(), BudgetExhaustion::default());
+        assert_eq!(phase_name(ProfilePhase::RegexCompile), "regex_compile");
+        assert_eq!(phase_name(ProfilePhase::HistoryFlush), "history_flush");
+    }
+
+    #[test]
+    fn process_cpu_time_is_reported_on_unix_issue_571() {
+        let cpu = process_cpu_time();
+        #[cfg(unix)]
+        {
+            // Burn a little CPU so a coarse clock cannot read zero.
+            let started = Instant::now();
+            let mut x = 0_u64;
+            while started.elapsed() < Duration::from_millis(20) {
+                x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+            }
+            let later = process_cpu_time().expect("getrusage succeeds");
+            assert!(later > cpu.expect("getrusage succeeds"));
+        }
+        #[cfg(not(unix))]
+        assert!(cpu.is_none());
     }
 
     #[test]

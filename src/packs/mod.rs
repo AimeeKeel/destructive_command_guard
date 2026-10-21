@@ -3778,6 +3778,237 @@ fn contains_unquoted_shell_operator(
     false
 }
 
+/// The POSIX command text with every inert redirection replaced by spaces,
+/// for keyword gating only (#571).
+///
+/// A redirection is inert when it can neither write nor read anything but
+/// the null device, and neither names a file nor runs code: a redirection of
+/// any descriptor to or from `/dev/null` (`2>/dev/null`, `>/dev/null`,
+/// `&>/dev/null`, `>>/dev/null`, `>|/dev/null`, `</dev/null`) and a
+/// descriptor duplication or close (`2>&1`, `>&2`, `1>&-`, `<&3`). Removing
+/// one from a command never changes which files the command touches, so it
+/// cannot be what makes the command destructive. Its bytes still spelled the
+/// `2>`, `>&`, `>/` and `/dev/` keywords, so `ls 2>/dev/null` selected
+/// `core.filesystem` and `system.disk` and paid for compiling both packs,
+/// about four times the cost of `ls`, while neither pack had a rule that could
+/// match it.
+///
+/// Only the gating decision reads this view. Every selected pack still
+/// matches against the original text.
+///
+/// Blanking is applied ONLY when every unquoted redirection in the command is
+/// inert. A command that also has a real redirection keeps its full text, so
+/// the pack it selects still evaluates that redirection — critically, a
+/// destructive redirect can have NO keyword of its own (`> logs/run_$x.log`
+/// carries none of `>/`, `>$`, …; it was caught only because some other
+/// redirect such as `2>&1` selected `core.filesystem`). Removing the inert
+/// redirect's keyword would then drop the pack and hide the real redirect, so
+/// in that case nothing is blanked.
+///
+/// The recognizer is deliberately narrow and lexical: the redirection must be
+/// unquoted and unescaped, a descriptor number must begin its word, and the
+/// target must be exactly `/dev/null` (or a descriptor number, or `-`) ending
+/// at a shell metacharacter. `>/dev/null"x"`, `>/dev/null/../sda`, `>&file`,
+/// `"2>/dev/null"` and `{fd}>/dev/null` are left as they are. Spans are blanked
+/// in place, so offsets and word boundaries are unchanged: in
+/// `"git">/dev/null reset --hard` the command word stays `"git"`.
+#[must_use]
+pub(crate) fn blank_inert_redirections(command: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = command.as_bytes();
+    if !bytes.iter().any(|&byte| matches!(byte, b'>' | b'<')) {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    // Pass 1: every unquoted `>`/`<` is a redirection operator. Collect the
+    // inert ones; a single real (non-inert) one means the whole command keeps
+    // its keywords, so return it unchanged.
+    let mut inert_spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_ansi_c = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_single {
+            in_single = byte != b'\'';
+            i += 1;
+            continue;
+        }
+        if in_ansi_c {
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            in_ansi_c = byte != b'\'';
+            i += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            i += 2;
+            continue;
+        }
+        if in_double {
+            in_double = byte != b'"';
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                in_ansi_c = true;
+                i += 2;
+                continue;
+            }
+            // A comment runs to the end of its line; its quotes quote nothing.
+            b'#' if i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')'
+                ) =>
+            {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'>' | b'<' => {
+                let start = redirect_operator_start(bytes, i);
+                match inert_redirection_end(bytes, start) {
+                    Some(end) => {
+                        inert_spans.push((start, end));
+                        i = end;
+                        continue;
+                    }
+                    // A real redirection: do not blank anything on this line.
+                    None => return std::borrow::Cow::Borrowed(command),
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if inert_spans.is_empty() {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    let mut out = bytes.to_vec();
+    for (start, end) in inert_spans {
+        out[start..end].fill(b' ');
+    }
+    // Only ASCII bytes were replaced, with ASCII spaces.
+    std::borrow::Cow::Owned(String::from_utf8(out).unwrap_or_else(|_| command.to_string()))
+}
+
+/// The byte where the redirection whose operator is at `op` (`>` or `<`)
+/// begins: a leading file-descriptor number that forms a whole word, or the
+/// `&` of an `&>`; otherwise the operator itself.
+fn redirect_operator_start(bytes: &[u8], op: usize) -> usize {
+    const fn boundary(byte: u8) -> bool {
+        matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'{' | b'}'
+        )
+    }
+    let mut digits = op;
+    while digits > 0 && bytes[digits - 1].is_ascii_digit() {
+        digits -= 1;
+    }
+    if digits < op && (digits == 0 || boundary(bytes[digits - 1])) {
+        return digits;
+    }
+    if bytes[op] == b'>'
+        && op > 0
+        && bytes[op - 1] == b'&'
+        && !(op >= 2 && matches!(bytes[op - 2], b'&' | b'|'))
+    {
+        return op - 1;
+    }
+    op
+}
+
+/// End of the inert redirection that starts at `start`, if one does (see
+/// [`blank_inert_redirections`]). `start` is an unquoted, unescaped byte.
+fn inert_redirection_end(bytes: &[u8], start: usize) -> Option<usize> {
+    const fn ends_word(byte: Option<&u8>) -> bool {
+        matches!(
+            byte,
+            None | Some(
+                b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+            )
+        )
+    }
+    let previous = start.checked_sub(1).map(|index| &bytes[index]);
+    let mut i = start;
+    if bytes[i].is_ascii_digit() {
+        // A descriptor number only when it is a whole word before the
+        // operator: in `foo2>/dev/null` the `2` belongs to the word `foo2`,
+        // and the redirection starts at `>`.
+        if !matches!(
+            previous,
+            None | Some(b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')')
+        ) {
+            return None;
+        }
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if !matches!(bytes.get(i), Some(b'>' | b'<')) {
+            return None;
+        }
+    } else if bytes[i] == b'&' {
+        // `&>` and `&>>`, but not the `&&` / `|&` operators before a `>`.
+        if bytes.get(i + 1) != Some(&b'>') || matches!(previous, Some(b'&' | b'|')) {
+            return None;
+        }
+        i += 1;
+    } else if matches!(previous, Some(b'&' | b'<' | b'>' | b'}')) {
+        // The tail of a longer operator an earlier position declined (`&&>`,
+        // `<<<`, `<>`), or a bash `{name}` descriptor variable.
+        return None;
+    }
+    let input = bytes[i] == b'<';
+    i += 1;
+    let mut duplication = false;
+    match (input, bytes.get(i)) {
+        // `<<`, `<<<` and `<>` are here-documents, here-strings and
+        // read-write opens, never inert.
+        (true, Some(b'<' | b'>')) => return None,
+        (_, Some(b'&')) if bytes[start] != b'&' => {
+            duplication = true;
+            i += 1;
+        }
+        (false, Some(b'>' | b'|')) => i += 1,
+        _ => {}
+    }
+    if duplication {
+        // `N>&M`, `N>&-`, `N<&M`, `N<&-`. A word target after `>&` is a file
+        // (`>&/etc/passwd` truncates it), except the null device itself.
+        let target = i;
+        if bytes.get(i) == Some(&b'-') {
+            i += 1;
+        } else {
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+        }
+        if i > target && ends_word(bytes.get(i)) {
+            return Some(i);
+        }
+        if input {
+            return None;
+        }
+        i = target;
+    }
+    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    let target = bytes.get(i..i + b"/dev/null".len())?;
+    if target != b"/dev/null" {
+        return None;
+    }
+    i += b"/dev/null".len();
+    ends_word(bytes.get(i)).then_some(i)
+}
+
 #[inline]
 fn pipeline_text_may_be_executed(command: &str) -> bool {
     if !contains_shell_pipeline_operator(command) {
@@ -4616,6 +4847,17 @@ pub(crate) fn pack_aware_quick_reject_pre_normalized(
         && !span_matches_any_keyword(normalized, enabled_keywords)
 }
 
+/// [`pack_aware_quick_reject`] for a view that is already normalized, such as
+/// the evaluator's normalized command after [`blank_inert_redirections`].
+#[inline]
+#[must_use]
+pub(crate) fn pack_aware_quick_reject_normalized_view(
+    normalized: &str,
+    enabled_keywords: &[&str],
+) -> bool {
+    pack_aware_quick_reject_from_normalized_spans(normalized, enabled_keywords)
+}
+
 #[inline]
 fn pack_aware_quick_reject_from_normalized_spans(
     normalized: &str,
@@ -4999,6 +5241,84 @@ destructive_patterns:
             !pack_aware_quick_reject(r#""git">/dev/null reset --hard"#, &keywords),
             "quoted command words with attached redirections must still trigger pack evaluation"
         );
+    }
+
+    #[test]
+    fn blank_inert_redirections_spans_issue_571() {
+        // (input, expected gating view)
+        let blanked = [
+            ("ls 2>/dev/null", "ls            "),
+            ("ls >/dev/null 2>&1", "ls                "),
+            ("ls &>/dev/null", "ls            "),
+            ("ls &>>/dev/null", "ls             "),
+            ("ls >> /dev/null", "ls             "),
+            ("ls >|/dev/null", "ls            "),
+            ("ls 2> /dev/null;rm x", "ls             ;rm x"),
+            ("cat x </dev/null", "cat x           "),
+            ("cat x 0< /dev/null", "cat x             "),
+            ("echo hi >&2", "echo hi    "),
+            ("echo hi 1>&2", "echo hi     "),
+            ("exec 3>&- 4<&3", "exec          "),
+            ("ls >& /dev/null", "ls             "),
+            ("ls 10>/dev/null|wc", "ls             |wc"),
+            ("(ls 2>/dev/null)", "(ls            )"),
+            ("$(ls 2>/dev/null)", "$(ls            )"),
+            ("foo2>/dev/null x", "foo2           x"),
+            (
+                "\"git\">/dev/null reset --hard",
+                "\"git\"           reset --hard",
+            ),
+            ("ls 2&>/dev/null", "ls 2           "),
+            ("ls # it's\nls 2>/dev/null", "ls # it's\nls            "),
+        ];
+        for (input, expected) in blanked {
+            assert_eq!(blank_inert_redirections(input), expected, "{input:?}");
+            assert_eq!(
+                blank_inert_redirections(input).len(),
+                input.len(),
+                "{input:?}"
+            );
+        }
+        // Not inert, or not provably a redirection at this level: unchanged.
+        for input in [
+            "ls",
+            "ls > /etc/hosts",
+            "ls 2>/dev/null2",
+            "ls 2>/dev/null/../sda",
+            r#"ls >/dev/null"x""#,
+            "ls >/dev/nul'l'",
+            "ls >\"/dev/null\"",
+            "echo x >&/etc/passwd",
+            "echo x >&2x",
+            "echo x >& file",
+            "ls {fd}>/dev/null",
+            "cat <<EOF",
+            "cat <<</dev/null",
+            "cat <>/dev/null",
+            "echo '2>/dev/null'",
+            "echo \"2>/dev/null\"",
+            "echo $'2>/dev/null'",
+            r"echo \>/dev/null",
+            "ls >/dev/zero",
+            "ls >/dev/sda",
+            "ls &&>/dev/null",
+            "ls # 2>/dev/null",
+            // A real redirection anywhere keeps the WHOLE command's keywords,
+            // so a destructive redirect without a keyword of its own (caught
+            // only because the inert redirect's keyword selected the pack) is
+            // still evaluated. Nothing is blanked when a real redirect is
+            // present, e.g. a remote script's `>logs/run_$x.log 2>&1`.
+            "ls 2>/dev/null >/etc/hosts",
+            "echo x 2>&1 >/etc/hosts",
+            "cat a.log 2>/dev/null > out_$x.log",
+            "ssh h 'run 2>&1 >logs/gate_$t.log'",
+        ] {
+            assert_eq!(blank_inert_redirections(input), input, "{input:?}");
+        }
+        assert!(matches!(
+            blank_inert_redirections("ls -la"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

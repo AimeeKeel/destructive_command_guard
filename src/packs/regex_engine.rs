@@ -75,6 +75,9 @@ pub(crate) fn record_incomplete_analysis(
             true
         })
     });
+    if recorded {
+        crate::perf::note_incomplete_analysis(stage);
+    }
     // Diagnostics contain no submitted command text.
     tracing::debug!(target: "dcg_perf", stage, error = %error, recorded, "analysis incomplete");
     recorded
@@ -84,6 +87,7 @@ fn record_evaluation_failure(stage: &'static str, error: &impl std::fmt::Display
     EVALUATION_FAILURES.with(|stack| {
         if let Some(failed) = stack.borrow_mut().last_mut() {
             *failed = true;
+            crate::perf::note_incomplete_analysis(stage);
         }
     });
     // Engine diagnostics contain no submitted command text.

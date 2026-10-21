@@ -114,10 +114,12 @@ tru = "0.2.2"
 rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-# Safe `gethostname()` for the history `hostname` column (#514). nix is already
-# compiled in through ctrlc; this only turns on its `hostname` feature, so no
-# new crate enters the graph and `#![forbid(unsafe_code)]` still holds here.
-nix = { version = "0.31", default-features = false, features = ["hostname"] }
+# Safe `gethostname()` for the history `hostname` column (#514), and safe
+# `getrusage()` so a deadline miss can report the CPU time the hook got (#571).
+# nix is already compiled in through ctrlc; this only turns on two of its
+# features, so no new crate enters the graph and `#![forbid(unsafe_code)]`
+# still holds here.
+nix ={ version = "0.31", default-features = false, features = ["hostname", "resource"] }
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.8", features = ["build", "cargo", "rustc"] }

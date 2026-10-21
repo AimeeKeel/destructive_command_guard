@@ -234,9 +234,55 @@ fn format_oversized_command_reason(command_len: usize, max_command_bytes: usize)
     )
 }
 
-fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
+/// What a deadline miss reports beyond its stage (#571): the phase the budget
+/// ran out in, the bounded analysis that stopped short (if one did before the
+/// deadline), the wall time spent, and the CPU time the process actually got.
+/// Wall time close to the budget with little CPU means the host did not
+/// schedule dcg; CPU close to the wall time means the input was slow.
+#[derive(Debug, Clone, Copy)]
+struct IndeterminateDetail {
+    exhaustion: perf::BudgetExhaustion,
+    elapsed: Duration,
+    cpu: Option<Duration>,
+}
+
+impl IndeterminateDetail {
+    fn now(exhaustion: perf::BudgetExhaustion, deadline: &Deadline) -> Self {
+        Self {
+            exhaustion,
+            elapsed: deadline.elapsed(),
+            cpu: perf::process_cpu_time(),
+        }
+    }
+}
+
+fn format_indeterminate_reason(
+    stage: &str,
+    budget: Duration,
+    detail: &IndeterminateDetail,
+) -> String {
+    use std::fmt::Write as _;
+    let mut context = format!("stage: {stage}");
+    let exhaustion = detail.exhaustion;
+    // A bounded step that gave up while hook budget remained is the cause;
+    // otherwise name where the deadline itself was noticed.
+    let incomplete = exhaustion
+        .incomplete
+        .filter(|_| detail.elapsed < budget || exhaustion.deadline.is_none());
+    if let Some((step, step_phase)) = incomplete {
+        if let Some(step_phase) = step_phase {
+            let _ = write!(context, ", phase: {}", perf::phase_name(step_phase));
+        }
+        let _ = write!(context, ", incomplete: {step}");
+    } else if let Some(Some(deadline_phase)) = exhaustion.deadline {
+        let _ = write!(context, ", phase: {}", perf::phase_name(deadline_phase));
+    }
+    let _ = write!(context, "; elapsed {}ms", detail.elapsed.as_millis());
+    if let Some(cpu) = detail.cpu {
+        let _ = write!(context, ", process CPU {}ms", cpu.as_millis());
+    }
     format!(
-        "DCG could not complete safety evaluation within {}ms (stage: {stage}); \
+        "DCG could not complete safety evaluation within {}ms ({context}); \
          command was not verified. Review manually or increase hook_timeout_ms.",
         budget.as_millis()
     )
@@ -322,13 +368,15 @@ fn handle_indeterminate_evaluation(
     command: &str,
     working_dir: &str,
     stage: &str,
+    exhaustion: perf::BudgetExhaustion,
     deadline: &Deadline,
     deny_unverified: bool,
 ) -> i32 {
-    let elapsed = deadline.elapsed();
+    let detail = IndeterminateDetail::now(exhaustion, deadline);
+    let elapsed = detail.elapsed;
     let budget = deadline.max_duration();
 
-    let reason = format_indeterminate_reason(stage, budget);
+    let reason = format_indeterminate_reason(stage, budget, &detail);
     let delivery = hook::output_indeterminate_for_protocol(protocol, &reason, deny_unverified);
 
     if let Some(writer) = history_writer {
@@ -729,6 +777,7 @@ fn try_deny_unparseable_payload(
                 ResolvedCommandOutcome::DeadlineExhausted {
                     command: command.clone(),
                     stage: "oversized_payload_window_scan",
+                    exhaustion: perf::take_budget_exhaustion(),
                 },
                 &mut history_writer,
             );
@@ -1069,6 +1118,8 @@ enum ResolvedCommandOutcome {
     DeadlineExhausted {
         command: String,
         stage: &'static str,
+        /// Where the budget ran out, taken right after the evaluation (#571).
+        exhaustion: perf::BudgetExhaustion,
     },
     /// Deny / Ask / Warn candidate awaiting decisive selection.
     DenyFamily(Box<ResolvedDenyFamily>),
@@ -1338,10 +1389,13 @@ fn resolve_hook_command(
         };
     }
 
+    // Budget notes belong to this command's evaluation alone.
+    let _ = perf::take_budget_exhaustion();
     if ctx.deadline.is_exceeded() {
         return ResolvedCommandOutcome::DeadlineExhausted {
             command: command.to_string(),
             stage: "pre_evaluation",
+            exhaustion: perf::take_budget_exhaustion(),
         };
     }
 
@@ -1407,6 +1461,7 @@ fn resolve_hook_command(
         return ResolvedCommandOutcome::DeadlineExhausted {
             command: command.to_string(),
             stage: "evaluation",
+            exhaustion: perf::take_budget_exhaustion(),
         };
     }
 
@@ -1508,6 +1563,7 @@ fn resolve_hook_command(
                 return ResolvedCommandOutcome::DeadlineExhausted {
                     command: command.to_string(),
                     stage: "rebase_recovery_reevaluation",
+                    exhaustion: perf::take_budget_exhaustion(),
                 };
             }
             RecoveryAttempt::Residual(residual) => {
@@ -1600,7 +1656,11 @@ fn publish_decisive_response(
             );
             return blocking_verdict_exit_code(ctx.hook_protocol, delivery);
         }
-        ResolvedCommandOutcome::DeadlineExhausted { command, stage } => {
+        ResolvedCommandOutcome::DeadlineExhausted {
+            command,
+            stage,
+            exhaustion,
+        } => {
             return handle_indeterminate_evaluation(
                 ctx.hook_protocol,
                 history_writer.as_mut(),
@@ -1608,6 +1668,7 @@ fn publish_decisive_response(
                 &command,
                 ctx.working_dir,
                 stage,
+                exhaustion,
                 ctx.deadline,
                 ctx.config.unverified_denies(),
             );
@@ -2800,14 +2861,78 @@ mod tests {
 
     #[test]
     fn indeterminate_reason_uses_configured_budget_and_stage() {
-        let reason = format_indeterminate_reason("pre_evaluation", Duration::from_millis(1_500));
+        let detail = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion::default(),
+            elapsed: Duration::from_millis(1_502),
+            cpu: None,
+        };
+        let reason =
+            format_indeterminate_reason("pre_evaluation", Duration::from_millis(1_500), &detail);
         assert!(reason.contains("within 1500ms"), "reason: {reason}");
         assert!(reason.contains("stage: pre_evaluation"), "reason: {reason}");
+        assert!(reason.contains("elapsed 1502ms"), "reason: {reason}");
+        assert!(!reason.contains("process CPU"), "reason: {reason}");
         assert!(
             reason.contains("command was not verified"),
             "reason: {reason}"
         );
         assert!(reason.contains("hook_timeout_ms"), "reason: {reason}");
+    }
+
+    #[test]
+    fn indeterminate_reason_names_the_phase_and_cpu_issue_571() {
+        // A starved process: the deadline passed while compiling a regex,
+        // after only a tenth of the wall time on a CPU.
+        let starved = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion {
+                deadline: Some(Some(ProfilePhase::RegexCompile)),
+                incomplete: None,
+            },
+            elapsed: Duration::from_millis(1_152),
+            cpu: Some(Duration::from_millis(91)),
+        };
+        let reason = format_indeterminate_reason("evaluation", Duration::from_secs(1), &starved);
+        assert!(
+            reason.contains(
+                "within 1000ms (stage: evaluation, phase: regex_compile; elapsed 1152ms, process CPU 91ms)"
+            ),
+            "reason: {reason}"
+        );
+
+        // A bounded analysis step that gave up while hook budget remained is
+        // named instead of the deadline, which it did not reach.
+        let incomplete = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion {
+                deadline: None,
+                incomplete: Some(("interpreter_literal_recovery", Some(ProfilePhase::AstMatch))),
+            },
+            elapsed: Duration::from_millis(425),
+            cpu: Some(Duration::from_millis(410)),
+        };
+        let reason = format_indeterminate_reason("evaluation", Duration::from_secs(1), &incomplete);
+        assert!(
+            reason.contains(
+                "(stage: evaluation, phase: ast_match, incomplete: interpreter_literal_recovery; \
+                 elapsed 425ms, process CPU 410ms)"
+            ),
+            "reason: {reason}"
+        );
+
+        // Past the deadline, the deadline is the cause even if an optional
+        // step also stopped short earlier.
+        let both = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion {
+                deadline: Some(Some(ProfilePhase::PatternRules)),
+                incomplete: Some(("interpreter_literal_recovery", Some(ProfilePhase::AstMatch))),
+            },
+            elapsed: Duration::from_millis(1_003),
+            cpu: None,
+        };
+        let reason = format_indeterminate_reason("evaluation", Duration::from_secs(1), &both);
+        assert!(
+            reason.contains("(stage: evaluation, phase: pattern_rules; elapsed 1003ms)"),
+            "reason: {reason}"
+        );
     }
 
     #[test]
@@ -2828,6 +2953,7 @@ mod tests {
         let exhausted = ResolvedCommandOutcome::DeadlineExhausted {
             command: "echo hi".to_string(),
             stage: "evaluation",
+            exhaustion: perf::BudgetExhaustion::default(),
         };
         assert_eq!(outcome_rank(&oversized), RANK_INDETERMINATE);
         assert_eq!(outcome_rank(&exhausted), RANK_INDETERMINATE);

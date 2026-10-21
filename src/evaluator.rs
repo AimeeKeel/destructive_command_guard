@@ -571,7 +571,11 @@ impl EvaluationResult {
     /// Create an indeterminate result due to analysis-budget exhaustion.
     #[inline]
     #[must_use]
-    pub const fn indeterminate_due_to_budget() -> Self {
+    pub fn indeterminate_due_to_budget() -> Self {
+        // Name the phase that ran out for the hook's reason (#571), including
+        // the case where the remaining budget is too small for the next step
+        // although the deadline itself has not passed.
+        crate::perf::note_deadline_exhausted();
         Self {
             decision: EvaluationDecision::Indeterminate,
             pattern_info: None,
@@ -1605,6 +1609,19 @@ pub fn evaluate_command(
 #[inline]
 fn deadline_exceeded(deadline: Option<&Deadline>) -> bool {
     deadline.is_some_and(Deadline::is_exceeded)
+}
+
+/// The text keyword gating reads: the command without its inert POSIX
+/// redirections ([`crate::packs::blank_inert_redirections`], #571). Cmd and
+/// PowerShell give `>` and `/dev/null` other meanings (`2>/dev/null` writes a
+/// file there), so those dialects keep the full text.
+#[inline]
+fn inert_redirection_gating_view(command: &str, shell_dialect: ShellDialect) -> Cow<'_, str> {
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        crate::packs::blank_inert_redirections(command)
+    } else {
+        Cow::Borrowed(command)
+    }
 }
 
 #[inline]
@@ -14799,6 +14816,13 @@ fn evaluate_command_in_single_dialect_view(
 
     // Step 4: Quick rejection - if no relevant keywords, allow immediately.
     //
+    // Keyword gating reads the command without its inert redirections
+    // (`2>/dev/null`, `2>&1`, `</dev/null`, ...): their bytes spell the
+    // redirect and `/dev/` keywords, yet no rule can match them, and they
+    // made an ordinary `ls 2>/dev/null` compile two packs (#571). Rule
+    // matching below still reads the full command.
+    let gating_command = inert_redirection_gating_view(command, shell_dialect);
+    //
     // Fast path: when an Aho-Corasick keyword index is available, a single-pass
     // AC scan (O(n)) replaces the N×memmem per-keyword scan. If the AC says no
     // keyword appears in the raw command, we can skip the more expensive
@@ -14813,7 +14837,7 @@ fn evaluate_command_in_single_dialect_view(
             && tar_helper_sources.is_empty()
             && !crate::packs::get_external_packs()
                 .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
-            && !index.has_any_keyword(command)
+            && !index.has_any_keyword(gating_command.as_ref())
             && !contains_shell_word_obfuscation(command, shell_dialect)
             && !force_core_git
             && !force_core_filesystem
@@ -14840,7 +14864,11 @@ fn evaluate_command_in_single_dialect_view(
         && {
             let _phase = phase(ProfilePhase::Normalization);
             pack_aware_quick_reject(
-                crate::normalize::normalize_command_in_dialect(command, shell_dialect).as_ref(),
+                inert_redirection_gating_view(
+                    crate::normalize::normalize_command_in_dialect(command, shell_dialect).as_ref(),
+                    shell_dialect,
+                )
+                .as_ref(),
                 enabled_keywords,
             )
         }
@@ -14929,6 +14957,16 @@ fn evaluate_command_in_single_dialect_view(
     } else {
         pack_aware_quick_reject_with_normalized(dialect_normalized.as_ref(), enabled_keywords)
     };
+    // The same gating view as Step 4, over the normalized command. The
+    // normalized text itself, not this view, is what the packs match.
+    let quick_reject = quick_reject
+        || matches!(
+            inert_redirection_gating_view(normalized.as_ref(), shell_dialect),
+            Cow::Owned(ref gating) if crate::packs::pack_aware_quick_reject_normalized_view(
+                gating,
+                enabled_keywords,
+            )
+        );
     drop(normalization_phase);
     if sed_shell_sources.is_empty()
         && tar_helper_sources.is_empty()
@@ -23580,8 +23618,7 @@ fn evaluate_packs_with_allowlists_at_depth(
             original_command,
             shell_dialect,
         );
-    let core_filesystem_keyword_candidate =
-        crate::packs::core::filesystem::filesystem_keyword_candidate(command_for_packs);
+
     let force_windows_filesystem = ordered_packs
         .iter()
         .any(|pack_id| pack_id == "windows.filesystem")
@@ -23615,6 +23652,11 @@ fn evaluate_packs_with_allowlists_at_depth(
         );
     let force_literal_database_packs =
         literal_substitution_database_packs(original_command, shell_dialect);
+    // Inert redirections select no pack (#571); rules still match the text.
+    let gating_command = inert_redirection_gating_view(command_for_packs, shell_dialect);
+    let gating_command = gating_command.as_ref();
+    let core_filesystem_keyword_candidate =
+        crate::packs::core::filesystem::filesystem_keyword_candidate(gating_command);
     let candidate_pack_ids: Vec<&String> = keyword_index.map_or_else(
         || {
             ordered_packs
@@ -23623,7 +23665,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     let pack_id = *pack_id;
                     // Try built-in registry first
                     if let Some(entry) = REGISTRY.get_entry(pack_id) {
-                        return entry.might_match(command_for_packs)
+                        return entry.might_match(gating_command)
                             && (pack_id != "core.filesystem" || core_filesystem_keyword_candidate)
                             || force_core_git && pack_id == "core.git"
                             || force_core_filesystem && pack_id == "core.filesystem"
@@ -23646,7 +23688,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     external_store
                         .and_then(|store| store.get(pack_id))
                         .is_some_and(|pack| {
-                            pack.might_match(command_for_packs)
+                            pack.might_match(gating_command)
                                 || should_check_original_control_plane_payload(
                                     pack_id,
                                     command_for_packs,
@@ -23657,7 +23699,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                 .collect()
         },
         |index| {
-            let mask = index.candidate_pack_mask(command_for_packs);
+            let mask = index.candidate_pack_mask(gating_command);
             ordered_packs
                 .iter()
                 .enumerate()
@@ -35602,6 +35644,55 @@ mod tests {
 
     fn evaluate_with_pack_ids(command: &str, pack_ids: &[&str]) -> EvaluationResult {
         evaluate_with_pack_ids_at_path(command, pack_ids, None)
+    }
+
+    /// An inert redirection selects no pack (#571): `ls 2>/dev/null` used to
+    /// select `core.filesystem` and `system.disk` through the `2>`, `>/` and
+    /// `/dev/` keywords and compile both, though no rule could match it. It is
+    /// now quick-rejected like `ls`, while a destructive redirection or command
+    /// beside it is still judged against the full text.
+    #[test]
+    fn inert_redirections_select_no_pack_issue_571() {
+        let packs = ["core.filesystem", "core.git", "system.disk"];
+        for command in [
+            "ls 2>/dev/null",
+            "ls >/dev/null 2>&1",
+            "ls &>/dev/null",
+            "cat notes.txt </dev/null",
+            "echo done >&2",
+            "cargo build --release 2>&1 | tail -5",
+            "ps -o pid,rss -p 1 2>/dev/null; free -g",
+        ] {
+            // The Bash hook's dialect: no pack is selected at all.
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed() && result.quick_rejected,
+                "{command} -> {result:?}"
+            );
+            // The all-dialect view still replays cmd/PowerShell readings, where
+            // `>` and `&` mean other things; the verdict is the same.
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Unknown);
+            assert!(
+                result.is_allowed(),
+                "{command} (unknown dialect) -> {result:?}"
+            );
+        }
+        for command in [
+            "rm -rf ~ 2>/dev/null",
+            "ls 2>/dev/null; rm -rf ~",
+            "ls 2>/dev/null >/etc/hosts",
+            "echo x 2>&1 >/dev/sda",
+            "echo x >&/etc/passwd",
+            "dd if=/dev/zero of=/dev/sda 2>/dev/null",
+            "tee /dev/sda < /dev/zero 2>/dev/null",
+            "git reset --hard 2>/dev/null",
+            ": > /etc/hosts 2>&1",
+            "truncate -s 0 /etc/hosts 2>/dev/null",
+            "wipefs -a /dev/sda >/dev/null 2>&1",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(result.is_denied(), "{command} -> {result:?}");
+        }
     }
 
     /// `$IFS` word-splits to whitespace by default, so `rm${IFS}-rf${IFS}~`
