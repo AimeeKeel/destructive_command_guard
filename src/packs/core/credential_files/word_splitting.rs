@@ -548,6 +548,25 @@ fn render(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// Match the executable spelling understood by the shared native path policy.
+/// That classifier removes a terminal .exe/.EXE and folds ASCII case even for
+/// POSIX source (including Git Bash). Its IFS selector must not silently drop
+/// those writers, and tee variants must still check EVERY split destination.
+/// Decode shell syntax before calling this; do not reinterpret backslashes as
+/// Windows separators or change the actual argv passed to the native policy.
+fn policy_executable_basename(name: &str) -> Cow<'_, str> {
+    let basename = name.rsplit('/').next().unwrap_or(name);
+    let basename = basename
+        .strip_suffix(".exe")
+        .or_else(|| basename.strip_suffix(".EXE"))
+        .unwrap_or(basename);
+    if basename.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(basename.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(basename)
+    }
+}
+
 /// An execution frontend left in argv0 is not evidence of a non-writer.
 /// Normalization can stop on a dynamic option even in a single wrapper, or
 /// an expansion can supply the wrapper name after normalization has run.
@@ -626,15 +645,15 @@ fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWri
     let Some(name) = argv.first() else {
         return Ok(Vec::new());
     };
-    let basename = name.rsplit('/').next().unwrap_or(name);
+    let basename = policy_executable_basename(name);
     // Empty unquoted leading words may disappear and expose a frontend that
     // was not in the pre-expansion argv0 slot. Do not hand an unresolved
     // frontend to the destination classifier as if it were the final writer.
-    if execution_frontend(basename) {
+    if execution_frontend(basename.as_ref()) {
         return Err(());
     }
     let mut hits = Vec::new();
-    if matches!(basename, "tee" | "gtee") {
+    if matches!(basename.as_ref(), "tee" | "gtee") {
         let mut append = false;
         let mut options = true;
         let mut destinations = Vec::new();
@@ -1059,13 +1078,12 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                 let expanded_name = first_expanded_word(&arguments, &state);
                 let unknown_command_name = expanded_name.is_err();
                 let name = expanded_name.ok().flatten();
-                let writer = name
+                let basename = name.as_deref().map(policy_executable_basename);
+                let writer = basename
                     .as_deref()
-                    .map(|name| name.rsplit('/').next().unwrap_or(name))
                     .is_none_or(shell::is_credential_writer);
-                let unresolved_frontend = name
+                let unresolved_frontend = basename
                     .as_deref()
-                    .map(|name| name.rsplit('/').next().unwrap_or(name))
                     .is_some_and(execution_frontend)
                     && !command_queries_only(&arguments);
                 // A stripped wrapper's dynamic next word can still belong
@@ -1200,6 +1218,115 @@ pub(super) fn candidate(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_spelling_matches_the_existing_native_writer_policy() {
+        for (raw, expected) in [
+            ("tee", "tee"),
+            ("/usr/bin/tee.exe", "tee"),
+            ("C:/Tools/TEE.EXE", "tee"),
+            ("GTEE.exe", "gtee"),
+            ("/opt/é/CP.EXE", "cp"),
+            ("tee.exe.bak", "tee.exe.bak"),
+            ("teetool.exe", "teetool"),
+            ("tee.Exe", "tee.exe"),
+            (r"tools\tee.exe", r"tools\tee"),
+            ("/", ""),
+        ] {
+            assert_eq!(policy_executable_basename(raw), expected, "{raw}");
+        }
+        // A static native-policy witness prevents this selector's accepted
+        // spelling set from drifting away from the classifier behind it.
+        for (executable, tail, setup, arguments) in [
+            ("tee.exe", "/etc/shadow", "S=/tmp/a@/etc/shadow", "$S"),
+            ("GTEE.EXE", "/etc/shadow", "S=/tmp/a@/etc/shadow", "$S"),
+            ("CP.EXE", "source /etc/shadow", "S=source@/etc/shadow", "$S"),
+            ("mv.exe", "source /etc/shadow", "S=source@/etc/shadow", "$S"),
+            ("install.exe", "source /etc/shadow", "S=source@/etc/shadow", "$S"),
+            ("DD.EXE", "of=/etc/shadow", "S=of=/etc/shadow", "$S"),
+            ("SED.EXE", "-i s/a/b/ /etc/shadow", "S=/etc/shadow", "-i s/a/b/ $S"),
+            ("perl.exe", "-i -pe 1 /etc/shadow", "S=/etc/shadow", "-i -pe 1 $S"),
+        ] {
+            let literal_source = format!("{executable} {tail}");
+            let literal_hit = shell::classify_credential_file_write(
+                &literal_source,
+                ShellDialect::Posix,
+            )
+            .unwrap_or_else(|| panic!("missing existing native witness: {literal_source}"));
+            assert_eq!(literal_hit.rule, shell::CREDENTIAL_FILE_WRITE_NAME);
+            let source = format!("IFS=@; {setup}; {executable} {arguments}");
+            let start = source.rfind("; ").unwrap() + 2;
+            assert!(
+                scan(&source, ShellDialect::Posix).iter().any(|hit| {
+                    hit.rule == literal_hit.rule
+                        && hit.reason != UNCERTAIN
+                        && hit.span == (start..source.len())
+                }),
+                "the IFS selector lost a writer the native policy recognizes: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_tee_variants_check_all_destinations_and_keep_append_mode() {
+        for executable in ["tee.exe", "TEE.EXE", "/usr/bin/tee.exe", "GTEE.EXE"] {
+            let source = format!(
+                "S=/tmp/a@/etc/shadow@.git/config; IFS=@; {executable} $S"
+            );
+            let start = source.rfind("; ").unwrap() + 2;
+            let hits = scan(&source, ShellDialect::Posix);
+            for rule in [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME] {
+                assert!(
+                    hits.iter().any(|hit| hit.rule == rule
+                        && hit.reason != UNCERTAIN
+                        && hit.span == (start..source.len())),
+                    "{source}: missing {rule}: {hits:?}"
+                );
+            }
+            for (arguments, protected) in [
+                (vec!["-a", "/home/example/.ssh/known_hosts"], false),
+                (vec!["/home/example/.ssh/known_hosts", "-a"], true),
+                (vec!["/etc/shadow", "--help"], true),
+                (vec!["--help", "/etc/shadow"], false),
+            ] {
+                let argv: Vec<_> = std::iter::once(executable)
+                    .chain(arguments)
+                    .map(str::to_owned)
+                    .collect();
+                assert_eq!(!classify(&argv, 0..0).unwrap().is_empty(), protected, "{argv:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn executable_spelling_preserves_quotes_data_and_frontend_uncertainty() {
+        for invocation in [
+            "tee.exe $S",
+            "T''EE.EXE $S",
+            "W=tee.exe; $W $S",
+            "tee.exe \"$S\"",
+            "printf '%s' 'TEE.EXE' $S",
+            "teetool.exe $S",
+            "tee.exe.bak $S",
+        ] {
+            let source = format!("S=/tmp/a@/tmp/b; IFS=@; {invocation}");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+        for invocation in ["tee.exe \"$S\"", "tee.exe '$S'", "tee.exe \\$S"] {
+            let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
+        }
+        for invocation in ["ENV.EXE tee $S", "/usr/bin/env.exe tee $S", "W=ENV.EXE; $W tee $S"] {
+            let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+            let hits = scan(&source, ShellDialect::Posix);
+            for rule in [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME] {
+                assert!(
+                    hits.iter().any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                    "an executable frontend must not be mistaken for a non-writer: {source}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn executable_selection_skips_only_proven_vanishing_fields() {
