@@ -24025,6 +24025,15 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
 
     const MUSE_TEST_COMMAND: &str = "/opt/dcg/bin/dcg --agent muse";
 
+    /// An absolute path on this platform (`/x` is not absolute on Windows).
+    fn muse_test_absolute(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
     #[test]
     fn muse_config_dir_follows_absolute_xdg_config_home_only() {
         let home = std::path::Path::new("/home/u");
@@ -24032,9 +24041,10 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
             muse_config_dir_for(None, home),
             std::path::PathBuf::from("/home/u/.config/muse")
         );
+        let xdg = muse_test_absolute("/xdg");
         assert_eq!(
-            muse_config_dir_for(Some(std::ffi::OsStr::new("/xdg")), home),
-            std::path::PathBuf::from("/xdg/muse")
+            muse_config_dir_for(Some(std::ffi::OsStr::new(&xdg)), home),
+            std::path::PathBuf::from(&xdg).join("muse")
         );
         for ignored in ["", "relative/xdg"] {
             assert_eq!(
@@ -24047,26 +24057,30 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
 
     #[test]
     fn muse_hook_command_names_the_agent_and_quotes_only_when_needed() {
+        let exe = muse_test_absolute("/opt/dcg/bin/dcg");
         let plain =
-            muse_dcg_hook_command_for_executable(std::path::Path::new("/opt/dcg/bin/dcg"), false)
-                .unwrap();
-        assert_eq!(plain, MUSE_TEST_COMMAND);
+            muse_dcg_hook_command_for_executable(std::path::Path::new(&exe), false).unwrap();
+        assert_eq!(plain, format!("{exe} --agent muse"));
         assert!(is_dcg_command(&plain));
         assert!(muse_command_names_muse_agent(&plain));
 
+        let exe = muse_test_absolute("/opt/my tools/dcg");
         let spaced =
-            muse_dcg_hook_command_for_executable(std::path::Path::new("/opt/my tools/dcg"), false)
-                .unwrap();
-        assert_eq!(spaced, "\"/opt/my tools/dcg\" --agent muse");
+            muse_dcg_hook_command_for_executable(std::path::Path::new(&exe), false).unwrap();
+        assert_eq!(spaced, format!("\"{exe}\" --agent muse"));
         assert!(is_dcg_command(&spaced));
 
-        let windows = muse_dcg_hook_command_for_executable(
-            std::path::Path::new("/Users/Jane Doe/dcg.exe"),
-            true,
-        )
-        .unwrap();
-        assert_eq!(windows, "\"/Users/Jane Doe/dcg.exe\" --agent muse");
+        let exe = muse_test_absolute("/Users/Jane Doe/dcg.exe");
+        let windows =
+            muse_dcg_hook_command_for_executable(std::path::Path::new(&exe), true).unwrap();
+        assert_eq!(windows, format!("\"{exe}\" --agent muse"));
         assert!(is_dcg_command(&windows));
+        let exe = muse_test_absolute("/Users/jane/.local/bin/dcg.exe");
+        assert_eq!(
+            muse_dcg_hook_command_for_executable(std::path::Path::new(&exe), true).unwrap(),
+            format!("{exe} --agent muse"),
+            "a path without spaces needs no quotes in any shell"
+        );
 
         assert!(
             muse_dcg_hook_command_for_executable(std::path::Path::new("dcg"), false).is_err(),
