@@ -15180,6 +15180,12 @@ fn preserve_source_heredoc_data_mask<'a>(
     String::from_utf8(result).map_or(Cow::Borrowed(command_for_match), Cow::Owned)
 }
 
+#[cfg(test)]
+thread_local! {
+    // Documentation-mask analyses actually launched on this thread (#555).
+    static DOCUMENTATION_MASK_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Withdraw shell syntax invented from proven Python/JavaScript documentation
 /// literals (#544). Only the final shell matching view uses this mask. The
 /// complete original body remains input to interpreter, execution, pipeline,
@@ -15201,27 +15207,60 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
     thread_local! {
         static ACTIVE: std::sync::Arc<std::sync::atomic::AtomicBool> =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Completed analyses of recent sources. The mask is a pure function
+        // of the command text, and the per-segment pack passes ask for the
+        // same complete command once per segment: a 300-line documentation
+        // heredoc used to re-extract and re-parse the whole command about
+        // fifty times per hook (#555). Only finished analyses are kept; a
+        // timeout or busy slot is asked again, exactly as before.
+        static COMPLETED: std::cell::RefCell<
+            std::collections::VecDeque<(String, Option<String>)>,
+        > = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     }
-    let source = command.to_string();
-    run_documentation_mask_worker(
-        ACTIVE.with(std::sync::Arc::clone),
-        crate::ast_matcher::protected_scan_budget(),
-        move || match mask_proven_interpreter_documentation_inner(&source) {
-            Cow::Owned(masked) => Some(masked),
-            Cow::Borrowed(_) => None,
-        },
-    )
-    .map_or(Cow::Borrowed(command), Cow::Owned)
+    const COMPLETED_CAPACITY: usize = 4;
+    let cached = COMPLETED.with(|completed| {
+        completed
+            .borrow()
+            .iter()
+            .find(|(source, _)| source == command)
+            .map(|(_, mask)| mask.clone())
+    });
+    let completed = cached.or_else(|| {
+        #[cfg(test)]
+        DOCUMENTATION_MASK_ANALYSES.with(|count| count.set(count.get() + 1));
+        let source = command.to_string();
+        let mask = run_documentation_mask_worker(
+            ACTIVE.with(std::sync::Arc::clone),
+            crate::ast_matcher::protected_scan_budget(),
+            move || {
+                Some(match mask_proven_interpreter_documentation_inner(&source) {
+                    Cow::Owned(masked) => Some(masked),
+                    Cow::Borrowed(_) => None,
+                })
+            },
+        )?;
+        COMPLETED.with(|completed| {
+            let mut completed = completed.borrow_mut();
+            if completed.len() == COMPLETED_CAPACITY {
+                completed.pop_front();
+            }
+            completed.push_back((command.to_string(), mask.clone()));
+        });
+        Some(mask)
+    });
+    completed
+        .flatten()
+        .map_or(Cow::Borrowed(command), Cow::Owned)
 }
 
 /// At most one parser per slot may outlive its optional documentation proof.
 /// The permit remains owned through timeout or panic until analysis finishes;
 /// a busy slot keeps the conservative source view instead of spawning more work.
-fn run_documentation_mask_worker(
+fn run_documentation_mask_worker<T: Send + 'static>(
     active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     budget: std::time::Duration,
-    analyze: impl FnOnce() -> Option<String> + Send + 'static,
-) -> Option<String> {
+    analyze: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
     use std::sync::atomic::Ordering;
     let _phase = phase(ProfilePhase::AstMatch);
     let started = std::time::Instant::now();
@@ -34211,13 +34250,43 @@ mod tests {
         ));
         assert!(active.load(Ordering::Acquire));
         assert!(
-            run_documentation_mask_worker(Arc::clone(&active), Duration::from_secs(1), || {
-                panic!("a live parser must retain the only worker permit")
-            })
+            run_documentation_mask_worker(
+                Arc::clone(&active),
+                Duration::from_secs(1),
+                || -> Option<String> { panic!("a live parser must retain the only worker permit") }
+            )
             .is_none()
         );
         release.send(()).unwrap();
         completion.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    /// The documentation mask is a pure function of the command, and the
+    /// per-segment pack passes ask for it once per segment. It used to extract
+    /// and re-parse the whole command every time: about fifty analyses for one
+    /// 300-line documentation heredoc (#555). A completed analysis is reused.
+    #[test]
+    fn documentation_mask_analysis_runs_once_per_source_issue_555() {
+        let source = "python3 - <<'PY'\ns = \"run `git branch -d x` later\"\nprint(s)\nPY";
+        let other = "python3 - <<'PY'\ns = \"run `git status` later\"\nprint(s)\nPY";
+        let before = DOCUMENTATION_MASK_ANALYSES.with(std::cell::Cell::get);
+        let first = mask_proven_interpreter_documentation(source).into_owned();
+        for _ in 0..8 {
+            assert_eq!(mask_proven_interpreter_documentation(source), first);
+        }
+        assert_ne!(first, source, "the proven literal is masked");
+        let after_repeats = DOCUMENTATION_MASK_ANALYSES.with(std::cell::Cell::get);
+        assert_eq!(
+            after_repeats - before,
+            1,
+            "repeats reuse the completed analysis"
+        );
+        let _ = mask_proven_interpreter_documentation(other);
+        assert_eq!(
+            DOCUMENTATION_MASK_ANALYSES.with(std::cell::Cell::get) - before,
+            2,
+            "a different source is analysed on its own"
+        );
     }
 
     #[test]
@@ -34234,9 +34303,11 @@ mod tests {
         );
         assert!(!active.load(Ordering::Acquire));
         assert!(
-            run_documentation_mask_worker(Arc::clone(&active), Duration::ZERO, || {
-                panic!("an expired budget must not start a worker")
-            })
+            run_documentation_mask_worker(
+                Arc::clone(&active),
+                Duration::ZERO,
+                || -> Option<String> { panic!("an expired budget must not start a worker") }
+            )
             .is_none()
         );
     }
