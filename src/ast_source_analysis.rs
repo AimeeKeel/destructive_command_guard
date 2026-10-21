@@ -323,7 +323,12 @@ impl DocumentationProof {
 }
 
 const MAX_INTERPRETER_LITERAL_SOURCE_BYTES: usize = 256 * 1024;
-const MAX_INTERPRETER_LITERAL_NODES: usize = 4096;
+// The interpreter AST has already been parsed before this walk. Keep a hard
+// node ceiling, but align it with DocumentationProof's 16,384-step budget so
+// ordinary 300+ line edit scripts do not become unverified solely because
+// their complete syntax tree exceeds the old 4,096-node threshold (#555).
+// The independent source/payload/candidate limits and worker deadline remain.
+const MAX_INTERPRETER_LITERAL_NODES: usize = 16 * 1024;
 const MAX_INTERPRETER_LITERAL_CANDIDATES: usize = 128;
 const MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES: usize = 64 * 1024;
 
@@ -2789,6 +2794,48 @@ mod tests {
             assert!(detail.contains(expected), "{detail}");
         }
 
+        #[test]
+        fn large_bounded_documentation_source_exceeds_old_node_limit_without_failing_555() {
+            use ast_grep_core::AstGrep;
+            use ast_grep_language::SupportLang;
+
+            for language in LANGUAGES {
+                let mut source = String::new();
+                for index in 0..1400 {
+                    match language {
+                        ScriptLanguage::Python => {
+                            source.push_str(&format!("value_{index} = 'documentation'\\n"));
+                        }
+                        ScriptLanguage::JavaScript => {
+                            source.push_str(&format!("const value_{index} = 'documentation';\\n"));
+                        }
+                        _ => unreachable!("bounded language table"),
+                    }
+                }
+                append_assignment(&mut source, language, "'run `tool --help` later'");
+                let grammar = match language {
+                    ScriptLanguage::Python => SupportLang::Python,
+                    ScriptLanguage::JavaScript => SupportLang::JavaScript,
+                    _ => unreachable!("bounded language table"),
+                };
+                let ast = AstGrep::try_new(source.as_str(), grammar).expect("fixture parses");
+                let nodes = ast.root().dfs().count();
+                assert!(
+                    nodes > 4096,
+                    "fixture must exercise the former node ceiling: {language:?}: {nodes}"
+                );
+                assert!(
+                    nodes < MAX_INTERPRETER_LITERAL_NODES,
+                    "fixture must stay inside the retained hard bound: {language:?}: {nodes}"
+                );
+                assert!(
+                    interpreter_literal_shell_commands_inner(&source, language, true)
+                        .expect("large bounded documentation program remains analyzable")
+                        .is_empty(),
+                    "documentation-only candidate text must remain data: {language:?}"
+                );
+            }
+        }
         #[test]
         fn ordinary_strings_do_not_spend_the_shell_candidate_budget() {
             for language in LANGUAGES {
