@@ -717,11 +717,38 @@ fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWri
                 hits.push(hit);
             }
         }
-    } else if let Some(mut hit) =
-        shell::classify_credential_file_write(&render(argv), ShellDialect::Posix)
-    {
-        hit.span = span;
-        hits.push(hit);
+    } else {
+        // The shared native classifier intentionally returns the first write in
+        // a simple command. IFS reconstruction can create several concrete file
+        // operands, though: sed/perl in-place mode may rewrite every one of
+        // them. Re-run the exact same native policy after replacing only the
+        // already-reported operand with inert data. This keeps option parsing,
+        // writer semantics and protected-path resolution centralized while
+        // retaining later rule families for independent allowlisting.
+        let mut rendered = render(argv);
+        for _ in 0..MAX_FIELDS {
+            let Some(mut hit) =
+                shell::classify_credential_file_write(&rendered, ShellDialect::Posix)
+            else {
+                return Ok(hits);
+            };
+            let local = hit.span.clone();
+            if local.start >= local.end
+                || local.end > rendered.len()
+                || !rendered.is_char_boundary(local.start)
+                || !rendered.is_char_boundary(local.end)
+            {
+                return Err(());
+            }
+            // Preserve byte offsets and surrounding quote/option syntax. A
+            // same-length ASCII operand cannot itself name a protected path,
+            // and a malformed/non-target span fails closed above.
+            rendered.replace_range(local.clone(), &"x".repeat(local.len()));
+            hit.span = span.clone();
+            hits.push(hit);
+        }
+        // More findings than the argv bound means the proof did not finish.
+        return Err(());
     }
     Ok(hits)
 }
@@ -1307,6 +1334,51 @@ mod tests {
                     .collect();
                 assert_eq!(!classify(&argv, 0..0).unwrap().is_empty(), protected, "{argv:?}");
             }
+        }
+    }
+
+    #[test]
+    fn in_place_writers_keep_every_split_protected_destination() {
+        for argv in [
+            vec!["sed", "-i", "s/x/y/", "/etc/shadow", ".git/config"],
+            vec!["perl", "-i", "-pe", "1", "/etc/shadow", ".git/config"],
+        ] {
+            let argv: Vec<_> = argv.into_iter().map(str::to_owned).collect();
+            let hits = classify(&argv, 0..7).expect("bounded concrete argv");
+            for rule in [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ] {
+                assert!(
+                    hits.iter().any(|hit| hit.rule == rule && hit.span == (0..7)),
+                    "{argv:?}: missing {rule}: {hits:?}"
+                );
+            }
+        }
+
+        for writer in ["sed -i s/x/y/", "perl -i -pe 1"] {
+            for source in [
+                format!("S=/etc/shadow@.git/config; IFS=@; {writer} $S"),
+                format!("S=.git/config@/etc/shadow; IFS=@; {writer} $S"),
+            ] {
+                let start = source.rfind("; ").unwrap() + 2;
+                let hits = scan(&source, ShellDialect::Posix);
+                for rule in [
+                    shell::CREDENTIAL_FILE_WRITE_NAME,
+                    shell::GIT_INTERNALS_WRITE_NAME,
+                ] {
+                    assert!(
+                        hits.iter().any(|hit| {
+                            hit.rule == rule
+                                && hit.reason != UNCERTAIN
+                                && hit.span == (start..source.len())
+                        }),
+                        "{source}: missing {rule}: {hits:?}"
+                    );
+                }
+            }
+            let source = format!("S=/tmp/a@/tmp/b; IFS=@; {writer} $S");
+            assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
         }
     }
 

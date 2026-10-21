@@ -756,6 +756,30 @@ fn printf_option_text_after_the_format_preserves_harmless_bindings() {
 }
 
 #[test]
+fn in_place_multi_destination_writes_keep_native_rule_grants_independent() {
+    for (grant, control, remaining, destinations) in [
+        (
+            "core.filesystem:credential-file-write",
+            "tee /etc/shadow",
+            "core.filesystem:git-internals-write",
+            "/etc/shadow@.git/config",
+        ),
+        (
+            "core.filesystem:git-internals-write",
+            "tee .git/config",
+            "core.filesystem:credential-file-write",
+            ".git/config@/etc/shadow",
+        ),
+    ] {
+        assert_allowed_by_grant(control, grant);
+        for writer in ["sed -i s/x/y/", "perl -i -pe 1"] {
+            let source = format!("S={destinations}; IFS=@; {writer} $S");
+            assert_decision_with_grant(&source, false, Some(remaining), Some(grant));
+        }
+    }
+}
+
+#[test]
 fn stale_binding_refusal_keeps_native_allowlist_families_independent() {
     for (grant, control, remaining) in [
         (
