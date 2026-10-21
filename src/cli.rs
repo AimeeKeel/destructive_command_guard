@@ -13801,6 +13801,7 @@ fn hook_has_dcg_identity(hook: &serde_json::Value, desired_hook: &serde_json::Va
 fn merge_host_owned_hook_fields<'a>(
     desired_hook: serde_json::Value,
     previous: impl Iterator<Item = &'a serde_json::Value>,
+    owned_keys: &[&str],
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let serde_json::Value::Object(desired) = desired_hook else {
         return Ok(desired_hook);
@@ -13811,7 +13812,7 @@ fn merge_host_owned_hook_fields<'a>(
             continue;
         };
         for (key, value) in fields {
-            if DCG_OWNED_HOOK_KEYS.contains(&key.as_str()) {
+            if owned_keys.contains(&key.as_str()) {
                 continue;
             }
             if let Some(existing) = merged.get(key) {
@@ -13827,7 +13828,7 @@ fn merge_host_owned_hook_fields<'a>(
         }
     }
     for (key, value) in desired {
-        if DCG_OWNED_HOOK_KEYS.contains(&key.as_str()) {
+        if owned_keys.contains(&key.as_str()) {
             merged.insert(key, value);
         } else {
             merged.entry(key).or_insert(value);
@@ -13929,7 +13930,8 @@ fn install_dcg_hook_for_matcher(
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(is_dcg_command)
         });
-    let desired_hook = merge_host_owned_hook_fields(desired_hook, previous_hooks)?;
+    let desired_hook =
+        merge_host_owned_hook_fields(desired_hook, previous_hooks, DCG_OWNED_HOOK_KEYS)?;
     let mut canonical_entry = None;
     let mut retained_entries = Vec::with_capacity(original.len());
 
@@ -14598,57 +14600,46 @@ fn remove_dcg_hooks_from_crush_hooks(
 ///
 /// Stale dcg entries under any spelling of the event key are removed, the
 /// fresh entry is inserted at the front of `hooks.PreToolUse` (Crush resolves
-/// hooks in config order; first deny wins), and host-owned fields from the
-/// entry being replaced are kept. Returns `Ok(true)` when the config changed
+/// hooks in config order; first deny wins), and compatible host-owned fields
+/// from every replaced entry are kept. Returns `Ok(true)` when the config changed
 /// (always `true` with `force`).
 ///
 /// # Errors
 ///
-/// Returns an error if the config, its `hooks`, or a `PreToolUse` value has an
-/// unexpected JSON shape.
+/// Returns an error without changing the config if its shape is unexpected
+/// or duplicate dcg entries disagree on an operator-owned field.
 fn install_crush_hook_into_config(
     config: &mut serde_json::Value,
     force: bool,
     desired_entry: serde_json::Value,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let config_obj = config
-        .as_object_mut()
-        .ok_or("Invalid crush.json format (expected JSON object)")?;
-    let hooks = config_obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    let original = hooks.clone();
-
-    let previous = remove_dcg_hooks_from_crush_hooks(hooks)?;
-    let desired_keys: Vec<String> = desired_entry
         .as_object()
-        .map(|desired| desired.keys().cloned().collect())
-        .unwrap_or_default();
-    let mut merged = match previous.as_ref().and_then(serde_json::Value::as_object) {
-        Some(previous) => {
-            // Owned keys the new entry still carries are overwritten in place
-            // below, so a re-install keeps the key order it wrote the first
-            // time; removing and re-inserting them moved them after `name` and
-            // `timeout`, rewriting an unchanged crush.json on every --force.
-            let mut merged = previous.clone();
-            for key in DCG_OWNED_CRUSH_HOOK_KEYS {
-                if !desired_keys.iter().any(|desired| desired == key) {
-                    merged.remove(*key);
-                }
-            }
-            merged
-        }
-        None => serde_json::Map::new(),
-    };
-    if let serde_json::Value::Object(desired) = desired_entry {
-        for (key, value) in desired {
-            // dcg-owned keys are always refreshed; host-owned defaults
-            // (`name`, `timeout`) only fill gaps so user edits survive.
-            if DCG_OWNED_CRUSH_HOOK_KEYS.contains(&key.as_str()) || !merged.contains_key(&key) {
-                merged.insert(key, value);
-            }
+        .ok_or("Invalid crush.json format (expected JSON object)")?;
+    let original = config_obj.get("hooks");
+    let mut hooks = original.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let hooks_obj = hooks
+        .as_object()
+        .ok_or("Invalid hooks format in crush.json (expected JSON object)")?;
+    let mut previous = Vec::new();
+    for (key, value) in hooks_obj {
+        if is_crush_pre_tool_use_key(key) {
+            let entries = value.as_array().ok_or_else(|| {
+                format!("Invalid hooks.{key} format in crush.json (expected JSON array)")
+            })?;
+            previous.extend(
+                entries
+                    .iter()
+                    .filter(|entry| crush_hook_entry_is_dcg(entry)),
+            );
         }
     }
+    let merged = merge_host_owned_hook_fields(
+        desired_entry,
+        previous.into_iter(),
+        DCG_OWNED_CRUSH_HOOK_KEYS,
+    )?;
+    remove_dcg_hooks_from_crush_hooks(&mut hooks)?;
 
     let entries = hooks
         .as_object_mut()
@@ -14657,9 +14648,13 @@ fn install_crush_hook_into_config(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .ok_or("Invalid hooks.PreToolUse format in crush.json (expected JSON array)")?;
-    entries.insert(0, serde_json::Value::Object(merged));
+    entries.insert(0, merged);
 
-    Ok(force || *hooks != original)
+    let changed = force || original != Some(&hooks);
+    if changed {
+        config["hooks"] = hooks;
+    }
+    Ok(changed)
 }
 
 /// Remove dcg's hook entries from an in-memory Crush config. Returns
@@ -14731,19 +14726,26 @@ fn install_crush_hook_at(
     config_path: &std::path::Path,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut config = if config_path.exists() {
-        read_crush_config(config_path)?
-    } else {
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let mut config = match read_crush_config(config_path) {
+        Ok(config) => config,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && !config_path.is_symlink() =>
+        {
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error),
     };
 
     let changed = install_crush_hook_into_config(&mut config, force, crush_dcg_hook_entry()?)?;
     if changed {
         let content = serde_json::to_string_pretty(&config)?;
-        std::fs::write(config_path, content)?;
+        write_installer_hook_settings(config_path, &content)?;
     }
     Ok(changed)
 }
@@ -14813,6 +14815,10 @@ const REASONIX_SHELL_MATCH: &str = "bash|pwsh";
 
 /// The `hooks` key Reasonix reads for pre-execution hooks.
 const REASONIX_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
+
+/// Only the command and tool match belong to dcg. Every other field belongs
+/// to the operator and must survive repair, including fields added by Reasonix.
+const DCG_OWNED_REASONIX_HOOK_KEYS: &[&str] = &["command", "match"];
 
 /// Reasonix home (#358), resolved as `reasonixHomeDir` in Reasonix's
 /// `internal/config/paths.go` resolves it.
@@ -15031,7 +15037,8 @@ fn reasonix_hook_entry_is_dcg(entry: &serde_json::Value) -> bool {
 ///
 /// Stale dcg entries are removed and the fresh one is inserted first:
 /// Reasonix runs a scope's hooks in array order and stops at the first block.
-/// A user's own `timeout` or `description` on the previous dcg entry is kept.
+/// Operator-owned fields from every replaced dcg entry are kept. Conflicting
+/// duplicate policies are refused rather than resolved by their array order.
 /// Returns `Ok(true)` when the settings changed (always `true` with `force`).
 ///
 /// # Errors
@@ -15045,7 +15052,7 @@ fn install_reasonix_hook_into_settings(
     desired_entry: serde_json::Value,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let settings_obj = settings
-        .as_object_mut()
+        .as_object()
         .ok_or("Invalid Reasonix settings.json (expected a JSON object with a \"hooks\" key)")?;
     if !settings_obj.contains_key("hooks") && settings_obj.contains_key(REASONIX_PRE_TOOL_USE_EVENT)
     {
@@ -15056,36 +15063,48 @@ fn install_reasonix_hook_into_settings(
         );
     }
     let hooks = settings_obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    let original = hooks.clone();
+        .get("hooks")
+        .map(|hooks| {
+            hooks
+                .as_object()
+                .ok_or("Invalid hooks format in Reasonix settings.json (expected JSON object)")
+        })
+        .transpose()?;
     let entries = hooks
-        .as_object_mut()
-        .ok_or("Invalid hooks format in Reasonix settings.json (expected JSON object)")?
-        .entry(REASONIX_PRE_TOOL_USE_EVENT)
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut()
-        .ok_or("Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)")?;
-
+        .and_then(|hooks| hooks.get(REASONIX_PRE_TOOL_USE_EVENT))
+        .map(|entries| {
+            entries.as_array().ok_or(
+                "Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)",
+            )
+        })
+        .transpose()?;
     let previous = entries
-        .iter()
-        .find(|entry| reasonix_hook_entry_is_dcg(entry))
-        .cloned();
-    entries.retain(|entry| !reasonix_hook_entry_is_dcg(entry));
-    let mut entry = desired_entry;
-    if let (Some(previous), Some(entry)) = (
-        previous.as_ref().and_then(serde_json::Value::as_object),
-        entry.as_object_mut(),
-    ) {
-        for key in ["timeout", "description"] {
-            if let Some(value) = previous.get(key) {
-                entry.insert(key.to_string(), value.clone());
-            }
-        }
-    }
-    entries.insert(0, entry);
+        .into_iter()
+        .flatten()
+        .filter(|entry| reasonix_hook_entry_is_dcg(entry));
+    let merged =
+        merge_host_owned_hook_fields(desired_entry, previous, DCG_OWNED_REASONIX_HOOK_KEYS)?;
+    let mut updated_entries = vec![merged];
+    updated_entries.extend(
+        entries
+            .into_iter()
+            .flatten()
+            .filter(|entry| !reasonix_hook_entry_is_dcg(entry))
+            .cloned(),
+    );
 
-    Ok(force || *hooks != original)
+    // Publish the completed merge only after all validation succeeds, so a
+    // conflict cannot partly remove the guard even for in-memory callers.
+    let changed = force || entries.is_none_or(|entries| *entries != updated_entries);
+    if changed {
+        let hooks = settings
+            .as_object_mut()
+            .expect("validated settings object")
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}));
+        hooks[REASONIX_PRE_TOOL_USE_EVENT] = serde_json::Value::Array(updated_entries);
+    }
+    Ok(changed)
 }
 
 /// Remove dcg's entries from an in-memory Reasonix settings object. Returns
@@ -15124,18 +15143,26 @@ fn install_reasonix_hook_at(
     path: &std::path::Path,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut settings = if path.exists() {
-        read_reasonix_settings(path)?
-    } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let mut settings = match read_reasonix_settings(path) {
+        Ok(settings) => settings,
+        Err(error)
+            if !path.is_symlink()
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error),
     };
     let entry = reasonix_dcg_hook_entry_for_executable(&current_dcg_executable()?, cfg!(windows))?;
     let changed = install_reasonix_hook_into_settings(&mut settings, force, entry)?;
     if changed {
-        std::fs::write(path, serde_json::to_string_pretty(&settings)?)?;
+        let content = serde_json::to_string_pretty(&settings)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_installer_hook_settings(path, &content)?;
     }
     Ok(changed)
 }
@@ -15343,8 +15370,8 @@ fn ensure_muse_schema_version(
 
 /// Remove dcg's handlers from every `PreToolUse` matcher group, dropping a
 /// group only when dcg's removal emptied it (a group the user left empty is
-/// theirs). Returns the first removed dcg handler, whose operator-owned fields
-/// a reinstall carries over.
+/// theirs). Returns the first removed dcg handler to signal that a removal
+/// occurred; install collects every handler's policy before calling this.
 fn strip_dcg_from_muse_groups(
     groups: &mut Vec<serde_json::Value>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -15387,8 +15414,10 @@ fn install_muse_hook_into_settings(
     force: bool,
     command: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let original = settings.clone();
-    let settings_obj = settings
+    // Work on a candidate so validation errors, including conflicting policies
+    // on duplicate registrations, cannot even partially mutate the caller.
+    let mut candidate = settings.clone();
+    let settings_obj = candidate
         .as_object_mut()
         .ok_or("Invalid Muse Code settings.json (expected a JSON object)")?;
     ensure_muse_schema_version(settings_obj)?;
@@ -15402,24 +15431,55 @@ fn install_muse_hook_into_settings(
         .as_array_mut()
         .ok_or("Invalid hooks.PreToolUse in Muse Code settings.json (expected a JSON array)")?;
 
-    let previous = strip_dcg_from_muse_groups(groups);
-    let mut handler = serde_json::Map::new();
-    handler.insert("type".to_string(), serde_json::json!("command"));
-    handler.insert("command".to_string(), serde_json::json!(command));
-    for (key, value) in previous.into_iter().flatten() {
-        if !MUSE_DCG_OWNED_HANDLER_KEYS.contains(&key.as_str()) {
-            handler.insert(key, value);
+    for group in groups.iter() {
+        let group = group
+            .as_object()
+            .ok_or("Invalid Muse Code PreToolUse matcher group (expected a JSON object)")?;
+        if group.get("matcher").is_some_and(|value| !value.is_string()) {
+            return Err("Invalid Muse Code PreToolUse matcher (expected a string)".into());
+        }
+        let handlers = group
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("Invalid Muse Code PreToolUse matcher hooks (expected a JSON array)")?;
+        if handlers.iter().any(|handler| !handler.is_object()) {
+            return Err("Invalid Muse Code PreToolUse handler (expected a JSON object)".into());
         }
     }
-    groups.insert(
-        0,
-        serde_json::json!({
-            "matcher": MUSE_SHELL_MATCHER,
-            "hooks": [serde_json::Value::Object(handler)],
-        }),
-    );
 
-    Ok(force || *settings != original)
+    let previous = groups
+        .iter()
+        .filter_map(|group| group.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|handler| muse_handler_is_dcg(handler));
+    let handler = merge_host_owned_hook_fields(
+        serde_json::json!({"type": "command", "command": command}),
+        previous,
+        MUSE_DCG_OWNED_HANDLER_KEYS,
+    )?;
+
+    // Keep the first canonical group's metadata and its unrelated handlers in
+    // the same scope. Other groups keep their own matchers when dcg leaves.
+    let mut canonical = groups
+        .iter()
+        .position(|group| {
+            group.get("matcher").and_then(serde_json::Value::as_str) == Some(MUSE_SHELL_MATCHER)
+        })
+        .map(|index| groups.remove(index))
+        .unwrap_or_else(|| serde_json::json!({"matcher": MUSE_SHELL_MATCHER, "hooks": []}));
+    let canonical_handlers = canonical["hooks"]
+        .as_array_mut()
+        .expect("validated canonical hooks array");
+    canonical_handlers.retain(|handler| !muse_handler_is_dcg(handler));
+    canonical_handlers.insert(0, handler);
+    let _ = strip_dcg_from_muse_groups(groups);
+    groups.insert(0, canonical);
+
+    let changed = force || candidate != *settings;
+    if changed {
+        *settings = candidate;
+    }
+    Ok(changed)
 }
 
 /// Remove dcg's handlers from an in-memory Muse settings object. Returns
@@ -15464,19 +15524,26 @@ fn install_muse_hook_at(
     path: &std::path::Path,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut settings = if path.exists() {
-        read_muse_settings(path)?
-    } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let mut settings = match read_muse_settings(path) {
+        Ok(settings) => settings,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && !path.is_symlink() =>
+        {
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error),
     };
     let command = muse_dcg_hook_command_for_executable(&current_dcg_executable()?, cfg!(windows))?;
     let changed = install_muse_hook_into_settings(&mut settings, force, &command)?;
     if changed {
         let mut content = serde_json::to_string_pretty(&settings)?;
         content.push('\n');
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         write_settings_atomic(path, &content)?;
     }
     Ok(changed)
@@ -24079,6 +24146,132 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     }
 
     #[test]
+    fn install_crush_hook_policy_merges_all_aliases_and_repeats_without_loss() {
+        let audit = serde_json::json!({
+            "matcher": "^write$", "command": "/usr/bin/logger /opt/dcg", "name": "audit"
+        });
+        let policy = serde_json::json!({
+            "matcher": "bash", "command": "/old/dcg", "onFailure": "block", "timeout": 15
+        });
+        let extra = serde_json::json!({
+            "matcher": ".*", "command": "/older/dcg", "name": "operator-guard",
+            "env": {"DCG_HOOK_TIMEOUT_MS": "4000"}, "enabled": false
+        });
+        for (first, second) in [(&policy, &extra), (&extra, &policy)] {
+            let mut config = serde_json::json!({
+                "options": {"debug": true},
+                "hooks": {
+                    "PreToolUse": [first, audit],
+                    "pre_tool_use": [second],
+                    "PostToolUse": [{"command": "notify"}]
+                }
+            });
+            let original = config.clone();
+            assert!(
+                install_crush_hook_into_config(&mut config, false, crush_entry_for("/new/dcg"))
+                    .expect("compatible duplicate policies")
+            );
+            let entries = crush_pre_tool_use(&config);
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0]["onFailure"], "block");
+            assert_eq!(entries[0]["timeout"], 15);
+            assert_eq!(entries[0]["name"], "operator-guard");
+            assert_eq!(entries[0]["enabled"], false);
+            assert_eq!(entries[0]["env"], extra["env"]);
+            assert_eq!(entries[0]["matcher"], CRUSH_SHELL_MATCHER);
+            assert_eq!(
+                entries[0]["command"],
+                crush_entry_for("/new/dcg")["command"]
+            );
+            assert_eq!(entries[1], audit);
+            assert_eq!(config["hooks"]["pre_tool_use"], serde_json::json!([]));
+            assert_eq!(config["options"], original["options"]);
+            assert_eq!(
+                config["hooks"]["PostToolUse"],
+                original["hooks"]["PostToolUse"]
+            );
+            let repaired = serde_json::to_string_pretty(&config).unwrap();
+            for force in [false, true, false] {
+                assert_eq!(
+                    install_crush_hook_into_config(&mut config, force, crush_entry_for("/new/dcg"))
+                        .expect("repeat install"),
+                    force
+                );
+                assert_eq!(serde_json::to_string_pretty(&config).unwrap(), repaired);
+            }
+        }
+    }
+
+    #[test]
+    fn install_crush_hook_policy_conflicts_and_malformed_aliases_leave_config_untouched() {
+        for (key, first, second) in [
+            (
+                "onFailure",
+                serde_json::json!("block"),
+                serde_json::json!("continue"),
+            ),
+            ("timeout", serde_json::json!(15), serde_json::json!(5)),
+            ("enabled", serde_json::json!(false), serde_json::json!(0)),
+            (
+                "env",
+                serde_json::json!({"POLICY": "strict"}),
+                serde_json::json!({"POLICY": "audit"}),
+            ),
+        ] {
+            for force in [false, true] {
+                let mut first_hook = serde_json::json!({"matcher": "bash", "command": "/old/dcg"});
+                first_hook[key] = first.clone();
+                let mut second_hook = serde_json::json!({"matcher": ".*", "command": "/older/dcg"});
+                second_hook[key] = second.clone();
+                let mut config = serde_json::json!({
+                    "hooks": {"PreToolUse": [first_hook], "PRE_TOOL_USE": [second_hook]}
+                });
+                let original = config.clone();
+                let error =
+                    install_crush_hook_into_config(&mut config, force, crush_entry_for("/new/dcg"))
+                        .expect_err("conflicting operator fields must not be guessed");
+                assert!(error.to_string().contains(key), "{error}");
+                assert_eq!(config, original);
+            }
+        }
+        for force in [false, true] {
+            let mut config = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{"command": "/old/dcg", "onFailure": "block"}],
+                    "pre_tool_use": {"command": "/other/dcg", "timeout": 15}
+                }
+            });
+            let original = config.clone();
+            assert!(
+                install_crush_hook_into_config(&mut config, force, crush_entry_for("/new/dcg"))
+                    .is_err()
+            );
+            assert_eq!(
+                config, original,
+                "validate every alias before removing any hook"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_crush_hook_policy_failed_staging_preserves_blocking_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crush.json");
+        let original = br#"{"hooks":{"PreToolUse":[{"matcher":"bash","command":"/old/dcg","onFailure":"block","timeout":15}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let stage = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::write(&stage, b"foreign staged content").unwrap();
+        for force in [false, true] {
+            assert!(install_crush_hook_at(&path, force).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(&stage).unwrap(), b"foreign staged content");
+        }
+    }
+
+    #[test]
     fn uninstall_crush_removes_only_dcg_entries() {
         let mut config = serde_json::json!({
             "options": { "debug": true },
@@ -24361,6 +24554,154 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         }
     }
 
+    #[test]
+    fn reasonix_hook_policy_merges_every_registration_and_survives_repeats() {
+        let desired = reasonix_entry_for(&host_abs("/new/dcg"));
+        let first = serde_json::json!({
+            "match": "bash", "command": "/old/dcg", "timeout": 15000,
+            "description": "operator policy", "onFailure": "block"
+        });
+        let second = serde_json::json!({
+            "match": "pwsh", "command": "dcg --legacy", "onFailure": "block",
+            "env": {"DCG_STRICT": "1"}, "future": {"enabled": true},
+            "shell": "operator shell", "type": "operator type"
+        });
+        let unrelated = serde_json::json!({
+            "match": "write_file", "command": "/usr/bin/logger /opt/dcg", "timeout": 2500
+        });
+        for previous in [
+            vec![first.clone(), unrelated.clone(), second.clone()],
+            vec![second.clone(), unrelated.clone(), first.clone()],
+        ] {
+            let mut settings = serde_json::json!({
+                "theme": "operator theme",
+                "hooks": {"PreToolUse": previous, "Stop": [{"command": "audit-stop"}]}
+            });
+            assert!(
+                install_reasonix_hook_into_settings(&mut settings, false, desired.clone()).unwrap()
+            );
+            let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0]["command"], desired["command"]);
+            assert_eq!(entries[0]["match"], REASONIX_SHELL_MATCH);
+            assert_eq!(entries[0]["timeout"], 15000);
+            assert_eq!(entries[0]["description"], "operator policy");
+            assert_eq!(entries[0]["onFailure"], "block");
+            assert_eq!(entries[0]["env"], second["env"]);
+            assert_eq!(entries[0]["future"], second["future"]);
+            assert_eq!(entries[0]["shell"], "operator shell");
+            assert_eq!(entries[0]["type"], "operator type");
+            assert_eq!(entries[1], unrelated);
+            assert_eq!(settings["theme"], "operator theme");
+            assert_eq!(settings["hooks"]["Stop"][0]["command"], "audit-stop");
+            let repaired = serde_json::to_vec(&settings).unwrap();
+            for force in [false, true, false] {
+                assert_eq!(
+                    install_reasonix_hook_into_settings(&mut settings, force, desired.clone())
+                        .unwrap(),
+                    force
+                );
+                assert_eq!(serde_json::to_vec(&settings).unwrap(), repaired);
+            }
+        }
+    }
+
+    #[test]
+    fn reasonix_hook_policy_refuses_conflicting_duplicate_fields_without_mutation() {
+        for (key, first_value, second_value) in [
+            (
+                "onFailure",
+                serde_json::json!("block"),
+                serde_json::json!("continue"),
+            ),
+            ("timeout", serde_json::json!(15000), serde_json::json!(5000)),
+            ("future", serde_json::json!(false), serde_json::json!(0)),
+            (
+                "env",
+                serde_json::json!({"POLICY": "strict"}),
+                serde_json::json!({"POLICY": "observe"}),
+            ),
+        ] {
+            let mut first = serde_json::json!({"command": "dcg", "match": "bash"});
+            first[key] = first_value;
+            let mut second = serde_json::json!({"command": "/old/dcg", "match": "pwsh"});
+            second[key] = second_value;
+            for previous in [
+                vec![first.clone(), second.clone()],
+                vec![second.clone(), first.clone()],
+            ] {
+                let original = serde_json::json!({"hooks": {"PreToolUse": previous}});
+                for force in [false, true] {
+                    let mut settings = original.clone();
+                    let error = install_reasonix_hook_into_settings(
+                        &mut settings,
+                        force,
+                        reasonix_entry_for(&host_abs("/new/dcg")),
+                    )
+                    .unwrap_err();
+                    assert!(error.to_string().contains(key), "{error}");
+                    assert_eq!(settings, original, "failed repair must not mutate policy");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reasonix_hook_policy_read_and_validation_errors_preserve_existing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let fixtures: &[&[u8]] = &[
+            b"{\"hooks\":",
+            b"\xff",
+            b"null",
+            b"{\"PreToolUse\":[]}",
+            b"{\"hooks\":null}",
+            b"{\"hooks\":{\"PreToolUse\":{}}}",
+            br#"{"hooks":{"PreToolUse":[{"command":"dcg","onFailure":"block"},{"command":"/old/dcg","onFailure":"continue"}]}}"#,
+        ];
+        for original in fixtures {
+            std::fs::write(&path, original).unwrap();
+            for force in [false, true] {
+                assert!(install_reasonix_hook_at(&path, force).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), *original);
+            }
+        }
+        let directory_path = dir.path().join("unreadable-settings.json");
+        std::fs::create_dir(&directory_path).unwrap();
+        assert!(install_reasonix_hook_at(&directory_path, true).is_err());
+        assert!(directory_path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reasonix_hook_policy_refuses_dangling_links_and_failed_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let dangling_path = dir.path().join("dangling.json");
+        let missing_target = dir.path().join("missing.json");
+        std::os::unix::fs::symlink(&missing_target, &dangling_path).unwrap();
+        for force in [false, true] {
+            assert!(install_reasonix_hook_at(&dangling_path, force).is_err());
+            assert_eq!(std::fs::read_link(&dangling_path).unwrap(), missing_target);
+            assert!(!missing_target.exists());
+        }
+
+        let path = dir.path().join("settings.json");
+        let original = br#"{"hooks":{"PreToolUse":[{"command":"dcg","match":"bash","onFailure":"block","timeout":15000}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let staging_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::write(&staging_path, b"foreign staging content").unwrap();
+        for force in [false, true] {
+            assert!(install_reasonix_hook_at(&path, force).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(
+                std::fs::read(&staging_path).unwrap(),
+                b"foreign staging content"
+            );
+        }
+    }
+
     /// #358: the Windows command form is a double-quoted path, which Reasonix
     /// hands to `cmd.exe /d /s /c "<command>"`; dcg must recognize it as its
     /// own on reinstall and uninstall.
@@ -24552,6 +24893,185 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         );
         assert_eq!(unversioned["schema_version"], 1);
         assert_eq!(unversioned["model"], "m");
+    }
+
+    #[test]
+    fn muse_hook_policy_merges_every_registration_and_preserves_scopes_on_repeat() {
+        let fixture = serde_json::json!({
+            "schema_version": 1,
+            "model": "operator-model",
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": MUSE_SHELL_MATCHER, "operator_note": "keep", "hooks": [
+                        {"type": "command", "command": "canonical-audit"},
+                        {"type": "command", "command": "/old/dcg --agent muse", "timeout_ms": 15000}
+                    ]},
+                    {"matcher": "^shell$", "hooks": [
+                        {"type": "command", "command": "dcg", "onFailure": "block"},
+                        {"type": "command", "command": "shell-audit"}
+                    ]},
+                    {"matcher": "^exec_command$", "hooks": [
+                        {"type": "command", "command": "/stale/dcg", "onFailure": "block",
+                         "env": {"DCG_HOOK_TIMEOUT_MS": "5000"}, "future_policy": [true, "retain"]}
+                    ]}
+                ],
+                "SessionStart": [{"hooks": [{"type": "command", "command": "hello"}]}]
+            }
+        });
+        for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+            let mut settings = fixture.clone();
+            settings["hooks"]["PreToolUse"] = serde_json::Value::Array(
+                order
+                    .map(|index| fixture["hooks"]["PreToolUse"][index].clone())
+                    .to_vec(),
+            );
+            assert!(
+                install_muse_hook_into_settings(&mut settings, false, MUSE_TEST_COMMAND).unwrap()
+            );
+            assert_eq!(settings["model"], fixture["model"]);
+            assert_eq!(
+                settings["hooks"]["SessionStart"],
+                fixture["hooks"]["SessionStart"]
+            );
+            let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(groups.len(), 2, "duplicate-only groups are removed");
+            assert_eq!(groups[0]["matcher"], MUSE_SHELL_MATCHER);
+            assert_eq!(groups[0]["operator_note"], "keep");
+            let handler = &groups[0]["hooks"][0];
+            assert_eq!(handler["type"], "command");
+            assert_eq!(handler["command"], MUSE_TEST_COMMAND);
+            assert_eq!(handler["timeout_ms"], 15000);
+            assert_eq!(handler["onFailure"], "block");
+            assert_eq!(
+                handler["env"],
+                serde_json::json!({"DCG_HOOK_TIMEOUT_MS": "5000"})
+            );
+            assert_eq!(
+                handler["future_policy"],
+                serde_json::json!([true, "retain"])
+            );
+            assert_eq!(groups[0]["hooks"][1]["command"], "canonical-audit");
+            assert_eq!(groups[1]["matcher"], "^shell$");
+            assert_eq!(
+                groups[1]["hooks"],
+                serde_json::json!([{"type": "command", "command": "shell-audit"}])
+            );
+
+            let repaired = settings.clone();
+            for force in [false, true, false] {
+                assert_eq!(
+                    install_muse_hook_into_settings(&mut settings, force, MUSE_TEST_COMMAND)
+                        .unwrap(),
+                    force
+                );
+                assert_eq!(settings, repaired);
+            }
+        }
+    }
+
+    #[test]
+    fn muse_hook_policy_conflicts_refuse_without_adding_a_schema_version() {
+        for (field, left, right) in [
+            (
+                "onFailure",
+                serde_json::json!("block"),
+                serde_json::json!("continue"),
+            ),
+            (
+                "timeout_ms",
+                serde_json::json!(15000),
+                serde_json::json!(5000),
+            ),
+            (
+                "future_policy",
+                serde_json::json!(false),
+                serde_json::json!(0),
+            ),
+        ] {
+            for reverse in [false, true] {
+                for force in [false, true] {
+                    let mut first = serde_json::json!({"type": "command", "command": "dcg"});
+                    first[field] = left.clone();
+                    let mut second = serde_json::json!({"type": "command", "command": "/old/dcg"});
+                    second[field] = right.clone();
+                    let mut handlers = vec![first, second];
+                    if reverse {
+                        handlers.reverse();
+                    }
+                    let mut settings = serde_json::json!({
+                        "model": "operator-model",
+                        "hooks": {"PreToolUse": [{"matcher": MUSE_SHELL_MATCHER, "hooks": handlers}]}
+                    });
+                    let before = settings.clone();
+                    let error =
+                        install_muse_hook_into_settings(&mut settings, force, MUSE_TEST_COMMAND)
+                            .expect_err("conflicting policy must not be resolved by order");
+                    assert!(error.to_string().contains(field), "{error}");
+                    assert_eq!(
+                        settings, before,
+                        "failed repair must leave the entire object intact"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn muse_hook_policy_malformed_groups_refuse_without_mutation() {
+        for fixture in [
+            serde_json::json!({"hooks": []}),
+            serde_json::json!({"hooks": {"PreToolUse": {}}}),
+            serde_json::json!({"hooks": {"PreToolUse": [null]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": MUSE_SHELL_MATCHER}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "^shell$", "hooks": null}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": 7, "hooks": [{"command": "dcg"}]}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": MUSE_SHELL_MATCHER, "hooks": ["dcg"]}]}}),
+        ] {
+            for force in [false, true] {
+                let mut settings = fixture.clone();
+                assert!(
+                    install_muse_hook_into_settings(&mut settings, force, MUSE_TEST_COMMAND)
+                        .is_err()
+                );
+                assert_eq!(
+                    settings, fixture,
+                    "failed validation must not add schema_version or hooks"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn muse_hook_policy_failed_staging_and_broken_symlink_preserve_existing_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let original = br#"{"schema_version":1,"hooks":{"PreToolUse":[{"matcher":"^shell$","hooks":[{"type":"command","command":"dcg","onFailure":"block"}]}]}}"#;
+        std::fs::write(&settings_path, original).unwrap();
+        let stage_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::write(&stage_path, b"foreign staged content").unwrap();
+        for force in [false, true] {
+            assert!(install_muse_hook_at(&settings_path, force).is_err());
+            assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+            assert_eq!(
+                std::fs::read(&stage_path).unwrap(),
+                b"foreign staged content"
+            );
+        }
+
+        let broken_dir = tempfile::tempdir().unwrap();
+        let broken_path = broken_dir.path().join("settings.json");
+        let missing_target = broken_dir.path().join("operator-settings.json");
+        symlink(&missing_target, &broken_path).unwrap();
+        for force in [false, true] {
+            assert!(install_muse_hook_at(&broken_path, force).is_err());
+            assert_eq!(std::fs::read_link(&broken_path).unwrap(), missing_target);
+            assert!(!missing_target.exists());
+        }
     }
 
     // ---- #577: Amp plugin --------------------------------------------------

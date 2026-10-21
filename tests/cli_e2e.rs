@@ -2528,6 +2528,7 @@ mod config_tests {
             .env("USERPROFILE", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("REASONIX_HOME", home.join(".reasonix"))
             .env("TMPDIR", &tmp)
             .env("TEMP", &tmp)
             .env("TMP", &tmp)
@@ -2536,6 +2537,406 @@ mod config_tests {
             .current_dir(home)
             .output()
             .expect("run isolated dcg install")
+    }
+
+    fn agent_policy_settings_path(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
+        home.join(match agent {
+            "--reasonix" => ".reasonix/settings.json",
+            "--crush" => ".config/crush/crush.json",
+            "--muse" => ".config/muse/settings.json",
+            _ => panic!("unsupported fixture agent: {agent}"),
+        })
+    }
+
+    fn agent_policy_fixture(agent: &str) -> serde_json::Value {
+        let mut first = serde_json::json!({"command": "/retired/dcg"});
+        let mut protected = serde_json::json!({
+            "command": "\"C:\\old tools\\dcg.exe\"",
+            "onFailure": "block",
+            "timeout": 15,
+            "description": "Operator-managed safety policy",
+            "future": {"enabled": true, "labels": ["security", "interactive"]}
+        });
+        let mut last = serde_json::json!({
+            "command": "/older/dcg",
+            "statusMessage": "Checking safety"
+        });
+        let mut settings = serde_json::json!({
+            "model": "operator-model",
+            "operator": {"managed": true},
+            "hooks": {"Stop": [{"command": "after-audit"}]}
+        });
+        match agent {
+            "--reasonix" => {
+                protected["match"] = serde_json::json!("pwsh");
+                last["match"] = serde_json::json!("write");
+                settings["hooks"]["PreToolUse"] = serde_json::json!([
+                    {"match": "bash", "command": first["command"]},
+                    {"match": "read", "command": "/usr/bin/logger /opt/dcg"},
+                    protected,
+                    last,
+                    {"match": "write", "command": "write-audit", "timeout": 7}
+                ]);
+            }
+            "--crush" => {
+                protected["matcher"] = serde_json::json!("^bash$");
+                last["matcher"] = serde_json::json!(".*");
+                settings["hooks"]["PreToolUse"] = serde_json::json!([
+                    {"matcher": ".*", "command": first["command"]},
+                    {"matcher": "^read$", "command": "/usr/bin/logger /opt/dcg"}
+                ]);
+                settings["hooks"]["pre_tool_use"] = serde_json::json!([
+                    protected,
+                    {"matcher": "^write$", "command": "write-audit", "timeout": 7}
+                ]);
+                settings["hooks"]["pre-tool-use"] = serde_json::json!([last]);
+            }
+            "--muse" => {
+                first["type"] = serde_json::json!("command");
+                protected["type"] = serde_json::json!("command");
+                last["type"] = serde_json::json!("command");
+                settings["schema_version"] = serde_json::json!(1);
+                settings["hooks"]["PreToolUse"] = serde_json::json!([
+                    {"matcher": "^(shell|exec_command|bash)$", "hooks": [
+                        first,
+                        {"type": "command", "command": "shell-audit"}
+                    ]},
+                    {"matcher": "^exec_command$", "hooks": [
+                        protected,
+                        {"type": "command", "command": "terminal-audit"}
+                    ]},
+                    {"matcher": "^write_file$", "hooks": [last]},
+                    {"matcher": "^read_file$", "hooks": [
+                        {"type": "command", "command": "/usr/bin/logger /opt/dcg"}
+                    ]}
+                ]);
+            }
+            _ => panic!("unsupported fixture agent: {agent}"),
+        }
+        settings
+    }
+
+    fn agent_policy_guard<'a>(
+        settings: &'a serde_json::Value,
+        agent: &str,
+    ) -> &'a serde_json::Value {
+        let first = &settings["hooks"]["PreToolUse"][0];
+        if agent == "--muse" {
+            &first["hooks"][0]
+        } else {
+            first
+        }
+    }
+
+    fn assert_agent_policy_repair_and_repeat(agent: &str) {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = agent_policy_settings_path(home.path(), agent);
+        let fresh = run_hook_policy_install(home.path(), &["install", agent]);
+        assert!(
+            fresh.status.success(),
+            "{agent}: {}",
+            String::from_utf8_lossy(&fresh.stderr)
+        );
+        let fresh: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let desired = agent_policy_guard(&fresh, agent);
+        let original = agent_policy_fixture(agent);
+
+        // Both ordinary upgrades and an explicit repair must preserve the
+        // complete policy, even when it lives on a later stale registration.
+        for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+            std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+            let repaired = run_hook_policy_install(home.path(), args);
+            assert!(
+                repaired.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&repaired.stderr)
+            );
+            let installed_bytes = std::fs::read(&path).unwrap();
+            let installed: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+            let guard = agent_policy_guard(&installed, agent);
+            assert_eq!(guard["command"], desired["command"], "{agent}");
+            assert_eq!(guard["onFailure"], "block", "{agent}");
+            assert_eq!(guard["timeout"], 15, "{agent}");
+            assert_eq!(guard["description"], "Operator-managed safety policy");
+            assert_eq!(guard["statusMessage"], "Checking safety", "{agent}");
+            assert_eq!(
+                guard["future"],
+                serde_json::json!({"enabled": true, "labels": ["security", "interactive"]})
+            );
+            assert_eq!(installed["model"], original["model"]);
+            assert_eq!(installed["operator"], original["operator"]);
+            assert_eq!(installed["hooks"]["Stop"], original["hooks"]["Stop"]);
+            let entries = installed["hooks"]["PreToolUse"].as_array().unwrap();
+            match agent {
+                "--reasonix" => {
+                    assert_eq!(guard["match"], "bash|pwsh");
+                    assert_eq!(entries.len(), 3);
+                    assert_eq!(entries[1], original["hooks"]["PreToolUse"][1]);
+                    assert_eq!(entries[2], original["hooks"]["PreToolUse"][4]);
+                }
+                "--crush" => {
+                    assert_eq!(guard["matcher"], "^bash$");
+                    assert_eq!(entries.len(), 2);
+                    assert_eq!(entries[1], original["hooks"]["PreToolUse"][1]);
+                    assert_eq!(
+                        installed["hooks"]["pre_tool_use"],
+                        serde_json::json!([original["hooks"]["pre_tool_use"][1]])
+                    );
+                    assert!(
+                        installed["hooks"]["pre-tool-use"]
+                            .as_array()
+                            .is_none_or(Vec::is_empty)
+                    );
+                }
+                "--muse" => {
+                    assert_eq!(installed["schema_version"], 1);
+                    assert_eq!(entries[0]["matcher"], "^(shell|exec_command|bash)$");
+                    assert_eq!(guard["type"], "command");
+                    assert!(
+                        guard["command"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with(" --agent muse")
+                    );
+                    let audits: Vec<_> = entries
+                        .iter()
+                        .flat_map(|group| {
+                            group["hooks"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter(|handler| handler["command"] != guard["command"])
+                                .map(|handler| (group["matcher"].clone(), handler.clone()))
+                        })
+                        .collect();
+                    assert_eq!(
+                        audits,
+                        vec![
+                            (
+                                serde_json::json!("^(shell|exec_command|bash)$"),
+                                serde_json::json!({"type": "command", "command": "shell-audit"})
+                            ),
+                            (
+                                serde_json::json!("^exec_command$"),
+                                serde_json::json!({"type": "command", "command": "terminal-audit"})
+                            ),
+                            (
+                                serde_json::json!("^read_file$"),
+                                serde_json::json!({"type": "command", "command": "/usr/bin/logger /opt/dcg"})
+                            )
+                        ]
+                    );
+                    assert_eq!(
+                        entries
+                            .iter()
+                            .flat_map(|group| group["hooks"].as_array().unwrap())
+                            .filter(|handler| handler["command"] == guard["command"])
+                            .count(),
+                        1
+                    );
+                }
+                _ => unreachable!(),
+            }
+            for repeated_args in [
+                &["install", agent, "--force"][..],
+                &["install", agent][..],
+                &["install", agent][..],
+            ] {
+                let repeated = run_hook_policy_install(home.path(), repeated_args);
+                assert!(
+                    repeated.status.success(),
+                    "{repeated_args:?}: {}",
+                    String::from_utf8_lossy(&repeated.stderr)
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    installed_bytes,
+                    "{repeated_args:?} changed an already repaired configuration"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_agent_hook_policy_reasonix_preserves_block_across_repair_and_repeat() {
+        assert_agent_policy_repair_and_repeat("--reasonix");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_crush_preserves_block_across_repair_and_repeat() {
+        assert_agent_policy_repair_and_repeat("--crush");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_muse_preserves_block_across_repair_and_repeat() {
+        assert_agent_policy_repair_and_repeat("--muse");
+    }
+
+    fn assert_agent_policy_conflicts_preserve_file(agent: &str) {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = agent_policy_settings_path(home.path(), agent);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (field, conflicting_value) in [
+            ("onFailure", serde_json::json!("continue")),
+            ("timeout", serde_json::json!(5)),
+            ("future", serde_json::json!({"enabled": false})),
+        ] {
+            let mut original = agent_policy_fixture(agent);
+            let first = if agent == "--muse" {
+                &mut original["hooks"]["PreToolUse"][0]["hooks"][0]
+            } else {
+                &mut original["hooks"]["PreToolUse"][0]
+            };
+            first[field] = conflicting_value;
+            let original = serde_json::to_vec(&original).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                let output = run_hook_policy_install(home.path(), args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse conflicting {field}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(field),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn native_agent_hook_policy_reasonix_conflicts_preserve_previous_file() {
+        assert_agent_policy_conflicts_preserve_file("--reasonix");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_crush_conflicts_preserve_previous_file() {
+        assert_agent_policy_conflicts_preserve_file("--crush");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_muse_conflicts_preserve_previous_file() {
+        assert_agent_policy_conflicts_preserve_file("--muse");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_malformed_files_and_read_errors_are_not_replaced() {
+        for agent in ["--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = agent_policy_settings_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            for original in [
+                b"{\"hooks\": ".to_vec(),
+                b"{\"invalid_utf8\":\"\xff\"}".to_vec(),
+                b"[]".to_vec(),
+                b"{\"hooks\":[]}".to_vec(),
+                b"{\"hooks\":{\"PreToolUse\":{}}}".to_vec(),
+            ] {
+                std::fs::write(&path, &original).unwrap();
+                for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                    let output = run_hook_policy_install(home.path(), args);
+                    assert!(
+                        !output.status.success(),
+                        "{args:?} must refuse {original:?}"
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+            }
+
+            let unreadable_home = tempfile::tempdir().expect("isolated unreadable HOME");
+            let directory = agent_policy_settings_path(unreadable_home.path(), agent);
+            std::fs::create_dir_all(&directory).unwrap();
+            let sentinel = directory.join("managed-data");
+            std::fs::write(&sentinel, b"preserve this directory").unwrap();
+            for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                let output = run_hook_policy_install(unreadable_home.path(), args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse a read error"
+                );
+                assert!(directory.is_dir());
+                assert_eq!(
+                    std::fs::read(&sentinel).unwrap(),
+                    b"preserve this directory"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_agent_hook_policy_managed_symlinks_and_permissions_survive_updates() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for agent in ["--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = agent_policy_settings_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let target = home.path().join("managed-settings.json");
+            std::fs::write(
+                &target,
+                serde_json::to_vec(&agent_policy_fixture(agent)).unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            symlink(&target, &path).unwrap();
+            for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                let output = run_hook_policy_install(home.path(), args);
+                assert!(
+                    output.status.success(),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    std::fs::symlink_metadata(&path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(std::fs::read_link(&path).unwrap(), target);
+                assert_eq!(
+                    std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+                let installed: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+                let guard = agent_policy_guard(&installed, agent);
+                assert_eq!(guard["onFailure"], "block");
+                assert_eq!(guard["timeout"], 15);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_agent_hook_policy_broken_managed_symlinks_are_not_created_over() {
+        use std::os::unix::fs::symlink;
+
+        for agent in ["--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = agent_policy_settings_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let missing_target = home.path().join("unavailable-managed-settings.json");
+            symlink(&missing_target, &path).unwrap();
+            for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                let output = run_hook_policy_install(home.path(), args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse an unavailable managed configuration"
+                );
+                assert!(
+                    std::fs::symlink_metadata(&path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(std::fs::read_link(&path).unwrap(), missing_target);
+                assert!(!missing_target.exists());
+            }
+        }
     }
 
     #[test]
