@@ -13774,29 +13774,48 @@ fn hook_has_dcg_identity(hook: &serde_json::Value, desired_hook: &serde_json::Va
             .all(|key| hook.get(key) == desired_hook.get(key))
 }
 
-/// Rebuild the hook object dcg will write, keeping host-owned fields from the
-/// hook it replaces (#345).
+/// Rebuild the hook object dcg will write, keeping host-owned fields from every
+/// registration it replaces (#345, #582).
 ///
-/// `desired_hook` supplies every dcg-owned key; `previous` (the dcg hook found
-/// in the existing settings, if any) supplies the rest. dcg-owned keys absent
-/// from `desired_hook` are dropped even when `previous` has them, so identity
-/// always ends up exactly as dcg defines it for this platform.
-fn merge_host_owned_hook_fields(
+/// Duplicate registrations may each carry part of the operator's policy. Merge
+/// compatible values, but refuse conflicts instead of choosing a policy by file
+/// order. Desired host fields are defaults; only dcg-owned keys are refreshed.
+fn merge_host_owned_hook_fields<'a>(
     desired_hook: serde_json::Value,
-    previous: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let Some(previous) = previous.and_then(serde_json::Value::as_object) else {
-        return desired_hook;
-    };
+    previous: impl Iterator<Item = &'a serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let serde_json::Value::Object(desired) = desired_hook else {
-        return desired_hook;
+        return Ok(desired_hook);
     };
-    let mut merged = previous.clone();
-    for key in DCG_OWNED_HOOK_KEYS {
-        merged.remove(*key);
+    let mut merged = serde_json::Map::new();
+    for hook in previous {
+        let Some(fields) = hook.as_object() else {
+            continue;
+        };
+        for (key, value) in fields {
+            if DCG_OWNED_HOOK_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            if let Some(existing) = merged.get(key) {
+                if existing != value {
+                    return Err(format!(
+                        "Conflicting dcg hook field '{key}'; leaving settings unchanged"
+                    )
+                    .into());
+                }
+            } else {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
     }
-    merged.extend(desired);
-    serde_json::Value::Object(merged)
+    for (key, value) in desired {
+        if DCG_OWNED_HOOK_KEYS.contains(&key.as_str()) {
+            merged.insert(key, value);
+        } else {
+            merged.entry(key).or_insert(value);
+        }
+    }
+    Ok(serde_json::Value::Object(merged))
 }
 
 fn is_exact_hook_entry_for_matcher(
@@ -13813,8 +13832,8 @@ fn is_exact_hook_entry_for_matcher(
             .and_then(serde_json::Value::as_array)
             .is_some_and(|hooks| {
                 hooks
-                    .iter()
-                    .any(|hook| hook_has_dcg_identity(hook, desired_hook))
+                    .first()
+                    .is_some_and(|hook| hook_has_dcg_identity(hook, desired_hook))
             })
 }
 
@@ -13860,34 +13879,41 @@ fn install_dcg_hook_for_matcher(
         "hooks": []
     });
 
+    // Validate and build locally. A malformed entry or conflicting duplicate
+    // must not partially mutate the caller's settings, even under --force.
     let settings_obj = settings
-        .as_object_mut()
+        .as_object()
         .ok_or("Invalid settings format (expected JSON object)")?;
+    let hooks_obj = settings_obj
+        .get("hooks")
+        .map(|hooks| {
+            hooks
+                .as_object()
+                .ok_or("Invalid hooks format (expected JSON object)")
+        })
+        .transpose()?;
+    let pre_tool_use = hooks_obj
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .map(|entries| {
+            entries
+                .as_array()
+                .ok_or("Invalid PreToolUse hooks format (expected JSON array)")
+        })
+        .transpose()?;
 
-    let hooks_value = settings_obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks_obj = hooks_value
-        .as_object_mut()
-        .ok_or("Invalid hooks format (expected JSON object)")?;
-
-    let pre_tool_use_value = hooks_obj
-        .entry("PreToolUse")
-        .or_insert_with(|| serde_json::json!([]));
-
-    let pre_tool_use = pre_tool_use_value
-        .as_array_mut()
-        .ok_or("Invalid PreToolUse hooks format (expected JSON array)")?;
-
-    let original = pre_tool_use.clone();
+    let original = pre_tool_use.cloned().unwrap_or_default();
+    let previous_hooks = original
+        .iter()
+        .filter_map(|entry| entry.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|hook| {
+            hook.get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_dcg_command)
+        });
+    let desired_hook = merge_host_owned_hook_fields(desired_hook, previous_hooks)?;
     let mut canonical_entry = None;
     let mut retained_entries = Vec::with_capacity(original.len());
-    // The dcg hook being replaced, so its host-owned fields (`timeout`, ...)
-    // survive the rewrite (#345). A hook under the canonical matcher is the
-    // best template; one under a legacy matcher is the fallback.
-    let mut previous_canonical_hook: Option<serde_json::Value> = None;
-    let mut previous_legacy_hook: Option<serde_json::Value> = None;
 
     for mut entry in original {
         let entry_matcher = entry
@@ -13908,14 +13934,10 @@ fn install_dcg_hook_for_matcher(
             };
             let original_len = entry_hooks.len();
             entry_hooks.retain(|hook| {
-                let is_dcg = hook
+                !hook
                     .get("command")
                     .and_then(|command| command.as_str())
-                    .is_some_and(is_dcg_command);
-                if is_dcg && previous_canonical_hook.is_none() {
-                    previous_canonical_hook = Some(hook.clone());
-                }
-                !is_dcg
+                    .is_some_and(is_dcg_command)
             });
             let keep_duplicate = entry_hooks.len() == original_len || !entry_hooks.is_empty();
 
@@ -13929,28 +13951,29 @@ fn install_dcg_hook_for_matcher(
 
         let is_legacy_entry =
             legacy_matchers.contains(&entry_matcher.as_deref().unwrap_or_default());
+        if is_legacy_entry
+            && entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .is_none()
+        {
+            return Err(format!(
+                "Invalid legacy {} matcher hooks format (expected JSON array)",
+                entry_matcher.as_deref().unwrap_or_default()
+            )
+            .into());
+        }
         let drop_entry = match entry.get_mut("hooks") {
             None | Some(serde_json::Value::Null) => false,
             Some(value) => match value.as_array_mut() {
-                None if is_legacy_entry => {
-                    return Err(format!(
-                        "Invalid legacy {} matcher hooks format (expected JSON array)",
-                        entry_matcher.as_deref().unwrap_or_default()
-                    )
-                    .into());
-                }
                 None => false,
                 Some(entry_hooks) => {
                     let original_len = entry_hooks.len();
                     entry_hooks.retain(|hook| {
-                        let is_dcg = hook
+                        !hook
                             .get("command")
                             .and_then(|command| command.as_str())
-                            .is_some_and(is_dcg_command);
-                        if is_dcg && previous_legacy_hook.is_none() {
-                            previous_legacy_hook = Some(hook.clone());
-                        }
-                        !is_dcg
+                            .is_some_and(is_dcg_command)
                     });
                     entry_hooks.len() < original_len && entry_hooks.is_empty()
                 }
@@ -13962,9 +13985,6 @@ fn install_dcg_hook_for_matcher(
         }
     }
 
-    let previous_hook = previous_canonical_hook.or(previous_legacy_hook);
-    let desired_hook = merge_host_owned_hook_fields(desired_hook, previous_hook.as_ref());
-
     let mut canonical_entry = canonical_entry.unwrap_or(hook_config);
     canonical_entry["hooks"]
         .as_array_mut()
@@ -13972,11 +13992,37 @@ fn install_dcg_hook_for_matcher(
         .insert(0, desired_hook);
     retained_entries.insert(0, canonical_entry);
 
-    let changed = force || *pre_tool_use != retained_entries;
+    let changed = force || pre_tool_use.is_none_or(|entries| *entries != retained_entries);
     if changed {
-        *pre_tool_use = retained_entries;
+        let hooks = settings
+            .as_object_mut()
+            .expect("validated settings object")
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}));
+        hooks["PreToolUse"] = serde_json::Value::Array(retained_entries);
     }
     Ok(changed)
+}
+
+/// Persist native installer settings without changing the platform's existing
+/// permission contract. Unix can preserve mode bits during an atomic replace;
+/// Windows needs an ACL-preserving replacement API before taking that path.
+fn write_installer_hook_settings(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        write_settings_atomic(path, content)
+    }
+    #[cfg(not(unix))]
+    {
+        // Keep the existing file's ACL by retaining the native installer's
+        // in-place write. Renaming a fresh staging file over it would instead
+        // install the staging file's inherited ACL.
+        std::fs::write(path, content)?;
+        Ok(())
+    }
 }
 
 /// Install the dcg hook entry into Claude Code settings without printing.
@@ -13996,7 +14042,7 @@ fn install_hook_silent(force: bool) -> Result<bool, Box<dyn std::error::Error>> 
     let changed = install_dcg_hook_into_settings(&mut settings, force)?;
     if changed {
         let content = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(&settings_path, content)?;
+        write_installer_hook_settings(&settings_path, &content)?;
     }
     Ok(changed)
 }
@@ -14132,7 +14178,7 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
 
     // Write back
     let content = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&settings_path, content)?;
+    write_installer_hook_settings(&settings_path, &content)?;
 
     let level = if project { "project" } else { "user" };
     println!("{}", "Hook installed successfully!".green().bold());
@@ -14289,7 +14335,7 @@ fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn st
     }
 
     let content = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&hooks_path, content)?;
+    write_installer_hook_settings(&hooks_path, &content)?;
 
     let level = if project { "project" } else { "user" };
     println!(
@@ -19352,17 +19398,7 @@ fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
     let settings: serde_json::Value = serde_json::from_str(&content)?;
     let desired_hook = claude_dcg_hook()?;
 
-    let registered = settings
-        .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
-        .and_then(|arr| arr.as_array())
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, &desired_hook)
-            })
-        });
-
-    Ok(registered)
+    Ok(settings_has_exact_dcg_hook(&settings, &desired_hook))
 }
 
 /// Ensure the DCG hook is registered in the active Claude Code settings with
@@ -19442,21 +19478,50 @@ fn self_heal_lock_path(settings_path: &std::path::Path) -> std::path::PathBuf {
     config_dir().join(format!("selfheal-{hex8}.lock"))
 }
 
-/// True if `settings` already contains the exact desired dcg hook entry for
-/// the Claude shell matcher.
+/// True if the canonical registration is first and is the only dcg hook in
+/// PreToolUse. Operator fields do not mark it stale, but duplicates must still
+/// be reconciled so a later registration's policy is not silently ignored.
 fn settings_has_exact_dcg_hook(
     settings: &serde_json::Value,
     desired_hook: &serde_json::Value,
 ) -> bool {
-    settings
+    let Some(entries) = settings
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|arr| arr.as_array())
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, desired_hook)
-            })
-        })
+    else {
+        return false;
+    };
+    if !entries.first().is_some_and(|entry| {
+        is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, desired_hook)
+    }) {
+        return false;
+    }
+
+    let mut dcg_count = 0;
+    for entry in entries {
+        if let Some(hooks) = entry.get("hooks").and_then(serde_json::Value::as_array) {
+            dcg_count += hooks
+                .iter()
+                .filter(|hook| {
+                    hook.get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_dcg_command)
+                })
+                .count();
+            if dcg_count > 1 {
+                return false;
+            }
+        } else {
+            let matcher = entry.get("matcher").and_then(serde_json::Value::as_str);
+            if matcher == Some(CLAUDE_SHELL_MATCHER)
+                || matcher.is_some_and(|value| LEGACY_CLAUDE_SHELL_MATCHERS.contains(&value))
+            {
+                return false;
+            }
+        }
+    }
+    dcg_count == 1
 }
 
 /// Try to take an exclusive advisory lock on `lock_path` with a small bounded
@@ -19509,7 +19574,7 @@ fn try_acquire_self_heal_lock(
 ///   manager). Renaming over the link would orphan the managed target and
 ///   silently detach the file from the user's source of truth, so the write
 ///   resolves the link first and replaces the real file.
-/// - **Permissions are preserved.** settings.json can hold API keys in `env`
+/// - **Unix mode bits are preserved.** settings.json can hold API keys in `env`
 ///   blocks; a `chmod 600` file must not come back world-readable 0644 just
 ///   because dcg repaired a hook entry.
 fn write_settings_atomic(
@@ -19527,16 +19592,23 @@ fn write_settings_atomic(
     let temp_name = format!(".dcg-settings-{}.tmp", std::process::id());
     let temp_path = parent.join(&temp_name);
 
-    // Every failure after this point must remove the temp file: a failed
-    // write/sync used to leave `.dcg-settings-<pid>.tmp` behind forever.
-    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        {
-            let mut temp_file = std::fs::File::create(&temp_path)?;
-            temp_file.write_all(content.as_bytes())?;
-            temp_file.sync_all()?; // Ensure data is flushed to disk
-        }
+    // Never truncate a pre-existing staging file or follow a staging symlink.
+    // Creation happens outside cleanup: only a file we created is ours to
+    // remove. On Unix, start private before any sensitive settings are written.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp_file = options.open(&temp_path)?;
 
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
         copy_file_permissions(&target, &temp_path)?;
+        temp_file.write_all(content.as_bytes())?;
+        temp_file.sync_all()?; // Ensure data is flushed to disk
+        drop(temp_file);
 
         // Atomic rename (on Unix this is atomic; on Windows `std::fs::rename`
         // replaces the existing file via MOVEFILE_REPLACE_EXISTING).
@@ -19558,8 +19630,7 @@ fn write_settings_atomic(
 ///
 /// A missing/unreadable source is not an error: there is nothing to preserve,
 /// and the temp file's default mode is the correct outcome. On non-Unix this
-/// is a no-op — Windows permissions live in ACLs that `std::fs` cannot carry
-/// across, and `rename` does not reset them the way a fresh file would.
+/// is a no-op: Windows ACLs are not copied to the replacement by `std::fs::rename`.
 #[allow(clippy::unnecessary_wraps)] // the non-unix arm still needs the Result shape
 fn copy_file_permissions(
     from: &std::path::Path,
@@ -32872,6 +32943,361 @@ added_at = 2026-08-01T12:00:00Z
                     .find(|hook| hook["command"].as_str().is_some_and(is_dcg_command))
             })
             .expect("a dcg hook under the canonical matcher")
+    }
+
+    fn duplicated_dcg_policy_settings() -> serde_json::Value {
+        let mut canonical = claude_dcg_hook().unwrap();
+        canonical["future"] =
+            serde_json::json!({"values": [null, false, 0, [], {}], "policy": "Strict"});
+        serde_json::json!({
+            "model": "operator-model",
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": CLAUDE_SHELL_MATCHER,
+                        "label": "canonical metadata",
+                        "hooks": [
+                            canonical,
+                            {"type": "command", "command": "canonical-audit"}
+                        ]
+                    },
+                    {
+                        "matcher": "Bash",
+                        "label": "legacy metadata",
+                        "hooks": [
+                            {"type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"},
+                            {"type": "command", "command": "bash-audit", "timeout": 7}
+                        ]
+                    },
+                    {
+                        "matcher": "Write",
+                        "hooks": [
+                            {
+                                "type": "prompt", "command": "\"C:\\old installation\\dcg.exe\"",
+                                "shell": "foreign-shell", "statusMessage": "Checking safety",
+                                "future": {"policy": "Strict", "values": [null, false, 0, [], {}]}
+                            },
+                            {"type": "command", "command": "write-audit"}
+                        ]
+                    },
+                    {"matcher": "Read", "hooks": [{"command": ["dcg"]}, {"command": "dcg-audit"}]}
+                ],
+                "PostToolUse": [{"matcher": "Write", "hooks": [{"command": "formatter"}]}]
+            }
+        })
+    }
+
+    #[test]
+    fn native_hook_policy_unions_all_duplicates_without_widening_siblings() {
+        let desired = claude_dcg_hook().unwrap();
+        for force in [false, true] {
+            for reversed in [false, true] {
+                let mut settings = duplicated_dcg_policy_settings();
+                if reversed {
+                    settings["hooks"]["PreToolUse"]
+                        .as_array_mut()
+                        .unwrap()
+                        .reverse();
+                }
+                assert!(install_dcg_hook_into_settings(&mut settings, force).unwrap());
+                let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+                assert_eq!(entries.len(), 4);
+                assert_eq!(entries[0]["matcher"], CLAUDE_SHELL_MATCHER);
+                assert_eq!(entries[0]["label"], "canonical metadata");
+                assert_eq!(entries[0]["hooks"][1]["command"], "canonical-audit");
+                let hook = &entries[0]["hooks"][0];
+                assert!(hook_has_dcg_identity(hook, &desired));
+                assert_eq!(hook["timeout"], 15, "force={force}, reversed={reversed}");
+                assert_eq!(hook["onFailure"], "block");
+                assert_eq!(hook["statusMessage"], "Checking safety");
+                assert_eq!(
+                    hook["future"],
+                    serde_json::json!({"values": [null, false, 0, [], {}], "policy": "Strict"})
+                );
+                assert_eq!(
+                    entries
+                        .iter()
+                        .flat_map(|entry| entry["hooks"].as_array().unwrap())
+                        .filter(|hook| hook["command"].as_str().is_some_and(is_dcg_command))
+                        .count(),
+                    1
+                );
+                let bash = entries
+                    .iter()
+                    .find(|entry| entry["matcher"] == "Bash")
+                    .unwrap();
+                assert_eq!(bash["label"], "legacy metadata");
+                assert_eq!(
+                    bash["hooks"],
+                    serde_json::json!([{"type": "command", "command": "bash-audit", "timeout": 7}])
+                );
+                let write = entries
+                    .iter()
+                    .find(|entry| entry["matcher"] == "Write")
+                    .unwrap();
+                assert_eq!(
+                    write["hooks"],
+                    serde_json::json!([{"type": "command", "command": "write-audit"}])
+                );
+                let read = entries
+                    .iter()
+                    .find(|entry| entry["matcher"] == "Read")
+                    .unwrap();
+                assert_eq!(
+                    read["hooks"],
+                    serde_json::json!([{"command": ["dcg"]}, {"command": "dcg-audit"}])
+                );
+                assert_eq!(settings["model"], "operator-model");
+                assert_eq!(
+                    settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+                    "formatter"
+                );
+
+                let installed = settings.clone();
+                assert_eq!(
+                    install_dcg_hook_into_settings(&mut settings, force).unwrap(),
+                    force
+                );
+                assert_eq!(settings, installed, "repeat keeps the complete policy");
+                assert!(settings_has_exact_dcg_hook(&settings, &desired));
+            }
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_conflicts_preserve_input_and_file() {
+        let desired = claude_dcg_hook().unwrap();
+        for (field, left, right) in [
+            (
+                "onFailure",
+                serde_json::json!("block"),
+                serde_json::json!("continue"),
+            ),
+            ("timeout", serde_json::json!(15), serde_json::json!(30)),
+            (
+                "future",
+                serde_json::json!({"enabled": false}),
+                serde_json::json!({"enabled": 0}),
+            ),
+            ("future", serde_json::json!([]), serde_json::json!(null)),
+            (
+                "future",
+                serde_json::json!([1, 2]),
+                serde_json::json!([2, 1]),
+            ),
+        ] {
+            let mut current = desired.clone();
+            current[field] = left;
+            let mut duplicate = serde_json::json!({"type": "command", "command": "dcg"});
+            duplicate[field] = right;
+            let original = serde_json::json!({
+                "hooks": {"PreToolUse": [
+                    {"matcher": CLAUDE_SHELL_MATCHER, "hooks": [current]},
+                    {"matcher": "Write", "hooks": [duplicate]}
+                ]}
+            });
+            assert!(!settings_has_exact_dcg_hook(&original, &desired));
+            for force in [false, true] {
+                let mut settings = original.clone();
+                let error = install_dcg_hook_into_settings(&mut settings, force).unwrap_err();
+                assert!(
+                    error.to_string().contains(field),
+                    "conflict must name {field}: {error}"
+                );
+                assert_eq!(
+                    settings, original,
+                    "a conflict must not partially edit settings"
+                );
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let settings_path = dir.path().join("settings.json");
+            let lock_path = dir.path().join("selfheal.lock");
+            let bytes = serde_json::to_vec(&original).unwrap();
+            std::fs::write(&settings_path, &bytes).unwrap();
+            let error = ensure_hook_registered_at(&settings_path, &lock_path).unwrap_err();
+            assert!(error.to_string().contains(field));
+            assert_eq!(std::fs::read(&settings_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_currentness_requires_one_canonical_first_hook() {
+        let desired = claude_dcg_hook().unwrap();
+        let canonical =
+            serde_json::json!({"matcher": CLAUDE_SHELL_MATCHER, "hooks": [desired.clone()]});
+        let other = serde_json::json!({"matcher": "Read", "hooks": [{"command": "read-audit"}]});
+        for entries in [
+            serde_json::json!([canonical.clone(), {"matcher": "Bash", "hooks": [{"command": "dcg", "onFailure": "block"}]}]),
+            serde_json::json!([{"matcher": CLAUDE_SHELL_MATCHER, "hooks": [desired.clone(), desired.clone()]}]),
+            serde_json::json!([other.clone(), canonical]),
+            serde_json::json!([{"matcher": CLAUDE_SHELL_MATCHER, "hooks": [{"command": "canonical-audit"}, desired.clone()]}]),
+            serde_json::json!([{"matcher": "bash|powershell|monitor", "hooks": [desired.clone()]}]),
+        ] {
+            let mut settings = serde_json::json!({"hooks": {"PreToolUse": entries}});
+            assert!(!settings_has_exact_dcg_hook(&settings, &desired));
+            assert!(install_dcg_hook_into_settings(&mut settings, false).unwrap());
+            assert!(settings_has_exact_dcg_hook(&settings, &desired));
+            assert_eq!(
+                settings["hooks"]["PreToolUse"][0]["matcher"],
+                CLAUDE_SHELL_MATCHER
+            );
+            assert!(hook_has_dcg_identity(
+                &settings["hooks"]["PreToolUse"][0]["hooks"][0],
+                &desired
+            ));
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_malformed_owned_entries_preserve_input_and_file() {
+        let desired = claude_dcg_hook().unwrap();
+        for matcher in [CLAUDE_SHELL_MATCHER, "Bash", "Bash|PowerShell"] {
+            for malformed_hooks in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!("not an array")),
+                Some(serde_json::json!({"command": "dcg", "onFailure": "block"})),
+            ] {
+                let mut malformed = serde_json::json!({"matcher": matcher});
+                if let Some(hooks) = malformed_hooks {
+                    malformed["hooks"] = hooks;
+                }
+                let original = serde_json::json!({"hooks": {"PreToolUse": [
+                    {"matcher": CLAUDE_SHELL_MATCHER, "hooks": [desired.clone()]},
+                    malformed
+                ]}});
+                assert!(!settings_has_exact_dcg_hook(&original, &desired));
+                for force in [false, true] {
+                    let mut settings = original.clone();
+                    let error = install_dcg_hook_into_settings(&mut settings, force).unwrap_err();
+                    assert!(error.to_string().contains("hooks format"));
+                    assert_eq!(
+                        settings, original,
+                        "malformed settings must not be partially repaired"
+                    );
+                }
+
+                let dir = tempfile::tempdir().unwrap();
+                let settings_path = dir.path().join("settings.json");
+                let lock_path = dir.path().join("selfheal.lock");
+                let bytes = serde_json::to_vec(&original).unwrap();
+                std::fs::write(&settings_path, &bytes).unwrap();
+                assert!(ensure_hook_registered_at(&settings_path, &lock_path).is_err());
+                assert_eq!(std::fs::read(&settings_path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_self_heal_repairs_duplicates_and_retains_block_on_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let original = duplicated_dcg_policy_settings();
+        std::fs::write(&settings_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        let repaired = std::fs::read(&settings_path).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        let hook = canonical_dcg_hook(&settings);
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(hook["timeout"], 15);
+        assert_eq!(
+            hook["future"],
+            original["hooks"]["PreToolUse"][2]["hooks"][0]["future"]
+        );
+        assert!(settings_has_exact_dcg_hook(
+            &settings,
+            &claude_dcg_hook().unwrap()
+        ));
+
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        assert_eq!(std::fs::read(&settings_path).unwrap(), repaired);
+    }
+
+    #[test]
+    fn native_hook_policy_failed_staging_preserves_valid_blocking_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let original = serde_json::to_vec(&duplicated_dcg_policy_settings()).unwrap();
+        std::fs::write(&settings_path, &original).unwrap();
+        let occupied_stage = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::create_dir(&occupied_stage).unwrap();
+
+        assert!(ensure_hook_registered_at(&settings_path, &lock_path).is_err());
+        assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        assert!(
+            occupied_stage.is_dir(),
+            "a foreign directory must not be removed during cleanup"
+        );
+    }
+
+    #[test]
+    fn native_hook_policy_atomic_write_refuses_an_existing_stage_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let stage_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        let original = br#"{"onFailure":"block"}"#;
+        std::fs::write(&settings_path, original).unwrap();
+        std::fs::write(&stage_path, b"foreign staged content").unwrap();
+
+        assert!(write_settings_atomic(&settings_path, "{\"updated\":true}").is_err());
+        assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(&stage_path).unwrap(),
+            b"foreign staged content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_hook_policy_atomic_write_refuses_a_stage_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let stage_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        let foreign = dir.path().join("foreign.json");
+        let original = br#"{"onFailure":"block"}"#;
+        std::fs::write(&settings_path, original).unwrap();
+        std::fs::write(&foreign, b"foreign settings").unwrap();
+        std::os::unix::fs::symlink(&foreign, &stage_path).unwrap();
+
+        assert!(write_settings_atomic(&settings_path, "{\"updated\":true}").is_err());
+        assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign settings");
+        assert!(
+            std::fs::symlink_metadata(&stage_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn native_hook_policy_antigravity_preserves_later_duplicate_fields() {
+        let desired = antigravity_dcg_hook().unwrap();
+        let mut settings = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": ANTIGRAVITY_SHELL_MATCHER, "hooks": [desired.clone()]},
+            {"matcher": "Write", "hooks": [{"type": "command", "command": "dcg", "onFailure": "block", "timeout": 15}]}
+        ]}});
+        assert!(install_antigravity_hook_into_settings(&mut settings, true).unwrap());
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["matcher"], ANTIGRAVITY_SHELL_MATCHER);
+        let hook = &entries[0]["hooks"][0];
+        assert!(hook_has_dcg_identity(hook, &desired));
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(hook["timeout"], 15);
+        let repaired = settings.clone();
+        assert!(!install_antigravity_hook_into_settings(&mut settings, false).unwrap());
+        assert_eq!(settings, repaired);
     }
 
     #[test]

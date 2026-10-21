@@ -2518,6 +2518,176 @@ mod config_tests {
         (home_dir, xdg_config_dir, bin_dir)
     }
 
+    fn run_hook_policy_install(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let tmp = home.join("tmp");
+        std::fs::create_dir_all(&tmp).expect("isolated installer temp directory");
+        std::process::Command::new(dcg_binary())
+            .args(args)
+            .env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("TMPDIR", &tmp)
+            .env("TEMP", &tmp)
+            .env("TMP", &tmp)
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("NO_COLOR", "1")
+            .current_dir(home)
+            .output()
+            .expect("run isolated dcg install")
+    }
+
+    #[test]
+    fn native_hook_policy_install_force_preserves_block_across_duplicate_repair_and_repeat() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let settings_path = home.path().join(".claude/settings.json");
+        let created = run_hook_policy_install(home.path(), &["install"]);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let fresh: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        let desired = fresh["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+        let original = serde_json::json!({
+            "model": "operator-model",
+            "hooks": {"PreToolUse": [
+                {"matcher": "Bash|PowerShell|Monitor", "label": "keep", "hooks": [desired.clone()]},
+                {"matcher": "Bash", "label": "legacy", "hooks": [
+                    {"type": "command", "command": "dcg", "onFailure": "block", "timeout": 15},
+                    {"type": "command", "command": "bash-audit", "timeout": 7}
+                ]},
+                {"matcher": "Write", "hooks": [
+                    {"type": "command", "command": "\"C:\\old installation\\dcg.exe\"", "statusMessage": "Checking safety"},
+                    {"type": "command", "command": "write-audit"}
+                ]}
+            ]}
+        });
+        std::fs::write(&settings_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        let repaired = run_hook_policy_install(home.path(), &["install", "--force"]);
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        let installed_bytes = std::fs::read(&settings_path).unwrap();
+        let installed: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+        let entries = installed["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["matcher"], "Bash|PowerShell|Monitor");
+        assert_eq!(entries[0]["label"], "keep");
+        let hook = &entries[0]["hooks"][0];
+        for key in ["type", "command", "shell"] {
+            assert_eq!(hook.get(key), desired.get(key));
+        }
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(hook["timeout"], 15);
+        assert_eq!(hook["statusMessage"], "Checking safety");
+        assert_eq!(entries[1]["matcher"], "Bash");
+        assert_eq!(entries[1]["label"], "legacy");
+        assert_eq!(
+            entries[1]["hooks"],
+            serde_json::json!([{"type": "command", "command": "bash-audit", "timeout": 7}])
+        );
+        assert_eq!(entries[2]["matcher"], "Write");
+        assert_eq!(
+            entries[2]["hooks"],
+            serde_json::json!([{"type": "command", "command": "write-audit"}])
+        );
+        assert_eq!(installed["model"], "operator-model");
+
+        for args in [&["install", "--force"][..], &["install"][..]] {
+            let repeated = run_hook_policy_install(home.path(), args);
+            assert!(
+                repeated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&repeated.stderr)
+            );
+            assert_eq!(std::fs::read(&settings_path).unwrap(), installed_bytes);
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_install_refuses_conflicting_failure_policies_without_rewriting() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let claude = home.path().join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        let settings_path = claude.join("settings.json");
+        let original = serde_json::to_vec(&serde_json::json!({
+            "hooks": {"PreToolUse": [
+                {"matcher": "Bash|PowerShell|Monitor", "hooks": [{"type": "command", "command": "dcg", "onFailure": "block"}]},
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "/old/dcg", "onFailure": "continue"}]}
+            ]}
+        })).unwrap();
+        std::fs::write(&settings_path, &original).unwrap();
+
+        for args in [&["install"][..], &["install", "--force"][..]] {
+            let output = run_hook_policy_install(home.path(), args);
+            assert!(
+                !output.status.success(),
+                "conflicting policies must fail even with --force"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("onFailure"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_hook_policy_install_keeps_managed_symlink_and_private_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let claude = home.path().join(".claude");
+        let managed = home.path().join("managed");
+        std::fs::create_dir(&claude).unwrap();
+        std::fs::create_dir(&managed).unwrap();
+        let target = managed.join("settings.json");
+        let settings_path = claude.join("settings.json");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"
+                }]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &settings_path).unwrap();
+
+        let output = run_hook_policy_install(home.path(), &["install", "--force"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::fs::symlink_metadata(&settings_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+            "block"
+        );
+    }
+
     /// The machine-wide config file the binary always reads
     /// (`system_config_dir()` in `src/config.rs`).
     fn machine_config_path() -> std::path::PathBuf {
