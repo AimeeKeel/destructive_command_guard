@@ -208,6 +208,91 @@ fn split_destinations_reach_native_credential_policy_without_custom_packs() {
 }
 
 #[test]
+fn export_brace_assignments_require_native_review_without_custom_packs() {
+    for source in [
+        "IFS=@; export S=/tmp/a{,@/etc/shadow}; tee $S",
+        "S=/tmp/safe; IFS=@; export S=/tmp/a{,@/etc/shadow}; tee $S",
+        "IFS=@; export S={/tmp/safe,/tmp/a@/etc/shadow}; tee $S",
+        r#"IFS=@; export S="/tmp/a"{,@/etc/shadow}; tee $S"#,
+        r#"IFS=@; export S=/tmp/a{,"@/etc/shadow"}; tee $S"#,
+        "IFS=@; export S=/tmp/a{1..2}@/etc/shadow; tee $S",
+        "IFS=@; S=/tmp/a; export S+={,@/etc/shadow}; tee $S",
+        "IFS=@; export T=ok S=/tmp/a{,@/etc/shadow}; tee $S",
+        "S=/tmp/a:/etc/shadow; IFS=@; export IFS={/,:}; tee $S",
+        "IFS=@; export S=/tmp/a@{/tmp/safe,.git/config}; tee $S",
+    ] {
+        assert_decision(source, false, Some("core.filesystem:credential-file-write"));
+    }
+}
+
+#[test]
+fn quoted_braces_assignment_only_words_and_unrelated_exports_remain_allowed() {
+    for source in [
+        "IFS=@; S=/tmp/a{,@/etc/shadow}; tee $S",
+        "IFS=@; S=/tmp/a; S+={,@/etc/shadow}; tee $S",
+        "IFS=@; export S='/tmp/a{,@/etc/shadow}'; tee $S",
+        r#"IFS=@; export S="/tmp/a{,@/etc/shadow}"; tee $S"#,
+        r"IFS=@; export S=/tmp/a\{,@/etc/shadow\}; tee $S",
+        r#"IFS=@; export S=/tmp/a"{,@/etc/shadow}"; tee $S"#,
+        "IFS=@; S=/tmp/safe; export T={a,b}; tee $S",
+        "IFS=@; S=/tmp/safe; export T={a,b} U=ok; tee $S",
+        "IFS=@; export S=/tmp/a{,@/etc/shadow}; S=/tmp/safe; tee $S",
+        "IFS=@; export S=/tmp/a{,@/etc/shadow} S=/tmp/safe; tee $S",
+        "S=/tmp/a@/etc/shadow; IFS=; export T={a,b}; tee $S",
+        "S=/tmp/safe; export IFS={/,:}; IFS=@; tee $S",
+        "IFS=@; export T=/tmp/* S=/tmp/safe; tee $S",
+        "IFS=@; export T=/tmp/[ab]? S=/tmp/safe; tee $S",
+    ] {
+        assert_decision(source, true, None);
+    }
+}
+
+#[test]
+fn unrelated_export_braces_do_not_erase_concrete_native_rule_attribution() {
+    for (source, rule) in [
+        (
+            "IFS=@; S=/tmp/a@/etc/shadow; export T={a,b}; tee $S",
+            "core.filesystem:credential-file-write",
+        ),
+        (
+            "IFS=@; S=/tmp/a@.git/config; export T={a,b}; tee $S",
+            "core.filesystem:git-internals-write",
+        ),
+        (
+            "IFS=@; export T={a,b} S=/tmp/a@/etc/shadow; tee $S",
+            "core.filesystem:credential-file-write",
+        ),
+    ] {
+        assert_decision(source, false, Some(rule));
+    }
+}
+
+#[test]
+fn export_brace_uncertainty_keeps_native_allowlist_families_independent() {
+    for (grant, control, remaining) in [
+        (
+            "core.filesystem:credential-file-write",
+            "tee /etc/shadow",
+            "core.filesystem:git-internals-write",
+        ),
+        (
+            "core.filesystem:git-internals-write",
+            "tee .git/config",
+            "core.filesystem:credential-file-write",
+        ),
+    ] {
+        assert_allowed_by_grant(control, grant);
+        for source in [
+            "IFS=@; export S=/tmp/a{,@/etc/shadow}; tee $S",
+            "S=/tmp/a:/etc/shadow; IFS=@; export IFS={/,:}; tee $S",
+            "IFS=@; export S=/tmp/a@{/tmp/safe,.git/config}; tee $S",
+        ] {
+            assert_decision_with_grant(source, false, Some(remaining), Some(grant));
+        }
+    }
+}
+
+#[test]
 fn background_assignment_groups_cannot_hide_inherited_native_destinations() {
     for mutation in [
         "S=/tmp/safe T=x &",
