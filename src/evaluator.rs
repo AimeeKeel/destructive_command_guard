@@ -35717,6 +35717,57 @@ mod tests {
         evaluate_with_pack_ids_at_path(command, pack_ids, None)
     }
 
+    /// A module-scope Python string/`Path` constant in an archive-only tar
+    /// argv resolves to its literal value, so the archive is allowed exactly
+    /// as the literal inline (#562), while every operand whose value is not
+    /// provably fixed, and every constant whose literal is itself a tar option,
+    /// still denies.
+    #[test]
+    fn python_module_constant_tar_argv_resolves_to_its_literal_562() {
+        let packs = ["core.filesystem", "core.git", "system.disk"];
+        let dq = |s: &str| format!("python3 -c \"{}\"", s.replace('"', "\\\""));
+        // Archive-only tar whose member/dir is a proven constant: allowed.
+        for program in [
+            "import subprocess; name = 'checkout'; subprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', name])",
+            "from pathlib import Path; import subprocess; source = Path('/tmp/dcg-synthetic/checkout'); subprocess.Popen(['tar', '-cf', '-', '-C', str(source.parent), source.name])",
+            "import pathlib, subprocess; source = pathlib.Path('/tmp/dcg-synthetic/checkout'); subprocess.Popen(['tar', '-cf', '-', '-C', str(source.parent), source.name])",
+            "import subprocess; subprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', 'checkout'])",
+        ] {
+            let command = dq(program);
+            let result = evaluate_with_pack_ids(&command, &packs);
+            assert!(result.is_allowed(), "{program} -> {result:?}");
+        }
+        // The fold must never turn a non-fixed or option-valued operand into an
+        // allow. Each of these keeps the deny it had before the fold.
+        for program in [
+            // Unknown value.
+            "import subprocess, sys; subprocess.Popen(['tar', '-xf', 'a.tar', sys.argv[1]])",
+            // Constant whose literal IS a helper-exec option: resolving to the
+            // true value still denies.
+            "import subprocess; name = '--to-command=sh'; subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            "import subprocess; name = '-I'; subprocess.Popen(['tar', '-cf', 'a.tar', name, 'sh', 'x'])",
+            "import subprocess; name = 'checkout'; name = '--to-command=sh'; subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            "import subprocess; name = 'x'; name += '--to-command=sh'; subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            // Reflection or import-* can rebind the name out of view.
+            "import subprocess; name = 'checkout'; globals()['name'] = '--to-command=sh'; subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            "import subprocess; name = 'checkout'; exec('name = 1'); subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            // str / Path rebound (simple name or attribute).
+            "import subprocess; from pathlib import Path; str = lambda x: '--to-command=sh'; source = Path('/tmp/x/checkout'); subprocess.Popen(['tar', '-xf', 'a.tar', str(source)])",
+            "import subprocess; from pathlib import Path; Path.name = '--to-command=sh'; source = Path('/tmp/x/checkout'); subprocess.Popen(['tar', '-xf', 'a.tar', source.name])",
+            // An f-string operand is not a resolvable constant.
+            "import subprocess; name = 'sh'; subprocess.Popen(['tar', '-xf', 'a.tar', f'--to-command={name}'])",
+            // A star-args argv cannot be verified.
+            "import subprocess; args = ['--to-command=sh']; subprocess.Popen(['tar', '-xf', 'a.tar', *args])",
+        ] {
+            let command = dq(program);
+            let result = evaluate_with_pack_ids(&command, &packs);
+            assert!(
+                result.is_denied(),
+                "fold must not open a bypass: {program} -> {result:?}"
+            );
+        }
+    }
+
     /// An inert redirection selects no pack (#571): `ls 2>/dev/null` used to
     /// select `core.filesystem` and `system.disk` through the `2>`, `>/` and
     /// `/dev/` keywords and compile both, though no rule could match it. It is

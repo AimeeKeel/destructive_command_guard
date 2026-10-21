@@ -754,6 +754,17 @@ pub fn exec_sink_reconstructed_commands(
     };
     let haystack = masked.as_ref();
 
+    // Resolve proven module-scope Python constants in archive-tool argv
+    // operands (#562). Built only when a sink and a tar reference are both
+    // present, so a sink-free or tar-free Python body pays no extra parse.
+    // `tar`/`gtar`/`bsdtar` all contain "tar". The guard is held for the
+    // operand reads below; resolution itself is enabled per call.
+    let const_env = (language == ScriptLanguage::Python
+        && code.contains("tar")
+        && sink_regex.is_match(haystack))
+    .then(|| install_python_const_env(build_python_const_env(code)))
+    .flatten();
+
     let mut out = Vec::new();
     for caps in sink_regex.captures_iter(haystack) {
         let Some(m) = caps.get(0) else { continue };
@@ -770,7 +781,27 @@ pub fn exec_sink_reconstructed_commands(
         // Operands, for the same reason `detect_destructive_in_args` uses them:
         // reconstructing `dd` from `"d"+"d"` as two argv words would not be the
         // command the call actually runs (#474).
-        let argv = exec_argv_operands(region, language);
+        //
+        // #562 resolution is enabled only once this call's program word
+        // (read with resolution off) is an archive tool, never a launcher.
+        let argv = if const_env.is_some() {
+            RESOLVE_ENABLED.with(|cell| cell.set(false));
+            let unresolved = exec_argv_operands(region, language);
+            let archive = unresolved
+                .values
+                .first()
+                .is_some_and(|program| is_archive_program(program));
+            if archive {
+                RESOLVE_ENABLED.with(|cell| cell.set(true));
+                let resolved = exec_argv_operands(region, language);
+                RESOLVE_ENABLED.with(|cell| cell.set(false));
+                resolved
+            } else {
+                unresolved
+            }
+        } else {
+            exec_argv_operands(region, language)
+        };
         if argv.unverified {
             continue;
         }
@@ -4792,6 +4823,11 @@ fn concatenated_operand(expression: &str, language: ScriptLanguage, depth: usize
     if let Some(value) = exec_literal_operand(expression, language) {
         return value;
     }
+    // A proven module-scope Python constant resolves to its exact literal
+    // value, judged downstream exactly as that literal spelled inline (#562).
+    if let Some(value) = resolve_active_python_const(expression, language) {
+        return Cow::Owned(value);
+    }
     let Some(terms) = split_exec_operands(expression, b"+.", language) else {
         return Cow::Borrowed(RUNTIME_VALUE);
     };
@@ -4816,6 +4852,421 @@ fn concatenated_operand(expression: &str, language: ScriptLanguage, depth: usize
         return concatenated_operand(inner, language, depth + 1);
     }
     Cow::Borrowed(RUNTIME_VALUE)
+}
+
+// =============================================================================
+// Python module-constant argv resolution (#562)
+// =============================================================================
+//
+// An archive-only `subprocess.Popen(['tar', '-cf', '-', '-C', src, name])`
+// whose `name`/`src` are module-scope string or `pathlib.Path` constants
+// denied as `tar-exec-unverified`, because the reconstruction turned each
+// non-literal operand into `${dcg_runtime_value}` and the tar helper check
+// read an unresolved positional as a possible option. These constants have one
+// provable value, so resolve exactly that value and let the ordinary pack
+// pipeline judge it — the identical reconstruction as spelling the literal
+// inline, which already allows an archive and still denies an option such as
+// `--to-command=sh`.
+//
+// Soundness is fail-closed: a resolved operand is always the operand's true
+// literal value (the downstream tar check still decides it), so resolution can
+// only be wrong by resolving to a value the program does not have. The env is
+// therefore built only for straight-line programs (see
+// `build_python_const_env`), where a name assigned exactly once at module level
+// has one provable value, and resolution runs only for archive programs, never
+// for a launcher's code argument. Any doubt leaves the operand unresolved, i.e.
+// denied as before.
+
+#[derive(Clone)]
+enum PythonConst {
+    /// Bound to a plain string literal: its decoded value.
+    Str(String),
+    /// Bound to `Path('<literal>')` / `pathlib.Path('<literal>')`: the literal
+    /// path, recorded only when `Path`/`pathlib` were not rebound and the path
+    /// is "clean" (every `/`-separated component non-empty and not `.`/`..`),
+    /// so `str()`, `.name` and `.parent` match pathlib without normalization.
+    Path(String),
+}
+
+#[derive(Default, Clone)]
+struct PythonConstEnv {
+    values: HashMap<String, PythonConst>,
+    /// The `str` builtin was rebound, so a `str(...)` operand is not stringify.
+    str_rebound: bool,
+}
+
+impl PythonConstEnv {
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+thread_local! {
+    // Set only for the duration of one Python exec-sink reconstruction, whose
+    // operands all belong to that one program. Absent for every other caller
+    // and language, so resolution changes nothing there.
+    static PYTHON_CONST_ENV: std::cell::RefCell<Option<PythonConstEnv>> =
+        const { std::cell::RefCell::new(None) };
+    // Resolution is enabled per call only while reading the argv of an archive
+    // program (`tar`/`gtar`/`bsdtar`), the case #562 is about. It stays off for
+    // a shell/interpreter launcher (`pwsh -c <code>`, `sh -c <code>`, …), where
+    // resolving the code-string argument would defeat the launcher-unverified
+    // conservatism and let a payload no enabled pack matches through.
+    static RESOLVE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a reconstructed program word is an archive tool whose positional
+/// operands #562 may resolve. Never a shell or interpreter launcher.
+fn is_archive_program(program: &str) -> bool {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    matches!(name, "tar" | "gtar" | "bsdtar")
+}
+
+struct PythonConstEnvGuard;
+
+impl Drop for PythonConstEnvGuard {
+    fn drop(&mut self) {
+        PYTHON_CONST_ENV.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Install `env` as the active Python constant environment until the returned
+/// guard drops. Nesting is not expected; a prior env is restored on drop only
+/// through the single top-level install in the reconstruction entry.
+fn install_python_const_env(env: PythonConstEnv) -> Option<PythonConstEnvGuard> {
+    if env.is_empty() {
+        return None;
+    }
+    PYTHON_CONST_ENV.with(|slot| *slot.borrow_mut() = Some(env));
+    Some(PythonConstEnvGuard)
+}
+
+/// A "clean" path's basename: every component non-empty and not `.`/`..`.
+fn clean_path_components(path: &str) -> Option<Vec<&str>> {
+    let body = path.strip_prefix('/').unwrap_or(path);
+    let mut components = Vec::new();
+    for component in body.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return None;
+        }
+        components.push(component);
+    }
+    (!components.is_empty()).then_some(components)
+}
+
+/// Resolve one argv-operand expression to a `PythonConst`, given the active
+/// environment. Only bare names, `str(...)`, `.name` and `.parent` resolve.
+fn resolve_python_const_value(
+    env: &PythonConstEnv,
+    expression: &str,
+    depth: usize,
+) -> Option<PythonConst> {
+    if depth >= MAX_EXEC_ARGV_DEPTH {
+        return None;
+    }
+    let expression = expression.trim();
+    // Unwrap one transparent parenthesized expression (no top-level comma).
+    if let Some(inner) = expression
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        && split_exec_operands(inner, b",", ScriptLanguage::Python).is_some_and(|p| p.len() == 1)
+    {
+        return resolve_python_const_value(env, inner, depth + 1);
+    }
+    // str(<expr>): the builtin stringify, only if `str` was not rebound.
+    if !env.str_rebound
+        && let Some(argument) = expression
+            .strip_prefix("str")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+        && split_exec_operands(argument, b",", ScriptLanguage::Python).is_some_and(|p| p.len() == 1)
+    {
+        return match resolve_python_const_value(env, argument, depth + 1)? {
+            PythonConst::Str(value) | PythonConst::Path(value) => Some(PythonConst::Str(value)),
+        };
+    }
+    // <expr>.name / <expr>.parent on a Path value.
+    if let Some(base) = expression.strip_suffix(".name") {
+        let PythonConst::Path(path) = resolve_python_const_value(env, base, depth + 1)? else {
+            return None;
+        };
+        let components = clean_path_components(&path)?;
+        return Some(PythonConst::Str((*components.last()?).to_string()));
+    }
+    if let Some(base) = expression.strip_suffix(".parent") {
+        let PythonConst::Path(path) = resolve_python_const_value(env, base, depth + 1)? else {
+            return None;
+        };
+        let components = clean_path_components(&path)?;
+        if components.len() < 2 {
+            return None;
+        }
+        let absolute = path.starts_with('/');
+        let parent = components[..components.len() - 1].join("/");
+        return Some(PythonConst::Path(if absolute {
+            format!("/{parent}")
+        } else {
+            parent
+        }));
+    }
+    // A bare identifier.
+    if is_python_identifier(expression) {
+        return env.values.get(expression).cloned();
+    }
+    None
+}
+
+fn is_python_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Resolve an argv-operand to its proven literal string, using the active
+/// Python constant environment, if any. A bare `Path` operand stringifies to
+/// its path (subprocess uses `os.fspath`).
+fn resolve_active_python_const(expression: &str, language: ScriptLanguage) -> Option<String> {
+    if language != ScriptLanguage::Python || !RESOLVE_ENABLED.with(std::cell::Cell::get) {
+        return None;
+    }
+    PYTHON_CONST_ENV.with(|slot| {
+        let slot = slot.borrow();
+        let env = slot.as_ref()?;
+        match resolve_python_const_value(env, expression, 0)? {
+            PythonConst::Str(value) | PythonConst::Path(value) => Some(value),
+        }
+    })
+}
+
+/// Build the Python module-constant environment for `code` (#562).
+///
+/// Sound by a straight-line requirement: the program may contain only imports,
+/// plain simple-identifier assignments, and expression statements. Any
+/// construct that could rebind a name without a counted top-level assignment —
+/// `def`/`class`/`lambda`, `for`/`while`/`with`/`try`/`match`, a comprehension
+/// or generator, a walrus, `global`/`nonlocal`/`del`, an augmented assignment,
+/// an attribute/subscript/tuple/starred target, a wildcard import, or any
+/// reflective name (`exec`/`eval`/`globals`/`getattr`/…) — makes the whole env
+/// empty, so nothing is resolved and the operand keeps its denial. With that
+/// shape the only binder is a top-level assignment, so a name assigned exactly
+/// once has a provably fixed value. Returns an empty env on any disqualifier.
+fn build_python_const_env(code: &str) -> PythonConstEnv {
+    let empty = PythonConstEnv::default();
+    if code.len() > super::MAX_INTERPRETER_LITERAL_SOURCE_BYTES || !code.contains('=') {
+        return empty;
+    }
+    let Ok(ast) = AstGrep::try_new(code, SupportLang::Python) else {
+        return empty;
+    };
+    let root = ast.root();
+
+    let mut candidates: HashMap<String, PythonConst> = HashMap::new();
+    let mut assign_count: HashMap<String, usize> = HashMap::new();
+    let mut str_rebound = false;
+
+    for (index, node) in root.dfs().enumerate() {
+        if index >= super::MAX_INTERPRETER_LITERAL_NODES {
+            return empty;
+        }
+        if node.is_error() || node.is_missing() {
+            return empty;
+        }
+        let kind = node.kind();
+        match kind.as_ref() {
+            // Any construct that can introduce or rebind a name outside a
+            // counted top-level assignment. Bailing keeps the proof trivial.
+            "wildcard_import"
+            | "function_definition"
+            | "class_definition"
+            | "decorated_definition"
+            | "lambda"
+            | "for_statement"
+            | "while_statement"
+            | "with_statement"
+            | "try_statement"
+            | "match_statement"
+            | "named_expression"
+            | "global_statement"
+            | "nonlocal_statement"
+            | "delete_statement"
+            | "augmented_assignment"
+            | "list_comprehension"
+            | "dictionary_comprehension"
+            | "set_comprehension"
+            | "generator_expression"
+            | "for_in_clause" => return empty,
+            "identifier" if python_reflective_name(node.text().as_ref()) => return empty,
+            "identifier" if !node.text().is_ascii() => return empty,
+            "assignment" => {
+                let Some(left) = node.field("left") else {
+                    continue;
+                };
+                // Only a single bare-identifier target. A tuple/list/attribute/
+                // subscript/starred target cannot be tracked, so bail.
+                let targets = binding_target_names(&left);
+                let [Some(name)] = targets.as_slice() else {
+                    return empty;
+                };
+                *assign_count.entry(name.clone()).or_insert(0) += 1;
+                if name == "str" {
+                    str_rebound = true;
+                }
+                // tree-sitter wraps a top-level `name = …` in an
+                // `expression_statement`, so the statement is the parent whose
+                // own parent must be the module.
+                let statement = node
+                    .parent()
+                    .filter(|parent| matches!(parent.kind().as_ref(), "expression_statement"));
+                let module_level = statement
+                    .as_ref()
+                    .unwrap_or(&node)
+                    .parent()
+                    .is_some_and(|parent| matches!(parent.kind().as_ref(), "module" | "program"));
+                if module_level
+                    && let Some(value) = node
+                        .field("right")
+                        .and_then(|right| python_const_rhs(&right))
+                {
+                    candidates.insert(name.clone(), value);
+                }
+            }
+            "import_statement" | "import_from_statement" => {
+                // An import binds a name too; count it so a const shadowed by
+                // `import evil as name` is not resolved.
+                for name in import_bound_names(&node) {
+                    *assign_count.entry(name.clone()).or_insert(0) += 1;
+                    if name == "str" {
+                        str_rebound = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut env = PythonConstEnv {
+        values: HashMap::new(),
+        str_rebound,
+    };
+    for (name, value) in candidates {
+        // Exactly one top-level binding of the name: its candidate assignment.
+        if assign_count.get(&name) == Some(&1) {
+            env.values.insert(name, value);
+        }
+    }
+    env
+}
+
+/// The names a `left` assignment target binds. `None` for a target that is not
+/// a bare identifier (attribute, subscript, starred), so the caller fails
+/// closed rather than resolve a name whose value it cannot track.
+fn binding_target_names<D: ast_grep_core::Doc>(
+    left: &ast_grep_core::Node<'_, D>,
+) -> Vec<Option<String>> {
+    match left.kind().as_ref() {
+        "identifier" => vec![Some(left.text().into_owned())],
+        "pattern_list" | "tuple_pattern" | "list_pattern" | "tuple" | "list" => left
+            .children()
+            .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
+            .flat_map(|child| binding_target_names(&child))
+            .collect(),
+        // An attribute/subscript/starred target is not a tracked name.
+        "attribute"
+        | "subscript"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern"
+        | "list_splat" => vec![None],
+        _ => vec![None],
+    }
+}
+
+/// Names a Python import statement binds into the module namespace.
+fn import_bound_names<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+    let mut names = Vec::new();
+    for child in node.children() {
+        match child.kind().as_ref() {
+            "dotted_name" => {
+                if let Some(first) = child.children().find(|n| n.kind().as_ref() == "identifier") {
+                    names.push(first.text().into_owned());
+                }
+            }
+            "aliased_import" => {
+                if let Some(alias) = child.field("alias") {
+                    names.push(alias.text().into_owned());
+                } else if let Some(name) = child.field("name") {
+                    if let Some(first) = name.children().find(|n| n.kind().as_ref() == "identifier")
+                    {
+                        names.push(first.text().into_owned());
+                    } else {
+                        names.push(name.text().into_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// A qualifying constant right-hand side: a plain string literal, or a
+/// `Path('<literal>')` / `pathlib.Path('<literal>')` whose path is clean.
+fn python_const_rhs<D: ast_grep_core::Doc>(
+    right: &ast_grep_core::Node<'_, D>,
+) -> Option<PythonConst> {
+    if let Some(value) = super::static_interpreter_literal(right, ScriptLanguage::Python, 0) {
+        return Some(PythonConst::Str(value));
+    }
+    if right.kind().as_ref() != "call" {
+        return None;
+    }
+    let function = right.field("function")?;
+    let is_path = match function.kind().as_ref() {
+        "identifier" => function.text() == "Path",
+        "attribute" => {
+            function
+                .field("object")
+                .is_some_and(|object| object.text() == "pathlib")
+                && function
+                    .field("attribute")
+                    .is_some_and(|attr| attr.text() == "Path")
+        }
+        _ => false,
+    };
+    if !is_path {
+        return None;
+    }
+    let arguments = right.field("arguments")?;
+    let mut args = arguments
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+    let argument = args.next()?;
+    if args.next().is_some() {
+        return None; // Path(a, b, …) joins; keep to the single-literal case.
+    }
+    let literal = super::static_interpreter_literal(&argument, ScriptLanguage::Python, 0)?;
+    clean_path_components(&literal)?;
+    Some(PythonConst::Path(literal))
+}
+
+fn python_reflective_name(name: &str) -> bool {
+    matches!(
+        name,
+        "exec"
+            | "eval"
+            | "compile"
+            | "getattr"
+            | "setattr"
+            | "delattr"
+            | "vars"
+            | "globals"
+            | "locals"
+            | "__import__"
+            | "__builtins__"
+            | "__dict__"
+    )
 }
 
 /// End of one complete quoted literal, including escaped delimiters.
@@ -11171,6 +11622,37 @@ def cleanup():
         /// The reconstruction rejoins an argv-split spawn's literals into the
         /// command line, for verbs the rm/git backstop does not own, and skips
         /// the calls it does own.
+        #[test]
+        fn reconstructs_module_constant_python_argv_562() {
+            let lines = |code| {
+                exec_sink_reconstructed_commands(code, ScriptLanguage::Python)
+                    .into_iter()
+                    .map(|c| c.command)
+                    .collect::<Vec<_>>()
+            };
+            // A module-scope string/Path constant resolves to its literal, so
+            // the reconstruction has no `${dcg_runtime_value}` placeholder.
+            assert_eq!(
+                lines(
+                    "import subprocess\nname = 'checkout'\nsubprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', name])"
+                ),
+                vec!["tar -cf - -C /tmp/dcg-synthetic checkout".to_string()]
+            );
+            assert_eq!(
+                lines(
+                    "from pathlib import Path\nimport subprocess\nsource = Path('/tmp/dcg-synthetic/checkout')\nsubprocess.Popen(['tar', '-cf', '-', '-C', str(source.parent), source.name])"
+                ),
+                vec!["tar -cf - -C /tmp/dcg-synthetic checkout".to_string()]
+            );
+            // A reassigned name is not resolved: the placeholder remains.
+            assert!(
+                lines(
+                    "import subprocess\nname = 'checkout'\nname = sys.argv[1]\nsubprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/x', name])"
+                )[0]
+                .contains(RUNTIME_VALUE)
+            );
+        }
+
         #[test]
         fn reconstructs_non_rm_argv_commands() {
             let lines = |code, lang| {
