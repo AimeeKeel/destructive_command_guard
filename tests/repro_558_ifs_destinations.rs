@@ -226,6 +226,38 @@ fn export_brace_assignments_require_native_review_without_custom_packs() {
 }
 
 #[test]
+fn exhausted_wrappers_cannot_allow_split_protected_destinations() {
+    for wrapper in ["command ", "command -p ", "env "] {
+        for depth in [33, 64, 96] {
+            for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config"] {
+                let source = format!("S={value}; IFS=@; {}tee $S", wrapper.repeat(depth));
+                // Earlier native launcher checks may own the denial. What
+                // matters at the CLI/hook boundary is that it cannot allow.
+                assert_decision(&source, false, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn bounded_wrappers_preserve_native_attribution_and_benign_destinations() {
+    for wrapper in ["command ", "command -p ", "env "] {
+        for depth in [1, 8] {
+            let prefix = wrapper.repeat(depth);
+            for (value, rule) in [
+                ("/tmp/a@/etc/shadow", "core.filesystem:credential-file-write"),
+                ("/tmp/a@.git/config", "core.filesystem:git-internals-write"),
+            ] {
+                let source = format!("S={value}; IFS=@; {prefix}tee $S");
+                assert_decision(&source, false, Some(rule));
+            }
+            let source = format!("S=/tmp/a@/tmp/b; IFS=@; {prefix}tee $S");
+            assert_decision(&source, true, None);
+        }
+    }
+}
+
+#[test]
 fn quoted_braces_assignment_only_words_and_unrelated_exports_remain_allowed() {
     for source in [
         "IFS=@; S=/tmp/a{,@/etc/shadow}; tee $S",
