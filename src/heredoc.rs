@@ -602,7 +602,9 @@ fn respelled_command_may_be_present(command: &str) -> bool {
 /// inside quotes is never taken for a redirect, so a quoted payload reads the
 /// same in both. A comment (`#` starting a word) runs to the end of its line
 /// and is skipped: its quotes quote nothing, so an apostrophe in it must not
-/// hide the redirects of the lines after it. Length
+/// hide the redirects of the lines after it. A `#` right after a `)` is not
+/// taken for one: that `)` may close an expansion inside a word (`$(…)#x`),
+/// and skipping a line that is not a comment would hide its redirects. Length
 /// preserving (every blanked byte becomes a space, so the view stays UTF-8
 /// and every range in it is the same range in `command`); linear.
 fn blank_local_redirects(command: &str) -> Option<String> {
@@ -623,7 +625,7 @@ fn blank_local_redirects(command: &str) -> Option<String> {
             index += 1;
             continue;
         }
-        if byte == b'#' && word_start {
+        if byte == b'#' && word_start && (index == 0 || bytes[index - 1] != b')') {
             index = memchr(b'\n', &bytes[index..]).map_or(len, |at| index + at);
             continue;
         }
@@ -21386,6 +21388,10 @@ EOF";
             // `#` inside a word or an expansion is no comment.
             ("echo a#b>l", Some("echo a#b  ")),
             ("echo ${#x}>l", Some("echo ${#x}  ")),
+            // Nor is a `#` after the `)` that closes an expansion in a word:
+            // the rest of the line is still read, and its redirects found.
+            ("echo $(x)#y; b>l", Some("echo $(x)#y; b  ")),
+            ("echo $((1))#y 2>l", Some("echo $((1))#y    ")),
         ] {
             assert_eq!(
                 blank_local_redirects(command).as_deref(),

@@ -247,6 +247,9 @@ fn redirect_at_the_command_word_does_not_hide_git() {
             "git>/dev/null reset --hard # it's done",
             "ls # it's fine\ngit>/dev/null reset --hard",
             "cat <<'EOF' >notes.md\nit's fine\nEOF\ngit>/dev/null reset --hard",
+            // A `#` after an expansion's `)` is part of its word, no comment.
+            "echo $(date)#1; git>/dev/null reset --hard",
+            "echo $((1+1))#x; git>/dev/null reset --hard",
         ],
         "core.git",
     );
@@ -265,6 +268,7 @@ fn redirect_at_the_command_word_keeps_benign_git_allowed() {
         "git>/dev/null clean -n",
         "echo 'git>/dev/null reset --hard'",
         "cat <<'EOF' >notes.md\ngit>/dev/null reset --hard is dangerous\nEOF",
+        "echo $(date)#1; git>/dev/null status",
     ]);
 }
 
