@@ -21425,6 +21425,7 @@ fn handle_allow_once_clear(
                 "pending_wiped={pending_wiped}, allow_once_wiped={allow_once_wiped}, flags=all:{} pending:{} allow_once:{}",
                 args.all, args.pending, args.allow_once
             ),
+            &config.logging.redaction,
         );
     }
 
@@ -21501,6 +21502,7 @@ fn handle_allow_once_revoke(
                 "target={}, full_hash={}, pending_removed={}, allow_once_removed={}",
                 args.target, full_hash, pending_removed, allow_once_removed
             ),
+            &config.logging.redaction,
         );
     }
 

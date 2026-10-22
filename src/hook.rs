@@ -4699,6 +4699,10 @@ pub fn output_warning_for_protocol(
 
 /// Log a blocked command to a file (if logging is enabled).
 ///
+/// Full logging redaction suppresses the command and diagnostic text. Other
+/// modes retain the legacy unconditional filtering of recognised secrets,
+/// followed by configured argument truncation.
+///
 /// # Errors
 ///
 /// Returns any I/O errors encountered while creating directories or appending
@@ -4734,11 +4738,25 @@ pub fn log_blocked_command(
 
     // The log file outlives the hook invocation and a blocked command is
     // exactly where credentials turn up, so recognised secret shapes are
-    // replaced before the line is written (issue #386). Honor the configured
-    // redaction as well: secret recognition alone cannot enforce full mode.
-    let command = crate::redaction::redact_secrets(command);
-    let command = crate::logging::redact_command(&command, redaction);
-    let reason = crate::logging::redact_reason(reason, redaction);
+    // replaced before the line is written (issue #386). Full redaction also
+    // covers the reason, which can contain arbitrary command-derived text
+    // (#585), and avoids compiling or running secret-detection regexes.
+    let (command, reason) = if redaction.is_full() {
+        (
+            crate::logging::redact_command(command, redaction),
+            Cow::Owned(crate::logging::redact_reason(reason, redaction)),
+        )
+    } else {
+        let command = crate::redaction::redact_secrets(command);
+        let command = if redaction.enabled
+            && matches!(redaction.mode, crate::logging::RedactionMode::Arguments)
+        {
+            crate::logging::redact_command(&command, redaction)
+        } else {
+            command
+        };
+        (command, Cow::Borrowed(reason))
+    };
     writeln!(file, "[{timestamp}] [{pack_str}] {reason}")?;
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
@@ -4780,6 +4798,13 @@ pub fn log_budget_skip(
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     let timestamp = chrono_lite_timestamp();
+    // Stage labels are free text at this API boundary; apply the same policy
+    // as other diagnostic metadata before any formatter sees them.
+    let stage = if redaction.is_full() {
+        Cow::Owned(crate::logging::redact_metadata(stage, redaction))
+    } else {
+        Cow::Borrowed(stage)
+    };
     writeln!(
         file,
         "[{timestamp}] [budget] evaluation skipped due to budget at {stage}"
@@ -4790,9 +4815,17 @@ pub fn log_budget_skip(
         budget.as_millis(),
         elapsed.as_millis()
     )?;
-    // Same unconditional secret redaction as `log_blocked_command`.
-    let command = crate::redaction::redact_secrets(command);
-    let command = crate::logging::redact_command(&command, redaction);
+    // Same full/secret-pattern policy as `log_blocked_command`.
+    let command = if redaction.is_full() {
+        crate::logging::redact_command(command, redaction)
+    } else {
+        let command = crate::redaction::redact_secrets(command);
+        if redaction.enabled && matches!(redaction.mode, crate::logging::RedactionMode::Arguments) {
+            crate::logging::redact_command(&command, redaction)
+        } else {
+            command
+        }
+    };
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
 
@@ -9786,9 +9819,10 @@ mod tests {
         }
     }
 
-    /// Issue #386: `[general] log_file` originally took no redaction config and
-    /// write `Command: {command}` raw, so a blocked command carrying a token
-    /// landed in the log verbatim. Canaries below are synthetic.
+    /// Issue #386: `[general] log_file` used to write `Command: {command}` raw,
+    /// so a blocked command carrying a token landed in the log verbatim.
+    /// Secret-pattern filtering remains active without configured redaction.
+    /// Canaries below are synthetic.
     #[test]
     fn blocked_command_log_redacts_secrets() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9797,21 +9831,16 @@ mod tests {
         let command = "deploy --purge AKIAABCDEFGHIJKLMNOP \
              ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-        log_blocked_command(
-            path,
-            command,
-            "destructive",
-            Some("core"),
-            &Default::default(),
-        )
-        .expect("write log");
+        let redaction = crate::logging::RedactionConfig::default();
+        log_blocked_command(path, command, "destructive", Some("core"), &redaction)
+            .expect("write log");
         log_budget_skip(
             path,
             command,
             "prefilter",
             Duration::from_millis(5),
             Duration::from_millis(1),
-            &Default::default(),
+            &redaction,
         )
         .expect("write budget log");
 
@@ -9829,6 +9858,50 @@ mod tests {
         assert!(contents.contains("deploy --purge"), "{contents}");
         assert!(contents.contains("[AWS_ACCESS_KEY]"), "{contents}");
         assert!(contents.contains("[GITHUB_TOKEN]"), "{contents}");
+    }
+
+    #[test]
+    fn legacy_log_preserves_configured_argument_redaction_issue_585() {
+        use crate::logging::{RedactionConfig, RedactionMode};
+
+        for (enabled, mode, expected_argument) in [
+            (false, RedactionMode::Full, r#""synthetic argument""#),
+            (false, RedactionMode::Arguments, r#""synthetic argument""#),
+            (true, RedactionMode::None, r#""synthetic argument""#),
+            (true, RedactionMode::Arguments, r#""synth...""#),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let log = dir.path().join("arguments.log");
+            let path = log.to_str().expect("utf-8 path");
+            let command = r#"deploy "synthetic argument" AKIAABCDEFGHIJKLMNOP"#;
+            let redaction = RedactionConfig {
+                enabled,
+                mode,
+                max_argument_len: 5,
+            };
+            log_blocked_command(path, command, "diagnostic detail", Some("core"), &redaction)
+                .expect("blocked log");
+            log_budget_skip(
+                path,
+                command,
+                "prefilter",
+                Duration::ZERO,
+                Duration::ZERO,
+                &redaction,
+            )
+            .expect("budget log");
+
+            let contents = std::fs::read_to_string(log).expect("read log");
+            let expected_command = format!("Command: deploy {expected_argument} [AWS_ACCESS_KEY]");
+            assert_eq!(
+                contents.matches(expected_command.as_str()).count(),
+                2,
+                "{contents}"
+            );
+            assert!(!contents.contains("AKIAABCDEFGHIJKLMNOP"), "{contents}");
+            assert!(contents.contains("diagnostic detail"), "{contents}");
+            assert!(contents.contains("at prefilter"), "{contents}");
+        }
     }
 
     #[test]
@@ -9867,5 +9940,48 @@ mod tests {
         assert!(log.contains("[core]"));
         assert!(log.contains("Diagnostic details redacted."));
         assert!(log.contains("[budget]"));
+    }
+
+    #[test]
+    fn legacy_log_full_redaction_covers_entire_records_issue_585() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("full.log");
+        let path = log.to_str().expect("utf-8 path");
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let command = format!("{marker} | python -");
+        let reason = format!("unverified producer {:?}", marker.to_ascii_lowercase());
+        let redaction = crate::logging::RedactionConfig {
+            enabled: true,
+            mode: crate::logging::RedactionMode::Full,
+            ..Default::default()
+        };
+
+        log_blocked_command(path, &command, &reason, Some("heredoc.posix"), &redaction)
+            .expect("write blocked log");
+        log_budget_skip(
+            path,
+            &command,
+            &reason,
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            &redaction,
+        )
+        .expect("write budget log");
+
+        let contents = std::fs::read_to_string(&log).expect("read log");
+        assert!(
+            !contents
+                .to_ascii_lowercase()
+                .contains(&marker.to_ascii_lowercase()),
+            "synthetic command text survived full redaction: {contents}"
+        );
+        assert!(contents.contains("[heredoc.posix]"), "{contents}");
+        assert!(
+            contents.contains("Diagnostic details redacted."),
+            "{contents}"
+        );
+        assert_eq!(contents.matches("Command: [REDACTED]").count(), 2);
+        assert!(contents.contains("[budget]"), "{contents}");
+        assert!(contents.contains("Budget: 1ms, Elapsed: 5ms"), "{contents}");
     }
 }

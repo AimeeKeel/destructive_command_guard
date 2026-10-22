@@ -2,6 +2,11 @@
 //!
 //! This module provides structured logging for command evaluation decisions,
 //! supporting both text and JSON output formats with optional redaction.
+//!
+//! Full redaction replaces free-form diagnostics and runtime metadata as well
+//! as commands before either format is serialized. Rule identities come from
+//! built-in rules or configuration, not command captures, and remain useful
+//! alongside decisions, timing, and other enum-derived metadata.
 
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -58,7 +63,7 @@ const MAX_CALLER_CHARS: usize = 64;
 ///
 /// Anyone who can set the variable controls it, so it is reduced to a short,
 /// single-line label (printable ASCII only), fit for an audit record and
-/// unable to forge log structure.
+/// unable to forge log structure. Full redaction replaces this free-form value.
 #[must_use]
 pub fn caller_label(config: &LoggingConfig) -> Option<String> {
     let name = config.caller_env.as_deref()?;
@@ -127,7 +132,7 @@ pub enum RedactionMode {
     None,
     #[default]
     Arguments,
-    // Suppress command text, diagnostic text, caller labels and audit paths.
+    // Suppress command text, diagnostics, caller labels, audit paths and hashes.
     // Stable rule identifiers, decisions, timestamps and counters remain.
     Full,
 }
@@ -938,6 +943,7 @@ impl AllowOnceEvent {
 }
 
 /// A structured log entry for allow-once events.
+/// Full redaction also suppresses command-derived hashes and short codes.
 #[derive(Debug, Clone, Serialize)]
 pub struct AllowOnceLogEntry {
     pub timestamp: String,
@@ -974,8 +980,8 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: current_iso8601(),
             event: AllowOnceEvent::Issued,
-            short_code: short_code.to_string(),
-            full_hash: full_hash.to_string(),
+            short_code: redact_metadata(short_code, redaction),
+            full_hash: redact_metadata(full_hash, redaction),
             command: redact_command(command, redaction),
             cwd: redact_metadata(cwd, redaction),
             expires_at: expires_at.to_string(),
@@ -1003,12 +1009,16 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: current_iso8601(),
             event: AllowOnceEvent::Granted,
-            short_code: short_code.to_string(),
-            full_hash: full_hash.to_string(),
+            short_code: redact_metadata(short_code, redaction),
+            full_hash: redact_metadata(full_hash, redaction),
             command: redact_command(command, redaction),
             cwd: redact_metadata(cwd, redaction),
             expires_at: expires_at.to_string(),
-            scope_kind: Some(scope_kind.to_string()),
+            scope_kind: Some(if matches!(scope_kind, "cwd" | "project") {
+                scope_kind.to_string()
+            } else {
+                redact_metadata(scope_kind, redaction)
+            }),
             scope_path: Some(redact_metadata(scope_path, redaction)),
             reason: None,
             single_use: Some(single_use),
@@ -1027,8 +1037,8 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: current_iso8601(),
             event: AllowOnceEvent::Consumed,
-            short_code: short_code.to_string(),
-            full_hash: full_hash.to_string(),
+            short_code: redact_metadata(short_code, redaction),
+            full_hash: redact_metadata(full_hash, redaction),
             command: redact_command(command, redaction),
             cwd: redact_metadata(cwd, redaction),
             expires_at: String::new(),
@@ -1041,12 +1051,17 @@ impl AllowOnceLogEntry {
 
     /// Create an entry for expiry (record pruned).
     #[must_use]
-    pub fn expired(short_code: &str, full_hash: &str, expires_at: &str) -> Self {
+    pub fn expired(
+        short_code: &str,
+        full_hash: &str,
+        expires_at: &str,
+        redaction: &RedactionConfig,
+    ) -> Self {
         Self {
             timestamp: current_iso8601(),
             event: AllowOnceEvent::Expired,
-            short_code: short_code.to_string(),
-            full_hash: full_hash.to_string(),
+            short_code: redact_metadata(short_code, redaction),
+            full_hash: redact_metadata(full_hash, redaction),
             command: String::new(),
             cwd: String::new(),
             expires_at: expires_at.to_string(),
@@ -1233,6 +1248,72 @@ mod tests {
     }
 
     #[test]
+    fn full_redaction_covers_complete_decision_records_issue_585() {
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let normalized_marker = "DCG_SYNTHETIC_NORMALIZED_ARGUMENT_2c7a";
+        let reason = format!("unmodeled producer {:?}", marker.to_ascii_lowercase());
+        let redaction = RedactionConfig {
+            enabled: true,
+            mode: RedactionMode::Full,
+            ..RedactionConfig::default()
+        };
+        let mut result = EvaluationResult::denied_by_pack_pattern(
+            "heredoc.posix",
+            "pipeline-consumer",
+            &reason,
+            Some(marker),
+            crate::packs::Severity::Critical,
+            &[],
+        );
+
+        for (decision, mode, expected, expected_mode) in [
+            (
+                EvaluationDecision::Allow,
+                DecisionMode::Deny,
+                "allow",
+                "allow",
+            ),
+            (EvaluationDecision::Deny, DecisionMode::Deny, "deny", "deny"),
+            (EvaluationDecision::Deny, DecisionMode::Ask, "ask", "ask"),
+            (EvaluationDecision::Deny, DecisionMode::Warn, "warn", "warn"),
+            (EvaluationDecision::Deny, DecisionMode::Log, "log", "log"),
+            (
+                EvaluationDecision::Indeterminate,
+                DecisionMode::Deny,
+                "indeterminate",
+                "deny",
+            ),
+        ] {
+            result.decision = decision;
+            let entry = LogEntry::from_result(
+                &result,
+                marker,
+                Some(normalized_marker),
+                mode,
+                &redaction,
+                Some(123),
+            );
+            for serialized in [entry.format_json(), entry.format_text()] {
+                let lowercase = serialized.to_ascii_lowercase();
+                assert!(!lowercase.contains(&marker.to_ascii_lowercase()));
+                assert!(!lowercase.contains(&normalized_marker.to_ascii_lowercase()));
+                assert!(serialized.contains("heredoc.posix:pipeline-consumer"));
+                assert!(serialized.contains("Diagnostic details redacted."));
+            }
+            let json: serde_json::Value = serde_json::from_str(&entry.format_json()).unwrap();
+            assert_eq!(json["command"], "[REDACTED]");
+            assert_eq!(json["normalized_command"], "[REDACTED]");
+            assert_eq!(json["decision"], expected);
+            assert_eq!(json["mode"], expected_mode);
+            assert_eq!(json["pack_id"], "heredoc.posix");
+            assert_eq!(json["pattern_name"], "pipeline-consumer");
+            assert_eq!(json["elapsed_us"], 123);
+            assert_eq!(result.decision, decision);
+            assert_eq!(result.pattern_info.as_ref().unwrap().reason, reason);
+        }
+    }
+
+    #[test]
     fn full_redaction_covers_allow_once_metadata() {
         let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
         let config = RedactionConfig {
@@ -1249,13 +1330,44 @@ mod tests {
             ),
             AllowOnceLogEntry::consumed("abcd", "hash", marker, marker, &config),
         ] {
+            assert_eq!(entry.short_code, "[REDACTED]");
+            assert_eq!(entry.full_hash, "[REDACTED]");
             for serialized in [entry.format_json(), entry.format_text()] {
                 assert!(
                     !serialized.to_lowercase().contains(&marker.to_lowercase()),
                     "{serialized}"
                 );
-                assert!(serialized.contains("abcd"));
+                assert!(!serialized.contains("abcd"));
             }
+        }
+    }
+
+    #[test]
+    fn non_full_redaction_preserves_diagnostic_details_issue_585() {
+        let reason = "producer dcg_synthetic_private_argument_9b4e is unmodeled";
+        let result = EvaluationResult::denied_by_legacy(reason);
+        for (enabled, mode) in [
+            (false, RedactionMode::Full),
+            (true, RedactionMode::None),
+            (true, RedactionMode::Arguments),
+        ] {
+            let redaction = RedactionConfig {
+                enabled,
+                mode,
+                ..RedactionConfig::default()
+            };
+            let entry = LogEntry::from_result(
+                &result,
+                "producer | python -",
+                None,
+                DecisionMode::Deny,
+                &redaction,
+                None,
+            );
+            assert_eq!(entry.reason.as_deref(), Some(reason));
+            assert!(entry.format_json().contains(reason));
+            assert!(entry.format_text().contains(reason));
+            assert_eq!(redact_metadata(reason, &redaction), reason);
         }
     }
 
@@ -1507,7 +1619,12 @@ mod tests {
 
     #[test]
     fn allow_once_log_entry_expired() {
-        let entry = AllowOnceLogEntry::expired("abc1", "full_hash_abc1", "2026-01-10T12:00:00Z");
+        let entry = AllowOnceLogEntry::expired(
+            "abc1",
+            "full_hash_abc1",
+            "2026-01-10T12:00:00Z",
+            &RedactionConfig::default(),
+        );
 
         assert_eq!(entry.event, AllowOnceEvent::Expired);
         assert_eq!(entry.expires_at, "2026-01-10T12:00:00Z");
@@ -1574,6 +1691,70 @@ mod tests {
         );
 
         assert_eq!(entry.command, "[REDACTED]");
+    }
+
+    #[test]
+    fn allow_once_full_redaction_covers_complete_records_issue_585() {
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let cwd = format!("/repo/{marker}");
+        let reason = format!("producer {} is unmodeled", marker.to_ascii_lowercase());
+        let redaction = RedactionConfig {
+            enabled: true,
+            mode: RedactionMode::Full,
+            ..RedactionConfig::default()
+        };
+        let entries = [
+            AllowOnceLogEntry::issued(
+                "abc1",
+                "full_hash",
+                marker,
+                &cwd,
+                "2026-01-11T12:00:00Z",
+                &reason,
+                true,
+                &redaction,
+            ),
+            AllowOnceLogEntry::granted(
+                "abc1",
+                "full_hash",
+                marker,
+                &cwd,
+                "2026-01-11T12:00:00Z",
+                "project",
+                &cwd,
+                true,
+                &redaction,
+            ),
+            AllowOnceLogEntry::granted(
+                "abc1",
+                "full_hash",
+                marker,
+                &cwd,
+                "2026-01-11T12:00:00Z",
+                marker,
+                &cwd,
+                true,
+                &redaction,
+            ),
+            AllowOnceLogEntry::consumed("abc1", "full_hash", marker, &cwd, &redaction),
+            AllowOnceLogEntry::expired("abc1", "full_hash", "2026-01-11T12:00:00Z", &redaction),
+        ];
+        for entry in &entries {
+            for serialized in [entry.format_json(), entry.format_text()] {
+                assert!(
+                    !serialized
+                        .to_ascii_lowercase()
+                        .contains(&marker.to_ascii_lowercase())
+                );
+                assert!(!serialized.contains("abc1"));
+                assert!(serialized.contains("[REDACTED]"));
+            }
+            assert_eq!(entry.full_hash, "[REDACTED]");
+            assert_eq!(entry.short_code, "[REDACTED]");
+        }
+        assert_eq!(entries[1].scope_kind.as_deref(), Some("project"));
+        assert_eq!(entries[1].scope_path.as_deref(), Some("[REDACTED]"));
+        assert_eq!(entries[2].scope_kind.as_deref(), Some("[REDACTED]"));
     }
 
     #[test]

@@ -1919,6 +1919,327 @@ mod allow_once_flow_tests {
         );
     }
 
+    /// Exercise the actual single-payload hook and its persisted structured
+    /// log. Candidate commands are JSON input to dcg; they are never executed.
+    fn run_structured_logging_hook(
+        command: &str,
+        format: &str,
+        redaction: &str,
+        policy_mode: &str,
+        caller: &str,
+    ) -> (HookRunOutput, String) {
+        let env = FlowTestEnv::new();
+        let config_path = env.temp.path().join("config.toml");
+        let log_path = env.temp.path().join("decisions.log");
+        let temp_path = env.temp.path().join("tmp");
+        std::fs::create_dir_all(&temp_path).expect("isolated temporary directory");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[packs]\nenabled = [\"windows\"]\n\
+                 [history]\nenabled = false\n\
+                 [logging]\nenabled = true\nfile = {:?}\nformat = \"{format}\"\n\
+                 caller_env = \"DCG_TEST_CALLER\"\n\
+                 [logging.redaction]\n{redaction}\n\
+                 [logging.events]\ndeny = true\nwarn = true\nallow = true\n\
+                 [policy.rules]\n\"heredoc.posix:pipeline-consumer\" = \"{policy_mode}\"\n",
+                log_path.to_string_lossy()
+            ),
+        )
+        .expect("write isolated structured logging config");
+        let payload = serde_json::json!({
+            "turn_id": "synthetic-redaction-repro",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        });
+        let mut child = Command::new(dcg_binary())
+            .arg("hook")
+            .env_clear()
+            .env("HOME", &env.home_dir)
+            .env("USERPROFILE", &env.home_dir)
+            .env("XDG_CONFIG_HOME", &env.xdg_config_dir)
+            .env("TMPDIR", &temp_path)
+            .env("TEMP", &temp_path)
+            .env("TMP", &temp_path)
+            .env("DCG_CONFIG", &config_path)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_PENDING_EXCEPTIONS_PATH", &env.pending_path)
+            .env("DCG_ALLOW_ONCE_PATH", &env.allow_once_path)
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .env("DCG_DIALECT", "posix")
+            .env("DCG_TEST_CALLER", caller)
+            .env("NO_COLOR", "1")
+            .env("TERM", "dumb")
+            .current_dir(env.temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn structured logging hook");
+        serde_json::to_writer(child.stdin.take().expect("hook stdin"), &payload)
+            .expect("write synthetic hook payload");
+        let output = child.wait_with_output().expect("wait for logging hook");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_else(|error| {
+            panic!(
+                "read structured log: {error}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        (
+            HookRunOutput {
+                command: command.to_string(),
+                output,
+            },
+            log,
+        )
+    }
+
+    #[test]
+    fn logging_full_redaction_covers_entire_records_and_preserves_decisions_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let pipeline = format!("{MARKER} | python -");
+        let allowed = format!("echo {MARKER}");
+        for format in ["json", "text"] {
+            for (command, policy_mode, decision) in [
+                (pipeline.as_str(), "deny", "deny"),
+                (pipeline.as_str(), "warn", "warn"),
+                (allowed.as_str(), "deny", "allow"),
+            ] {
+                let (result, log) = run_structured_logging_hook(
+                    command,
+                    format,
+                    "enabled = true\nmode = \"full\"",
+                    policy_mode,
+                    MARKER,
+                );
+                match decision {
+                    "deny" => {
+                        let stdout = assert_is_denial(&result);
+                        assert!(
+                            stdout
+                                .to_ascii_lowercase()
+                                .contains(&MARKER.to_ascii_lowercase()),
+                            "log redaction must not remove the live hook's actionable diagnostic: {stdout}"
+                        );
+                    }
+                    "warn" => {
+                        assert_is_allowed(&result);
+                        assert!(result.stderr_str().contains("WARNING"));
+                    }
+                    _ => assert_is_allowed(&result),
+                }
+                assert_eq!(log.lines().count(), 1, "one record per decision: {log}");
+                assert!(
+                    !log.to_ascii_lowercase()
+                        .contains(&MARKER.to_ascii_lowercase()),
+                    "full redaction leaked into the complete {format} {decision} record: {log}"
+                );
+                if format == "json" {
+                    let entry: serde_json::Value =
+                        serde_json::from_str(log.trim()).expect("JSON log record");
+                    assert_eq!(entry["command"], "[REDACTED]", "{log}");
+                    assert_eq!(entry["decision"], decision, "{log}");
+                    assert_eq!(entry["mode"], decision, "{log}");
+                    if let Some(normalized) = entry.get("normalized_command") {
+                        assert_eq!(normalized, "[REDACTED]", "{log}");
+                    }
+                    if decision != "allow" {
+                        assert_eq!(entry["rule_id"], "heredoc.posix:pipeline-consumer", "{log}");
+                        assert_eq!(entry["pack_id"], "heredoc.posix", "{log}");
+                        assert_eq!(entry["pattern_name"], "pipeline-consumer", "{log}");
+                        assert!(
+                            entry["reason"].as_str().is_some_and(|r| !r.is_empty()),
+                            "{log}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        log.contains(&format!(" {} ", decision.to_ascii_uppercase())),
+                        "{log}"
+                    );
+                    assert!(log.contains("\"[REDACTED]\""), "{log}");
+                    if decision != "allow" {
+                        assert!(log.contains("heredoc.posix:pipeline-consumer"), "{log}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logging_without_redaction_preserves_dynamic_diagnostics_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        for format in ["json", "text"] {
+            for redaction in [
+                "enabled = false\nmode = \"full\"",
+                "enabled = true\nmode = \"none\"",
+            ] {
+                let command = format!("{MARKER} | python -");
+                let (result, log) =
+                    run_structured_logging_hook(&command, format, redaction, "deny", "agent-7");
+                assert_is_denial(&result);
+                assert_eq!(log.lines().count(), 1, "{log}");
+                // A positive control for the reported secondary leak: the
+                // diagnostic contains the lowercased executable, independently
+                // of the original command's spelling.
+                let reason = if format == "json" {
+                    let entry: serde_json::Value =
+                        serde_json::from_str(log.trim()).expect("JSON log record");
+                    assert_eq!(entry["command"], command, "{log}");
+                    assert_eq!(entry["decision"], "deny", "{log}");
+                    assert_eq!(entry["caller"], "agent-7", "{log}");
+                    entry["reason"]
+                        .as_str()
+                        .expect("diagnostic reason")
+                        .to_string()
+                } else {
+                    assert!(log.contains(&command), "{log}");
+                    log.split_once(" -- ")
+                        .expect("text diagnostic reason")
+                        .1
+                        .to_string()
+                };
+                assert!(reason.contains(&MARKER.to_ascii_lowercase()), "{reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn logging_full_redaction_covers_allow_once_audit_lifecycle_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        for format in ["json", "text"] {
+            let env = FlowTestEnv::new();
+            let log_path = env.temp.path().join("dcg-audit.log");
+            let config = format!(
+                "[general]\nlog_file = {:?}\n\
+                 [history]\nenabled = false\n\
+                 [logging]\nformat = \"{format}\"\n\
+                 [logging.redaction]\nenabled = true\nmode = \"full\"\n",
+                log_path.to_string_lossy()
+            );
+            for dir in [
+                env.xdg_config_dir.join("dcg"),
+                env.home_dir.join(".config").join("dcg"),
+            ] {
+                std::fs::create_dir_all(&dir).expect("isolated config directory");
+                std::fs::write(dir.join("config.toml"), &config).expect("write audit config");
+            }
+            let temp_path = env.temp.path().join("tmp");
+            std::fs::create_dir_all(&temp_path).expect("isolated temporary directory");
+            let temp_string = temp_path.to_string_lossy();
+            let extra_env = [
+                ("DCG_SELF_HEAL_HOOK", "0"),
+                ("DCG_HOOK_TIMEOUT_MS", "5000"),
+                ("DCG_DIALECT", "posix"),
+                ("TMPDIR", temp_string.as_ref()),
+                ("TEMP", temp_string.as_ref()),
+                ("TMP", temp_string.as_ref()),
+            ];
+            let command = format!("{MARKER} | python -");
+            let denial = assert_is_denial(&env.run_hook_with_env(&command, &extra_env));
+            let code = extract_code_from_denial(&denial).expect("denial carries allow-once code");
+            let redemption = env.run_cli(&["allow-once", &code, "--yes"]);
+            assert!(
+                redemption.status.success(),
+                "allow-once redemption failed: {}",
+                String::from_utf8_lossy(&redemption.stderr)
+            );
+            assert_is_allowed(&env.run_hook_with_env(&command, &extra_env));
+            // Redacting audit data must not change single-use enforcement.
+            let second_denial = assert_is_denial(&env.run_hook_with_env(&command, &extra_env));
+            let second_code = extract_code_from_denial(&second_denial)
+                .expect("a fresh denial carries a revocable code");
+
+            let log = std::fs::read_to_string(&log_path).expect("read allow-once audit log");
+            assert!(
+                !log.to_ascii_lowercase()
+                    .contains(&MARKER.to_ascii_lowercase()),
+                "full redaction leaked into the complete {format} audit log: {log}"
+            );
+            // The general log also carries legacy text diagnostics for both
+            // denials, even when allow-once events use JSON. Check those bytes
+            // as well as the structured lifecycle records.
+            assert_eq!(log.matches("  Command: [REDACTED]").count(), 2, "{log}");
+            let expected_events = [
+                "code_issued",
+                "code_resolved",
+                "allow_granted",
+                "entry_consumed",
+            ];
+            if format == "json" {
+                let entries: Vec<serde_json::Value> = log
+                    .lines()
+                    .filter(|line| line.starts_with('{'))
+                    .map(|line| serde_json::from_str(line).expect("JSON audit record"))
+                    .collect();
+                assert_eq!(entries.len(), 5, "{log}");
+                for event in expected_events {
+                    assert!(entries.iter().any(|entry| entry["event"] == event), "{log}");
+                }
+                for entry in entries {
+                    for field in ["command", "cwd", "full_hash", "short_code"] {
+                        assert_eq!(entry[field], "[REDACTED]", "{field}: {log}");
+                    }
+                }
+            } else {
+                for event in expected_events {
+                    assert!(log.contains(&format!("[allow-once:{event}]")), "{log}");
+                }
+                let audit_lines: Vec<_> = log
+                    .lines()
+                    .filter(|line| line.contains("[allow-once:"))
+                    .collect();
+                assert_eq!(audit_lines.len(), 5, "{log}");
+                for line in audit_lines {
+                    assert_eq!(
+                        line.split_ascii_whitespace()
+                            .find(|field| field.starts_with("code=")),
+                        Some("code=[REDACTED]"),
+                        "{line}"
+                    );
+                }
+                assert!(
+                    !log.contains(env.temp.path().to_string_lossy().as_ref()),
+                    "full redaction must hide audit path metadata: {log}"
+                );
+            }
+
+            // Management actions use the same audit file. Their target and
+            // resolved hash also derive from the command and must be redacted.
+            let revoke = env.run_cli(&["allow-once", "revoke", &second_code, "--yes", "--json"]);
+            assert!(
+                revoke.status.success(),
+                "revoke failed\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&revoke.stdout),
+                String::from_utf8_lossy(&revoke.stderr)
+            );
+            let revoked: serde_json::Value =
+                serde_json::from_slice(&revoke.stdout).expect("JSON revoke result");
+            assert_eq!(revoked["status"], "ok");
+            assert_eq!(revoked["pending"]["removed"], 1);
+            let full_hash = revoked["full_hash"]
+                .as_str()
+                .expect("resolved command hash");
+            let log = std::fs::read_to_string(&log_path).expect("read management audit log");
+            assert!(
+                !log.to_ascii_lowercase()
+                    .contains(&MARKER.to_ascii_lowercase()),
+                "full redaction leaked into the complete {format} management log: {log}"
+            );
+            assert!(!log.contains(full_hash), "{log}");
+            let management_details: Vec<_> = log
+                .lines()
+                .filter_map(|line| line.split_once("[allow-once] revoke: "))
+                .map(|(_, details)| details)
+                .collect();
+            assert_eq!(management_details, vec!["[REDACTED]"], "{log}");
+            assert!(!management_details[0].contains(&second_code), "{log}");
+        }
+    }
+
     /// An allow-once grant is consumed by its first use unless `--reusable`
     /// asks otherwise (#378): "allow once" means once.
     #[test]

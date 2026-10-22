@@ -396,23 +396,36 @@ recognises vendor variables. Whoever sets the variable controls it, so it is
 treated as a label and never as input: it is reduced to printable ASCII on a
 single line, capped at 64 characters, and never consulted by any decision.
 
-To suppress command content in persisted decision logs, use:
+To suppress command content throughout persisted log records, enable full
+redaction:
 
 ```toml
 [logging.redaction]
 enabled = true
-mode = "full"
+mode = "full"               # "none" | "arguments" | "full"
 ```
 
-Full redaction replaces commands (including normalized commands) and caller
-labels with `[REDACTED]`, and reasons with `Diagnostic details redacted.`, in both
-JSON and text logs. The same policy covers legacy blocked-command entries and
-allow-once audit logs written to `general.log_file`, including audit working
-directories and scope paths. Stable rule IDs, decisions, event kinds, timestamps,
-timings and allow-once correlation codes remain available. Redaction affects
-logging only; command evaluation and hook diagnostics retain their usual behavior.
-`mode = "arguments"` only truncates long quoted command arguments and does not
-provide full-record confidentiality. History has its own `redaction_mode` setting.
+Full redaction applies before JSON or text serialization. It replaces commands,
+normalized commands, and caller labels with `[REDACTED]`, and free-form reasons
+with `Diagnostic details redacted.`. It also redacts runtime paths and
+unrecognized labels in allow-once audit records.
+Allow-once command hashes and their derived short codes are also redacted,
+because they could otherwise be used to test guesses about command content.
+Decisions, policy modes, configured pack and rule identifiers, timestamps,
+timings, and typed event metadata remain available. Rule names are retained as
+configuration identifiers, so do not put secrets in those names.
+
+The same policy covers allow-once audit events, management actions, and legacy
+command-log entries written to `[general] log_file`. It does not alter command
+evaluation, hook responses, or the operational pending-exception and allow-once
+stores, which retain raw commands for exact authorization matching. History
+has its own `[history] redaction_mode` setting.
+
+Configurable redaction is off when `enabled = false` or `mode = "none"`;
+legacy command-log entries still apply their unconditional filtering of known
+secret formats. The `arguments` mode only truncates long quoted command
+arguments using `max_argument_len` (50 by default); it does not provide
+full-record confidentiality.
 
 ## Editor Autocomplete & Validation (JSON Schema)
 
