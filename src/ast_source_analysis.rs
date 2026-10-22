@@ -2798,16 +2798,17 @@ mod tests {
         fn large_bounded_documentation_source_exceeds_old_node_limit_without_failing_555() {
             use ast_grep_core::AstGrep;
             use ast_grep_language::SupportLang;
+            use std::fmt::Write as _;
 
             for language in LANGUAGES {
                 let mut source = String::new();
                 for index in 0..1400 {
                     match language {
                         ScriptLanguage::Python => {
-                            source.push_str(&format!("value_{index} = 'documentation'\\n"));
+                            let _ = write!(source, "value_{index} = 'documentation'\\n");
                         }
                         ScriptLanguage::JavaScript => {
-                            source.push_str(&format!("const value_{index} = 'documentation';\\n"));
+                            let _ = write!(source, "const value_{index} = 'documentation';\\n");
                         }
                         _ => unreachable!("bounded language table"),
                     }

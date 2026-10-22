@@ -39,7 +39,10 @@ fn literal_frontend_options_keep_concrete_native_checks_and_harmless_reads() {
         "ionice -c 2 ",
     ] {
         for (value, rule) in [
-            ("/tmp/a@/etc/shadow", "core.filesystem:credential-file-write"),
+            (
+                "/tmp/a@/etc/shadow",
+                "core.filesystem:credential-file-write",
+            ),
             ("/tmp/a@.git/config", "core.filesystem:git-internals-write"),
         ] {
             let source = format!("S={value}; IFS=@; {prefix}tee $S");
@@ -293,7 +296,10 @@ fn bounded_wrappers_preserve_native_attribution_and_benign_destinations() {
         for depth in [1, 8] {
             let prefix = wrapper.repeat(depth);
             for (value, rule) in [
-                ("/tmp/a@/etc/shadow", "core.filesystem:credential-file-write"),
+                (
+                    "/tmp/a@/etc/shadow",
+                    "core.filesystem:credential-file-write",
+                ),
                 ("/tmp/a@.git/config", "core.filesystem:git-internals-write"),
             ] {
                 let source = format!("S={value}; IFS=@; {prefix}tee $S");
@@ -398,7 +404,10 @@ fn vanished_words_before_wrapper_controls_cannot_allow_protected_writes() {
 fn vanished_words_keep_known_writers_and_harmless_lookups_distinct() {
     for invocation in ["command $E tee $S", "env $E tee $S"] {
         for (value, rule) in [
-            ("/tmp/a@/etc/shadow", "core.filesystem:credential-file-write"),
+            (
+                "/tmp/a@/etc/shadow",
+                "core.filesystem:credential-file-write",
+            ),
             ("/tmp/a@.git/config", "core.filesystem:git-internals-write"),
         ] {
             let source = format!("E=; S={value}; IFS=@; {invocation}");
@@ -520,7 +529,10 @@ fn single_field_wrapper_options_preserve_concrete_destination_checks() {
         r"\tee $S",
     ] {
         for (value, rule) in [
-            ("/tmp/a@/etc/shadow", "core.filesystem:credential-file-write"),
+            (
+                "/tmp/a@/etc/shadow",
+                "core.filesystem:credential-file-write",
+            ),
             ("/tmp/a@.git/config", "core.filesystem:git-internals-write"),
         ] {
             let source = format!("N=DCG_UNUSED; D=1; P=0; B=L; S={value}; IFS=@; {invocation}");
@@ -562,7 +574,11 @@ fn background_assignment_groups_cannot_hide_inherited_native_destinations() {
         "IFS=: T=x \\\n&",
     ] {
         let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {mutation} tee $S");
-        assert_decision(&source, false, Some("core.filesystem:credential-file-write"));
+        assert_decision(
+            &source,
+            false,
+            Some("core.filesystem:credential-file-write"),
+        );
     }
 }
 

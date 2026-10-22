@@ -928,11 +928,8 @@ fn declaration_may_expand_braces(raw: &str) -> bool {
                 previous_dot = true;
                 continue;
             }
-            (None, '}') => {
-                if braces.pop() == Some(true) {
-                    return true;
-                }
-            }
+            // Every `}` closes its group; the guard pops it either way.
+            (None, '}') if braces.pop() == Some(true) => return true,
             _ => {}
         }
         previous_dot = false;
@@ -1120,12 +1117,8 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
                 let unknown_command_name = expanded_name.is_err();
                 let name = expanded_name.ok().flatten();
                 let basename = name.as_deref().map(policy_executable_basename);
-                let writer = basename
-                    .as_deref()
-                    .is_none_or(shell::is_credential_writer);
-                let unresolved_frontend = basename
-                    .as_deref()
-                    .is_some_and(execution_frontend)
+                let writer = basename.as_deref().is_none_or(shell::is_credential_writer);
+                let unresolved_frontend = basename.as_deref().is_some_and(execution_frontend)
                     && !command_queries_only(&arguments);
                 // Expansion can expose wrapper controls at a boundary that
                 // normalization chose from raw source. This includes nice
@@ -1281,17 +1274,30 @@ mod tests {
             ("GTEE.EXE", "/etc/shadow", "S=/tmp/a@/etc/shadow", "$S"),
             ("CP.EXE", "source /etc/shadow", "S=source@/etc/shadow", "$S"),
             ("mv.exe", "source /etc/shadow", "S=source@/etc/shadow", "$S"),
-            ("install.exe", "source /etc/shadow", "S=source@/etc/shadow", "$S"),
+            (
+                "install.exe",
+                "source /etc/shadow",
+                "S=source@/etc/shadow",
+                "$S",
+            ),
             ("DD.EXE", "of=/etc/shadow", "S=of=/etc/shadow", "$S"),
-            ("SED.EXE", "-i s/a/b/ /etc/shadow", "S=/etc/shadow", "-i s/a/b/ $S"),
-            ("perl.exe", "-i -pe 1 /etc/shadow", "S=/etc/shadow", "-i -pe 1 $S"),
+            (
+                "SED.EXE",
+                "-i s/a/b/ /etc/shadow",
+                "S=/etc/shadow",
+                "-i s/a/b/ $S",
+            ),
+            (
+                "perl.exe",
+                "-i -pe 1 /etc/shadow",
+                "S=/etc/shadow",
+                "-i -pe 1 $S",
+            ),
         ] {
             let literal_source = format!("{executable} {tail}");
-            let literal_hit = shell::classify_credential_file_write(
-                &literal_source,
-                ShellDialect::Posix,
-            )
-            .unwrap_or_else(|| panic!("missing existing native witness: {literal_source}"));
+            let literal_hit =
+                shell::classify_credential_file_write(&literal_source, ShellDialect::Posix)
+                    .unwrap_or_else(|| panic!("missing existing native witness: {literal_source}"));
             assert_eq!(literal_hit.rule, shell::CREDENTIAL_FILE_WRITE_NAME);
             let source = format!("IFS=@; {setup}; {executable} {arguments}");
             let start = source.rfind("; ").unwrap() + 2;
@@ -1309,12 +1315,13 @@ mod tests {
     #[test]
     fn executable_tee_variants_check_all_destinations_and_keep_append_mode() {
         for executable in ["tee.exe", "TEE.EXE", "/usr/bin/tee.exe", "GTEE.EXE"] {
-            let source = format!(
-                "S=/tmp/a@/etc/shadow@.git/config; IFS=@; {executable} $S"
-            );
+            let source = format!("S=/tmp/a@/etc/shadow@.git/config; IFS=@; {executable} $S");
             let start = source.rfind("; ").unwrap() + 2;
             let hits = scan(&source, ShellDialect::Posix);
-            for rule in [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME] {
+            for rule in [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ] {
                 assert!(
                     hits.iter().any(|hit| hit.rule == rule
                         && hit.reason != UNCERTAIN
@@ -1332,7 +1339,11 @@ mod tests {
                     .chain(arguments)
                     .map(str::to_owned)
                     .collect();
-                assert_eq!(!classify(&argv, 0..0).unwrap().is_empty(), protected, "{argv:?}");
+                assert_eq!(
+                    !classify(&argv, 0..0).unwrap().is_empty(),
+                    protected,
+                    "{argv:?}"
+                );
             }
         }
     }
@@ -1350,7 +1361,8 @@ mod tests {
                 shell::GIT_INTERNALS_WRITE_NAME,
             ] {
                 assert!(
-                    hits.iter().any(|hit| hit.rule == rule && hit.span == (0..7)),
+                    hits.iter()
+                        .any(|hit| hit.rule == rule && hit.span == (0..7)),
                     "{argv:?}: missing {rule}: {hits:?}"
                 );
             }
@@ -1400,12 +1412,20 @@ mod tests {
             let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
             assert!(scan(&source, ShellDialect::Posix).is_empty(), "{source}");
         }
-        for invocation in ["ENV.EXE tee $S", "/usr/bin/env.exe tee $S", "W=ENV.EXE; $W tee $S"] {
+        for invocation in [
+            "ENV.EXE tee $S",
+            "/usr/bin/env.exe tee $S",
+            "W=ENV.EXE; $W tee $S",
+        ] {
             let source = format!("S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
             let hits = scan(&source, ShellDialect::Posix);
-            for rule in [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME] {
+            for rule in [
+                shell::CREDENTIAL_FILE_WRITE_NAME,
+                shell::GIT_INTERNALS_WRITE_NAME,
+            ] {
                 assert!(
-                    hits.iter().any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                    hits.iter()
+                        .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
                     "an executable frontend must not be mistaken for a non-writer: {source}"
                 );
             }
@@ -1466,7 +1486,11 @@ mod tests {
             ("E=", "nice $E -n 0 tee $S", "nice"),
             ("E=", "nice ${E}${E} --adjustment=0 tee $S", "nice"),
             ("E=", "nice $E -- tee $S", "nice"),
-            ("OPT=--adjustment=0", r#"/usr/bin/nice "$OPT" tee $S"#, "nice"),
+            (
+                "OPT=--adjustment=0",
+                r#"/usr/bin/nice "$OPT" tee $S"#,
+                "nice",
+            ),
             ("OPT=-oL", "stdbuf $OPT tee $S", "stdbuf"),
             ("E=", "stdbuf -oL $E -eL tee $S", "stdbuf"),
             ("E=", "/usr/bin/time $E -p tee $S", "time"),
@@ -1587,7 +1611,10 @@ mod tests {
         );
         let mut words = vec!["$E"; MAX_FIELDS - 1];
         words.push("tee");
-        assert_eq!(first_expanded_word(&words, &state), Ok(Some("tee".to_owned())));
+        assert_eq!(
+            first_expanded_word(&words, &state),
+            Ok(Some("tee".to_owned()))
+        );
         words.insert(0, "$E");
         assert!(first_expanded_word(&words, &state).is_err());
         let source = format!(
@@ -1595,8 +1622,14 @@ mod tests {
             "$E ".repeat(MAX_FIELDS + 1)
         );
         let hits = scan(&source, ShellDialect::Posix);
-        for rule in [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME] {
-            assert!(hits.iter().any(|hit| hit.rule == rule && hit.reason == UNCERTAIN));
+        for rule in [
+            shell::CREDENTIAL_FILE_WRITE_NAME,
+            shell::GIT_INTERNALS_WRITE_NAME,
+        ] {
+            assert!(
+                hits.iter()
+                    .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN)
+            );
         }
     }
 
@@ -1618,9 +1651,7 @@ mod tests {
             assert!(!normalized.wrapper_limit_reached);
             assert!(normalized.normalized.starts_with('$'), "{invocation}");
             for value in ["/tmp/a@/etc/shadow", "/tmp/a@.git/config"] {
-                let source = format!(
-                    "E=; OPT=-p; SETTING=DCG_X=1; S={value}; IFS=@; {invocation}"
-                );
+                let source = format!("E=; OPT=-p; SETTING=DCG_X=1; S={value}; IFS=@; {invocation}");
                 let start = source.rfind("; ").unwrap() + 2;
                 let hits = scan(&source, ShellDialect::Posix);
                 for rule in [
@@ -1700,7 +1731,10 @@ mod tests {
             expand("\"$TA\\\nRGET\"", &state).unwrap(),
             ["/tmp/a@/etc/shadow"]
         );
-        assert_eq!(expand("\"$TA\"\\\nRGET", &state).unwrap(), ["/tmp/safeRGET"]);
+        assert_eq!(
+            expand("\"$TA\"\\\nRGET", &state).unwrap(),
+            ["/tmp/safeRGET"]
+        );
         state.assign("COPY=$TA\\\nRGET", true);
         assert_eq!(state.value("COPY"), Some("/tmp/a@/etc/shadow"));
         state.assign("TA\\\nRGET+=@.git/config", true);
@@ -1765,9 +1799,13 @@ mod tests {
         }
         let source = "NA=DCG_UNUSED; NAME=DCG_UNUSED@tee; S=/tmp/a@/etc/shadow; IFS=@; env -u $NA\\\nME echo $S";
         let hits = scan(source, ShellDialect::Posix);
-        for rule in [shell::CREDENTIAL_FILE_WRITE_NAME, shell::GIT_INTERNALS_WRITE_NAME] {
+        for rule in [
+            shell::CREDENTIAL_FILE_WRITE_NAME,
+            shell::GIT_INTERNALS_WRITE_NAME,
+        ] {
             assert!(
-                hits.iter().any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
+                hits.iter()
+                    .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
                 "continued wrapper options must not bind to a shorter name: {hits:?}"
             );
         }
@@ -1898,7 +1936,8 @@ mod tests {
             r#"stdbuf -o "$B" tee $S"#,
             r"\tee $S",
         ] {
-            let source = format!("N=DCG_UNUSED; D=1; P=0; B=L; S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
+            let source =
+                format!("N=DCG_UNUSED; D=1; P=0; B=L; S=/tmp/a@/etc/shadow; IFS=@; {invocation}");
             assert!(
                 scan(&source, ShellDialect::Posix).iter().any(|hit| {
                     hit.rule == shell::CREDENTIAL_FILE_WRITE_NAME && hit.reason != UNCERTAIN
@@ -1977,7 +2016,10 @@ mod tests {
                 ] {
                     let source = format!("S={value}; IFS=@; {prefix}tee $S");
                     let hits = scan(&source, ShellDialect::Posix);
-                    assert!(hits.iter().any(|hit| hit.rule == rule && hit.reason != UNCERTAIN));
+                    assert!(
+                        hits.iter()
+                            .any(|hit| hit.rule == rule && hit.reason != UNCERTAIN)
+                    );
                 }
                 for invocation in ["tee $S", "printf '%s' $S", "tee \"$S\""] {
                     let source = format!("S=/tmp/a@/tmp/b; IFS=@; {prefix}{invocation}");
@@ -2175,8 +2217,7 @@ mod tests {
                     .expect("background assignment argv probe");
                 assert!(output.status.success(), "{shell}: {output:?}");
                 assert_eq!(
-                    output.stdout,
-                    b"2\0/tmp/a\0/etc/shadow\0",
+                    output.stdout, b"2\0/tmp/a\0/etc/shadow\0",
                     "{shell}: {mutation}"
                 );
             }
