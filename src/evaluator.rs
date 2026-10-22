@@ -15223,6 +15223,7 @@ fn evaluate_command_in_single_dialect_view(
         &normalized,
         command_for_match,
         command,
+        command,
         ordered_packs,
         allowlists,
         keyword_index,
@@ -15240,7 +15241,10 @@ fn evaluate_command_in_single_dialect_view(
     // the executable position, and after the operand a rule expects last, it
     // ended the command early. Deny wins between the two readings, exactly as
     // between dialect views; the full reading keeps every redirect target for
-    // the rules about those.
+    // the rules about those. Where each command's input comes from is still
+    // read from the full command: the view blanks the input redirections and
+    // heredocs that say it, and a client whose input looked unknown there
+    // would be refused for want of the input the full reading verified.
     if result.decision == EvaluationDecision::Allow
         && let Some(views) = redirection_free_pack_views(command, command_for_match, shell_dialect)
     {
@@ -15252,6 +15256,7 @@ fn evaluate_command_in_single_dialect_view(
             &views.normalized,
             &views.for_match,
             &views.command,
+            command,
             ordered_packs,
             allowlists,
             keyword_index,
@@ -23342,6 +23347,7 @@ fn evaluate_indirect_inputs_for_pack(
                             &command,
                             &command,
                             &command,
+                            &command,
                             ordered_packs,
                             allowlists,
                             keyword_index,
@@ -23825,6 +23831,7 @@ fn evaluate_packs_with_allowlists(
         normalized,
         command_for_match,
         original_command,
+        original_command,
         ordered_packs,
         allowlists,
         keyword_index,
@@ -23837,6 +23844,12 @@ fn evaluate_packs_with_allowlists(
     )
 }
 
+/// `input_command` is the text whose redirections and pipelines say where
+/// each command's standard input comes from: the indirect input of the
+/// database and DNS clients, and the client a heredoc payload is attributed
+/// to. It is `original_command` except in the argv reading, whose
+/// `original_command` has every redirection blanked; there the full command
+/// still answers where input comes from.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn evaluate_packs_with_allowlists_at_depth(
@@ -23844,6 +23857,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     normalized: &str,
     command_for_match: &str,
     original_command: &str,
+    input_command: &str,
     ordered_packs: &[String],
     allowlists: &LayeredAllowlist,
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
@@ -23870,7 +23884,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     // denial can be lost; first match wins, so the carrier's own dialect is
     // the one named.
     let selection_phase = phase(ProfilePhase::PatternSelection);
-    let carrier_ordered_packs = database_carrier_first(ordered_packs, original_command);
+    let carrier_ordered_packs = database_carrier_first(ordered_packs, input_command);
     let ordered_packs = carrier_ordered_packs.as_deref().unwrap_or(ordered_packs);
 
     // Pre-compute which packs might match.
@@ -24104,14 +24118,14 @@ fn evaluate_packs_with_allowlists_at_depth(
         .any(|pack_id| is_indirect_input_pack(pack_id));
     let indirect_input_flows = if has_indirect_input_pack {
         let mut flows = collect_indirect_input_flows(
-            original_command,
-            &command_segment_ranges(original_command),
+            input_command,
+            &command_segment_ranges(input_command),
             shell_dialect,
         );
         for flow in collect_dialect_snowflake_flows(
-            original_command,
+            input_command,
             shell_dialect,
-            command_segment_ranges_in_dialect(original_command, shell_dialect).len() > 1,
+            command_segment_ranges_in_dialect(input_command, shell_dialect).len() > 1,
         ) {
             push_indirect_flow(&mut flows, flow);
         }

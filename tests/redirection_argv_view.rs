@@ -14,9 +14,20 @@ use destructive_command_guard::normalize::ShellDialect;
 use destructive_command_guard::packs::REGISTRY;
 use destructive_command_guard::{Config, LayeredAllowlist};
 
+/// The default pack set, read under `dialect`.
 fn evaluate(command: &str, dialect: ShellDialect) -> destructive_command_guard::EvaluationResult {
+    evaluate_with_packs(command, dialect, &[])
+}
+
+/// The default pack set plus `extra`, read under `dialect`.
+fn evaluate_with_packs(
+    command: &str,
+    dialect: ShellDialect,
+    extra: &[&str],
+) -> destructive_command_guard::EvaluationResult {
     let config = Config::default();
-    let enabled_packs = config.enabled_pack_ids();
+    let mut enabled_packs = config.enabled_pack_ids();
+    enabled_packs.extend(extra.iter().map(|pack| (*pack).to_string()));
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY
@@ -222,8 +233,11 @@ fn redirect_at_the_command_word_does_not_hide_git() {
             "git>/tmp/log reset --hard",
             "git>log reset --hard",
             "git>&2 reset --hard",
+            "git&>log reset --hard",
             "git</dev/null reset --hard",
             "git<<<x reset --hard",
+            "git<<EOF reset --hard\nx\nEOF",
+            "</dev/null git reset --hard",
             ">/dev/null git reset --hard",
             "2>/dev/null git reset --hard",
             "sudo git>/dev/null reset --hard",
@@ -262,7 +276,9 @@ fn trailing_redirect_does_not_hide_the_device_operand() {
             "cp x /dev/sda >log",
             "cp x /dev/sda 2>&1",
             "cp x /dev/sda &>/dev/null",
+            "cp x /dev/sda >>log",
             "cp x /dev/sda </dev/null",
+            "cp x /dev/sda <<<x",
             "install x /dev/sdb 2> err.txt",
             "cp x /dev/sda 2>/dev/null; echo ok",
         ],
@@ -347,4 +363,39 @@ fn windows_redirect_at_the_command_word_keeps_benign_git_allowed() {
             "$x = 5; if ($x -gt 3) { Write-Output big > out.txt }",
         ],
     );
+}
+
+/// The argv view blanks the heredocs and input redirections that feed a
+/// command, but where its input comes from is still read from the full
+/// command: a client whose verified input the view leaves out must not be
+/// refused for want of it, and a destructive payload must still be denied.
+#[test]
+fn argv_view_keeps_each_commands_input() {
+    let packs = ["database.postgresql", "database.redis"];
+    for command in [
+        "cat <<'SQL' | psql app >out.log\nSELECT 1;\nSQL",
+        "cat <<'SQL' | psql app 2>&1\nSELECT 1;\nSQL",
+        "cat <<'EOF' | redis-cli >/dev/null\nGET account:1\nEOF",
+        "psql app >out.log <<'SQL'\nSELECT 1;\nSQL",
+    ] {
+        for dialect in DIALECTS {
+            let result = evaluate_with_packs(command, dialect, &packs);
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed under {dialect:?}, got {result:?}"
+            );
+        }
+    }
+    for command in [
+        "cat <<'SQL' | psql app >out.log\nDROP TABLE users;\nSQL",
+        "cat <<'EOF' | redis-cli >/dev/null\nFLUSHALL\nEOF",
+    ] {
+        for dialect in DIALECTS {
+            let result = evaluate_with_packs(command, dialect, &packs);
+            assert!(
+                result.is_denied(),
+                "{command:?} must be denied under {dialect:?}, got {result:?}"
+            );
+        }
+    }
 }
