@@ -11583,6 +11583,116 @@ fn cmd_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
     None
 }
 
+/// The Cmd or PowerShell counterpart of
+/// [`crate::heredoc::redirection_free_view`]: every redirection the shell
+/// performs, glued to a word (`prog>nul`, `2>$null`) or standing alone with
+/// the target that follows it (`> nul`), blank-filled at unchanged byte
+/// offsets. `None` for other dialects, and when there is no redirection.
+///
+/// A descriptor number or PowerShell's `*` written before the operator
+/// belongs to it. PowerShell's tokenizer splits a stream merge (`2>&1`) at
+/// its `&`, so that `&` and the descriptor after it are part of the
+/// redirection too. PowerShell text that is not command syntax stays as
+/// written, so the view never turns it into syntax: a comment (`# …` to the
+/// end of its line, `<# … #>`), a word spanning lines (a here-string), and
+/// the words after the stop-parsing token `--%`, which reach the program
+/// verbatim.
+fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option<String> {
+    let redirect_suffix: fn(&str) -> Option<(usize, bool)> = match dialect {
+        ShellDialect::Cmd => cmd_unescaped_redirect_suffix,
+        ShellDialect::PowerShell => powershell_unescaped_redirect_suffix,
+        ShellDialect::Posix | ShellDialect::Unknown => return None,
+    };
+    memchr::memchr2(b'<', b'>', command.as_bytes())?;
+    let powershell = dialect == ShellDialect::PowerShell;
+    let mut view: Option<Vec<u8>> = None;
+    let mut blank = |range: Range<usize>| {
+        let bytes = view.get_or_insert_with(|| command.as_bytes().to_vec());
+        for byte in &mut bytes[range] {
+            if !matches!(*byte, b'\r' | b'\n') {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut target_next = false;
+    let mut previous_word_end = None;
+    // PowerShell: the end of the comment being passed over, and whether the
+    // words are verbatim arguments after `--%` (until a pipe or newline).
+    let mut comment_end = 0usize;
+    let mut verbatim = false;
+    for token in &tokenize_for_shell_dialect(command, dialect) {
+        if token.byte_range.start < comment_end {
+            continue;
+        }
+        if token.kind != NormalizeTokenKind::Word {
+            let stream_merge = powershell
+                && target_next
+                && token.text(command) == Some("&")
+                && previous_word_end == Some(token.byte_range.start);
+            if stream_merge {
+                blank(token.byte_range.clone());
+            } else {
+                target_next = false;
+            }
+            previous_word_end = None;
+            verbatim = false;
+            continue;
+        }
+        previous_word_end = Some(token.byte_range.end);
+        let Some(raw) = token.text(command) else {
+            continue;
+        };
+        if powershell {
+            if verbatim || raw.contains(['\r', '\n']) {
+                target_next = false;
+                continue;
+            }
+            let rest = &command[token.byte_range.start..];
+            if raw.starts_with("<#") {
+                comment_end = rest
+                    .get(2..)
+                    .and_then(|body| body.find("#>"))
+                    .map_or(command.len(), |at| token.byte_range.start + 2 + at + 2);
+                target_next = false;
+                continue;
+            }
+            if raw.starts_with('#') {
+                comment_end = token.byte_range.start
+                    + memchr::memchr2(b'\r', b'\n', rest.as_bytes()).unwrap_or(rest.len());
+                target_next = false;
+                continue;
+            }
+            // The decoder consumes `--%` (quoted or not) as control syntax.
+            if ShellTokenDecoder::new(ShellDialect::PowerShell)
+                .decode(raw, ShellTokenRole::Syntax)
+                .is_none()
+            {
+                verbatim = true;
+                target_next = false;
+                continue;
+            }
+        }
+        if std::mem::take(&mut target_next) {
+            blank(token.byte_range.clone());
+            continue;
+        }
+        let Some((start, needs_target)) = redirect_suffix(raw) else {
+            continue;
+        };
+        let start = if raw
+            .get(..start)
+            .is_some_and(|prefix| prefix.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            0
+        } else {
+            start
+        };
+        blank(token.byte_range.start + start..token.byte_range.end);
+        target_next = needs_target;
+    }
+    view.and_then(|view| String::from_utf8(view).ok())
+}
+
 fn cmd_leading_redirect_needs_target(word: &str) -> Option<bool> {
     let bytes = word.as_bytes();
     let mut index = bytes
@@ -15206,20 +15316,26 @@ struct RedirectionFreePackViews {
 /// Build the argv-view counterparts of `command` and of its byte-aligned
 /// match view, or `None` when the command has no redirection outside quotes.
 ///
-/// POSIX syntax only (and the unknown dialect, which reads it): Cmd and
-/// PowerShell give `>`, `<` and `#` other meanings. The match view keeps its
-/// own masking: the bytes the argv view blanks are blanked in it as well.
+/// Each dialect reads its own redirection syntax: POSIX (which the unknown
+/// dialect reads too) with [`crate::heredoc::redirection_free_view`], Cmd and
+/// PowerShell with [`windows_redirection_free_view`]. The match view keeps
+/// its own masking: the bytes the argv view blanks are blanked in it as well.
 /// Only if it is not byte-aligned with the command is it rebuilt from the
-/// argv view by the generic sanitizer, which masks less, never more.
+/// argv view, as the match view itself is built (the generic sanitizer,
+/// which Cmd skips), masking less, never more.
 fn redirection_free_pack_views(
     command: &str,
     command_for_match: &str,
     shell_dialect: ShellDialect,
 ) -> Option<RedirectionFreePackViews> {
-    if !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        return None;
-    }
-    let argv_command = crate::heredoc::redirection_free_view(command)?;
+    let argv_command = match shell_dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            crate::heredoc::redirection_free_view(command)?
+        }
+        ShellDialect::Cmd | ShellDialect::PowerShell => {
+            windows_redirection_free_view(command, shell_dialect)?
+        }
+    };
     let for_match = (command_for_match.len() == command.len())
         .then(|| {
             let mut bytes = command_for_match.as_bytes().to_vec();
@@ -15235,10 +15351,21 @@ fn redirection_free_pack_views(
             String::from_utf8(bytes).ok()
         })
         .flatten()
-        .unwrap_or_else(|| sanitize_for_pattern_matching(&argv_command).into_owned());
+        .unwrap_or_else(|| {
+            if shell_dialect == ShellDialect::Cmd {
+                argv_command.clone()
+            } else {
+                sanitize_for_pattern_matching(&argv_command).into_owned()
+            }
+        });
     let dialect_normalized =
         crate::normalize::normalize_command_in_dialect(&for_match, shell_dialect);
-    let normalized = crate::normalize::normalize_command(dialect_normalized.as_ref()).into_owned();
+    // As in the full reading, Cmd's dialect normalization is the last pass.
+    let normalized = if shell_dialect == ShellDialect::Cmd {
+        dialect_normalized.into_owned()
+    } else {
+        crate::normalize::normalize_command(dialect_normalized.as_ref()).into_owned()
+    };
     let for_packs = crate::heredoc::mask_non_executing_heredocs(&normalized).into_owned();
     Some(RedirectionFreePackViews {
         command: argv_command,
@@ -54402,5 +54529,112 @@ mod issue_561_git_bash_cmd_switch_tests {
             parsed("cmd //c \"ver\"", ShellDialect::Cmd),
             WindowsLauncherParse::Envelope(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod windows_redirection_free_view_tests {
+    use super::*;
+
+    /// The Cmd and PowerShell argv views blank each redirection the shell
+    /// performs, at unchanged byte offsets, and nothing else.
+    #[test]
+    fn windows_views_blank_only_redirections() {
+        for (dialect, command, expected) in [
+            (
+                ShellDialect::Cmd,
+                "git>nul reset --hard",
+                "git     reset --hard",
+            ),
+            (
+                ShellDialect::Cmd,
+                ">nul git reset --hard",
+                "     git reset --hard",
+            ),
+            (
+                ShellDialect::Cmd,
+                "git 2>nul reset --hard",
+                "git       reset --hard",
+            ),
+            (ShellDialect::Cmd, "git > nul reset", "git       reset"),
+            // Cmd keeps a descriptor duplication in one word.
+            (ShellDialect::Cmd, "git 2>&1 reset", "git      reset"),
+            (
+                ShellDialect::Cmd,
+                "git>nul & rd /s /q x",
+                "git     & rd /s /q x",
+            ),
+            (
+                ShellDialect::Cmd,
+                "\"git\">\"a b\" reset",
+                "\"git\"       reset",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "git>$null reset --hard",
+                "git       reset --hard",
+            ),
+            // PowerShell's tokenizer splits a stream merge at its `&`.
+            (
+                ShellDialect::PowerShell,
+                "git 2>&1 reset --hard",
+                "git      reset --hard",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "git *>$null reset",
+                "git         reset",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "git > $null reset",
+                "git         reset",
+            ),
+            // A comment is not syntax, and neither is a here-string's body.
+            (
+                ShellDialect::PowerShell,
+                "<# a > b #> git>$null reset",
+                "<# a > b #> git       reset",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "git>$null reset # a > b",
+                "git       reset # a > b",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output @\"\na > b\n\"@ > out.txt",
+                "Write-Output @\"\na > b\n\"@          ",
+            ),
+            // The words after `--%` reach the program verbatim, up to a pipe.
+            (
+                ShellDialect::PowerShell,
+                "git --% x > y | git>$null reset --hard",
+                "git --% x > y | git       reset --hard",
+            ),
+        ] {
+            assert_eq!(
+                windows_redirection_free_view(command, dialect).as_deref(),
+                Some(expected),
+                "{dialect:?} {command:?}"
+            );
+        }
+        for (dialect, command) in [
+            (ShellDialect::Cmd, "echo git^>nul reset"),
+            (ShellDialect::Cmd, "echo \"a>b\""),
+            (ShellDialect::Cmd, "git status"),
+            (ShellDialect::PowerShell, "Write-Output 'a>b'"),
+            (ShellDialect::PowerShell, "git status # a > b"),
+            (ShellDialect::PowerShell, "<# a > b #> git status"),
+            (ShellDialect::PowerShell, "cmd /c --% echo a > b"),
+            (ShellDialect::Posix, "git>/dev/null reset --hard"),
+            (ShellDialect::Unknown, "git>nul reset --hard"),
+        ] {
+            assert_eq!(
+                windows_redirection_free_view(command, dialect),
+                None,
+                "{dialect:?} {command:?}"
+            );
+        }
     }
 }

@@ -41,8 +41,13 @@ fn evaluate(command: &str, dialect: ShellDialect) -> destructive_command_guard::
 /// The real binary in hook mode, with the default pack set and no ambient
 /// configuration, as an agent's Bash tool call reaches it.
 fn hook_decision(command: &str) -> String {
+    hook_decision_for("Bash", command)
+}
+
+/// The same for a call of the named shell tool.
+fn hook_decision_for(tool: &str, command: &str) -> String {
     let input = serde_json::json!({
-        "tool_name": "Bash",
+        "tool_name": tool,
         "tool_input": { "command": command },
     });
     let sandbox = tempfile::tempdir().expect("failed to create hook sandbox");
@@ -86,7 +91,7 @@ fn hook_decision(command: &str) -> String {
     let output = child.wait_with_output().expect("failed to wait for dcg");
     assert!(
         output.status.success(),
-        "hook failed for {command:?}: status={} stderr={}",
+        "{tool} hook failed for {command:?}: status={} stderr={}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -138,6 +143,55 @@ fn assert_denied(commands: &[&str], pack: &str) {
             hook_decision(command),
             "deny",
             "{command:?} through the hook"
+        );
+    }
+}
+
+/// The shell tool whose calls the hook evaluates in `dialect`.
+fn windows_tool(dialect: ShellDialect) -> &'static str {
+    match dialect {
+        ShellDialect::Cmd => "cmd.exe",
+        ShellDialect::PowerShell => "PowerShell",
+        ShellDialect::Posix | ShellDialect::Unknown => unreachable!("Windows dialects only"),
+    }
+}
+
+fn assert_denied_in(dialect: ShellDialect, commands: &[&str], pack: &str) {
+    for command in commands {
+        let result = evaluate(command, dialect);
+        assert!(
+            result.is_denied(),
+            "{command:?} must be denied under {dialect:?}, got {result:?}"
+        );
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pack_id.as_deref()),
+            Some(pack),
+            "{command:?} under {dialect:?}: {result:?}"
+        );
+        let tool = windows_tool(dialect);
+        assert_eq!(
+            hook_decision_for(tool, command),
+            "deny",
+            "{command:?} through the hook as a {tool} call"
+        );
+    }
+}
+
+fn assert_allowed_in(dialect: ShellDialect, commands: &[&str]) {
+    for command in commands {
+        let result = evaluate(command, dialect);
+        assert!(
+            result.is_allowed(),
+            "{command:?} must stay allowed under {dialect:?}, got {result:?}"
+        );
+        let tool = windows_tool(dialect);
+        assert_eq!(
+            hook_decision_for(tool, command),
+            "allow",
+            "{command:?} through the hook as a {tool} call"
         );
     }
 }
@@ -225,4 +279,72 @@ fn trailing_redirect_keeps_benign_copies_allowed() {
         "cp x ./out >log 2>&1",
         "install -m 755 x ./bin/x 2>/dev/null",
     ]);
+}
+
+/// Cmd and PowerShell take a redirection out of the argv wherever it stands
+/// too, so each has an argv view of its own, built with its own syntax.
+#[test]
+fn windows_redirect_at_the_command_word_does_not_hide_git() {
+    assert_denied_in(
+        ShellDialect::Cmd,
+        &[
+            "git>nul reset --hard",
+            "git>log.txt reset --hard",
+            "git>>log.txt reset --hard",
+            "git<nul reset --hard",
+            "git>\"x y.txt\" reset --hard",
+            "git>nul 2>&1 reset --hard",
+            "@git>nul reset --hard",
+            "(git>nul reset --hard)",
+            "git.exe>nul reset --hard",
+            "git>nul reset --hard & echo ok",
+            "git>nul clean -fdx",
+        ],
+        "core.git",
+    );
+    assert_denied_in(
+        ShellDialect::PowerShell,
+        &[
+            "git>$null reset --hard",
+            "git>nul reset --hard",
+            "git>>log.txt reset --hard",
+            ">$null git reset --hard",
+            "& git>$null reset --hard",
+            "git.exe>$null reset --hard",
+            "git>$null push --force origin main",
+            "git>$null clean -fdx",
+        ],
+        "core.git",
+    );
+}
+
+#[test]
+fn windows_redirect_at_the_command_word_keeps_benign_git_allowed() {
+    assert_allowed_in(
+        ShellDialect::Cmd,
+        &[
+            "git>nul status",
+            "git>nul fetch origin",
+            "git>nul reset --soft HEAD~1",
+            "git log --oneline -5 >log.txt 2>&1",
+            "git status >nul 2>&1 && echo clean",
+            "echo git>nul reset --hard",
+            "echo git^>nul reset --hard",
+            "echo \"git>nul reset --hard\"",
+            "findstr /c:\"a>b\" file.txt",
+        ],
+    );
+    assert_allowed_in(
+        ShellDialect::PowerShell,
+        &[
+            "git>$null status",
+            "git>$null fetch origin",
+            "git>$null reset --soft HEAD~1",
+            "git log --oneline -5 > log.txt",
+            "Write-Output 'git>$null reset --hard'",
+            "Write-Output \"a>b\" > out.txt",
+            "Set-Content -Path notes.md -Value 'git>$null reset --hard'",
+            "$x = 5; if ($x -gt 3) { Write-Output big > out.txt }",
+        ],
+    );
 }
