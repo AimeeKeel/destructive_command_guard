@@ -403,3 +403,32 @@ fn argv_view_keeps_each_commands_input() {
         }
     }
 }
+
+/// Neither Cmd nor PowerShell has a `<<` operator, and PowerShell has no
+/// input redirection at all, so their argv views leave such words as written.
+/// The full reading takes `<<` for the POSIX heredoc it spells, whose body is
+/// data to a reader; blanking the operator left that body behind as command
+/// text. The unknown dialect replays Cmd and PowerShell readings of POSIX
+/// text, so a heredoc of notes met those views there as well.
+#[test]
+fn windows_argv_views_keep_posix_heredocs_as_data() {
+    let readers = [
+        "cat <<EOF\nrm -rf /home/user\nEOF",
+        "git commit -F - <<'EOF'\ndocs: note that rm -rf /tmp/x is denied\nEOF",
+        "tee /private/tmp/sink.md <<'EOF'\n`rm -rf ~/foo`\nEOF\n",
+        "tee /private/tmp/sink.md <<-'EOF'\n\t`rm -rf ~/foo`\n\tEOF\n",
+    ];
+    assert_allowed_in(ShellDialect::Cmd, &readers);
+    assert_allowed_in(ShellDialect::PowerShell, &readers);
+    for command in &readers[2..] {
+        let result = evaluate(command, ShellDialect::Unknown);
+        assert!(
+            result.is_allowed(),
+            "{command:?} must stay allowed under Unknown, got {result:?}"
+        );
+    }
+    assert_allowed_in(ShellDialect::PowerShell, &["rm -ri ./tree <> /etc/passwd"]);
+    // A heredoc fed to a shell is still read as that shell's source.
+    let result = evaluate("bash <<'EOF'\nrm -rf ~/x\nEOF", ShellDialect::Unknown);
+    assert!(result.is_denied(), "got {result:?}");
+}

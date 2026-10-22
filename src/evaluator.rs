@@ -11596,7 +11596,11 @@ fn cmd_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
 /// written, so the view never turns it into syntax: a comment (`# …` to the
 /// end of its line, `<# … #>`), a word spanning lines (a here-string), and
 /// the words after the stop-parsing token `--%`, which reach the program
-/// verbatim.
+/// verbatim. Only the redirections the shell performs are blanked: a word
+/// led by `<` stays as written in PowerShell, which has no input
+/// redirection, and a `<<` word in both, since neither shell has that
+/// operator and the full reading takes it for the POSIX heredoc or
+/// here-string it spells, whose body is data to a reader like `cat`.
 fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option<String> {
     let redirect_suffix: fn(&str) -> Option<(usize, bool)> = match dialect {
         ShellDialect::Cmd => cmd_unescaped_redirect_suffix,
@@ -11679,6 +11683,18 @@ fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option
         let Some((start, needs_target)) = redirect_suffix(raw) else {
             continue;
         };
+        // Only what the shell itself redirects is blanked. PowerShell has no
+        // input redirection (`<` is a reserved operator there), and neither
+        // shell has `<<`: written in either, it is the POSIX heredoc or
+        // here-string that the full reading treats as one, so a reader's
+        // heredoc body is data there, and blanking the operator would leave
+        // that body behind as command text.
+        if raw.get(start..).is_some_and(|redirect| {
+            let operator = redirect.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '*');
+            operator.starts_with("<<") || (powershell && operator.starts_with('<'))
+        }) {
+            continue;
+        }
         let start = if raw
             .get(..start)
             .is_some_and(|prefix| prefix.bytes().all(|byte| byte.is_ascii_digit()))
@@ -54626,6 +54642,24 @@ mod windows_redirection_free_view_tests {
                 "git --% x > y | git>$null reset --hard",
                 "git --% x > y | git       reset --hard",
             ),
+            // Neither shell has `<<`: a POSIX heredoc stays one, its body
+            // data to the reader, while the shell's own redirects go.
+            (
+                ShellDialect::Cmd,
+                "cat <<'EOF' >out.txt\nrm -rf x\nEOF",
+                "cat <<'EOF'         \nrm -rf x\nEOF",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "cat <<'EOF' >out.txt\nrm -rf x\nEOF",
+                "cat <<'EOF'         \nrm -rf x\nEOF",
+            ),
+            // Cmd has input redirection; PowerShell (below) does not.
+            (
+                ShellDialect::Cmd,
+                "git<nul reset --hard",
+                "git     reset --hard",
+            ),
         ] {
             assert_eq!(
                 windows_redirection_free_view(command, dialect).as_deref(),
@@ -54641,6 +54675,12 @@ mod windows_redirection_free_view_tests {
             (ShellDialect::PowerShell, "git status # a > b"),
             (ShellDialect::PowerShell, "<# a > b #> git status"),
             (ShellDialect::PowerShell, "cmd /c --% echo a > b"),
+            (ShellDialect::Cmd, "cat <<EOF\nrm -rf x\nEOF"),
+            (ShellDialect::Cmd, "git 0<<x reset"),
+            (ShellDialect::PowerShell, "cat << EOF\nrm -rf x\nEOF"),
+            (ShellDialect::PowerShell, "git<<<x reset --hard"),
+            (ShellDialect::PowerShell, "git<nul reset --hard"),
+            (ShellDialect::PowerShell, "rm -ri ./tree <> /etc/passwd"),
             (ShellDialect::Posix, "git>/dev/null reset --hard"),
             (ShellDialect::Unknown, "git>nul reset --hard"),
         ] {
