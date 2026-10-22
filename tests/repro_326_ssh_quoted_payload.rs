@@ -227,3 +227,68 @@ fn keyword_less_payloads_get_their_local_verdict_551() {
         }
     }
 }
+
+/// An ssh_config option can carry a command line: `ProxyCommand`,
+/// `LocalCommand` and `KnownHostsCommand` run theirs on the local host,
+/// `RemoteCommand` on the remote one. `ssh`, `scp` and `sftp` all take them
+/// as `-o` options, and every spelling OpenSSH accepts (attached, after `=`
+/// or a blank, any letter case, bundled behind flags, after the destination)
+/// must reach the same verdict as the command line itself.
+#[test]
+fn ssh_config_option_commands_are_evaluated() {
+    let denied = [
+        "ssh -o ProxyCommand='rm -rf ~' host",
+        "ssh -oProxyCommand='rm -rf ~' host true",
+        "ssh -o PermitLocalCommand=yes -o LocalCommand='rm -rf ~' host",
+        "ssh -o ProxyCommand='rm -rf ~' host 'rm -rf /tmp/probe'",
+        "ssh -o 'ProxyCommand rm -rf ~' host",
+        "ssh -o 'ProxyCommand = rm -rf ~' host",
+        "ssh -o proxycommand='rm -rf ~' host",
+        "ssh -nT -oProxyCommand='rm -rf ~' host",
+        "ssh \"-o\"ProxyCommand='rm -rf ~' host",
+        "ssh -o ProxyCommand=rm\\ -rf\\ ~ host",
+        "ssh host -o ProxyCommand='rm -rf ~'",
+        "ssh -F /dev/null -o ProxyCommand='rm -rf ~' host",
+        "ssh -oLocalCommand='rm -rf ~' host",
+        "ssh -o KnownHostsCommand='rm -rf /home/user' host",
+        "ssh -o RemoteCommand='rm -rf ~' host",
+        "ssh -o ProxyCommand='git reset --hard' host",
+        "scp -o ProxyCommand='rm -rf ~' a host:b",
+        "scp -qo ProxyCommand='rm -rf ~' a host:b",
+        "sftp -o ProxyCommand='rm -rf ~' host",
+        "/usr/bin/ssh -o ProxyCommand='rm -rf ~' host",
+        // Code chosen at run time, like `sh -c "$X"`.
+        "ssh -o \"ProxyCommand=$P\" host",
+    ];
+    for command in denied {
+        for dialect in DIALECTS {
+            let result = evaluate(command, &[], dialect);
+            assert!(
+                result.is_denied(),
+                "{command:?} must be denied under {dialect:?}, got {result:?}"
+            );
+        }
+    }
+    let allowed = [
+        "ssh -o ProxyCommand='ssh -W %h:%p bastion' host uptime",
+        "ssh -o 'ProxyCommand nc -X 5 -x proxy:1080 %h %p' host",
+        "ssh -o ProxyCommand=none host",
+        "ssh -o ProxyJump=bastion host",
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 host uptime",
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null host",
+        "ssh -o SendEnv='rm -rf ~' host",
+        "scp -o ProxyCommand='ssh -W %h:%p bastion' a host:b",
+        "sftp -o ProxyCommand='ssh -W %h:%p bastion' host",
+        "ssh -o \"ProxyCommand=ssh -W %h:%p $JUMP\" host",
+        "echo ssh -o ProxyCommand='rm -rf ~' host",
+    ];
+    for command in allowed {
+        for dialect in DIALECTS {
+            let result = evaluate(command, &[], dialect);
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed under {dialect:?}, got {result:?}"
+            );
+        }
+    }
+}

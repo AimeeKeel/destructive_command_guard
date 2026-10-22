@@ -77,7 +77,7 @@ macro_rules! shell_option_after_c_re {
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -201,6 +201,12 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // A quoted or escaped name (`\ssh`, `'ssh'`) is the same program, and a
     // descriptor duplication (`2>&1`) does not end the segment.
     r#"(?i)(?:^|[\s;|&(/\\'"])ssh(?:\.exe)?['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
+    // `ssh`, `scp` and `sftp` hand an `-o` option's ssh_config text to ssh,
+    // and `ProxyCommand`, `LocalCommand`, `KnownHostsCommand` and
+    // `RemoteCommand` carry a command line, which an escape alone can spell
+    // (`-o ProxyCommand=a\ b`). Superset of `push_ssh_config_option_commands`:
+    // any word holding a dash before an `o` (`-o`, `-No`, `"-o"`).
+    r#"(?i)(?:^|[\s;|&(/\\'"])(?:ssh|scp|sftp)(?:\.exe)?['"]?\s(?:[^\n;|&]|[<>]&)*-\S*o"#,
     // `watch '<cmd>'`, `parallel ::: '<cmd>'` / `parallel '<cmd>' ::: …`,
     // `env -S'<cmd>'`, `su -c '<cmd>'` and the other runners in
     // `COMMAND_STRING_RUNNERS` hand a command STRING to a shell (or, for
@@ -3715,29 +3721,251 @@ pub(crate) enum SshOptionShape {
 /// letter either consumes the token's remainder (attached value) or the next
 /// argv word (separate value), matching `getopt` semantics.
 pub(crate) fn classify_ssh_option(word: &str) -> SshOptionShape {
-    let Some(letters) = word.strip_prefix('-') else {
-        return SshOptionShape::Unknown;
-    };
-    if letters.is_empty() || letters.starts_with('-') {
-        // Bare `-` or a long option: not part of the modeled grammar (`--` is
-        // handled by the caller before classification).
-        return SshOptionShape::Unknown;
+    SshFamilyProgram::Ssh.classify(word).0
+}
+
+/// The OpenSSH programs that take `-o ssh_option`: `ssh`, and `scp` and
+/// `sftp`, which hand the option to the `ssh` they run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshFamilyProgram {
+    Ssh,
+    Scp,
+    Sftp,
+}
+
+impl SshFamilyProgram {
+    /// The program an executable word runs, whatever its directory, quoting,
+    /// letter case or `.exe` suffix (`ssh-keygen` and `autossh` are not one).
+    fn from_word(word: &str) -> Option<Self> {
+        let named = |word: &str| {
+            let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+            let basename = basename
+                .get(basename.len().saturating_sub(4)..)
+                .filter(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+                .map_or(basename, |_| &basename[..basename.len() - 4]);
+            [("ssh", Self::Ssh), ("scp", Self::Scp), ("sftp", Self::Sftp)]
+                .into_iter()
+                .find_map(|(name, program)| basename.eq_ignore_ascii_case(name).then_some(program))
+        };
+        named(word).or_else(|| named(&dequoted_executable_word(word)))
     }
-    let bytes = letters.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        if SSH_FLAG_OPTIONS.contains(byte) {
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Ssh => "ssh",
+            Self::Scp => "scp",
+            Self::Sftp => "sftp",
+        }
+    }
+
+    /// The `getopt` letters (value-taking, then no-value) of OpenSSH's
+    /// `ssh`, `scp` and `sftp`.
+    const fn letters(self) -> (&'static [u8], &'static [u8]) {
+        match self {
+            Self::Ssh => (SSH_VALUE_OPTIONS, SSH_FLAG_OPTIONS),
+            Self::Scp => (b"cDFiJlMoPSX", b"12346ABCTdfOpqRrstv"),
+            Self::Sftp => (b"BbcDFiJloPRSsX", b"1246AafhNpqrvC"),
+        }
+    }
+
+    /// Classify a leading-dash option cluster (see [`classify_ssh_option`]),
+    /// with the value-taking letter that ends it, if any.
+    fn classify(self, word: &str) -> (SshOptionShape, Option<u8>) {
+        let (value_letters, flag_letters) = self.letters();
+        let Some(letters) = word.strip_prefix('-') else {
+            return (SshOptionShape::Unknown, None);
+        };
+        if letters.is_empty() || letters.starts_with('-') {
+            // Bare `-` or a long option: not part of the modeled grammar (`--`
+            // is handled by the caller before classification).
+            return (SshOptionShape::Unknown, None);
+        }
+        let bytes = letters.as_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            if flag_letters.contains(byte) {
+                continue;
+            }
+            if value_letters.contains(byte) {
+                let shape = if index + 1 == bytes.len() {
+                    SshOptionShape::TakesSeparateValue
+                } else {
+                    SshOptionShape::ValueAttached
+                };
+                return (shape, Some(*byte));
+            }
+            return (SshOptionShape::Unknown, None);
+        }
+        (SshOptionShape::FlagsOnly, None)
+    }
+}
+
+/// ssh_config keywords whose value is a command line: `ProxyCommand`,
+/// `LocalCommand` and `KnownHostsCommand` run theirs on the local host,
+/// `RemoteCommand` on the remote one, like the positional command.
+const SSH_CONFIG_COMMAND_KEYWORDS: [&str; 4] = [
+    "ProxyCommand",
+    "LocalCommand",
+    "KnownHostsCommand",
+    "RemoteCommand",
+];
+
+/// The keyword and the command line of an ssh_config option that carries one
+/// (`ProxyCommand=…`, `localcommand …`), or `None`. As in OpenSSH, keywords
+/// match without regard to case, the value follows `=` and/or blanks, and
+/// `none` disables the keyword.
+fn ssh_config_option_command(option: &str) -> Option<(&'static str, &str)> {
+    let option = option.trim_start_matches([' ', '\t']);
+    let keyword_end = option.find(['=', ' ', '\t']).unwrap_or(option.len());
+    let keyword = SSH_CONFIG_COMMAND_KEYWORDS
+        .into_iter()
+        .find(|keyword| option[..keyword_end].eq_ignore_ascii_case(keyword))?;
+    let value = option[keyword_end..].trim_start_matches([' ', '\t', '=']);
+    (!value.trim().is_empty() && !value.trim().eq_ignore_ascii_case("none"))
+        .then_some((keyword, value))
+}
+
+/// An `-o` option met while walking an ssh-family argv: the index of the argv
+/// word holding the ssh_config text, and whether that text is glued to the
+/// option cluster (`-oProxyCommand=…`) rather than being the next word.
+struct SshConfigOptionSite {
+    word: usize,
+    attached: bool,
+}
+
+/// Note the ssh_config option an option cluster carries, if it is `-o`.
+fn note_ssh_config_option(
+    program: SshFamilyProgram,
+    word: &str,
+    index: usize,
+    sites: &mut Vec<SshConfigOptionSite>,
+) {
+    match program.classify(word) {
+        (SshOptionShape::TakesSeparateValue, Some(b'o')) => sites.push(SshConfigOptionSite {
+            word: index + 1,
+            attached: false,
+        }),
+        (SshOptionShape::ValueAttached, Some(b'o')) => sites.push(SshConfigOptionSite {
+            word: index,
+            attached: true,
+        }),
+        _ => {}
+    }
+}
+
+/// Push the command line each noted ssh_config option carries, for the
+/// recursive evaluation every inline payload gets. `argv` is the program's
+/// argv as [`local_command_argv`] returns it. The option word is read after
+/// the local shell's quote removal; an expansion in it cannot be resolved, so
+/// such a word is read as written and the extraction is marked incomplete,
+/// as an unresolved `sh -c` program is. `false` when the extraction limit
+/// stopped it.
+#[allow(clippy::too_many_arguments)]
+fn push_ssh_config_option_commands(
+    command: &str,
+    program: SshFamilyProgram,
+    argv: &[&crate::normalize::NormalizeToken],
+    sites: &[SshConfigOptionSite],
+    full_start: usize,
+    limits: &ExtractionLimits,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) -> bool {
+    for site in sites {
+        let Some(token) = argv.get(site.word) else {
+            continue;
+        };
+        let Some(raw) = token.text(command) else {
+            continue;
+        };
+        // The word after quote removal. A `~` or glob character stays as
+        // written: it is read again as shell syntax when the command line is
+        // evaluated. Only an expansion leaves the word unresolved, and then
+        // the quotes alone are removed (`"ProxyCommand=$P"` runs whatever
+        // `$P` holds, which the evaluation denies as unverifiable).
+        let syntax = crate::normalize::decode_posix_syntax_token(raw);
+        let resolved =
+            matches!(syntax, Cow::Owned(_)) || !raw.contains(['\'', '"', '\\', '$', '`']);
+        let decoded = if resolved {
+            syntax
+        } else {
+            dequoted_executable_word(raw)
+        };
+        let option = if site.attached {
+            // `-` plus the flags before `o`, whose value is the rest.
+            match program.classify(&decoded) {
+                (SshOptionShape::ValueAttached, Some(b'o')) => decoded
+                    .bytes()
+                    .skip(1)
+                    .position(|byte| byte == b'o')
+                    .and_then(|at| decoded.get(at + 2..)),
+                _ => None,
+            }
+        } else {
+            Some(decoded.as_ref())
+        };
+        let Some((keyword, value)) = option.and_then(ssh_config_option_command) else {
+            continue;
+        };
+        if !resolved {
+            skip_reasons.push(SkipReason::MalformedInput {
+                reason: format!(
+                    "{} {keyword} option is not a static shell word",
+                    program.name()
+                ),
+            });
+        }
+        // A raw word that is its own decoding ends with the value's bytes.
+        let content_range = (decoded.as_ref() == raw)
+            .then(|| token.byte_range.end - value.len()..token.byte_range.end);
+        if !push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            value,
+            full_start..token.byte_range.end,
+            content_range,
+            keyword,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Note the `-o` options of an `scp` or `sftp` invocation. Unlike the `ssh`
+/// walk, which must find the destination, this one only looks for options,
+/// so it reads every word up to `--`: an operand or an option it does not
+/// model is passed over rather than ending the walk.
+fn scp_sftp_config_option_sites(
+    command: &str,
+    program: SshFamilyProgram,
+    argv: &[&crate::normalize::NormalizeToken],
+) -> Vec<SshConfigOptionSite> {
+    let mut sites = Vec::new();
+    let mut index = 0usize;
+    while let Some(token) = argv.get(index) {
+        let Some(text) = token.text(command) else {
+            break;
+        };
+        let word = crate::normalize::decode_posix_literal_word(text).unwrap_or_else(|| {
+            Cow::Borrowed(dequoted_flag_word(text, token.byte_range.start, token.byte_range.end).0)
+        });
+        if word == "--" {
+            break;
+        }
+        if word.len() < 2 || !word.starts_with('-') {
+            index += 1;
             continue;
         }
-        if SSH_VALUE_OPTIONS.contains(byte) {
-            return if index + 1 == bytes.len() {
-                SshOptionShape::TakesSeparateValue
-            } else {
-                SshOptionShape::ValueAttached
-            };
-        }
-        return SshOptionShape::Unknown;
+        note_ssh_config_option(program, &word, index, &mut sites);
+        index += match program.classify(&word).0 {
+            SshOptionShape::TakesSeparateValue => 2,
+            SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached | SshOptionShape::Unknown => {
+                1
+            }
+        };
     }
-    SshOptionShape::FlagsOnly
+    sites
 }
 
 /// Extract the remote command payload of `ssh` invocations (#326).
@@ -5313,6 +5541,11 @@ fn applescript_leading_string_literal(program: &str, start: usize) -> Option<Ran
 /// would extract the wrong text, so bailing is the accuracy-preserving choice
 /// (a real ssh also refuses unknown options outright, so nothing executes in
 /// that shape anyway).
+///
+/// An ssh_config option can carry a command line as well: `-o
+/// ProxyCommand=…`, `LocalCommand` and `KnownHostsCommand` run theirs through
+/// the local shell, `RemoteCommand` remotely. Each is extracted like a
+/// payload, from `ssh` and from `scp` and `sftp`, which pass `-o` on to it.
 fn extract_ssh_inline_scripts(
     command: &str,
     limits: &ExtractionLimits,
@@ -5324,7 +5557,7 @@ fn extract_ssh_inline_scripts(
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
         return;
     }
-    if !may_name_a_command(command, &["ssh", "SSH"]) {
+    if !may_name_a_command(command, &["ssh", "SSH", "scp", "SCP", "sftp", "SFTP"]) {
         return;
     }
 
@@ -5350,21 +5583,35 @@ fn extract_ssh_inline_scripts(
             // Path-qualified spellings (`/usr/bin/ssh`, `C:\…\ssh.exe`) are
             // the same program, and so are quoted ones (`\ssh`, `"ssh"`);
             // `ssh-keygen`/`ssh-add`/`autossh` are not.
-            let names_ssh = |word: &str| {
-                let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
-                basename
-                    .strip_suffix(".exe")
-                    .or_else(|| basename.strip_suffix(".EXE"))
-                    .unwrap_or(basename)
-                    .eq_ignore_ascii_case("ssh")
-            };
-            if !names_ssh(word) && !names_ssh(&dequoted_executable_word(word)) {
+            let Some(program) = SshFamilyProgram::from_word(word) else {
                 continue;
+            };
+            let Some(argv) = local_command_argv(command, tokens, index + 1) else {
+                continue;
+            };
+            let full_start = token.byte_range.start;
+            let mut config_options = Vec::new();
+            let payload = if program == SshFamilyProgram::Ssh {
+                ssh_remote_payload(command, &argv, full_start, &mut config_options)
+            } else {
+                config_options = scp_sftp_config_option_sites(command, program, &argv);
+                None
+            };
+            if !push_ssh_config_option_commands(
+                command,
+                program,
+                &argv,
+                &config_options,
+                full_start,
+                limits,
+                extracted,
+                skip_reasons,
+            ) {
+                return;
             }
-            let Some(payload) = ssh_remote_payload(command, tokens, index) else {
-                continue;
-            };
-            if !push_joined_payload(command, payload, limits, extracted, skip_reasons, "ssh") {
+            if let Some(payload) = payload
+                && !push_joined_payload(command, payload, limits, extracted, skip_reasons, "ssh")
+            {
                 return;
             }
         }
@@ -7054,24 +7301,31 @@ pub(crate) fn local_command_argv<'a>(
     Some(argv)
 }
 
-/// Locate the remote-command payload of the `ssh` invocation whose executable
-/// token is at `start`. See [`extract_ssh_inline_scripts`] for the grammar and
-/// the deliberate bail on unmodeled options.
+/// Locate the remote-command payload of an `ssh` invocation, given its argv
+/// (as [`local_command_argv`] returns it) and the start of its executable
+/// word. See [`extract_ssh_inline_scripts`] for the grammar and the
+/// deliberate bail on unmodeled options. Each `-o` option the walk passes is
+/// noted in `config_options`, whether or not a payload follows.
 fn ssh_remote_payload(
     command: &str,
-    tokens: &[crate::normalize::NormalizeToken],
-    start: usize,
+    argv: &[&crate::normalize::NormalizeToken],
+    full_start: usize,
+    config_options: &mut Vec<SshConfigOptionSite>,
 ) -> Option<SshRemotePayload> {
-    let full_start = tokens.get(start)?.byte_range.start;
-    let argv = local_command_argv(command, tokens, start + 1)?;
-    let word_at = |index: usize| -> Option<&str> {
+    // What ssh receives: each word after the shell's quote removal, so a
+    // quoted option letter (`"-o"…`) is still an option. A word with an
+    // expansion keeps the established reading, one layer of whole-word
+    // quoting removed.
+    let word_at = |index: usize| -> Option<Cow<'_, str>> {
         let token = argv.get(index)?;
-        let (word, _, _) = dequoted_flag_word(
-            token.text(command)?,
-            token.byte_range.start,
-            token.byte_range.end,
-        );
-        Some(word)
+        let text = token.text(command)?;
+        Some(
+            crate::normalize::decode_posix_literal_word(text).unwrap_or_else(|| {
+                Cow::Borrowed(
+                    dequoted_flag_word(text, token.byte_range.start, token.byte_range.end).0,
+                )
+            }),
+        )
     };
     let mut index = 0usize;
     let mut options_ended = false;
@@ -7080,12 +7334,14 @@ fn ssh_remote_payload(
     loop {
         // No destination: plain `ssh` — no payload.
         let word = word_at(index)?;
+        let word = word.as_ref();
         if !options_ended && word == "--" {
             options_ended = true;
             index += 1;
             continue;
         }
         if !options_ended && word.len() > 1 && word.starts_with('-') {
+            note_ssh_config_option(SshFamilyProgram::Ssh, word, index, config_options);
             match classify_ssh_option(word) {
                 SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached => {
                     index += 1;
@@ -7108,6 +7364,7 @@ fn ssh_remote_payload(
     if !options_ended {
         let mut again = index;
         while let Some(word) = word_at(again) {
+            let word = word.as_ref();
             if word == "--" {
                 again += 1;
                 index = again;
@@ -7117,6 +7374,7 @@ fn ssh_remote_payload(
                 index = again;
                 break;
             }
+            note_ssh_config_option(SshFamilyProgram::Ssh, word, again, config_options);
             match classify_ssh_option(word) {
                 SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached => again += 1,
                 SshOptionShape::TakesSeparateValue => again += 2,
@@ -21178,6 +21436,35 @@ EOF";
             if let Some(view) = view {
                 assert_eq!(view.len(), command.len(), "{command:?}");
             }
+        }
+    }
+
+    /// The ssh_config keywords that carry a command line, spelled as OpenSSH
+    /// accepts them; any other keyword, or `none`, carries none.
+    #[test]
+    fn ssh_config_option_command_reads_only_command_keywords() {
+        for (option, expected) in [
+            ("ProxyCommand=nc %h %p", Some(("ProxyCommand", "nc %h %p"))),
+            ("proxycommand nc %h %p", Some(("ProxyCommand", "nc %h %p"))),
+            (
+                "ProxyCommand = nc %h %p",
+                Some(("ProxyCommand", "nc %h %p")),
+            ),
+            ("LocalCommand=echo hi", Some(("LocalCommand", "echo hi"))),
+            (
+                "KnownHostsCommand=kh %H",
+                Some(("KnownHostsCommand", "kh %H")),
+            ),
+            ("RemoteCommand=uptime", Some(("RemoteCommand", "uptime"))),
+            ("ProxyCommand=none", None),
+            ("ProxyCommand NONE", None),
+            ("ProxyCommand=", None),
+            ("ProxyJump=bastion", None),
+            ("ProxyCommandX=rm", None),
+            ("SendEnv=rm -rf ~", None),
+            ("BatchMode=yes", None),
+        ] {
+            assert_eq!(ssh_config_option_command(option), expected, "{option:?}");
         }
     }
 
