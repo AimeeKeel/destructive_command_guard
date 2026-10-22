@@ -594,7 +594,9 @@ fn respelled_command_may_be_present(command: &str) -> bool {
 /// substitution (`<(`) and a word without a target are left alone. A target's
 /// `$(…)`, `${…}` and backquoted parts belong to it (`2>$(mktemp) -c`). Text
 /// inside quotes is never taken for a redirect, so a quoted payload reads the
-/// same in both. Length
+/// same in both. A comment (`#` starting a word) runs to the end of its line
+/// and is skipped: its quotes quote nothing, so an apostrophe in it must not
+/// hide the redirects of the lines after it. Length
 /// preserving (every blanked byte becomes a space, so the view stays UTF-8
 /// and every range in it is the same range in `command`); linear.
 fn blank_local_redirects(command: &str) -> Option<String> {
@@ -613,6 +615,10 @@ fn blank_local_redirects(command: &str) -> Option<String> {
         {
             word_start = true;
             index += 1;
+            continue;
+        }
+        if byte == b'#' && word_start {
+            index = memchr(b'\n', &bytes[index..]).map_or(len, |at| index + at);
             continue;
         }
         // A redirect may also follow a word directly (`sh>/dev/null -c …`
@@ -710,6 +716,198 @@ fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
         };
     }
     (index > target_start).then_some(index)
+}
+
+/// The argv view of a POSIX command: every redirection its shell performs is
+/// blank-filled, so each simple command reads as the words its program
+/// receives. That is each redirect word [`blank_local_redirects`] finds
+/// (`prog>/dev/null`, `2>&1`, `<<<x`), and each heredoc whole: its operator
+/// and delimiter word, its body and its terminator line.
+///
+/// A redirect is not an argument wherever it stands, but a rule that reads
+/// argv positions sees it as one: before the command word (`>log prog …`),
+/// glued to it (`prog>log …`), or after the operand a rule expects last
+/// (`prog a b 2>log`). Pack matching therefore reads this view as well as
+/// the full text, which still carries every redirect target for the rules
+/// about those.
+///
+/// Length preserving (blanked bytes become spaces, so every range in the view
+/// is the same range in `command`); `None` when the command has no
+/// redirection outside quotes. When the heredoc structure cannot be parsed,
+/// heredocs stay in the view as written and only the redirect words are
+/// blanked.
+pub(crate) fn redirection_free_view(command: &str) -> Option<String> {
+    memchr::memchr2(b'<', b'>', command.as_bytes())?;
+    let spans = heredoc_redirection_spans(command);
+    if spans.is_empty() {
+        return blank_local_redirects(command);
+    }
+    let mut view = command.as_bytes().to_vec();
+    for span in spans {
+        view[span].fill(b' ');
+    }
+    // Every span starts and ends at an ASCII byte or the end of the input,
+    // so whole characters were replaced; fall back rather than assume it.
+    let Ok(view) = String::from_utf8(view) else {
+        return blank_local_redirects(command);
+    };
+    Some(blank_local_redirects(&view).unwrap_or(view))
+}
+
+/// The byte ranges [`redirection_free_view`] blanks for each heredoc: the
+/// operator with its descriptor digits and delimiter word, and the body
+/// through the terminator line (newlines included, so the body cannot leave
+/// a run of empty commands behind; the newline ending the terminator line
+/// stays). The terminator line is checked to be the delimiter rather than
+/// assumed: a heredoc whose terminator is not found right after its body
+/// gets no range, unless that body runs to the end of the input. Empty when
+/// the command holds no heredoc or its structure does not parse.
+fn heredoc_redirection_spans(command: &str) -> Vec<Range<usize>> {
+    if !contains_active_heredoc_operator(command) {
+        return Vec::new();
+    }
+    let Some(heredocs) = active_heredocs(command) else {
+        return Vec::new();
+    };
+    let bytes = command.as_bytes();
+    let mut spans = Vec::new();
+    for heredoc in heredocs {
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            ..
+        } = heredoc.body
+        else {
+            // A here-string is a redirect word of its own.
+            continue;
+        };
+        let Some((delimiter_end, delimiter, strip_tabs)) =
+            heredoc_delimiter(command, heredoc.operator_start)
+        else {
+            continue;
+        };
+        let mut operator_start = heredoc.operator_start;
+        let mut digits = operator_start;
+        while digits > 0 && bytes[digits - 1].is_ascii_digit() {
+            digits -= 1;
+        }
+        if digits < operator_start
+            && (digits == 0
+                || matches!(
+                    bytes[digits - 1],
+                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+                ))
+        {
+            operator_start = digits;
+        }
+        if body_start > body_end || body_end > command.len() || body_start < delimiter_end {
+            continue;
+        }
+        // For `<<-` the parsed body starts after the first line's tabs.
+        let Some(before_body) = command.get(..body_start) else {
+            continue;
+        };
+        let line_start = before_body.rfind('\n').map_or(0, |at| at + 1);
+        let body_start = if line_start >= delimiter_end
+            && bytes[line_start..body_start]
+                .iter()
+                .all(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            line_start
+        } else {
+            body_start
+        };
+        // An unterminated body runs to the end of the input. A terminator
+        // that is not where it should be leaves the heredoc as written: its
+        // operator must not be blanked while its body or terminator stays,
+        // or their lines would read as commands.
+        let terminator_end = match heredoc_terminator_end(command, body_end, &delimiter, strip_tabs)
+        {
+            Some(end) => end,
+            None if command
+                .get(body_end..)
+                .is_some_and(|rest| rest.trim().is_empty()) =>
+            {
+                command.len()
+            }
+            None => continue,
+        };
+        spans.push(operator_start..delimiter_end);
+        spans.push(body_start..terminator_end);
+    }
+    spans
+}
+
+/// The end of the delimiter word of the heredoc operator at `operator_start`,
+/// the delimiter after quote removal (what the terminator line must equal),
+/// and whether the operator is `<<-` (which strips leading tabs).
+fn heredoc_delimiter(command: &str, operator_start: usize) -> Option<(usize, String, bool)> {
+    let bytes = command.as_bytes();
+    let mut index = operator_start;
+    if bytes.get(index..index + 2) != Some(b"<<") {
+        return None;
+    }
+    index += 2;
+    let strip_tabs = bytes.get(index) == Some(&b'-');
+    if strip_tabs {
+        index += 1;
+    }
+    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+    let end = crate::normalize::consume_posix_word_token(bytes, index, bytes.len());
+    let word = command.get(index..end).filter(|word| !word.is_empty())?;
+    // Quote removal only: the shell does not expand a delimiter.
+    let mut delimiter = String::with_capacity(word.len());
+    let mut chars = word.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(open), _) if ch == open => quote = None,
+            (None, '\\') => delimiter.extend(chars.next()),
+            (Some('"'), '\\') if matches!(chars.peek(), Some('$' | '`' | '"' | '\\')) => {
+                delimiter.extend(chars.next());
+            }
+            _ => delimiter.push(ch),
+        }
+    }
+    Some((end, delimiter, strip_tabs))
+}
+
+/// The end of the terminator line of a heredoc body ending at `body_end`,
+/// when that line is exactly the delimiter. `body_end` is the start of that
+/// line, or the newline ending the body's last line, in which case the line
+/// after it is read.
+fn heredoc_terminator_end(
+    command: &str,
+    body_end: usize,
+    delimiter: &str,
+    strip_tabs: bool,
+) -> Option<usize> {
+    let line_end = |start: usize| -> Option<usize> {
+        let rest = command.get(start..)?;
+        Some(start + memchr(b'\n', rest.as_bytes()).unwrap_or(rest.len()))
+    };
+    let is_terminator = |start: usize, end: usize| -> bool {
+        let line = &command[start..end];
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        line == delimiter
+    };
+    let end = line_end(body_end)?;
+    if is_terminator(body_end, end) {
+        return Some(end);
+    }
+    if end == command.len() || !command[body_end..end].trim_end_matches('\r').is_empty() {
+        return None;
+    }
+    let next_end = line_end(end + 1)?;
+    is_terminator(end + 1, next_end).then_some(next_end)
 }
 
 /// Index just past the double-quoted string whose body starts at `start`.
@@ -20922,12 +21120,64 @@ EOF";
             ("cat <(ls) >(wc)", None),
             ("a 2>", None),
             ("ls", None),
+            // A comment's quotes quote nothing: the next line's redirect is
+            // still found, and the comment itself is left as written.
+            ("ls # it's\na>l b", Some("ls # it's\na   b")),
+            ("a # x>y", None),
+            ("a;#'\nb>l", Some("a;#'\nb  ")),
+            // `#` inside a word or an expansion is no comment.
+            ("echo a#b>l", Some("echo a#b  ")),
+            ("echo ${#x}>l", Some("echo ${#x}  ")),
         ] {
             assert_eq!(
                 blank_local_redirects(command).as_deref(),
                 expected,
                 "{command:?}"
             );
+        }
+    }
+
+    /// The argv view blanks every redirection the shell performs, heredocs
+    /// whole, and nothing else, at unchanged byte offsets.
+    #[test]
+    fn redirection_free_view_blanks_every_redirection() {
+        for (command, expected) in [
+            (
+                "git>/dev/null reset --hard",
+                Some("git           reset --hard"),
+            ),
+            (">/dev/null git reset", Some("           git reset")),
+            ("2>&1 git reset", Some("     git reset")),
+            (
+                "cp x /dev/sda 2>/dev/null",
+                Some("cp x /dev/sda            "),
+            ),
+            ("git<<<x reset", Some("git     reset")),
+            // A heredoc: operator and delimiter, then body and terminator
+            // line in one run of blanks, keeping the newline after it.
+            (
+                "cat <<'EOF' >out\nit's\nEOF\ngit>l reset",
+                Some("cat             \n        \ngit   reset"),
+            ),
+            (
+                "cat 3<<-X\n\tbody\n\tX\nls",
+                Some("cat      \n        \nls"),
+            ),
+            // The parse reports only the first heredoc of a line; a heredoc it
+            // does not report stays as written, still a heredoc in the view.
+            (
+                "a <<A <<\"B\"\n1\nA\n2\nB\nb",
+                Some("a     <<\"B\"\n   \n2\nB\nb"),
+            ),
+            ("echo 'a > b' \"c < d\"", None),
+            ("ls", None),
+            ("cat <(ls) >(wc)", None),
+        ] {
+            let view = redirection_free_view(command);
+            assert_eq!(view.as_deref(), expected, "{command:?}");
+            if let Some(view) = view {
+                assert_eq!(view.len(), command.len(), "{command:?}");
+            }
         }
     }
 

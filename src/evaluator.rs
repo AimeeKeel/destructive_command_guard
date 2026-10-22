@@ -15108,7 +15108,7 @@ fn evaluate_command_in_single_dialect_view(
         allow_once_audit,
         inherited_automated_stdin,
     };
-    let result = evaluate_packs_with_allowlists_at_depth(
+    let mut result = evaluate_packs_with_allowlists_at_depth(
         command_for_packs,
         &normalized,
         command_for_match,
@@ -15123,6 +15123,61 @@ fn evaluate_command_in_single_dialect_view(
         Some(&nested_context),
         inherited_automated_stdin,
     );
+    // The packs also read the command's argv view: the same text with every
+    // redirection blank-filled (`crate::heredoc::redirection_free_view`).
+    // A redirect is never an argument, yet rules that read argv positions saw
+    // one, wherever it stood: before or glued to the command word, it took
+    // the executable position, and after the operand a rule expects last, it
+    // ended the command early. Deny wins between the two readings, exactly as
+    // between dialect views; the full reading keeps every redirect target for
+    // the rules about those.
+    if result.decision == EvaluationDecision::Allow
+        && let Some(views) = redirection_free_pack_views(command, command_for_match, shell_dialect)
+    {
+        if deadline_exceeded(deadline) {
+            return EvaluationResult::indeterminate_due_to_budget();
+        }
+        let argv_result = evaluate_packs_with_allowlists_at_depth(
+            &views.for_packs,
+            &views.normalized,
+            &views.for_match,
+            &views.command,
+            ordered_packs,
+            allowlists,
+            keyword_index,
+            deadline,
+            project_path,
+            shell_dialect,
+            nested_command_depth,
+            Some(&nested_context),
+            inherited_automated_stdin,
+        );
+        let adopt = match argv_result.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && argv_result.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            result = argv_result;
+            // The view is length preserving, so the span is the same span
+            // of the command; preview the command's own text, not blanks.
+            // A blanked multi-byte character can leave an end inside it.
+            if let Some(info) = result.pattern_info.as_mut()
+                && let Some(span) = info.matched_span.as_mut()
+            {
+                span.end = span.end.min(command.len());
+                span.start = span.start.min(span.end);
+                while !command.is_char_boundary(span.start) {
+                    span.start -= 1;
+                }
+                while !command.is_char_boundary(span.end) {
+                    span.end += 1;
+                }
+                info.matched_text_preview = Some(extract_match_preview(command, span));
+            }
+        }
+    }
     // Attribute an ALLOW outcome to the recorded heredoc/launcher allowlist
     // grant — but never let that attribution replace a pack denial or an
     // indeterminate verdict. A grant scoped to e.g.
@@ -15136,6 +15191,61 @@ fn evaluate_command_in_single_dialect_view(
     }
 
     result
+}
+
+/// The four pack-evaluation views of a command's argv view (see
+/// [`crate::heredoc::redirection_free_view`]), in the roles
+/// [`evaluate_packs_with_allowlists_at_depth`] takes them.
+struct RedirectionFreePackViews {
+    command: String,
+    for_match: String,
+    normalized: String,
+    for_packs: String,
+}
+
+/// Build the argv-view counterparts of `command` and of its byte-aligned
+/// match view, or `None` when the command has no redirection outside quotes.
+///
+/// POSIX syntax only (and the unknown dialect, which reads it): Cmd and
+/// PowerShell give `>`, `<` and `#` other meanings. The match view keeps its
+/// own masking: the bytes the argv view blanks are blanked in it as well.
+/// Only if it is not byte-aligned with the command is it rebuilt from the
+/// argv view by the generic sanitizer, which masks less, never more.
+fn redirection_free_pack_views(
+    command: &str,
+    command_for_match: &str,
+    shell_dialect: ShellDialect,
+) -> Option<RedirectionFreePackViews> {
+    if !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return None;
+    }
+    let argv_command = crate::heredoc::redirection_free_view(command)?;
+    let for_match = (command_for_match.len() == command.len())
+        .then(|| {
+            let mut bytes = command_for_match.as_bytes().to_vec();
+            for ((byte, view), raw) in bytes
+                .iter_mut()
+                .zip(argv_command.as_bytes())
+                .zip(command.as_bytes())
+            {
+                if view != raw {
+                    *byte = b' ';
+                }
+            }
+            String::from_utf8(bytes).ok()
+        })
+        .flatten()
+        .unwrap_or_else(|| sanitize_for_pattern_matching(&argv_command).into_owned());
+    let dialect_normalized =
+        crate::normalize::normalize_command_in_dialect(&for_match, shell_dialect);
+    let normalized = crate::normalize::normalize_command(dialect_normalized.as_ref()).into_owned();
+    let for_packs = crate::heredoc::mask_non_executing_heredocs(&normalized).into_owned();
+    Some(RedirectionFreePackViews {
+        command: argv_command,
+        for_match,
+        normalized,
+        for_packs,
+    })
 }
 
 /// Carry the original command's data-body proof into the byte-aligned regex
