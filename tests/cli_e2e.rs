@@ -1772,6 +1772,115 @@ mod allow_once_flow_tests {
         assert_eq!(entries[1]["mode"], "allow");
     }
 
+    /// Issue #585: inspect the complete persisted record, not just `command`.
+    /// Candidate pipelines are evaluated by the hook and are never executed.
+    #[test]
+    fn full_logging_redaction_suppresses_diagnostics_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        for format in ["json", "text"] {
+            for mode in ["deny", "warn"] {
+                let env = FlowTestEnv::new();
+                let log_path = env.temp.path().join("decisions.log");
+                let audit_path = env.temp.path().join("audit.log");
+                let config_path = env.temp.path().join("config.toml");
+                let config = format!(
+                    "[general]\nlog_file = {:?}\n\
+                     [history]\nenabled = false\n\
+                     [packs]\nenabled = [\"windows\"]\n\
+                     [policy.rules]\n\"core.git:reset-hard\" = {mode:?}\n\
+                     [logging]\nenabled = true\nfile = {:?}\nformat = {format:?}\n\
+                     caller_env = \"DCG_TEST_CALLER\"\n\
+                     [logging.redaction]\nenabled = true\nmode = \"full\"\n\
+                     [logging.events]\ndeny = true\nwarn = true\nallow = true\n",
+                    audit_path.to_string_lossy(),
+                    log_path.to_string_lossy(),
+                );
+                std::fs::write(&config_path, &config).expect("write config");
+                // Redemption runs through the CLI, which must load the same
+                // redaction policy as the hook under both platform spellings.
+                for dir in [
+                    env.xdg_config_dir.join("dcg"),
+                    env.home_dir.join(".config").join("dcg"),
+                ] {
+                    std::fs::create_dir_all(&dir).expect("config dir");
+                    std::fs::write(dir.join("config.toml"), &config).expect("write config");
+                }
+                let config_str = config_path.to_str().expect("config path");
+                let extra_env = [
+                    ("DCG_CONFIG", config_str),
+                    ("DCG_TEST_CALLER", MARKER),
+                    ("DCG_PACKS", "core.git,core.filesystem,windows"),
+                    ("DCG_SELF_HEAL_HOOK", "0"),
+                    ("DCG_HOOK_TIMEOUT_MS", "10000"),
+                ];
+                let pipeline = format!("{MARKER} | python -");
+                let pipeline_result = env.run_hook_with_env(&pipeline, &extra_env);
+                // Unverified embedded execution remains denied even when the
+                // ordinary git rule is configured to warn.
+                assert_is_denial(&pipeline_result);
+                let git_result =
+                    env.run_hook_with_env(&format!("git reset --hard {MARKER}"), &extra_env);
+                if mode == "deny" {
+                    assert_is_denial(&git_result);
+                } else {
+                    assert_is_allowed(&git_result);
+                    assert!(!git_result.stderr_str().is_empty(), "warning retained");
+                }
+                assert_is_allowed(
+                    &env.run_hook_with_env(&format!("git status -- {MARKER}"), &extra_env),
+                );
+
+                let log = std::fs::read_to_string(&log_path).expect("decision log");
+                assert_eq!(log.lines().count(), 3, "{log}");
+                assert!(
+                    !log.to_lowercase().contains(&MARKER.to_lowercase()),
+                    "{log}"
+                );
+                assert!(log.contains("core.git:reset-hard"), "stable rule ID: {log}");
+                if format == "json" {
+                    let records: Vec<serde_json::Value> = log
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("JSON record"))
+                        .collect();
+                    assert_eq!(records[0]["decision"], "deny");
+                    assert_eq!(records[1]["decision"], mode);
+                    assert_eq!(records[2]["decision"], "allow");
+                    assert_eq!(records[0]["command"], "[REDACTED]");
+                    assert_eq!(records[0]["reason"], "Diagnostic details redacted.");
+                } else {
+                    assert!(log.lines().next().unwrap().contains("DENY"));
+                    assert!(log.lines().nth(1).unwrap().contains(&mode.to_uppercase()));
+                    assert!(log.lines().nth(2).unwrap().contains("ALLOW"));
+                }
+                if mode == "deny" {
+                    let code = extract_code_from_denial(&git_result.stdout_str())
+                        .expect("allow-once code");
+                    let granted = env.run_cli(&["allow-once", &code, "--yes"]);
+                    assert!(granted.status.success(), "{granted:?}");
+                    assert_is_allowed(
+                        &env.run_hook_with_env(&format!("git reset --hard {MARKER}"), &extra_env),
+                    );
+                    let log = std::fs::read_to_string(&log_path).expect("decision log after grant");
+                    assert!(
+                        !log.to_lowercase().contains(&MARKER.to_lowercase()),
+                        "{log}"
+                    );
+                }
+                let audit = std::fs::read_to_string(&audit_path).expect("allow-once audit");
+                assert!(audit.contains("code_issued"), "{audit}");
+                if mode == "deny" {
+                    for event in ["code_resolved", "allow_granted"] {
+                        assert!(audit.contains(event), "{audit}");
+                    }
+                }
+                assert!(
+                    !audit.to_lowercase().contains(&MARKER.to_lowercase()),
+                    "{audit}"
+                );
+            }
+        }
+    }
+
     /// `[logging] caller_env` attributes each record to a caller the built-in
     /// agent detection does not know (#378), sanitized to a single line.
     #[test]

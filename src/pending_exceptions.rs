@@ -984,10 +984,10 @@ impl AllowOnceLogEntry {
             event: AllowOnceEventKind::CodeIssued.label().to_string(),
             short_code: record.short_code.clone(),
             full_hash: record.full_hash.clone(),
-            cwd: record.cwd.clone(),
+            cwd: crate::logging::redact_metadata(&record.cwd, redaction),
             command: redact_for_log(&record.command_raw, redaction),
             expires_at: Some(record.expires_at.clone()),
-            reason: Some(record.reason.clone()),
+            reason: Some(crate::logging::redact_reason(&record.reason, redaction)),
             allowlist_layer: None,
             scope_kind: None,
             single_use: Some(record.single_use),
@@ -1004,10 +1004,10 @@ impl AllowOnceLogEntry {
             event: AllowOnceEventKind::CodeResolved.label().to_string(),
             short_code: entry.source_short_code.clone(),
             full_hash: entry.source_full_hash.clone(),
-            cwd: entry.scope_path.clone(),
+            cwd: crate::logging::redact_metadata(&entry.scope_path, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
-            reason: Some(entry.reason.clone()),
+            reason: Some(crate::logging::redact_reason(&entry.reason, redaction)),
             allowlist_layer: None,
             scope_kind: Some(format!("{:?}", entry.scope_kind).to_lowercase()),
             single_use: Some(entry.single_use),
@@ -1029,7 +1029,7 @@ impl AllowOnceLogEntry {
             event: AllowOnceEventKind::AllowGranted.label().to_string(),
             short_code: entry.source_short_code.clone(),
             full_hash: entry.source_full_hash.clone(),
-            cwd: cwd.to_string(),
+            cwd: crate::logging::redact_metadata(cwd, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
             reason: None,
@@ -1049,7 +1049,7 @@ impl AllowOnceLogEntry {
             event: AllowOnceEventKind::EntryConsumed.label().to_string(),
             short_code: entry.source_short_code.clone(),
             full_hash: entry.source_full_hash.clone(),
-            cwd: cwd.to_string(),
+            cwd: crate::logging::redact_metadata(cwd, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
             reason: None,
@@ -1076,7 +1076,7 @@ impl AllowOnceLogEntry {
             event: AllowOnceEventKind::EntryExpired.label().to_string(),
             short_code: short_code.to_string(),
             full_hash: full_hash.to_string(),
-            cwd: cwd.to_string(),
+            cwd: crate::logging::redact_metadata(cwd, redaction),
             command: redact_for_log(command, redaction),
             expires_at: Some(expires_at.to_string()),
             reason: None,
@@ -2244,11 +2244,12 @@ mod tests {
             mode: crate::logging::RedactionMode::Full,
             max_argument_len: 8,
         };
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
         let record = PendingExceptionRecord::new(
             now,
-            "/repo",
-            "git reset --hard HEAD",
-            "blocked",
+            marker,
+            &format!("git reset --hard {marker}"),
+            &format!("producer {}", marker.to_lowercase()),
             &redaction,
             false,
             None,
@@ -2256,6 +2257,37 @@ mod tests {
 
         let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
         assert_eq!(entry.command, "[REDACTED]");
+        let grant = AllowOnceEntry::from_pending(
+            &record,
+            now,
+            AllowOnceScopeKind::Cwd,
+            marker,
+            true,
+            false,
+            &redaction,
+        );
+        for entry in [
+            entry,
+            AllowOnceLogEntry::code_resolved(&grant, &redaction),
+            AllowOnceLogEntry::allow_granted(&grant, &redaction, "allow_once", marker),
+            AllowOnceLogEntry::entry_consumed(&grant, &redaction, marker),
+            AllowOnceLogEntry::entry_expired(
+                &record.short_code,
+                &record.full_hash,
+                marker,
+                marker,
+                &record.expires_at,
+                &redaction,
+            ),
+        ] {
+            for serialized in [entry.format_json(), entry.format_text()] {
+                assert!(
+                    !serialized.to_lowercase().contains(&marker.to_lowercase()),
+                    "{serialized}"
+                );
+                assert!(serialized.contains(&record.short_code));
+            }
+        }
     }
 
     #[test]

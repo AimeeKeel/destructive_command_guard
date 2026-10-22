@@ -62,7 +62,12 @@ const MAX_CALLER_CHARS: usize = 64;
 #[must_use]
 pub fn caller_label(config: &LoggingConfig) -> Option<String> {
     let name = config.caller_env.as_deref()?;
-    sanitize_caller_label(&std::env::var(name).ok()?)
+    let label = sanitize_caller_label(&std::env::var(name).ok()?)?;
+    Some(if config.redaction.is_full() {
+        "[REDACTED]".to_string()
+    } else {
+        label
+    })
 }
 
 /// Reduce a raw caller value to the label [`caller_label`] records.
@@ -106,6 +111,13 @@ impl Default for RedactionConfig {
     }
 }
 
+impl RedactionConfig {
+    /// Whether full-record suppression is active (mode alone is insufficient).
+    pub(crate) const fn is_full(&self) -> bool {
+        self.enabled && matches!(self.mode, RedactionMode::Full)
+    }
+}
+
 /// Redaction mode.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
@@ -115,6 +127,8 @@ pub enum RedactionMode {
     None,
     #[default]
     Arguments,
+    // Suppress command text, diagnostic text, caller labels and audit paths.
+    // Stable rule identifiers, decisions, timestamps and counters remain.
     Full,
 }
 
@@ -220,7 +234,10 @@ impl LogEntry {
                         (Some(p), Some(n)) => Some(format!("{p}:{n}")),
                         _ => None,
                     };
-                    let r = Some(pm.reason.clone());
+                    // Reasons may quote transformed command fragments (including
+                    // lowercased pipeline producers). Substring replacement is
+                    // insufficient: full mode must never copy diagnostic text.
+                    let r = Some(redact_reason(&pm.reason, redaction));
                     (pack, pattern, rule, r)
                 });
 
@@ -426,6 +443,26 @@ pub(crate) fn redact_command(command: &str, config: &RedactionConfig) -> String 
         RedactionMode::None => command.to_string(),
         RedactionMode::Full => "[REDACTED]".to_string(),
         RedactionMode::Arguments => redact_arguments(command, config.max_argument_len),
+    }
+}
+
+/// Free-form metadata is not shell syntax. Argument truncation cannot safely
+/// sanitize it; full mode replaces it wholesale, other modes preserve it.
+pub(crate) fn redact_metadata(value: &str, config: &RedactionConfig) -> String {
+    if config.is_full() {
+        "[REDACTED]".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Retain a safe explanation without attempting to recognize every possible
+/// transformation of a command fragment in evaluator or operator diagnostics.
+pub(crate) fn redact_reason(reason: &str, config: &RedactionConfig) -> String {
+    if config.is_full() {
+        "Diagnostic details redacted.".to_string()
+    } else {
+        reason.to_string()
     }
 }
 
@@ -940,11 +977,11 @@ impl AllowOnceLogEntry {
             short_code: short_code.to_string(),
             full_hash: full_hash.to_string(),
             command: redact_command(command, redaction),
-            cwd: cwd.to_string(),
+            cwd: redact_metadata(cwd, redaction),
             expires_at: expires_at.to_string(),
             scope_kind: None,
             scope_path: None,
-            reason: Some(reason.to_string()),
+            reason: Some(redact_reason(reason, redaction)),
             single_use: Some(single_use),
         }
     }
@@ -969,10 +1006,10 @@ impl AllowOnceLogEntry {
             short_code: short_code.to_string(),
             full_hash: full_hash.to_string(),
             command: redact_command(command, redaction),
-            cwd: cwd.to_string(),
+            cwd: redact_metadata(cwd, redaction),
             expires_at: expires_at.to_string(),
             scope_kind: Some(scope_kind.to_string()),
-            scope_path: Some(scope_path.to_string()),
+            scope_path: Some(redact_metadata(scope_path, redaction)),
             reason: None,
             single_use: Some(single_use),
         }
@@ -993,7 +1030,7 @@ impl AllowOnceLogEntry {
             short_code: short_code.to_string(),
             full_hash: full_hash.to_string(),
             command: redact_command(command, redaction),
-            cwd: cwd.to_string(),
+            cwd: redact_metadata(cwd, redaction),
             expires_at: String::new(),
             scope_kind: None,
             scope_path: None,
@@ -1142,6 +1179,84 @@ mod tests {
         };
         let result = redact_command("git reset --hard HEAD", &config);
         assert_eq!(result, "git reset --hard HEAD");
+    }
+
+    #[test]
+    fn full_redaction_covers_complete_records_and_preserves_decisions() {
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let reason = format!("Unverified producer: {}", marker.to_lowercase());
+        let result = EvaluationResult::denied_by_pack_pattern(
+            "core.git",
+            "reset-hard",
+            &reason,
+            None,
+            crate::packs::Severity::High,
+            &[],
+        );
+        for mode in [
+            DecisionMode::Deny,
+            DecisionMode::Warn,
+            DecisionMode::Ask,
+            DecisionMode::Log,
+        ] {
+            for enabled in [false, true] {
+                for redaction_mode in [
+                    RedactionMode::None,
+                    RedactionMode::Arguments,
+                    RedactionMode::Full,
+                ] {
+                    let config = RedactionConfig {
+                        enabled,
+                        mode: redaction_mode,
+                        max_argument_len: 8,
+                    };
+                    let entry = LogEntry::from_result(
+                        &result,
+                        marker,
+                        Some(&marker.to_lowercase()),
+                        mode,
+                        &config,
+                        Some(42),
+                    );
+                    assert_eq!(entry.rule_id.as_deref(), Some("core.git:reset-hard"));
+                    assert_eq!(entry.decision, format!("{mode:?}").to_lowercase());
+                    for serialized in [entry.format_json(), entry.format_text()] {
+                        assert_eq!(
+                            serialized.to_lowercase().contains(&marker.to_lowercase()),
+                            !(enabled && redaction_mode == RedactionMode::Full),
+                            "{serialized}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_redaction_covers_allow_once_metadata() {
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let config = RedactionConfig {
+            enabled: true,
+            mode: RedactionMode::Full,
+            max_argument_len: 8,
+        };
+        for entry in [
+            AllowOnceLogEntry::issued(
+                "abcd", "hash", marker, marker, "expiry", marker, true, &config,
+            ),
+            AllowOnceLogEntry::granted(
+                "abcd", "hash", marker, marker, "expiry", "cwd", marker, true, &config,
+            ),
+            AllowOnceLogEntry::consumed("abcd", "hash", marker, marker, &config),
+        ] {
+            for serialized in [entry.format_json(), entry.format_text()] {
+                assert!(
+                    !serialized.to_lowercase().contains(&marker.to_lowercase()),
+                    "{serialized}"
+                );
+                assert!(serialized.contains("abcd"));
+            }
+        }
     }
 
     #[test]

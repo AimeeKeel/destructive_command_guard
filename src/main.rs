@@ -1660,7 +1660,13 @@ fn resolve_hook_command(
             record_history(writer, entry);
         }
         if let Some(log_file) = &ctx.config.general.log_file {
-            let _ = hook::log_blocked_command(log_file, command, &info.reason, pack);
+            let _ = hook::log_blocked_command(
+                log_file,
+                command,
+                &info.reason,
+                pack,
+                &ctx.config.logging.redaction,
+            );
         }
         return ResolvedCommandOutcome::Allow(None);
     }
@@ -1882,7 +1888,13 @@ fn publish_decisive_response(
 
             // Log if configured
             if let Some(log_file) = &ctx.config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
+                let _ = hook::log_blocked_command(
+                    log_file,
+                    &command,
+                    &info.reason,
+                    pack,
+                    &ctx.config.logging.redaction,
+                );
             }
 
             // Review-capable clients receive ask; all others receive their

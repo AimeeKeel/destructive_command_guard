@@ -396,6 +396,24 @@ recognises vendor variables. Whoever sets the variable controls it, so it is
 treated as a label and never as input: it is reduced to printable ASCII on a
 single line, capped at 64 characters, and never consulted by any decision.
 
+To suppress command content in persisted decision logs, use:
+
+```toml
+[logging.redaction]
+enabled = true
+mode = "full"
+```
+
+Full redaction replaces commands (including normalized commands) and caller
+labels with `[REDACTED]`, and reasons with `Diagnostic details redacted.`, in both
+JSON and text logs. The same policy covers legacy blocked-command entries and
+allow-once audit logs written to `general.log_file`, including audit working
+directories and scope paths. Stable rule IDs, decisions, event kinds, timestamps,
+timings and allow-once correlation codes remain available. Redaction affects
+logging only; command evaluation and hook diagnostics retain their usual behavior.
+`mode = "arguments"` only truncates long quoted command arguments and does not
+provide full-record confidentiality. History has its own `redaction_mode` setting.
+
 ## Editor Autocomplete & Validation (JSON Schema)
 
 dcg publishes a JSON Schema for `config.toml` so editors can offer field

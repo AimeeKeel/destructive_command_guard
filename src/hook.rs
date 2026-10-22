@@ -4708,6 +4708,7 @@ pub fn log_blocked_command(
     command: &str,
     reason: &str,
     pack: Option<&str>,
+    redaction: &crate::logging::RedactionConfig,
 ) -> io::Result<()> {
     use std::fs::OpenOptions;
 
@@ -4733,9 +4734,11 @@ pub fn log_blocked_command(
 
     // The log file outlives the hook invocation and a blocked command is
     // exactly where credentials turn up, so recognised secret shapes are
-    // replaced before the line is written (issue #386). This path has no
-    // redaction config of its own; pattern redaction is unconditional here.
+    // replaced before the line is written (issue #386). Honor the configured
+    // redaction as well: secret recognition alone cannot enforce full mode.
     let command = crate::redaction::redact_secrets(command);
+    let command = crate::logging::redact_command(&command, redaction);
+    let reason = crate::logging::redact_reason(reason, redaction);
     writeln!(file, "[{timestamp}] [{pack_str}] {reason}")?;
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
@@ -4755,6 +4758,7 @@ pub fn log_budget_skip(
     stage: &str,
     elapsed: Duration,
     budget: Duration,
+    redaction: &crate::logging::RedactionConfig,
 ) -> io::Result<()> {
     use std::fs::OpenOptions;
 
@@ -4788,6 +4792,7 @@ pub fn log_budget_skip(
     )?;
     // Same unconditional secret redaction as `log_blocked_command`.
     let command = crate::redaction::redact_secrets(command);
+    let command = crate::logging::redact_command(&command, redaction);
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
 
@@ -9781,7 +9786,7 @@ mod tests {
         }
     }
 
-    /// Issue #386: `[general] log_file` takes no redaction config and used to
+    /// Issue #386: `[general] log_file` originally took no redaction config and
     /// write `Command: {command}` raw, so a blocked command carrying a token
     /// landed in the log verbatim. Canaries below are synthetic.
     #[test]
@@ -9792,13 +9797,21 @@ mod tests {
         let command = "deploy --purge AKIAABCDEFGHIJKLMNOP \
              ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-        log_blocked_command(path, command, "destructive", Some("core")).expect("write log");
+        log_blocked_command(
+            path,
+            command,
+            "destructive",
+            Some("core"),
+            &Default::default(),
+        )
+        .expect("write log");
         log_budget_skip(
             path,
             command,
             "prefilter",
             Duration::from_millis(5),
             Duration::from_millis(1),
+            &Default::default(),
         )
         .expect("write budget log");
 
@@ -9816,5 +9829,43 @@ mod tests {
         assert!(contents.contains("deploy --purge"), "{contents}");
         assert!(contents.contains("[AWS_ACCESS_KEY]"), "{contents}");
         assert!(contents.contains("[GITHUB_TOKEN]"), "{contents}");
+    }
+
+    #[test]
+    fn full_redaction_covers_legacy_log_records_issue_585() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("blocked.log");
+        let path = log.to_str().expect("utf-8 path");
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let redaction = crate::logging::RedactionConfig {
+            enabled: true,
+            mode: crate::logging::RedactionMode::Full,
+            ..Default::default()
+        };
+        log_blocked_command(
+            path,
+            marker,
+            &marker.to_lowercase(),
+            Some("core"),
+            &redaction,
+        )
+        .expect("blocked log");
+        log_budget_skip(
+            path,
+            marker,
+            "prefilter",
+            Duration::ZERO,
+            Duration::ZERO,
+            &redaction,
+        )
+        .expect("budget log");
+        let log = std::fs::read_to_string(log).expect("read log");
+        assert!(
+            !log.to_lowercase().contains(&marker.to_lowercase()),
+            "{log}"
+        );
+        assert!(log.contains("[core]"));
+        assert!(log.contains("Diagnostic details redacted."));
+        assert!(log.contains("[budget]"));
     }
 }
