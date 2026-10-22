@@ -2539,6 +2539,463 @@ mod config_tests {
             .expect("run isolated dcg install")
     }
 
+    fn native_settings_json_path(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
+        home.join(match agent {
+            "" => ".claude/settings.json",
+            "--grok" => ".grok/hooks/dcg.json",
+            "--agy" => ".gemini/config/hooks.json",
+            "--reasonix" => ".reasonix/settings.json",
+            "--crush" => ".config/crush/crush.json",
+            "--muse" => ".config/muse/settings.json",
+            _ => panic!("unsupported settings fixture: {agent}"),
+        })
+    }
+
+    fn native_settings_json_entries(agent: &str, fields: &str) -> String {
+        let hook = match agent {
+            "--reasonix" => format!(r#"{{"match":"bash","command":"/retired/dcg",{fields}}}"#),
+            "--crush" => format!(r#"{{"matcher":"^bash$","command":"/retired/dcg",{fields}}}"#),
+            _ => format!(r#"{{"type":"command","command":"/retired/dcg",{fields}}}"#),
+        };
+        if matches!(agent, "--reasonix" | "--crush") {
+            format!("[{hook}]")
+        } else {
+            format!(r#"[{{"matcher":"Bash","hooks":[{hook}]}}]"#)
+        }
+    }
+
+    fn native_settings_json_document(agent: &str, hooks: &str, extra: &str) -> String {
+        let schema = if agent == "--muse" {
+            r#""schema_version":1,"#
+        } else {
+            ""
+        };
+        format!(r#"{{{schema}"hooks":{{{hooks}}}{extra}}}"#)
+    }
+
+    fn assert_native_settings_json_duplicates_are_refused(agent: &str) {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), agent);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut fixtures = Vec::new();
+        for fields in [
+            r#""onFailure":"block","onFailure":"continue","timeout":15"#,
+            r#""onFailure":"block","on\u0046ailure":"continue","timeout":15"#,
+            r#""onFailure":"block","timeout":15,"timeout":5"#,
+            r#""onFailure":"block","timeout":15,"command":"audit-only"#,
+            r#""onFailure":"block","onFailure":"block","timeout":15"#,
+        ] {
+            let entries = native_settings_json_entries(agent, fields);
+            fixtures.push(native_settings_json_document(
+                agent,
+                &format!(r#""PreToolUse":{entries}"#),
+                "",
+            ));
+        }
+        let entries = native_settings_json_entries(agent, r#""onFailure":"block","timeout":15"#);
+        fixtures.push(native_settings_json_document(
+            agent,
+            &format!(r#""PreToolUse":{entries},"PreToolUse":[]"#),
+            "",
+        ));
+        fixtures.push(native_settings_json_document(
+            agent,
+            &format!(r#""PreToolUse":{entries}"#),
+            r#", "hooks":{}"#,
+        ));
+        fixtures.push(native_settings_json_document(
+            agent,
+            &format!(r#""PreToolUse":{entries}"#),
+            r#", "operator":{"policy":"strict","policy":"observe"}"#,
+        ));
+
+        for original in fixtures {
+            for force in [false, true] {
+                std::fs::write(&path, original.as_bytes()).unwrap();
+                let mut args = vec!["install"];
+                if !agent.is_empty() {
+                    args.push(agent);
+                }
+                if force {
+                    args.push("--force");
+                }
+                let output = run_hook_policy_install(home.path(), &args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse ambiguous settings: {original}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .to_ascii_lowercase()
+                        .contains("duplicate"),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn native_settings_json_claude_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("");
+    }
+
+    #[test]
+    fn native_settings_json_grok_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--grok");
+    }
+
+    #[test]
+    fn native_settings_json_antigravity_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--agy");
+    }
+
+    #[test]
+    fn native_settings_json_reasonix_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--reasonix");
+    }
+
+    #[test]
+    fn native_settings_json_crush_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--crush");
+    }
+
+    #[test]
+    fn native_settings_json_muse_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--muse");
+    }
+
+    #[test]
+    fn native_settings_json_unique_nested_fields_survive_repair_and_repeats() {
+        for agent in ["", "--grok", "--agy", "--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = native_settings_json_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let entries =
+                native_settings_json_entries(agent, r#""onFailure":"block","timeout":15"#);
+            let original = native_settings_json_document(
+                agent,
+                &format!(r#""PreToolUse":{entries}"#),
+                r#", "operator":{"first":{"name":"one","value":true},"second":{"name":"two","value":false},"Policy":null,"policy":[-9223372036854775808,18446744073709551615,1.25,"\u2603"]}"#,
+            );
+            let original_value: serde_json::Value = serde_json::from_str(&original).unwrap();
+            std::fs::write(&path, original.as_bytes()).unwrap();
+            let mut repaired = None;
+            for force in [false, true, false] {
+                let mut args = vec!["install"];
+                if !agent.is_empty() {
+                    args.push(agent);
+                }
+                if force {
+                    args.push("--force");
+                }
+                let output = run_hook_policy_install(home.path(), &args);
+                assert!(
+                    output.status.success(),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let bytes = std::fs::read(&path).unwrap();
+                let settings: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(settings["operator"], original_value["operator"]);
+                let guard = if matches!(agent, "--reasonix" | "--crush") {
+                    &settings["hooks"]["PreToolUse"][0]
+                } else {
+                    &settings["hooks"]["PreToolUse"][0]["hooks"][0]
+                };
+                assert_eq!(guard["onFailure"], "block");
+                assert_eq!(guard["timeout"], 15);
+                if let Some(previous) = &repaired {
+                    assert_eq!(
+                        &settings, previous,
+                        "{args:?} must preserve repaired settings"
+                    );
+                } else {
+                    repaired = Some(settings);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_settings_json_uninstall_refuses_ambiguous_operator_data() {
+        for agent in ["", "--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = native_settings_json_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let entries =
+                native_settings_json_entries(agent, r#""onFailure":"block","timeout":15"#);
+            let original = native_settings_json_document(
+                agent,
+                &format!(r#""PreToolUse":{entries}"#),
+                r#", "operator":{"policy":"strict","policy":"observe"}"#,
+            );
+            std::fs::write(&path, original.as_bytes()).unwrap();
+            let mut args = vec!["uninstall"];
+            if !agent.is_empty() {
+                args.push(agent);
+            }
+            let output = run_hook_policy_install(home.path(), &args);
+            assert!(
+                !output.status.success(),
+                "{args:?} must not discard operator data"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .to_ascii_lowercase()
+                    .contains("duplicate")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn native_settings_json_self_heal_keeps_ambiguous_file_and_still_blocks() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), "");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let entries = native_settings_json_entries(
+            "",
+            r#""onFailure":"block","onFailure":"continue","timeout":15"#,
+        );
+        let original = native_settings_json_document("", &format!(r#""PreToolUse":{entries}"#), "");
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        let tmp = home.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        for _ in 0..2 {
+            let mut child = Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+                .env("TMPDIR", &tmp)
+                .env("TEMP", &tmp)
+                .env("TMP", &tmp)
+                .env("DCG_SELF_HEAL_HOOK", "1")
+                .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                .env("DCG_PACKS", "core.git,core.filesystem")
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("NO_COLOR", "1")
+                .current_dir(home.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#)
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let denial: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(denial["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .to_ascii_lowercase()
+                    .contains("duplicate"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn native_settings_json_doctor_reports_ambiguity_without_repairing_it() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), "");
+        assert!(
+            run_hook_policy_install(home.path(), &["install"])
+                .status
+                .success()
+        );
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let original = format!(
+            r#"{{"operator":{{"policy":"strict","policy":"observe"}},"hooks":{}}}"#,
+            serde_json::to_string(&current["hooks"]).unwrap()
+        );
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        for args in [
+            &["doctor", "--format", "json"][..],
+            &["doctor", "--fix", "--format", "json"][..],
+        ] {
+            let output = run_hook_policy_install(home.path(), args);
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let wiring = report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["id"] == "hook_wiring")
+                .unwrap();
+            assert_eq!(wiring["status"], "error", "{wiring}");
+            assert_ne!(wiring["fixed"], true);
+            assert!(
+                wiring["message"]
+                    .as_str()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("duplicate")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn native_settings_json_grok_doctor_rejects_invalid_native_with_healthy_compat() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), "--grok");
+        for args in [&["install"][..], &["install", "--grok"][..]] {
+            let output = run_hook_policy_install(home.path(), args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let command =
+            serde_json::to_string(&current["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
+                .unwrap();
+        let duplicate_hook = format!(
+            r#"{{"type":"command","command":{command},"onFailure":"block","onFailure":"continue","timeout":15}}"#
+        );
+        let duplicate = native_settings_json_document(
+            "--grok",
+            &format!(r#""PreToolUse":[{{"matcher":"Bash","hooks":[{duplicate_hook}]}}]"#),
+            "",
+        );
+        for (original, diagnostic) in [("{".to_string(), None), (duplicate, Some("duplicate"))] {
+            std::fs::write(&path, original.as_bytes()).unwrap();
+            for args in [
+                &["doctor", "--format", "json"][..],
+                &["doctor", "--fix", "--format", "json"][..],
+            ] {
+                let output = run_hook_policy_install(home.path(), args);
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "doctor must emit one JSON document: {error}; stdout: {}; stderr: {}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        )
+                    });
+                let checks = report["checks"].as_array().unwrap();
+                let compat = checks
+                    .iter()
+                    .find(|check| check["id"] == "hook_wiring")
+                    .unwrap();
+                assert_eq!(compat["status"], "ok", "{compat}");
+                let native = checks
+                    .iter()
+                    .find(|check| check["id"] == "grok_hook")
+                    .unwrap();
+                assert_eq!(native["status"], "error", "{native}");
+                assert_ne!(native["fixed"], true);
+                assert_eq!(report["ok"], false);
+                let message = native["message"].as_str().unwrap().to_ascii_lowercase();
+                assert!(message.contains("invalid native grok"), "{native}");
+                if let Some(diagnostic) = diagnostic {
+                    assert!(message.contains(diagnostic), "{native}");
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn native_settings_json_grok_doctor_does_not_claim_async_policy_is_fixed() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), "--grok");
+        for args in [&["install"][..], &["install", "--grok"][..]] {
+            let output = run_hook_policy_install(home.path(), args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let hook = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+        hook["async"] = true.into();
+        hook["onFailure"] = "block".into();
+        hook["timeout"] = 15.into();
+        let expected = settings.clone();
+        settings["hooks"]["PreToolUse"][0]["matcher"] = "run_terminal_cmd".into();
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = "/retired/dcg".into();
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        for _ in 0..2 {
+            let output =
+                run_hook_policy_install(home.path(), &["doctor", "--fix", "--format", "json"]);
+            let report: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!(
+                        "doctor must emit one JSON document: {error}; stdout: {}; stderr: {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            let native = report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["id"] == "grok_hook")
+                .unwrap();
+            assert_eq!(native["status"], "error", "{native}");
+            assert_ne!(native["fixed"], true);
+            assert_eq!(report["ok"], false);
+            assert!(
+                native["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("synchronously"),
+                "{native}"
+            );
+            let repaired: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(repaired, expected, "repair must retain operator policy");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_settings_json_claude_and_antigravity_refuse_dangling_managed_links() {
+        for agent in ["", "--agy"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = native_settings_json_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let target = home.path().join("unavailable-operator-settings.json");
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            for force in [false, true] {
+                let mut args = vec!["install"];
+                if !agent.is_empty() {
+                    args.push(agent);
+                }
+                if force {
+                    args.push("--force");
+                }
+                let output = run_hook_policy_install(home.path(), &args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse a dangling link"
+                );
+                assert_eq!(std::fs::read_link(&path).unwrap(), target);
+                assert!(
+                    !target.exists(),
+                    "a missing managed target must stay missing"
+                );
+            }
+        }
+    }
+
     fn agent_policy_settings_path(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
         home.join(match agent {
             "--reasonix" => ".reasonix/settings.json",

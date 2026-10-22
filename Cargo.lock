@@ -977,6 +977,7 @@ dependencies = [
  "rich_rust",
  "rusqlite",
  "rust-mcp-sdk",
+ "rustix",
  "schemars",
  "self_update",
  "semver",

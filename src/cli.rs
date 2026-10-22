@@ -11279,11 +11279,11 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         print!("Checking Grok hook registration... ");
 
         let user_hook = grok_user_hook_path();
-        let user_hook_exists = user_hook.exists();
+        let native_probe = probe_grok_dcg_hook_at(&user_hook);
         let claude_compat_path = default_claude_settings_path();
         let claude_compat_diag = diagnose_hook_wiring_at(&claude_compat_path);
 
-        if user_hook_exists {
+        if matches!(&native_probe, Ok(true)) {
             println!("{}", "OK".green());
             println!("  Found: {}", user_hook.display());
             if claude_compat_diag.has_grok_compatible_hook() {
@@ -11292,7 +11292,9 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                     claude_compat_path.display()
                 );
             }
-        } else if claude_compat_diag.has_grok_compatible_hook() {
+        } else if matches!(&native_probe, Ok(false))
+            && claude_compat_diag.has_grok_compatible_hook()
+        {
             // Grok will use the Claude-compat path; this still works but the
             // native path is preferred. Surface as a friendly note, not an
             // error, so users who deliberately rely on Claude-compat aren't
@@ -11308,26 +11310,27 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 user_hook.display()
             );
         } else {
-            println!("{}", "NOT REGISTERED".yellow());
-            // Reached only when Grok is in use AND neither the native hook nor
-            // the Claude-compat path is wired — the guard is not guarding.
-            // This branch already incremented `fixed` on a successful repair;
-            // without the matching `issues` increment the summary verdict
-            // (`issues == 0 || (fix && fixed == issues)`) was corrupted in
-            // both directions: an unrelated unfixed issue could be masked, and
-            // a fully repaired machine could still report failure.
-            //
-            // `collect_doctor_report` carries the same check (id `grok_hook`)
-            // so `--strict` cannot give one answer for `--format json` and a
-            // different one here.
+            if let Err(error) = native_probe {
+                println!("{}", "INVALID".red());
+                println!("  {}: {error}", user_hook.display());
+            } else {
+                println!("{}", "NOT REGISTERED".yellow());
+            }
+            // Existing native configuration must be valid even if Claude
+            // compatibility is wired. Keep issue/fix accounting in sync with
+            // `collect_doctor_report`, and verify repairs before claiming success.
             issues += 1;
             if fix {
                 println!("  Attempting native install...");
-                if install_grok_hook(false, false).is_ok() {
-                    println!("  {}", "Fixed!".green());
-                    fixed += 1;
-                } else {
-                    println!("  {}", "Failed to fix".red());
+                match install_grok_hook_at(&user_hook, false)
+                    .and_then(|_| probe_grok_dcg_hook_at(&user_hook))
+                {
+                    Ok(true) => {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    }
+                    Ok(false) => println!("  {}", "Failed to fix: native hook is absent".red()),
+                    Err(error) => println!("  {}: {error}", "Failed to fix".red()),
                 }
             } else {
                 println!("  → Run 'dcg install --grok' to register the native hook");
@@ -12822,16 +12825,19 @@ fn collect_doctor_report(
     let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
     if grok_session_present || grok_home_exists {
         let user_hook = grok_user_hook_path();
+        let native_probe = probe_grok_dcg_hook_at(&user_hook);
         let claude_compat_path = default_claude_settings_path();
         let claude_compat_diag = diagnose_hook_wiring_at(&claude_compat_path);
         let mut grok_fixed = false;
-        let (status, message, remediation) = if user_hook.exists() {
+        let (status, message, remediation) = if matches!(&native_probe, Ok(true)) {
             (
                 DoctorCheckStatus::Ok,
                 format!("Native Grok hook found at {}", user_hook.display()),
                 None,
             )
-        } else if claude_compat_diag.has_grok_compatible_hook() {
+        } else if matches!(&native_probe, Ok(false))
+            && claude_compat_diag.has_grok_compatible_hook()
+        {
             // Wired via the Claude compatibility layer. Deliberately not an
             // error: users who rely on compat should not be pestered.
             (
@@ -12844,11 +12850,31 @@ fn collect_doctor_report(
                 Some("Run 'dcg install --grok' for a native hook".to_string()),
             )
         } else {
-            // Grok is in use and the guard is wired NOWHERE for it.
+            // A native file that cannot protect Grok must not be masked by
+            // Claude compatibility or reported fixed merely because it was written.
             issues += 1;
-            if fix && install_grok_hook(false, false).is_ok() {
-                fixed += 1;
-                grok_fixed = true;
+            let mut message = match native_probe {
+                Err(error) => format!(
+                    "Invalid native Grok hook at {}: {error}",
+                    user_hook.display()
+                ),
+                Ok(_) => "Grok is in use but dcg is registered neither natively nor via the \
+                          Claude compatibility layer"
+                    .to_string(),
+            };
+            if fix {
+                match install_grok_hook_at(&user_hook, false)
+                    .and_then(|_| probe_grok_dcg_hook_at(&user_hook))
+                {
+                    Ok(true) => {
+                        fixed += 1;
+                        grok_fixed = true;
+                    }
+                    Ok(false) => message.push_str("; repair left the native hook absent"),
+                    Err(error) => message = format!("{message}; repair failed: {error}"),
+                }
+            }
+            if grok_fixed {
                 (
                     DoctorCheckStatus::Ok,
                     format!("Installed native Grok hook at {}", user_hook.display()),
@@ -12857,10 +12883,11 @@ fn collect_doctor_report(
             } else {
                 (
                     DoctorCheckStatus::Error,
-                    "Grok is in use but dcg is registered neither natively nor via the \
-                     Claude compatibility layer"
-                        .to_string(),
-                    Some("Run 'dcg install --grok'".to_string()),
+                    message,
+                    Some(format!(
+                        "Review {} and run 'dcg install --grok'",
+                        user_hook.display()
+                    )),
                 )
             }
         };
@@ -13779,6 +13806,97 @@ fn is_dcg_hook_entry_for_matcher(entry: &serde_json::Value, matcher: &str) -> bo
 /// value onto the repaired hook.
 const DCG_OWNED_HOOK_KEYS: &[&str] = &["type", "command", "shell"];
 
+/// Parse an operator-owned settings document without discarding duplicate keys.
+///
+/// `serde_json::Value` normally keeps only the last value for an object key.
+/// A repair must not turn an ambiguous `onFailure`, `hooks`, or unrelated user
+/// setting into a single silently chosen policy. Check every object, including
+/// those nested in arrays, while retaining serde_json's syntax and depth limits.
+fn parse_hook_settings_json(content: &str) -> serde_json::Result<serde_json::Value> {
+    struct SettingsValue(serde_json::Value);
+    struct SettingsVisitor;
+
+    impl<'de> serde::Deserialize<'de> for SettingsValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(SettingsVisitor)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SettingsVisitor {
+        type Value = SettingsValue;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("JSON settings with unique object keys")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::Bool(value)))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::Number(value.into())))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::Number(value.into())))
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            serde_json::Number::from_f64(value)
+                .map(|number| SettingsValue(serde_json::Value::Number(number)))
+                .ok_or_else(|| E::custom("non-finite number in hook settings"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::String(value.to_owned())))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::String(value)))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::Null))
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(SettingsValue(value)) = sequence.next_element()? {
+                values.push(value);
+            }
+            Ok(SettingsValue(serde_json::Value::Array(values)))
+        }
+
+        fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut values = serde_json::Map::new();
+            while let Some(key) = object.next_key::<String>()? {
+                if values.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate object key {key:?} in hook settings"
+                    )));
+                }
+                let SettingsValue(value) = object.next_value()?;
+                values.insert(key, value);
+            }
+            Ok(SettingsValue(serde_json::Value::Object(values)))
+        }
+    }
+
+    serde_json::from_str::<SettingsValue>(content).map(|value| value.0)
+}
+
 /// Whether `hook` is the dcg hook `desired_hook` describes, judged on the
 /// dcg-owned keys only.
 ///
@@ -14049,19 +14167,22 @@ fn write_installer_hook_settings(
 fn install_hook_silent(force: bool) -> Result<bool, Box<dyn std::error::Error>> {
     let settings_path = claude_settings_path();
 
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        if let Some(parent) = settings_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let mut settings = match std::fs::read_to_string(&settings_path) {
+        Ok(content) => parse_hook_settings_json(&content)?,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error.into()),
     };
 
     let changed = install_dcg_hook_into_settings(&mut settings, force)?;
     if changed {
         let content = serde_json::to_string_pretty(&settings)?;
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         write_installer_hook_settings(&settings_path, &content)?;
     }
     Ok(changed)
@@ -14162,16 +14283,16 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
         claude_settings_path()
     };
 
-    // Read existing settings or create new
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        // Create parent directory if needed
-        if let Some(parent) = settings_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    // Only a genuinely missing file is a fresh install. Read errors and broken
+    // managed symlinks must not turn an operator's configuration into defaults.
+    let mut settings = match std::fs::read_to_string(&settings_path) {
+        Ok(content) => parse_hook_settings_json(&content)?,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error.into()),
     };
 
     let changed = install_dcg_hook_into_settings(&mut settings, force)?;
@@ -14198,6 +14319,9 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
 
     // Write back
     let content = serde_json::to_string_pretty(&settings)?;
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     write_installer_hook_settings(&settings_path, &content)?;
 
     let level = if project { "project" } else { "user" };
@@ -14246,6 +14370,90 @@ fn build_grok_hook_config() -> std::io::Result<serde_json::Value> {
     }))
 }
 
+/// Check the native Grok document before treating it as installed.
+///
+/// Only an absent file permits Claude-compatibility fallback. Existing invalid
+/// settings must remain visible to the operator, including ambiguous JSON that
+/// a normal `Value` parse would silently reduce to its last policy value.
+fn probe_grok_dcg_hook_at(hook_path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let content = match std::fs::read_to_string(hook_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !hook_path.is_symlink() => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let settings = parse_hook_settings_json(&content)?;
+    let settings = settings
+        .as_object()
+        .ok_or("Invalid native Grok settings (expected JSON object)")?;
+    let hooks = settings
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("Invalid native Grok hooks (expected JSON object)")?;
+    let entries = hooks
+        .get("PreToolUse")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Invalid native Grok PreToolUse hooks (expected JSON array)")?;
+    let defaults = build_grok_hook_config()?;
+    let desired_hook = &defaults["hooks"]["PreToolUse"][0]["hooks"][0];
+    let mut dcg_hook_count = 0;
+
+    for entry in entries {
+        let entry = entry
+            .as_object()
+            .ok_or("Invalid native Grok PreToolUse entry (expected JSON object)")?;
+        let matcher = entry
+            .get("matcher")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or("Invalid native Grok matcher (expected string)")
+            })
+            .transpose()?;
+        let handlers = entry
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("Invalid native Grok matcher hooks (expected JSON array)")?;
+        for hook in handlers {
+            let fields = hook
+                .as_object()
+                .ok_or("Invalid native Grok hook (expected JSON object)")?;
+            let hook_type = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Invalid native Grok hook type (expected string)")?;
+            let command = fields.get("command").and_then(serde_json::Value::as_str);
+            if hook_type == "command" && command.is_none_or(str::is_empty) {
+                return Err("Invalid native Grok hook command (expected nonempty string)".into());
+            }
+            let current_identity = hook_has_dcg_identity(hook, desired_hook);
+            if !current_identity && !command.is_some_and(is_dcg_command) {
+                continue;
+            }
+            dcg_hook_count += 1;
+            if !matches!(matcher, Some("Bash" | "run_terminal_cmd")) {
+                return Err("Native Grok dcg hook does not match the shell tool".into());
+            }
+            if !current_identity {
+                return Err("Native Grok dcg hook has a stale or invalid command identity".into());
+            }
+            if fields
+                .get("async")
+                .is_some_and(|value| value != &serde_json::Value::Bool(false))
+            {
+                return Err("Native Grok dcg hook must execute synchronously".into());
+            }
+        }
+    }
+
+    match dcg_hook_count {
+        1 => Ok(true),
+        0 => Err("Native Grok hook file does not register dcg".into()),
+        _ => Err("Native Grok hook file contains duplicate dcg registrations".into()),
+    }
+}
+
 /// Repair Grok's Claude-compatible hook registration without replacing the
 /// operator's failure policy, timeout, or other hook and file settings.
 fn install_grok_hook_into_settings(
@@ -14275,7 +14483,7 @@ fn install_grok_hook_at(
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut settings = match std::fs::read_to_string(hook_path) {
-        Ok(content) => serde_json::from_str(&content)?,
+        Ok(content) => parse_hook_settings_json(&content)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !hook_path.is_symlink() => {
             serde_json::json!({})
         }
@@ -14375,18 +14583,13 @@ fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn st
     // ~/.gemini/config/hooks.json and leaves a symlink at the old path. If the
     // canonical file is itself a symlink (or the old path exists as a real
     // file), prefer editing the real target so we don't clobber the symlink.
-    let mut settings: serde_json::Value = if hooks_path.exists() {
-        let content = std::fs::read_to_string(&hooks_path)?;
-        if content.trim().is_empty() {
+    let mut settings = match std::fs::read_to_string(&hooks_path) {
+        Ok(content) if content.trim().is_empty() => serde_json::json!({}),
+        Ok(content) => parse_hook_settings_json(&content)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !hooks_path.is_symlink() => {
             serde_json::json!({})
-        } else {
-            serde_json::from_str(&content)?
         }
-    } else {
-        if let Some(parent) = hooks_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        serde_json::json!({})
+        Err(error) => return Err(error.into()),
     };
 
     let changed = install_antigravity_hook_into_settings(&mut settings, force)?;
@@ -14397,6 +14600,9 @@ fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn st
     }
 
     let content = serde_json::to_string_pretty(&settings)?;
+    if let Some(parent) = hooks_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     write_installer_hook_settings(&hooks_path, &content)?;
 
     let level = if project { "project" } else { "user" };
@@ -14678,7 +14884,7 @@ fn read_crush_config(
     if content.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    Ok(serde_json::from_str(&content)?)
+    Ok(parse_hook_settings_json(&content)?)
 }
 
 /// Install the dcg hook into Crush's config (#388).
@@ -15133,7 +15339,7 @@ fn read_reasonix_settings(
     if content.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    Ok(serde_json::from_str(&content)?)
+    Ok(parse_hook_settings_json(&content)?)
 }
 
 /// Merge dcg's hook entry into the Reasonix settings at `path` without
@@ -15508,7 +15714,7 @@ fn read_muse_settings(
     if content.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    serde_json::from_str(&content).map_err(|error| {
+    parse_hook_settings_json(&content).map_err(|error| {
         format!(
             "{} is not valid JSON ({error}); fix it by hand, then retry",
             path.display()
@@ -16743,7 +16949,7 @@ fn probe_codex_dcg_hook_at(
     // Two-stage parse so a syntax error and a schema rejection get different
     // remedies: the first is a broken file, the second is a well-formed file
     // Codex refuses to load.
-    let json: serde_json::Value = match serde_json::from_str(&raw) {
+    let json = match parse_hook_settings_json(&raw) {
         Ok(json) => json,
         Err(err) => return CodexHookProbe::HooksFileInvalid(err.to_string()),
     };
@@ -18660,7 +18866,7 @@ fn uninstall_hook(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     // Read existing settings
     let content = std::fs::read_to_string(&settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+    let mut settings = parse_hook_settings_json(&content)?;
 
     // Remove dcg hooks (fail if settings structure is unexpected).
     let removed = uninstall_dcg_hook_from_settings(&mut settings)?;
@@ -19517,12 +19723,16 @@ fn which_executable(name: &str) -> Option<std::path::PathBuf> {
 #[allow(dead_code)]
 fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
     let settings_path = claude_settings_path();
-    if !settings_path.exists() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(&settings_path)?;
-    let settings: serde_json::Value = serde_json::from_str(&content)?;
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(content) => content,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let settings = parse_hook_settings_json(&content)?;
     let desired_hook = claude_dcg_hook()?;
 
     Ok(settings_has_exact_dcg_hook(&settings, &desired_hook))
@@ -19704,16 +19914,37 @@ fn try_acquire_self_heal_lock(
 /// - **Unix ownership and mode bits are preserved.** settings.json can hold API
 ///   keys in `env` blocks; a `chmod 600` file must remain private and readable by
 ///   its original owner even when a different user repairs its hook entry.
+///   On Linux/Android, preserve extended attributes as well, including POSIX
+///   ACLs: mode bits alone cannot express a restrictive ACL's access policy.
 fn write_settings_atomic(
     path: &std::path::Path,
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    write_settings_atomic_with_metadata(path, content, copy_file_permissions)
+}
+
+/// Keep the metadata step injectable so failures before publication can be
+/// tested without relying on privileges or filesystem-specific write failures.
+fn write_settings_atomic_with_metadata(
+    path: &std::path::Path,
+    content: &str,
+    copy_metadata: impl FnOnce(
+        &std::path::Path,
+        &std::fs::File,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
     // Resolve symlinks so the rename lands on the real file, and so the temp
-    // file shares its filesystem. A path that cannot be canonicalized (does
-    // not exist yet) keeps its literal form.
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // file shares its filesystem. Only a genuinely missing path may keep its
+    // literal form; an unreadable target or broken managed symlink is an error.
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
+            path.to_path_buf()
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let temp_name = format!(".dcg-settings-{}.tmp", std::process::id());
@@ -19732,8 +19963,10 @@ fn write_settings_atomic(
     let mut temp_file = options.open(&temp_path)?;
 
     let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        copy_file_permissions(&target, &temp_path)?;
+        // Keep content private until it is complete. Writes and ownership
+        // changes can clear security attributes, so copy metadata afterwards.
         temp_file.write_all(content.as_bytes())?;
+        copy_metadata(&target, &temp_file)?;
         temp_file.sync_all()?; // Ensure data is flushed to disk
         drop(temp_file);
 
@@ -19751,34 +19984,123 @@ fn write_settings_atomic(
     write_result
 }
 
-/// Copy `from`'s Unix ownership and permission bits onto `to` so an atomic replace
-/// does not silently widen a restrictive mode (e.g. a `chmod 600`
-/// settings.json or allowlist) or make it unreadable to its existing owner.
+/// Copy Unix ownership and permissions onto an open staging file. Linux and
+/// Android also preserve readable extended attributes, including POSIX ACLs,
+/// and remove attributes inherited by the stage that the original did not have.
 ///
-/// A missing/unreadable source is not an error: there is nothing to preserve,
-/// and the temp file's default mode is the correct outcome. On non-Unix this
-/// is a no-op: Windows ACLs are not copied to the replacement by `std::fs::rename`.
+/// Only a missing source has nothing to preserve. Metadata read/copy failures
+/// must abort before the caller publishes the stage. Other Unix platforms keep
+/// their ownership/mode behavior; their distinct ACL APIs are not covered here.
+/// On non-Unix this is a no-op; Windows ACLs require a separate platform API.
 #[allow(clippy::unnecessary_wraps)] // the non-unix arm still needs the Result shape
 fn copy_file_permissions(
     from: &std::path::Path,
-    to: &std::path::Path,
+    to: &std::fs::File,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, chown};
+        use std::os::unix::fs::MetadataExt;
 
-        if let Ok(metadata) = std::fs::metadata(from) {
-            let staged = std::fs::metadata(to)?;
-            if (metadata.uid(), metadata.gid()) != (staged.uid(), staged.gid()) {
-                chown(to, Some(metadata.uid()), Some(metadata.gid()))?;
+        let source = match std::fs::File::open(from) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !from.is_symlink() => {
+                return Ok(());
             }
-            // Changing ownership can clear mode bits, so restore them last.
-            std::fs::set_permissions(to, metadata.permissions())?;
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = source.metadata()?;
+        let staged = to.metadata()?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let attributes = read_file_xattrs(&source)?;
+
+        if (metadata.uid(), metadata.gid()) != (staged.uid(), staged.gid()) {
+            rustix::fs::fchown(
+                to,
+                Some(rustix::fs::Uid::from_raw(metadata.uid())),
+                Some(rustix::fs::Gid::from_raw(metadata.gid())),
+            )?;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        reconcile_file_xattrs(to, attributes.as_ref())?;
+
+        // Ownership changes can clear mode bits. Restore them only after the
+        // original security labels and ACL are installed: chmod first could
+        // briefly grant group access that the original ACL explicitly denied.
+        to.set_permissions(metadata.permissions())?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if read_file_xattrs(to)? != attributes {
+            return Err(
+                "Staged file security attributes changed while restoring permissions".into(),
+            );
         }
     }
     #[cfg(not(unix))]
     {
         let _ = (from, to);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type FileXattrs = std::collections::BTreeMap<std::ffi::CString, Vec<u8>>;
+
+/// Snapshot attributes through the opened inode. Linux limits both the name
+/// list and each value to 64 KiB; one reused buffer also preserves empty and
+/// non-UTF-8 values without allocating 64 KiB for every small attribute.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_file_xattrs(file: &std::fs::File) -> std::io::Result<Option<FileXattrs>> {
+    let mut names = vec![0_u8; 65_536];
+    let length = match rustix::fs::flistxattr(file, names.as_mut_slice()) {
+        Ok(length) => length,
+        Err(rustix::io::Errno::NOTSUP) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    names.truncate(length);
+
+    let mut attributes = FileXattrs::new();
+    let mut value = vec![0_u8; 65_536];
+    for name in names.split_inclusive(|byte| *byte == 0) {
+        let name = std::ffi::CStr::from_bytes_with_nul(name)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let length = rustix::fs::fgetxattr(file, name, value.as_mut_slice())?;
+        attributes.insert(name.to_owned(), value[..length].to_vec());
+    }
+    Ok(Some(attributes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reconcile_file_xattrs(file: &std::fs::File, source: Option<&FileXattrs>) -> std::io::Result<()> {
+    let staged = read_file_xattrs(file)?;
+    let (source, staged) = match (source, staged.as_ref()) {
+        (Some(source), Some(staged)) => (source, staged),
+        (None, None) => return Ok(()), // The shared filesystem has no xattr support.
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Cannot preserve security attributes across different xattr support",
+            ));
+        }
+    };
+
+    let mut names: Vec<_> = source.keys().chain(staged.keys()).collect();
+    names.sort_unstable();
+    names.dedup();
+    // Security labels must be restored before the access ACL can grant readers
+    // access to the stage. Its initial mode 0600 masks inherited group entries.
+    names.sort_by_key(|name| name.as_bytes() == b"system.posix_acl_access");
+    for name in names {
+        match (source.get(name), staged.get(name)) {
+            (Some(value), Some(old)) if value == old => {}
+            (Some(value), _) => {
+                rustix::fs::fsetxattr(
+                    file,
+                    name.as_c_str(),
+                    value,
+                    rustix::fs::XattrFlags::empty(),
+                )?;
+            }
+            (None, _) => rustix::fs::fremovexattr(file, name.as_c_str())?,
+        }
     }
     Ok(())
 }
@@ -19789,18 +20111,21 @@ fn ensure_hook_registered_at(
     settings_path: &std::path::Path,
     lock_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !settings_path.exists() {
-        // No settings.json at all — nothing to heal. The user hasn't run
-        // `dcg install` yet, or Claude Code hasn't been configured.
-        return Ok(());
-    }
-
-    let desired_hook = claude_dcg_hook()?;
-
     // Fast path (lock-free): if the hook is present, nothing to do. This is
     // the common case on every hook invocation, so it stays a read + parse.
-    let content = std::fs::read_to_string(settings_path)?;
-    let settings: serde_json::Value = serde_json::from_str(&content)?;
+    let content = match std::fs::read_to_string(settings_path) {
+        Ok(content) => content,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            // A genuinely missing file means the user has not installed the
+            // hook yet. An unavailable managed target must instead be reported.
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let desired_hook = claude_dcg_hook()?;
+    let settings = parse_hook_settings_json(&content)?;
     if settings_has_exact_dcg_hook(&settings, &desired_hook) {
         return Ok(());
     }
@@ -19816,7 +20141,7 @@ fn ensure_hook_registered_at(
     // Re-read under the lock so the modification applies to the freshest
     // snapshot (a concurrent healer may have already repaired the file).
     let content = std::fs::read_to_string(settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+    let mut settings = parse_hook_settings_json(&content)?;
     if settings_has_exact_dcg_hook(&settings, &desired_hook) {
         return Ok(());
     }
@@ -19918,21 +20243,23 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
 fn diagnose_hook_wiring_at(settings_path: &std::path::Path) -> HookDiagnostics {
     let mut diag = HookDiagnostics::default();
 
-    if !settings_path.exists() {
-        return diag;
-    }
-    diag.settings_exists = true;
-
     // Read and parse settings
     let content = match std::fs::read_to_string(settings_path) {
         Ok(c) => c,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            return diag;
+        }
         Err(e) => {
+            diag.settings_exists = true;
             diag.settings_error = Some(format!("Failed to read settings: {e}"));
             return diag;
         }
     };
+    diag.settings_exists = true;
 
-    let settings: serde_json::Value = match serde_json::from_str(&content) {
+    let settings = match parse_hook_settings_json(&content) {
         Ok(s) => s,
         Err(e) => {
             diag.settings_error = Some(format!("Invalid JSON: {e}"));
@@ -22110,7 +22437,10 @@ fn write_allowlist(
     // Preserve the existing file's permissions: a temp+rename replace
     // otherwise resets a deliberately restrictive mode (e.g. `chmod 600`) to
     // the process umask default.
-    copy_file_permissions(path, &temp_path)?;
+    let staged_file = std::fs::OpenOptions::new().write(true).open(&temp_path)?;
+    copy_file_permissions(path, &staged_file)?;
+    staged_file.sync_all()?;
+    drop(staged_file);
 
     // Create a backup before replacing the file so we can recover from write failures.
     let backup_path = backup_allowlist_file(path)?;
@@ -23714,6 +24044,140 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         let parsed_program = dcg_command_program(command).expect("dcg program");
         assert_eq!(std::path::Path::new(&parsed_program), executable);
         assert_ne!(command, "dcg");
+    }
+
+    #[test]
+    fn grok_hook_diagnostics_accept_current_native_and_legacy_matchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        assert!(!probe_grok_dcg_hook_at(&hook_path).unwrap());
+
+        for matcher in ["Bash", "run_terminal_cmd"] {
+            let mut settings = build_grok_hook_config().unwrap();
+            settings["hooks"]["PreToolUse"][0]["matcher"] = matcher.into();
+            let hook = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            hook["timeout"] = 15.into();
+            hook["onFailure"] = "block".into();
+            hook["future"] = serde_json::json!({"policy": ["operator-owned"]});
+            settings["hooks"]["PreToolUse"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "matcher": "Write", "hooks": [{"type": "command", "command": "audit"}]
+                }));
+            let original = serde_json::to_vec(&settings).unwrap();
+            std::fs::write(&hook_path, &original).unwrap();
+
+            assert!(probe_grok_dcg_hook_at(&hook_path).unwrap());
+            assert_eq!(std::fs::read(&hook_path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn grok_hook_diagnostics_reject_invalid_and_ambiguous_files_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        let fixtures: &[&[u8]] = &[
+            b"{",
+            b"\xff",
+            b"[]",
+            br#"{"hooks": []}"#,
+            br#"{"hooks": {"PreToolUse": {}}}"#,
+            br#"{"hooks": {"PreToolUse": [null]}}"#,
+            br#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": null}]}}"#,
+            br#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [null]}]}}"#,
+            br#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "dcg", "onFailure": "block", "onFailure": "continue"}]}]}}"#,
+            br#"{"hooks": {}, "hooks": {"PreToolUse": []}}"#,
+            br#"{"operator": [{"policy": "block", "policy": "continue"}]}"#,
+        ];
+        for original in fixtures {
+            std::fs::write(&hook_path, original).unwrap();
+            assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+            assert_eq!(std::fs::read(&hook_path).unwrap(), *original);
+        }
+        assert!(probe_grok_dcg_hook_at(dir.path()).is_err());
+    }
+
+    #[test]
+    fn grok_hook_diagnostics_reject_nonprotecting_native_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        let defaults = build_grok_hook_config().unwrap();
+        let mut fixtures = vec![serde_json::json!({"hooks": {"PreToolUse": []}})];
+        for (field, value) in [
+            ("type", serde_json::json!("prompt")),
+            ("command", serde_json::json!("/stale/dcg")),
+            ("command", serde_json::json!(null)),
+            ("async", serde_json::json!(true)),
+            ("async", serde_json::json!("false")),
+        ] {
+            let mut settings = defaults.clone();
+            settings["hooks"]["PreToolUse"][0]["hooks"][0][field] = value;
+            fixtures.push(settings);
+        }
+        let mut wrong_matcher = defaults.clone();
+        wrong_matcher["hooks"]["PreToolUse"][0]["matcher"] = "Write".into();
+        fixtures.push(wrong_matcher);
+        let mut duplicate = defaults.clone();
+        let mut second_hook = defaults["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+        duplicate["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"] = "block".into();
+        second_hook["onFailure"] = "continue".into();
+        duplicate["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_hook);
+        fixtures.push(duplicate);
+
+        for settings in fixtures {
+            let original = serde_json::to_vec(&settings).unwrap();
+            std::fs::write(&hook_path, &original).unwrap();
+            assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+            assert_eq!(std::fs::read(&hook_path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn grok_hook_diagnostics_verify_repairs_without_weakening_failure_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        std::fs::write(
+            &hook_path,
+            br#"{"hooks": {"PreToolUse": [{"matcher": "run_terminal_cmd", "hooks": [{"type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+
+        for force in [false, false, true] {
+            install_grok_hook_at(&hook_path, force).unwrap();
+            assert!(probe_grok_dcg_hook_at(&hook_path).unwrap());
+            let settings =
+                parse_hook_settings_json(&std::fs::read_to_string(&hook_path).unwrap()).unwrap();
+            let hook = &settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            assert_eq!(hook["onFailure"], "block");
+            assert_eq!(hook["timeout"], 15);
+        }
+
+        let mut settings = build_grok_hook_config().unwrap();
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = true.into();
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"] = "block".into();
+        std::fs::write(&hook_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        install_grok_hook_at(&hook_path, true).unwrap();
+        assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+        let after =
+            parse_hook_settings_json(&std::fs::read_to_string(&hook_path).unwrap()).unwrap();
+        assert_eq!(after, settings, "repair must not override operator policy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_hook_diagnostics_reject_dangling_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        let target = dir.path().join("missing.json");
+        std::os::unix::fs::symlink(&target, &hook_path).unwrap();
+        assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+        assert_eq!(std::fs::read_link(&hook_path).unwrap(), target);
+        assert!(!target.exists());
     }
 
     #[test]
@@ -33793,6 +34257,116 @@ added_at = 2026-08-01T12:00:00Z
     }
 
     #[test]
+    fn native_settings_json_parser_refuses_duplicate_keys_at_every_depth() {
+        for content in [
+            r#"{"onFailure":"block","onFailure":"continue"}"#,
+            r#"{"timeout":15,"timeout":15}"#,
+            r#"{"hooks":{},"hooks":{}}"#,
+            r#"{"hooks":{"PreToolUse":[],"PreToolUse":[]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"onFailure":"block","on\u0046ailure":"continue"}]}]}}"#,
+            r#"{"operator":{"policy":[{"enabled":true,"enabled":false}]}}"#,
+            r#"{"\u0061":1,"a":2}"#,
+            r#"{"":1,"":2}"#,
+        ] {
+            let error = parse_hook_settings_json(content).expect_err("ambiguous settings");
+            assert!(
+                error.to_string().contains("duplicate object key"),
+                "{error}"
+            );
+            assert!(error.line() > 0 && error.column() > 0, "{error}");
+        }
+    }
+
+    #[test]
+    fn native_settings_json_parser_preserves_unique_values_and_existing_depth_limits() {
+        let content = r#"{
+            "hooks":{"PreToolUse":[
+                {"matcher":"Bash","hooks":[{"type":"command","command":"dcg","onFailure":"block"}]},
+                {"matcher":"Write","hooks":[{"type":"command","command":"audit","onFailure":"continue"}]}
+            ]},
+            "values":[null,true,false,-9223372036854775808,18446744073709551615,-0.0,1.25,1e308,-1e-100,"quote\" and unicode \u2603"],
+            "$serde_json::private::Number":"literal operator data",
+            "operator":{"onFailure":"keep","nested":{"onFailure":"keep too"}}
+        }"#;
+        let expected: serde_json::Value = serde_json::from_str(content).unwrap();
+        let parsed = parse_hook_settings_json(content).unwrap();
+        assert_eq!(parsed, expected);
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+
+        for depth in [16, 128, 256] {
+            let nested = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            let standard = serde_json::from_str::<serde_json::Value>(&nested);
+            let strict = parse_hook_settings_json(&nested);
+            assert_eq!(strict.is_ok(), standard.is_ok(), "depth {depth}");
+            if let (Ok(strict), Ok(standard)) = (strict, standard) {
+                assert_eq!(strict, standard);
+            }
+        }
+        for malformed in [
+            "",
+            "NaN",
+            "Infinity",
+            "1e999",
+            "{} true",
+            "{\"hooks\":[]",
+            "[1,]",
+        ] {
+            assert!(parse_hook_settings_json(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn native_settings_json_self_heal_refuses_ambiguity_even_when_last_hook_is_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("settings.lock");
+        let current = serde_json::json!({"PreToolUse": [{
+            "matcher": CLAUDE_SHELL_MATCHER, "hooks": [claude_dcg_hook().unwrap()]
+        }]});
+        let original = format!(
+            "{{\"hooks\":{{\"PreToolUse\":[{{\"hooks\":[{{\"onFailure\":\"block\"}}]}}]}},\"hooks\":{current}}}"
+        );
+        std::fs::write(&settings_path, &original).unwrap();
+        for _ in 0..2 {
+            let error = ensure_hook_registered_at(&settings_path, &lock_path).unwrap_err();
+            assert!(
+                error.to_string().contains("duplicate object key"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), original);
+        }
+        let diagnostics = diagnose_hook_wiring_at(&settings_path);
+        assert!(diagnostics.settings_exists);
+        assert!(!diagnostics.settings_valid);
+        assert!(
+            diagnostics
+                .settings_error
+                .unwrap()
+                .contains("duplicate object key")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_settings_json_self_heal_and_diagnostics_report_broken_managed_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let target = dir.path().join("unavailable-settings.json");
+        let lock_path = dir.path().join("settings.lock");
+        std::os::unix::fs::symlink(&target, &settings_path).unwrap();
+        assert!(ensure_hook_registered_at(&settings_path, &lock_path).is_err());
+        let diagnostics = diagnose_hook_wiring_at(&settings_path);
+        assert!(diagnostics.settings_exists);
+        assert!(!diagnostics.settings_valid);
+        assert!(diagnostics.settings_error.is_some());
+        assert_eq!(std::fs::read_link(&settings_path).unwrap(), target);
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn native_hook_policy_unions_all_duplicates_without_widening_siblings() {
         let desired = claude_dcg_hook().unwrap();
         for force in [false, true] {
@@ -34377,6 +34951,193 @@ added_at = 2026-08-01T12:00:00Z
             "restrictive mode must survive the atomic write"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"new\": true}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_group_denied_acl(owner: u32) -> Vec<u8> {
+        // Linux's posix_acl_xattr ABI: version 2, then little-endian
+        // (tag, permissions, id) entries. Group mode bits reflect the mask,
+        // not group::---, so losing this ACL widens access despite mode 0640.
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 0x06_u16, u32::MAX), // user::rw-
+            (0x02, 0x04, owner),            // named user:r--
+            (0x04, 0x00, u32::MAX),         // group::---
+            (0x10, 0x04, u32::MAX),         // mask::r--
+            (0x20, 0x00, u32::MAX),         // other::---
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        acl
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn write_settings_atomic_preserves_access_acl_and_xattrs_on_repeated_repairs() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&duplicated_dcg_policy_settings()).unwrap(),
+        )
+        .unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        let acl = linux_group_denied_acl(original.metadata().unwrap().uid());
+        for (name, value) in [
+            (c"system.posix_acl_access", acl.as_slice()),
+            (c"user.dcg_policy", b"operator policy".as_slice()),
+            (c"user.dcg_binary", [0_u8, 255, 1, 0].as_slice()),
+            (c"user.dcg_empty", [].as_slice()),
+        ] {
+            rustix::fs::fsetxattr(&original, name, value, rustix::fs::XattrFlags::empty()).unwrap();
+        }
+        let original_attributes = read_file_xattrs(&original).unwrap().unwrap();
+        assert_eq!(
+            original_attributes.get(c"system.posix_acl_access"),
+            Some(&acl)
+        );
+        assert_eq!(original.metadata().unwrap().mode() & 0o777, 0o640);
+
+        for _ in 0..2 {
+            let mut settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            install_dcg_hook_into_settings(&mut settings, true).unwrap();
+            write_settings_atomic(&path, &serde_json::to_string_pretty(&settings).unwrap())
+                .unwrap();
+
+            let updated = std::fs::File::open(&path).unwrap();
+            assert_eq!(updated.metadata().unwrap().mode() & 0o777, 0o640);
+            assert_eq!(
+                read_file_xattrs(&updated).unwrap().as_ref(),
+                Some(&original_attributes),
+                "ACLs and binary/empty operator attributes must survive every replacement"
+            );
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(canonical_dcg_hook(&settings)["onFailure"], "block");
+            assert_eq!(canonical_dcg_hook(&settings)["timeout"], 15);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn write_settings_atomic_does_not_add_an_inherited_access_acl() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let content = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg","onFailure":"block","timeout":15}]}]}}"#;
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        // Add a directory default ACL only after the original file exists.
+        // Each new stage inherits it; the original has no access ACL to copy.
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let acl = linux_group_denied_acl(directory.metadata().unwrap().uid());
+        rustix::fs::fsetxattr(
+            &directory,
+            c"system.posix_acl_default",
+            &acl,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let before = std::fs::metadata(&path).unwrap();
+            write_settings_atomic(&path, content).unwrap();
+            let updated = std::fs::File::open(&path).unwrap();
+            assert_ne!(before.ino(), updated.metadata().unwrap().ino());
+            assert_eq!(updated.metadata().unwrap().mode() & 0o777, 0o640);
+            assert_eq!(
+                rustix::fs::fgetxattr(&updated, c"system.posix_acl_access", &mut [0_u8; 128]),
+                Err(rustix::io::Errno::NODATA),
+                "a parent default ACL must not change the original file's access policy"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_settings_atomic_metadata_failure_preserves_previous_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original_content = br#"{"onFailure":"block","timeout":15}"#;
+        std::fs::write(&path, original_content).unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let acl = linux_group_denied_acl(original.metadata().unwrap().uid());
+            rustix::fs::fsetxattr(
+                &original,
+                c"system.posix_acl_access",
+                &acl,
+                rustix::fs::XattrFlags::empty(),
+            )
+            .unwrap();
+            rustix::fs::fsetxattr(
+                &original,
+                c"user.dcg_policy",
+                b"keep policy",
+                rustix::fs::XattrFlags::empty(),
+            )
+            .unwrap();
+        }
+        let original_metadata = original.metadata().unwrap();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let original_attributes = read_file_xattrs(&original).unwrap();
+        let result = write_settings_atomic_with_metadata(
+            &path,
+            r#"{"onFailure":"block","timeout":30}"#,
+            |source, stage| {
+                assert_eq!(stage.metadata()?.mode() & 0o777, 0o600);
+                copy_file_permissions(source, stage)?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected metadata copy failure",
+                )
+                .into())
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected metadata copy failure")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original_content);
+        let after = std::fs::File::open(&path).unwrap();
+        let after_metadata = after.metadata().unwrap();
+        assert_eq!(after_metadata.ino(), original_metadata.ino());
+        assert_eq!(after_metadata.uid(), original_metadata.uid());
+        assert_eq!(after_metadata.gid(), original_metadata.gid());
+        assert_eq!(after_metadata.mode(), original_metadata.mode());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(read_file_xattrs(&after).unwrap(), original_attributes);
+        assert!(
+            !dir.path()
+                .join(format!(".dcg-settings-{}.tmp", std::process::id()))
+                .exists()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_file_permissions_refuses_unavailable_managed_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("missing-settings.json");
+        let managed_link = dir.path().join("managed-settings.json");
+        std::os::unix::fs::symlink(&source, &managed_link).unwrap();
+        let stage_path = dir.path().join("stage.json");
+        let stage = std::fs::File::create(&stage_path).unwrap();
+
+        assert!(copy_file_permissions(&source, &stage).is_ok());
+        assert!(copy_file_permissions(&managed_link, &stage).is_err());
     }
 
     #[test]
