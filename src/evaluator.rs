@@ -33158,12 +33158,17 @@ fn exec_sink_pack_verdict(
         .or_else(|| decoded_program.map(|(word, program)| (word, Some(program))))
         .filter(|_| command.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
         .map(|(range, program)| (command.to_owned(), range, program, content.language));
-    let mut budget = crate::ast_matcher::protected_scan_budget();
+    // The proof's budget grows with the program it reads (#555). Past the
+    // base budget it may take at most half of what remains of the deadline:
+    // the rest of the evaluation needs the other half.
+    let mut budget = crate::ast_matcher::protected_scan_budget_for(content.content.len());
     if let Some(deadline) = context.deadline {
         let Some(remaining) = deadline.remaining() else {
             return Some(EvaluationResult::indeterminate_due_to_budget());
         };
-        budget = budget.min(remaining);
+        budget = budget
+            .min((remaining / 2).max(crate::ast_matcher::protected_scan_budget()))
+            .min(remaining);
     }
     let recovered = match crate::ast_matcher::interpreter_literal_shell_commands(
         &content.content,

@@ -525,9 +525,11 @@ mod shared_literal_ast_tests {
             "#{}\ntext = '$(git reset --hard)'",
             "x".repeat(LITERAL_EVIDENCE_MAX_BYTES)
         );
+        // Past the evidence screen's node bound and denser than one node per
+        // source byte, which bounds the recovery's tree at any length.
         let many_nodes = format!(
             "{}text = '$(git reset --hard)'",
-            "pass\n".repeat(LITERAL_EVIDENCE_MAX_NODES)
+            "0;".repeat(4 * LITERAL_EVIDENCE_MAX_NODES)
         );
         for (language, source) in [
             (

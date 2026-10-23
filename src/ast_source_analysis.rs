@@ -75,6 +75,7 @@ pub(crate) fn inert_documentation_literal_ranges(
     let mut proof = DocumentationProof {
         language,
         values: std::collections::BTreeMap::new(),
+        max_values: 128,
         literals: Vec::new(),
         remaining_steps: 16_384,
     };
@@ -88,6 +89,8 @@ pub(crate) fn inert_documentation_literal_ranges(
 struct DocumentationProof {
     language: ScriptLanguage,
     values: std::collections::BTreeMap<String, DocumentationValue>,
+    /// How many names the proof may bind before it gives up.
+    max_values: usize,
     literals: Vec<std::ops::Range<usize>>,
     remaining_steps: usize,
 }
@@ -120,7 +123,7 @@ impl DocumentationProof {
             },
             "assignment" | "variable_declarator" => {
                 // Additional named children include evaluated annotations.
-                if named.len() != 2 || self.values.len() >= 128 {
+                if named.len() != 2 || self.values.len() >= self.max_values {
                     return None;
                 }
                 let left = node.field("left").or_else(|| node.field("name"))?;
@@ -332,6 +335,16 @@ const MAX_INTERPRETER_LITERAL_NODES: usize = 16 * 1024;
 const MAX_INTERPRETER_LITERAL_CANDIDATES: usize = 128;
 const MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES: usize = 64 * 1024;
 
+/// The node ceiling, and the documentation proof's step budget, for a program
+/// of `source_len` bytes: [`MAX_INTERPRETER_LITERAL_NODES`], or one node per
+/// source byte when that is more. Ordinary code has well under one node per
+/// byte, so a 1,000-line edit script no longer exceeds a ceiling sized for a
+/// 300-line one (#555), while a tree denser than its own source still does.
+/// The byte cap bounds the walk, and the worker's deadline its wall time.
+fn interpreter_literal_node_limit(source_len: usize) -> usize {
+    MAX_INTERPRETER_LITERAL_NODES.max(source_len)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LiteralModule {
     PythonOs,
@@ -355,10 +368,11 @@ type LiteralBindings = std::collections::BTreeMap<String, LiteralBinding>;
 fn literal_prefix_has_no_function_hoisting<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     language: ScriptLanguage,
+    node_limit: usize,
 ) -> bool {
     language != ScriptLanguage::JavaScript
         || root.dfs().enumerate().all(|(index, node)| {
-            index < MAX_INTERPRETER_LITERAL_NODES
+            index < node_limit
                 && !matches!(
                     node.kind().as_ref(),
                     "function_declaration" | "generator_function_declaration"
@@ -718,7 +732,7 @@ fn inert_named_exec_literal_ranges<D: ast_grep_core::Doc>(
     code: &str,
     language: ScriptLanguage,
 ) -> Vec<std::ops::Range<usize>> {
-    if !literal_prefix_has_no_function_hoisting(root, language) {
+    if !literal_prefix_has_no_function_hoisting(root, language, MAX_INTERPRETER_LITERAL_NODES) {
         return Vec::new();
     }
     let Some(owned) =
@@ -822,8 +836,9 @@ fn evaluated_shell_dependency(
         return Ok(None);
     };
     let root = ast.root();
+    let node_limit = interpreter_literal_node_limit(code.len());
     for (index, node) in root.dfs().enumerate() {
-        if index >= MAX_INTERPRETER_LITERAL_NODES {
+        if index >= node_limit {
             return Err(interpreter_literal_parse_error(
                 language,
                 "evaluated AST node limit",
@@ -874,8 +889,9 @@ fn evaluated_shell_dependency(
 fn evaluated_literal_commands<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     language: ScriptLanguage,
+    node_limit: usize,
 ) -> Result<Vec<ReconstructedCommand>, MatchError> {
-    if !literal_prefix_has_no_function_hoisting(root, language) {
+    if !literal_prefix_has_no_function_hoisting(root, language, node_limit) {
         return Ok(Vec::new());
     }
     let mut bindings = LiteralBindings::new();
@@ -1135,8 +1151,9 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
     {
         return Ok(Vec::new());
     }
+    let node_limit = interpreter_literal_node_limit(code.len());
     for (index, node) in root.dfs().enumerate() {
-        if index >= MAX_INTERPRETER_LITERAL_NODES {
+        if index >= node_limit {
             return Err(interpreter_literal_parse_error(language, "AST node limit"));
         }
         if node.is_error() || node.is_missing() {
@@ -1144,11 +1161,14 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
         }
     }
     if allow_documentation_literals {
+        // An edit script of a thousand lines binds hundreds of names; the
+        // step budget, which every binding spends, bounds the work (#555).
         let mut proof = DocumentationProof {
             language,
             values: std::collections::BTreeMap::new(),
+            max_values: node_limit / 16,
             literals: Vec::new(),
-            remaining_steps: 16_384,
+            remaining_steps: node_limit,
         };
         if proof.expression(&root, 0).is_some() {
             return Ok(Vec::new());
@@ -1164,7 +1184,7 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
     );
     owned_call_starts.sort_unstable();
     owned_call_starts.dedup();
-    let mut commands = evaluated_literal_commands(&root, language)?;
+    let mut commands = evaluated_literal_commands(&root, language, node_limit)?;
     let mut pending = vec![root];
     let mut candidates = commands.len();
     let mut payload_bytes = commands
@@ -1613,6 +1633,18 @@ pub(crate) fn protected_scan_budget() -> Duration {
             .map_or(FLOOR_MS, |ms| ms.clamp(FLOOR_MS, 60_000))
     });
     Duration::from_millis(*MILLIS)
+}
+
+/// [`protected_scan_budget`] for a proof over `source_len` bytes of source:
+/// one base budget per started 8 KiB, at most sixteen. Parsing and proving a
+/// 600-line program takes several base budgets, so a fixed one left a benign
+/// large heredoc unverified (#555). The caller still bounds the result by what
+/// remains of its deadline.
+pub(crate) fn protected_scan_budget_for(source_len: usize) -> Duration {
+    const BYTES_PER_BUDGET: usize = 8 * 1024;
+    const MAX_BUDGETS: usize = 16;
+    let budgets = (source_len / BYTES_PER_BUDGET + 1).min(MAX_BUDGETS);
+    protected_scan_budget().saturating_mul(u32::try_from(budgets).unwrap_or(1))
 }
 
 fn protected_matches(
@@ -2458,7 +2490,11 @@ mod tests {
             "s = '`git branch -d x`'\n#{}",
             "x".repeat(MAX_INTERPRETER_LITERAL_SOURCE_BYTES)
         );
-        let many_nodes = format!("# `git branch -d x`\n{}", "pass\n".repeat(4096));
+        // Denser than one node per source byte, the bound for any length.
+        let many_nodes = format!(
+            "# `git branch -d x`\n{}",
+            "0;".repeat(MAX_INTERPRETER_LITERAL_NODES)
+        );
         let many_literals =
             "consume('`git branch -d x`')\n".repeat(MAX_INTERPRETER_LITERAL_CANDIDATES + 1);
         let large_literal = format!(
@@ -2805,10 +2841,10 @@ mod tests {
                 for index in 0..1400 {
                     match language {
                         ScriptLanguage::Python => {
-                            let _ = write!(source, "value_{index} = 'documentation'\\n");
+                            let _ = writeln!(source, "value_{index} = 'documentation'");
                         }
                         ScriptLanguage::JavaScript => {
-                            let _ = write!(source, "const value_{index} = 'documentation';\\n");
+                            let _ = writeln!(source, "const value_{index} = 'documentation';");
                         }
                         _ => unreachable!("bounded language table"),
                     }
@@ -2826,7 +2862,7 @@ mod tests {
                     "fixture must exercise the former node ceiling: {language:?}: {nodes}"
                 );
                 assert!(
-                    nodes < MAX_INTERPRETER_LITERAL_NODES,
+                    nodes < interpreter_literal_node_limit(source.len()),
                     "fixture must stay inside the retained hard bound: {language:?}: {nodes}"
                 );
                 assert!(
