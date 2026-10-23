@@ -6211,9 +6211,18 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // crate family cannot enforce those without unbounded false
         // positives, and the canonical form is the one agents actually
         // reproduce (issue #302).
+        //
+        // The name starts where a word starts and is taken whole: a shorter
+        // name would be followed by a name character, which `\s*\(` cannot
+        // match, so the atomic group gives up nothing that could match. Tried
+        // from every byte and every length, the search ran out of its
+        // backtracking budget on a long program (every `f()` call in a large
+        // Python heredoc forces this pack), which left the whole command
+        // unverified (#555). A name inside a longer word (`x:` of `x:()`)
+        // defines another function, which no bomb is.
         destructive_pattern!(
             "fork-bomb",
-            r"([A-Za-z0-9_:]+)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*;?\s*\}\s*;\s*\1",
+            r"(?<![A-Za-z0-9_:])((?>[A-Za-z0-9_:]+))\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*;?\s*\}\s*;\s*\1",
             "This is a fork bomb: it recursively spawns processes until the system is unusable.",
             Critical,
             "A fork bomb defines a function that pipes itself into itself in the \
@@ -6461,15 +6470,34 @@ mod tests {
                 "fork-bomb regex must match: {bomb}"
             );
         }
-        // Same-shape functions piping two DIFFERENT commands are not bombs.
+        // Same-shape functions piping two DIFFERENT commands are not bombs,
+        // nor is a function whose name only ends in the piped one (`x:`
+        // pipes the `:` builtin).
         for benign in [
             "serve(){ python|tee & };logs",
             "f(){ a|b& };f",
             "retry(){ curl -s x|jq . ; };retry",
+            "x:(){ :|:& };:",
         ] {
             assert!(
                 !fork_bomb.regex.is_match(benign),
                 "non-self-referential function must not match fork-bomb: {benign}"
+            );
+        }
+        // A long program full of calls (each `f()` forces this pack) is
+        // searched within the backtracking budget, and a bomb after it is
+        // still found (#555). Tried at every length of every name, this
+        // 36 KB program took several times the budget.
+        let program = "    value_from_the_configuration_file = read_text()\n".repeat(700);
+        for (command, bomb) in [
+            (program.clone(), false),
+            (format!("{program}:(){{ :|:& }};:"), true),
+        ] {
+            let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+            assert_eq!(fork_bomb.regex.is_match(&command), bomb);
+            assert!(
+                !scope.has_failed(),
+                "the fork-bomb search must finish on a long program"
             );
         }
     }

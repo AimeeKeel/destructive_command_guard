@@ -83,15 +83,22 @@ pub(crate) fn record_incomplete_analysis(
     recorded
 }
 
-fn record_evaluation_failure(stage: &'static str, error: &impl std::fmt::Display) {
+fn record_evaluation_failure(stage: &'static str, pattern: &str, error: &impl std::fmt::Display) {
     EVALUATION_FAILURES.with(|stack| {
         if let Some(failed) = stack.borrow_mut().last_mut() {
             *failed = true;
             crate::perf::note_incomplete_analysis(stage);
         }
     });
-    // Engine diagnostics contain no submitted command text.
-    tracing::debug!(target: "dcg_perf", stage, error = %error, "regex analysis incomplete");
+    // Engine diagnostics contain no submitted command text. The pattern is a
+    // rule's own, and names which rule could not finish.
+    tracing::debug!(
+        target: "dcg_perf",
+        stage,
+        pattern,
+        error = %error,
+        "regex analysis incomplete"
+    );
 }
 
 /// Maximum backtracking steps allowed per fancy_regex match.
@@ -245,7 +252,7 @@ impl CompiledRegex {
         match self {
             Self::Linear(re) => re.is_match(text),
             Self::Backtracking(re) => re.is_match(text).unwrap_or_else(|error| {
-                record_evaluation_failure("match", &error);
+                record_evaluation_failure("match", re.as_str(), &error);
                 false
             }),
         }
@@ -262,7 +269,7 @@ impl CompiledRegex {
             Self::Backtracking(re) => re
                 .find(text)
                 .unwrap_or_else(|error| {
-                    record_evaluation_failure("find", &error);
+                    record_evaluation_failure("find", re.as_str(), &error);
                     None
                 })
                 .map(|m| (m.start(), m.end())),
@@ -285,7 +292,7 @@ impl CompiledRegex {
             Self::Backtracking(re) => re
                 .find_from_pos(text, start)
                 .unwrap_or_else(|error| {
-                    record_evaluation_failure("find_from", &error);
+                    record_evaluation_failure("find_from", re.as_str(), &error);
                     None
                 })
                 .map(|m| (m.start(), m.end())),
@@ -318,7 +325,7 @@ impl CompiledRegex {
             Self::Linear(re) => re.replacen(text, limit, rep),
             // Use try_replacen to handle errors gracefully (returns Result)
             Self::Backtracking(re) => re.try_replacen(text, limit, rep).unwrap_or_else(|error| {
-                record_evaluation_failure("replace", &error);
+                record_evaluation_failure("replace", re.as_str(), &error);
                 Cow::Borrowed(text)
             }),
         }
@@ -641,7 +648,7 @@ impl LazyCompiledRegex {
         {
             Ok(compiled) => Some(compiled),
             Err(error) => {
-                record_evaluation_failure("compile", error);
+                record_evaluation_failure("compile", self.pattern.as_str(), error);
                 None
             }
         }
