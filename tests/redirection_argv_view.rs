@@ -250,6 +250,11 @@ fn redirect_at_the_command_word_does_not_hide_git() {
             // A `#` after an expansion's `)` is part of its word, no comment.
             "echo $(date)#1; git>/dev/null reset --hard",
             "echo $((1+1))#x; git>/dev/null reset --hard",
+            // So is one inside `${…}`, or after a carriage return, which is
+            // no blank to the shell.
+            "echo ${x:- #}; git>/dev/null reset --hard",
+            "echo ${x:-${y} #}; git>/dev/null reset --hard",
+            "echo a\r#b; git>/dev/null reset --hard",
         ],
         "core.git",
     );
@@ -269,6 +274,8 @@ fn redirect_at_the_command_word_keeps_benign_git_allowed() {
         "echo 'git>/dev/null reset --hard'",
         "cat <<'EOF' >notes.md\ngit>/dev/null reset --hard is dangerous\nEOF",
         "echo $(date)#1; git>/dev/null status",
+        "echo ${x:- #}; git>/dev/null status",
+        "ls # git>/dev/null reset --hard",
     ]);
 }
 
@@ -285,6 +292,7 @@ fn trailing_redirect_does_not_hide_the_device_operand() {
             "cp x /dev/sda <<<x",
             "install x /dev/sdb 2> err.txt",
             "cp x /dev/sda 2>/dev/null; echo ok",
+            "echo ${x:- #}; cp x /dev/sda 2>/dev/null",
         ],
         "system.disk",
     );
@@ -298,7 +306,33 @@ fn trailing_redirect_keeps_benign_copies_allowed() {
         "cp x y.img 2>/dev/null",
         "cp x ./out >log 2>&1",
         "install -m 755 x ./bin/x 2>/dev/null",
+        "echo ${x:- #}; cp x y.img 2>/dev/null",
     ]);
+}
+
+/// The inline-script readers take their view of the command from the same
+/// redirect blanker, so a `#` it took for a comment where the shell does not
+/// also hid a redirect standing between a shell and its `-c`.
+#[test]
+fn shell_command_strings_after_a_non_comment_hash_are_judged() {
+    for command in [
+        "echo ${x:- #}; bash 2>/dev/null -c 'git reset --hard'",
+        "echo $(date)#1; sh 2>&1 -c 'git reset --hard'",
+    ] {
+        for dialect in DIALECTS {
+            let result = evaluate(command, dialect);
+            assert!(
+                result.is_denied(),
+                "{command:?} must be denied under {dialect:?}, got {result:?}"
+            );
+        }
+        assert_eq!(
+            hook_decision(command),
+            "deny",
+            "{command:?} through the hook"
+        );
+    }
+    assert_allowed(&["echo ${x:- #}; bash 2>/dev/null -c 'ls -la'"]);
 }
 
 /// Cmd and PowerShell take a redirection out of the argv wherever it stands

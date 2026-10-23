@@ -440,9 +440,20 @@ impl ContextClassifier {
                             i += 2;
                             continue;
                         }
+                        // `${…}` is part of the word it is in, blanks, `;`
+                        // and `#` included: pass over it whole, so a `#`
+                        // after a blank inside it starts no comment.
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                            i = consume_braced_parameter(command, i, true).0;
+                            continue;
+                        }
+                        // A carriage return or form feed is no blank to the
+                        // shell: a `#` right after one is part of a word.
                         b'#' if i == 0
-                            || bytes[i - 1].is_ascii_whitespace()
-                            || matches!(bytes[i - 1], b'|' | b'&' | b';') =>
+                            || matches!(
+                                bytes[i - 1],
+                                b' ' | b'\t' | b'\n' | b'|' | b'&' | b';'
+                            ) =>
                         {
                             // Comment start if start of word (including after separators).
                             if i > span_start {
@@ -574,7 +585,11 @@ impl ContextClassifier {
                         b'"' => stack.push(TokenizerState::DoubleQuote),
                         b'\'' => stack.push(TokenizerState::SingleQuote),
                         b'`' => stack.push(TokenizerState::Backtick),
-                        b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() => {
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                            i = consume_braced_parameter(command, i, true).0;
+                            continue;
+                        }
+                        b'#' if i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n') => {
                             stack.push(TokenizerState::Comment);
                         }
                         _ => {}
@@ -2585,8 +2600,10 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
             continue;
         }
 
-        // Check for comment start
-        if i < len && bytes[i] == b'#' {
+        // Check for comment start. A carriage return or form feed is skipped
+        // above like a blank, but the shell does not read either as one: a
+        // `#` right after it is part of a word.
+        if i < len && bytes[i] == b'#' && (i == 0 || !matches!(bytes[i - 1], b'\r' | b'\x0c')) {
             // Consume until newline
             let start = i;
             while i < len && bytes[i] != b'\n' {
@@ -2738,6 +2755,13 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
             b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
                 has_inline_code = true;
                 i = consume_dollar_paren(command, i);
+            }
+            // `${x:- #}` is one word: a blank inside the braces does not end
+            // it, so the `#` after one starts no comment.
+            b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                let (end, inline) = consume_braced_parameter(command, i, true);
+                has_inline_code |= inline;
+                i = end;
             }
             b'<' | b'>' if i + 1 < len && bytes[i + 1] == b'(' => {
                 has_inline_code = true;
@@ -2923,6 +2947,97 @@ fn consume_backticks(command: &str, start: usize) -> usize {
         }
     }
     i
+}
+
+/// End of the `${…}` parameter expansion whose `$` is at `start`, and whether
+/// it holds a command substitution. The shell reads the expansion as part of
+/// one word, blanks, `;` and `#` included, up to the `}` that closes it. As
+/// in the shell, only a `${` nests (a plain `{` is an ordinary character),
+/// and quotes, escapes and substitutions inside it are passed over whole, so
+/// a `}` in them closes nothing.
+///
+/// With `line_bounded`, the word is cut at the end of its line when no `}`
+/// closes it there. The shell would read on, but a line that does not close
+/// the expansion is rarely shell syntax at all (a heredoc's body line, say),
+/// and a reader that masks a word could take the commands of the lines after
+/// it for part of this one.
+#[must_use]
+pub(crate) fn consume_braced_parameter(
+    command: &str,
+    start: usize,
+    line_bounded: bool,
+) -> (usize, bool) {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+
+    debug_assert_eq!(bytes.get(start..start + 2), Some(&b"${"[..]));
+
+    let mut i = start + 2;
+    let mut depth = 1usize;
+    let mut has_inline_code = false;
+    while i < len {
+        match bytes[i] {
+            b'\n' if line_bounded => return (i, has_inline_code),
+            b'\\' => i = (i + 2).min(len),
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                depth += 1;
+                i += 2;
+            }
+            // `$'…'` takes backslash escapes, so `\'` does not close it.
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                i += 2;
+                while i < len && bytes[i] != b'\'' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(len);
+            }
+            b'}' => {
+                i += 1;
+                depth -= 1;
+                if depth == 0 {
+                    return (i, has_inline_code);
+                }
+            }
+            b'\'' => {
+                i += 1;
+                while i < len && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                i = (i + 1).min(len);
+            }
+            b'"' => {
+                i += 1;
+                while i < len {
+                    match bytes[i] {
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        b'\\' => i = (i + 2).min(len),
+                        b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                            has_inline_code = true;
+                            i = consume_dollar_paren(command, i);
+                        }
+                        b'`' => {
+                            has_inline_code = true;
+                            i = consume_backticks(command, i);
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                has_inline_code = true;
+                i = consume_dollar_paren(command, i);
+            }
+            b'`' => {
+                has_inline_code = true;
+                i = consume_backticks(command, i);
+            }
+            _ => i += 1,
+        }
+    }
+    (len, has_inline_code)
 }
 
 #[inline]
@@ -3897,6 +4012,54 @@ mod tests {
             .iter()
             .find(|s| s.kind == SpanKind::InlineCode);
         assert!(code_span.is_some(), "python -c content must be InlineCode");
+    }
+
+    /// A `#` that does not start a word starts no comment: inside `${…}`
+    /// (whose blanks do not end the word) or right after a carriage return or
+    /// form feed (no blank to the shell). The rest of the line stays visible
+    /// to both readers; a `#` that does start a word still hides its line.
+    #[test]
+    fn hash_inside_a_word_starts_no_comment() {
+        for cmd in [
+            "echo ${x:- #}; rm -rf /",
+            "echo ${x:-${y} #}; rm -rf /",
+            "echo ${x:-\"}\" #}; rm -rf /",
+            "echo ${x:-$(echo }) #}; rm -rf /",
+            "echo ${x:-$'a\\'b' #}; rm -rf /",
+            "echo a\r#b; rm -rf /",
+            "echo a\x0c#b; rm -rf /",
+        ] {
+            assert!(
+                sanitize_for_pattern_matching(cmd).contains("rm -rf /"),
+                "{cmd:?}"
+            );
+            let spans = classify_command(cmd);
+            assert!(
+                spans
+                    .spans()
+                    .iter()
+                    .all(|span| span.kind != SpanKind::Comment),
+                "{cmd:?}: {spans:?}"
+            );
+        }
+        for cmd in [
+            "echo ${x} # rm -rf /",
+            "echo ${x:-{} # rm -rf /",
+            "echo a\r\n# rm -rf /",
+        ] {
+            assert!(
+                !sanitize_for_pattern_matching(cmd).contains("rm -rf /"),
+                "{cmd:?}"
+            );
+            let spans = classify_command(cmd);
+            assert!(
+                spans
+                    .spans()
+                    .iter()
+                    .any(|span| span.kind == SpanKind::Comment && span.text(cmd) == "# rm -rf /"),
+                "{cmd:?}: {spans:?}"
+            );
+        }
     }
 
     #[test]

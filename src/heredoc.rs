@@ -600,13 +600,20 @@ fn respelled_command_may_be_present(command: &str) -> bool {
 /// substitution (`<(`) and a word without a target are left alone. A target's
 /// `$(…)`, `${…}` and backquoted parts belong to it (`2>$(mktemp) -c`). Text
 /// inside quotes is never taken for a redirect, so a quoted payload reads the
-/// same in both. A comment (`#` starting a word) runs to the end of its line
-/// and is skipped: its quotes quote nothing, so an apostrophe in it must not
-/// hide the redirects of the lines after it. A `#` right after a `)` is not
-/// taken for one: that `)` may close an expansion inside a word (`$(…)#x`),
-/// and skipping a line that is not a comment would hide its redirects. Length
-/// preserving (every blanked byte becomes a space, so the view stays UTF-8
-/// and every range in it is the same range in `command`); linear.
+/// same in both.
+///
+/// A comment (`#` starting a word) runs to the end of its line, or inside
+/// backquotes to the closing one, and is skipped: its quotes quote nothing,
+/// so an apostrophe in it must not hide the redirects of the lines after it.
+/// Skipping text that is not a comment would hide its redirects instead, so
+/// a `#` is not taken for one where the shell reads it as part of a word:
+/// inside a `${…}` expansion (`${x:- #}`; its end is found as the sanitizer
+/// finds it, past nested expansions, quotes and substitutions), right after
+/// a `)`, which may close an expansion inside a word (`$(…)#x`), and right
+/// after a carriage return, which the shell does not read as a blank.
+///
+/// Length preserving (every blanked byte becomes a space, so the view stays
+/// UTF-8 and every range in it is the same range in `command`); linear.
 fn blank_local_redirects(command: &str) -> Option<String> {
     let bytes = command.as_bytes();
     memchr::memchr2(b'<', b'>', bytes)?;
@@ -614,6 +621,11 @@ fn blank_local_redirects(command: &str) -> Option<String> {
     let mut view: Option<Vec<u8>> = None;
     let mut index = 0usize;
     let mut word_start = true;
+    // The end of the outermost `${…}` expansion seen so far (`index` is in
+    // one while below it), and whether `index` is inside a backquoted
+    // substitution.
+    let mut expansion_end = 0usize;
+    let mut backquoted = false;
     while index < len {
         let byte = bytes[index];
         if matches!(
@@ -625,8 +637,12 @@ fn blank_local_redirects(command: &str) -> Option<String> {
             index += 1;
             continue;
         }
-        if byte == b'#' && word_start && (index == 0 || bytes[index - 1] != b')') {
-            index = memchr(b'\n', &bytes[index..]).map_or(len, |at| index + at);
+        if byte == b'#'
+            && word_start
+            && index >= expansion_end
+            && !matches!(index.checked_sub(1).map(|at| bytes[at]), Some(b')' | b'\r'))
+        {
+            index = comment_end(bytes, index, backquoted);
             continue;
         }
         // A redirect may also follow a word directly (`sh>/dev/null -c …`
@@ -641,6 +657,20 @@ fn blank_local_redirects(command: &str) -> Option<String> {
         word_start = false;
         index = match byte {
             b'\\' => (index + 2).min(len),
+            // Its end is found as the shell finds it (only a `${` nests, and
+            // a `}` inside quotes or a substitution closes nothing), and the
+            // scan goes on inside it, where a substitution's redirects are.
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                if index >= expansion_end {
+                    expansion_end =
+                        crate::context::consume_braced_parameter(command, index, false).0;
+                }
+                index + 2
+            }
+            b'`' => {
+                backquoted = !backquoted;
+                index + 1
+            }
             // `<<`, `<<-`, `<<<`: a heredoc or here-string operator, whose
             // second `<` must not be read as a redirect of the delimiter.
             b'<' => index + bytes[index..].iter().take_while(|&&b| b == b'<').count(),
@@ -658,6 +688,26 @@ fn blank_local_redirects(command: &str) -> Option<String> {
         };
     }
     view.map(|view| String::from_utf8(view).expect("blank-filling whole characters keeps UTF-8"))
+}
+
+/// End of the comment whose `#` is at `start`: the newline ending its line,
+/// or, inside a backquoted substitution, the backquote closing it if that
+/// comes first (the shell finds the closing backquote before it parses the
+/// command between the two, so a comment there cannot run past it).
+fn comment_end(bytes: &[u8], start: usize, backquoted: bool) -> usize {
+    let line_end = memchr(b'\n', &bytes[start..]).map_or(bytes.len(), |at| start + at);
+    if !backquoted {
+        return line_end;
+    }
+    let mut index = start;
+    while index < line_end {
+        match bytes[index] {
+            b'`' => return index,
+            b'\\' => index += 2,
+            _ => index += 1,
+        }
+    }
+    line_end
 }
 
 /// End of the local redirect word starting at `start` (see
@@ -21392,6 +21442,29 @@ EOF";
             // the rest of the line is still read, and its redirects found.
             ("echo $(x)#y; b>l", Some("echo $(x)#y; b  ")),
             ("echo $((1))#y 2>l", Some("echo $((1))#y    ")),
+            // Nor a `#` inside `${…}`, nested ones included, or after a
+            // carriage return, which is no blank to the shell. A plain `{`
+            // does not nest: the first `}` closes the expansion.
+            ("echo ${x:- #}; b>l", Some("echo ${x:- #}; b  ")),
+            ("echo ${x:-${y} #}; b>l", Some("echo ${x:-${y} #}; b  ")),
+            ("echo ${x:-{} #c>l", None),
+            // A `}` inside a substitution or quotes in it closes nothing, and
+            // the substitution's own redirects are still found.
+            (
+                "echo ${x:-$(echo }) #}; b>l",
+                Some("echo ${x:-$(echo }) #}; b  "),
+            ),
+            ("echo ${x:-'}' #}; b>l", Some("echo ${x:-'}' #}; b  ")),
+            ("echo ${x:-$(a 2>l)}", Some("echo ${x:-$(a    )}")),
+            ("echo a\r#b; c>l", Some("echo a\r#b; c  ")),
+            // A comment inside backquotes ends at the closing backquote (or
+            // its line's end), and its quotes quote nothing there either.
+            ("echo `a #it's`; b>l", Some("echo `a #it's`; b  ")),
+            ("echo `a #c\nd`; b>l", Some("echo `a #c\nd`; b  ")),
+            // Once the expansion or substitution is closed, `#` starts a
+            // comment again.
+            ("echo ${x} #c>l", None),
+            ("echo `a` #c>l", None),
         ] {
             assert_eq!(
                 blank_local_redirects(command).as_deref(),
