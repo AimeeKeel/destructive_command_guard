@@ -1214,7 +1214,7 @@ mod tests {
             "(?P<empty>^)",
             "(?>(?=tee))",
             "(?:(?=tee)|$)",
-            "(?=tee){2}",
+            "((?=tee)){2}",
             "(?x:\n# ignored literal text\n^ (?=tee)\n)",
         ] {
             fancy_regex::Regex::new(pattern).expect("valid zero-width regex");
