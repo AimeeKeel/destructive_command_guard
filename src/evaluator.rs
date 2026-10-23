@@ -14247,6 +14247,64 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         nested_command_depth,
         inherited_automated_stdin,
     );
+    // A program name in another case runs the same program on a
+    // case-insensitive filesystem (`RM -rf ~` runs `rm`), while the packs and
+    // the shell analysis compare lower-case names. Read the command again with
+    // those names folded to lower case, on every platform. Deny wins, as
+    // between dialect views. What the user authorized for the command as
+    // written stays authorized: an exact-command grant, an allow override and
+    // an allowlist entry all bind to its own spelling, and an allow-once grant
+    // to its bytes, so the view matches and spends none. Nested payloads come
+    // through here as well, so a name inside one is folded when it is read.
+    if result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && let Some(folded) = crate::normalize::fold_program_name_case(command, enabled_keywords)
+        && !explicitly_allowed_as_written(
+            command,
+            compiled_overrides,
+            allowlists,
+            project_path,
+            shell_dialect,
+        )
+    {
+        let alternate = if deadline_exceeded(deadline) {
+            EvaluationResult::indeterminate_due_to_budget()
+        } else {
+            evaluate_command_in_dialect_union(
+                &folded,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path,
+                deadline,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            )
+        };
+        let adopt = match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && alternate.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            result = alternate;
+            // The view is length preserving: a preview of its own text shows
+            // the command's text at the same span.
+            if let Some(info) = result.pattern_info.as_mut()
+                && let Some(span) = info.matched_span.as_ref()
+                && info.matched_text_preview.as_deref()
+                    == Some(extract_match_preview(&folded, span).as_str())
+            {
+                info.matched_text_preview = Some(extract_match_preview(command, span));
+            }
+        }
+    }
     // A positive denial remains decisive. An exact-command grant explicitly
     // authorizes the whole request. Every other would-be allow (including a
     // warn/log result or a rule-scoped exemption) requires complete analysis.
@@ -14262,6 +14320,30 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         result.regex_evaluation_incomplete = true;
     }
     result
+}
+
+/// Whether an allow override or an allowlist entry authorizes `command` as
+/// written, the spelling the user's authorization binds to.
+fn explicitly_allowed_as_written(
+    command: &str,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    dialect: ShellDialect,
+) -> bool {
+    if compiled_overrides.check_allow(command) {
+        return true;
+    }
+    let normalized = crate::normalize::normalize_command_in_dialect(command, dialect);
+    allowlists
+        .match_exact_command_at_path(&normalized, project_path)
+        .is_some()
+        || allowlists
+            .match_command_prefix_at_path(&normalized, project_path)
+            .is_some()
+        || allowlists
+            .match_pattern_at_path(&normalized, project_path)
+            .is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -36569,6 +36651,56 @@ mod tests {
             None,
             shell_dialect,
         )
+    }
+
+    /// A case-insensitive filesystem runs `/bin/rm` for `RM`, `Rm` or
+    /// `/bin/RM`, and `ssh` for `sSH`. A program name in another case gets the
+    /// decision its lower-case spelling gets, wherever it stands and in every
+    /// dialect view; words that are no program name keep their case.
+    #[test]
+    fn program_names_in_another_case_are_judged_like_lower_case() {
+        let config = default_config();
+        let pack_ids: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+        let pack_ids: Vec<&str> = pack_ids.iter().map(String::as_str).collect();
+        for command in [
+            "RM -rf ~",
+            "Rm -rf ~",
+            "/bin/RM -rf ~",
+            "\"RM\" -rf ~",
+            "R\\M -rf ~",
+            "SUDO rm -rf ~",
+            "sudo RM -rf ~",
+            "echo ~ | XARGS RM -rf",
+            "BASH -c 'RM -rf ~'",
+            "sSH host 'rm -rf ~'",
+            "SSH host rm -rf ~",
+            "Ssh -o ProxyCommand='rm -rf ~' host",
+            "Git reset --hard",
+            "if true; then RM -rf ~; fi",
+            "bash <<'EOF'\nRM -rf ~\nEOF",
+            "python3 -c 'import os; os.system(\"RM -rf ~\")'",
+            // Text that bash runs as commands and dash reads as a body is
+            // folded.
+            "cat <<EOF >notes\nE\\\nOF\nRM -rf ~\nEOF",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &pack_ids, dialect);
+                assert!(result.is_denied(), "{command:?} {dialect:?}: {result:?}");
+            }
+        }
+        for command in [
+            "LS -la",
+            "echo RM -rf ~",
+            "git commit -m 'RM -rf ~ is gone'",
+            "RM_DIR=build make",
+            "SSH host ls",
+            "R --version",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &pack_ids, dialect);
+                assert!(result.is_allowed(), "{command:?} {dialect:?}: {result:?}");
+            }
+        }
     }
 
     fn evaluate_with_pack_ids_at_path(

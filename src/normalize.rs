@@ -4076,7 +4076,14 @@ fn decode_segment_command_words_in_dialect(command: &str, dialect: ShellDialect)
 
         segment_has_command = true;
         if word != raw {
-            replacements.push((token.byte_range.clone(), word.to_string()));
+            // A case-insensitive filesystem runs the same program for a name
+            // in any case, and the escapes can spell it in another one
+            // (`$'\x52\x4d'` is `RM`, which runs `rm`). Its base name is read
+            // in lower case, as the packs spell it.
+            let base = word.rfind('/').map_or(0, |slash| slash + 1);
+            let mut decoded = word.to_string();
+            decoded[base..].make_ascii_lowercase();
+            replacements.push((token.byte_range.clone(), decoded));
         }
     }
 
@@ -4189,6 +4196,198 @@ pub fn normalize_command_in_dialect(cmd: &str, dialect: ShellDialect) -> Cow<'_,
 #[inline]
 pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     normalize_command_in_dialect(cmd, ShellDialect::Unknown)
+}
+
+/// Program names dcg recognizes by their own analysis rather than by a pack
+/// keyword: wrappers and frontends that run the command after them, shells,
+/// interpreters and runners whose argument is a command or a program, and
+/// remote shells. Lower case.
+const STRUCTURAL_PROGRAM_NAMES: &[&str] = &[
+    // Wrappers and frontends.
+    "sudo",
+    "doas",
+    "su",
+    "sg",
+    "runuser",
+    "env",
+    "command",
+    "builtin",
+    "exec",
+    "eval",
+    "time",
+    "nohup",
+    "nice",
+    "ionice",
+    "setsid",
+    "timeout",
+    "stdbuf",
+    "chrt",
+    "busybox",
+    "xargs",
+    "parallel",
+    "watch",
+    "entr",
+    "flock",
+    "hyperfine",
+    "script",
+    "nix-shell",
+    "npx",
+    "mise",
+    "mise-exec",
+    "find",
+    // Shells and interpreters.
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "mksh",
+    "yash",
+    "ash",
+    "fish",
+    "csh",
+    "tcsh",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "nodejs",
+    "bun",
+    "deno",
+    "tclsh",
+    "wish",
+    "expect",
+    "julia",
+    "osascript",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "sed",
+    // Remote shells and copies.
+    "ssh",
+    "scp",
+    "sftp",
+    "mosh",
+    "rsync",
+];
+
+/// Interpreters that are also run by a versioned name (`python3.12`).
+const VERSIONED_INTERPRETER_NAMES: &[&str] = &[
+    "python", "pypy", "node", "ruby", "perl", "php", "lua", "luajit",
+];
+
+/// Whether lower-case `name` names a program that an enabled pack keys on or
+/// that dcg's own analysis recognizes.
+fn is_recognized_program_name(name: &[u8], enabled_keywords: &[&str]) -> bool {
+    let unversioned = {
+        let digits = name
+            .iter()
+            .rev()
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b'.')
+            .count();
+        &name[..name.len() - digits]
+    };
+    STRUCTURAL_PROGRAM_NAMES
+        .iter()
+        .any(|known| known.as_bytes() == name)
+        || VERSIONED_INTERPRETER_NAMES
+            .iter()
+            .any(|known| known.as_bytes() == unversioned)
+        || enabled_keywords
+            .iter()
+            .any(|keyword| keyword.as_bytes().eq_ignore_ascii_case(name))
+}
+
+/// `command` with every program name it spells in a case other than lower
+/// case folded to lower case, or `None` when it spells none.
+///
+/// A case-insensitive filesystem (macOS by default, Windows) runs `/bin/rm`
+/// for `RM`, `Rm` or `/bin/RM`, and every name the packs and the shell
+/// analysis compare is a lower-case one, so `RM -rf ~` or `sSH host '…'`
+/// matched nothing. The evaluator also reads this view, on every platform:
+/// a name that is folded runs the same program in it.
+///
+/// A program name here is a word (a run of letters, digits and `._+-`, with
+/// quotes and backslashes inside it removed, as the shell removes them, and a
+/// `.exe` suffix ignored) whose lower-case form an enabled pack keys on or
+/// dcg's own analysis recognizes (see [`STRUCTURAL_PROGRAM_NAMES`]). The last
+/// part of a word a backslash splits counts too, as a Windows path ends in
+/// it. Arguments that are no program name keep their case: unlike program
+/// names, they mean what their case says. Heredoc bodies are left as they
+/// are: a body is data, or a script read on its own (where this applies
+/// again), and folding its words could only cost time. Only text that every
+/// shell reads as a body is left out (see
+/// [`crate::context::undisputed_heredoc_body_ranges`]): what one shell reads
+/// as a body may be commands to another.
+///
+/// Length preserving (ASCII case folding), so every range in the view is the
+/// same range in `command`.
+#[must_use]
+pub(crate) fn fold_program_name_case(command: &str, enabled_keywords: &[&str]) -> Option<String> {
+    let bytes = command.as_bytes();
+    if !bytes.iter().any(u8::is_ascii_uppercase) {
+        return None;
+    }
+    let is_name_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-');
+    let is_transparent = |byte: u8| matches!(byte, b'\'' | b'"' | b'\\');
+    let mut bodies = crate::context::undisputed_heredoc_body_ranges(command)
+        .into_iter()
+        .peekable();
+    let mut folded: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(body) = bodies.peek() {
+            if i >= body.end {
+                bodies.next();
+                continue;
+            }
+            if i >= body.start {
+                i = body.end;
+                continue;
+            }
+        }
+        if !is_name_byte(bytes[i]) && !is_transparent(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let limit = bodies.peek().map_or(bytes.len(), |body| body.start);
+        while i < limit && (is_name_byte(bytes[i]) || is_transparent(bytes[i])) {
+            i += 1;
+        }
+        let run = &bytes[start..i];
+        if !run.iter().any(u8::is_ascii_uppercase) {
+            continue;
+        }
+        let name_of = |part: &[u8]| -> Vec<u8> {
+            let mut name: Vec<u8> = part
+                .iter()
+                .filter(|byte| !is_transparent(**byte))
+                .map(u8::to_ascii_lowercase)
+                .collect();
+            if name.len() > 4 && name.ends_with(b".exe") {
+                name.truncate(name.len() - 4);
+            }
+            name
+        };
+        let fold = if is_recognized_program_name(&name_of(run), enabled_keywords) {
+            Some(start..i)
+        } else {
+            // A Windows path: the part after its last backslash.
+            run.iter()
+                .rposition(|byte| *byte == b'\\')
+                .map(|at| start + at + 1..i)
+                .filter(|last| {
+                    let name = name_of(&bytes[last.clone()]);
+                    !name.is_empty() && is_recognized_program_name(&name, enabled_keywords)
+                })
+        };
+        if let Some(range) = fold {
+            folded.get_or_insert_with(|| bytes.to_vec())[range].make_ascii_lowercase();
+        }
+    }
+    folded.map(|view| String::from_utf8(view).expect("ASCII case folding keeps UTF-8"))
 }
 
 /// Strip leading backslash from the first command token.
@@ -4315,6 +4514,60 @@ mod tests {
             assert!(
                 !strip_wrapper_prefixes(command).was_normalized(),
                 "informational/process mode was treated as command execution: {command}"
+            );
+        }
+    }
+
+    /// Program names a pack keys on or the analysis recognizes are folded to
+    /// lower case wherever a word spells one, through quotes, backslashes, a
+    /// directory and a `.exe` suffix; flags, other words and heredoc bodies
+    /// keep their case, and the view keeps the command's length.
+    #[test]
+    fn program_names_fold_to_lower_case() {
+        let keywords = ["rm", "git", "dd"];
+        for (command, folded) in [
+            ("RM -rf ~", "rm -rf ~"),
+            ("Rm -rf ~", "rm -rf ~"),
+            ("/bin/RM -rf ~", "/bin/rm -rf ~"),
+            ("\"RM\" -rf ~", "\"rm\" -rf ~"),
+            ("R\\M -rf ~", "r\\m -rf ~"),
+            ("C:\\Tools\\RM.EXE -rf x", "C:\\Tools\\rm.exe -rf x"),
+            ("SUDO RM -rf ~", "sudo rm -rf ~"),
+            ("echo ~ | XARGS RM -rf", "echo ~ | xargs rm -rf"),
+            ("sSH host 'RM -rf ~'", "ssh host 'rm -rf ~'"),
+            ("Python3.12 -c 'x'", "python3.12 -c 'x'"),
+            ("DD if=/dev/zero of=/dev/sda", "dd if=/dev/zero of=/dev/sda"),
+            (
+                "cat <<'EOF' >notes\nRM -rf ~\nEOF\nRM x",
+                "cat <<'EOF' >notes\nRM -rf ~\nEOF\nrm x",
+            ),
+        ] {
+            let view = fold_program_name_case(command, &keywords);
+            assert_eq!(view.as_deref(), Some(folded), "{command:?}");
+            assert_eq!(folded.len(), command.len());
+        }
+        for command in [
+            "rm -RF ~",
+            "git branch -D Feature",
+            "RM_DIR=build make",
+            "LS -la",
+            "Get-ChildItem -Path C:\\",
+            "rm -rf ~",
+            "cat <<'EOF'\nRM -rf ~\nEOF",
+        ] {
+            assert_eq!(
+                fold_program_name_case(command, &keywords),
+                None,
+                "{command:?}"
+            );
+        }
+        // A command word spelled with escapes is read with its base name in
+        // lower case too.
+        for command in ["$'\\x52\\x4d' -rf ~", "/bin/$'\\x52M' -rf ~"] {
+            let normalized = normalize_command_in_dialect(command, ShellDialect::Posix);
+            assert!(
+                normalized.contains("rm -rf ~"),
+                "{command:?} -> {normalized:?}"
             );
         }
     }

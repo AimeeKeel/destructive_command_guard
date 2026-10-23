@@ -3427,6 +3427,26 @@ pub(crate) fn heredoc_body_layouts(command: &str) -> SmallVec<[SmallVec<[Heredoc
     layouts
 }
 
+/// The byte ranges that are heredoc body text (terminator lines included)
+/// under every rule set, sorted and merged. A reader that leaves bodies out
+/// leaves out only these: text one shell reads as a body may be commands to
+/// another.
+pub(crate) fn undisputed_heredoc_body_ranges(command: &str) -> SmallVec<[Range<usize>; 8]> {
+    let ranges = |rules| -> SmallVec<[Range<usize>; 8]> {
+        let mut ranges: SmallVec<[Range<usize>; 8]> = heredoc_body_ranges(command, rules)
+            .into_iter()
+            .map(|body| body.range)
+            .collect();
+        ranges.sort_by_key(|range| range.start);
+        merge_ranges(&ranges)
+    };
+    let bash = ranges(HeredocRules::Bash);
+    if bash.is_empty() {
+        return bash;
+    }
+    intersect_ranges(&bash, &ranges(HeredocRules::Dash))
+}
+
 /// How a shell reads heredoc bodies. Bash and zsh read them alike; dash
 /// differs on four points. With an unquoted delimiter, a body line ending in
 /// a backslash-newline goes on to the next line in all of them, so `x\`
@@ -5282,6 +5302,32 @@ mod tests {
                 "{command:?}"
             );
         }
+    }
+
+    /// The text every rule set reads as a body: where bash and dash end a
+    /// body at different lines, only the part they share.
+    #[test]
+    fn undisputed_body_text_is_what_every_shell_reads_as_a_body() {
+        let text = |command: &'static str| -> Vec<&'static str> {
+            undisputed_heredoc_body_ranges(command)
+                .into_iter()
+                .map(|range| &command[range])
+                .collect()
+        };
+        assert_eq!(text("cat <<'A'\nx\nA\nls"), ["x\nA"]);
+        assert_eq!(text("cat <<A <<B\na\nA\nb\nB\nls"), ["a\nA", "b\nB"]);
+        // bash ends the body at `E\` joined with `OF`; dash reads on to `EOF`.
+        assert_eq!(text("cat <<EOF\nE\\\nOF\nRM x\nEOF\nls"), ["E\\\nOF"]);
+        // Both read on past an `EOF` that a backslash-newline continues to.
+        assert_eq!(
+            text("cat <<EOF\nx\\\nEOF\nRM x\nEOF\nls"),
+            ["x\\\nEOF\nRM x\nEOF"]
+        );
+        // dash reads `$'EOF'` as `$EOF`; bash and zsh as `EOF`.
+        assert_eq!(text("cat <<$'EOF'\nx\nEOF\nRM x\n$EOF"), ["x\nEOF"]);
+        // Only dash has a body here.
+        assert!(text("echo $[1<<2]\nRM x\n2]").is_empty());
+        assert!(text("ls\nRM x").is_empty());
     }
 
     /// A `${` closed on a later line is one word to the shell, its line ends
