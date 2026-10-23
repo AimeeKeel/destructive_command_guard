@@ -1063,7 +1063,7 @@ fn decode_ansi_c_strings(command: &str) -> Option<String> {
 use regex::Regex;
 
 /// Limits for content extraction to prevent resource exhaustion.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtractionLimits {
     /// Maximum bytes to extract from heredoc body (default: 1MB)
     pub max_body_bytes: usize,
@@ -1935,8 +1935,83 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
     //
     // The mask is blank-fill and length preserving, so every `byte_range` an
     // extractor computes against the view is the same range in the original.
+    if let Some(completed) = completed_extraction(command, limits) {
+        return completed;
+    }
+    #[cfg(test)]
+    EXTRACTIONS_RUN.with(|count| count.set(count.get() + 1));
     let scan_view = mask_non_expanding_data_heredocs(command);
-    extract_content_with_scan_view(command, scan_view.as_ref(), limits)
+    let result = extract_content_with_scan_view(command, scan_view.as_ref(), limits);
+    remember_completed_extraction(command, limits, &result);
+    result
+}
+
+/// How many completed extractions each thread keeps.
+const COMPLETED_EXTRACTIONS: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    // Extractions actually run on this thread (#555).
+    static EXTRACTIONS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A completed extraction: the command, the limits it ran under, and what it
+/// extracted (`None`: no content).
+type CompletedExtraction = (String, ExtractionLimits, Option<Vec<ExtractedContent>>);
+
+thread_local! {
+    /// The completed extractions of the last few commands, with the limits
+    /// they ran under (`None`: no content). The rule filters ask the same
+    /// structural question of one command once for each candidate match, and
+    /// a large program heredoc has hundreds of them: each call parsed the
+    /// whole command again, which took a 300-line JavaScript heredoc past the
+    /// hook deadline (#555). Extraction is a function of the command, the
+    /// limits and the process environment (an exported shell function can
+    /// override a data sink), which the process does not change. Only a
+    /// complete answer is kept: a skip, a partial result or a failure (a
+    /// timeout among them) is computed again, as before.
+    static COMPLETED: std::cell::RefCell<std::collections::VecDeque<CompletedExtraction>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+fn completed_extraction(command: &str, limits: &ExtractionLimits) -> Option<ExtractionResult> {
+    COMPLETED.with(|completed| {
+        completed
+            .borrow()
+            .iter()
+            .find(|(source, kept, _)| kept == limits && source == command)
+            .map(|(_, _, contents)| {
+                contents
+                    .clone()
+                    .map_or(ExtractionResult::NoContent, ExtractionResult::Extracted)
+            })
+    })
+}
+
+fn remember_completed_extraction(
+    command: &str,
+    limits: &ExtractionLimits,
+    result: &ExtractionResult,
+) {
+    // Keep the memory bounded: a command too large to be read again cheaply
+    // is too large to keep.
+    if command.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
+        return;
+    }
+    let contents = match result {
+        ExtractionResult::NoContent => None,
+        ExtractionResult::Extracted(contents) => Some(contents.clone()),
+        ExtractionResult::Skipped(_)
+        | ExtractionResult::Partial { .. }
+        | ExtractionResult::Failed(_) => return,
+    };
+    COMPLETED.with(|completed| {
+        let mut completed = completed.borrow_mut();
+        if completed.len() == COMPLETED_EXTRACTIONS {
+            completed.pop_front();
+        }
+        completed.push_back((command.to_string(), *limits, contents));
+    });
 }
 
 /// [`extract_content`], with the view that inline-script extraction scans given
@@ -14678,6 +14753,49 @@ mod tests {
             };
             assert_eq!(contents[0].content, body, "{command:?}");
         }
+    }
+
+    /// A completed extraction is reused for the same command and limits: the
+    /// rule filters ask once per candidate match, and each call used to parse
+    /// the whole command again (#555). Other limits, another command, and an
+    /// extraction that did not finish are computed on their own.
+    #[test]
+    fn a_completed_extraction_runs_once_per_command_and_limits_issue_555() {
+        let command = "node - <<'JS'\nconsole.log(`ready`);\nJS";
+        let structural = ExtractionLimits::structural_scan();
+        let runs = || EXTRACTIONS_RUN.with(std::cell::Cell::get);
+        let before = runs();
+        let ExtractionResult::Extracted(first) = extract_content(command, &structural) else {
+            panic!("the body is extracted");
+        };
+        for _ in 0..8 {
+            let ExtractionResult::Extracted(again) = extract_content(command, &structural) else {
+                panic!("a repeat is the same extraction");
+            };
+            assert_eq!(again.len(), first.len());
+            assert_eq!(again[0].content, first[0].content);
+            assert_eq!(again[0].content_range, first[0].content_range);
+        }
+        assert_eq!(runs() - before, 1, "repeats reuse the completed extraction");
+        let _ = extract_content(command, &ExtractionLimits::default());
+        let _ = extract_content("python3 - <<'PY'\nprint(1)\nPY", &structural);
+        assert_eq!(
+            runs() - before,
+            3,
+            "other limits and commands run their own"
+        );
+        let stopped = ExtractionLimits {
+            timeout_ms: 0,
+            ..structural
+        };
+        let other = "node - <<'JS'\nconsole.log(`other`);\nJS";
+        let _ = extract_content(other, &stopped);
+        let _ = extract_content(other, &stopped);
+        assert_eq!(
+            runs() - before,
+            5,
+            "an extraction that stopped early runs again"
+        );
     }
 
     #[test]
