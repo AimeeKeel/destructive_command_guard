@@ -32252,7 +32252,7 @@ fn extract_heredoc_contents(
 
     let run_fallbacks =
         |first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>| {
-            check_fallback_patterns(command, context, first_allowlist_hit)
+            check_command_fallback_patterns(command, context, first_allowlist_hit)
                 .or_else(|| check_credential_write_fallback(command, context, first_allowlist_hit))
                 .or_else(|| check_exec_sink_fallback(command, context, first_allowlist_hit))
         };
@@ -32324,7 +32324,9 @@ fn evaluate_heredoc(
             // for every incomplete extraction class so scheduler stalls,
             // malformed syntax, and size limits cannot turn an obvious
             // catastrophic sink into a quick-rejected allow.
-            if let Some(blocked) = check_fallback_patterns(command, context, first_allowlist_hit) {
+            if let Some(blocked) =
+                check_command_fallback_patterns(command, context, first_allowlist_hit)
+            {
                 return Some(blocked);
             }
             if let Some(blocked) =
@@ -32403,7 +32405,9 @@ fn evaluate_heredoc(
             (extracted, fallback_needed)
         }
         ExtractionResult::Failed(err) => {
-            if let Some(blocked) = check_fallback_patterns(command, context, first_allowlist_hit) {
+            if let Some(blocked) =
+                check_command_fallback_patterns(command, context, first_allowlist_hit)
+            {
                 return Some(blocked);
             }
             if let Some(blocked) =
@@ -32960,7 +32964,9 @@ fn evaluate_heredoc(
     }
 
     if fallback_needed {
-        if let Some(blocked) = check_fallback_patterns(command, context, first_allowlist_hit) {
+        if let Some(blocked) =
+            check_command_fallback_patterns(command, context, first_allowlist_hit)
+        {
             return Some(blocked);
         }
         if let Some(blocked) =
@@ -33696,6 +33702,50 @@ fn fallback_pattern_hit(command: &str) -> bool {
     let check_target = sanitized.as_ref();
 
     FALLBACK_PATTERNS.is_match(check_target)
+}
+
+/// [`check_fallback_patterns`] over the whole command, whose denial yields to
+/// the packs' own.
+///
+/// The bounded fallback reads the whole command, ordinary shell text
+/// included, so a destructive command beside an embedded program that could
+/// not be read (a `-c` source that is one expansion, followed by
+/// `; git reset --hard`) was reported as incomplete embedded-code analysis,
+/// and its remedy was to waive the whole backstop. When the packs deny the
+/// command on their own, read without the embedded-code tier, that denial is
+/// the verdict, named for the rule that owns the text. Otherwise (the packs
+/// allow it, an allowlist entry of theirs included) the fallback's denial
+/// stands. Either way the command is denied.
+fn check_command_fallback_patterns(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let denial = check_fallback_patterns(command, context, first_allowlist_hit)?;
+    let mut without_tier = context.heredoc_settings.clone();
+    without_tier.enabled = false;
+    // Only the packs' own verdict is asked for: no allow-once grant is
+    // matched or spent here.
+    let packs = evaluate_command_with_pack_order_deadline_at_path_inner(
+        command,
+        context.enabled_keywords,
+        context.ordered_packs,
+        context.keyword_index,
+        context.compiled_overrides,
+        context.allowlists,
+        &without_tier,
+        None,
+        context.project_path,
+        context.deadline,
+        context.shell_dialect,
+        context.nested_command_depth,
+        context.inherited_automated_stdin,
+    );
+    Some(if packs.decision == EvaluationDecision::Deny {
+        packs
+    } else {
+        denial
+    })
 }
 
 /// The bounded fallback's verdict, with its rule's allowlist grant honoured.
