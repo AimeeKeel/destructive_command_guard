@@ -543,9 +543,22 @@ fn uncertain(span: Range<usize>) -> Vec<CredentialFileWrite> {
 
 fn render(argv: &[String]) -> String {
     argv.iter()
-        .map(|word| shell_words::quote(word))
+        .map(|word| quote_field(word))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Quote an expanded field for the native policy so that it reads as the
+/// literal it is. The shell expands braces before parameters, so a brace a
+/// field holds (`/etc/shadow}` from `S=/tmp/a{,@/etc/shadow}` split on `@`)
+/// expands to nothing; `shell_words` leaves braces unquoted, and the policy
+/// read one as a brace that may still name a protected path.
+fn quote_field(word: &str) -> Cow<'_, str> {
+    if word.contains(['{', '}']) {
+        Cow::Owned(format!("'{}'", word.replace('\'', "'\\''")))
+    } else {
+        shell_words::quote(word)
+    }
 }
 
 /// Match the executable spelling understood by the shared native path policy.
@@ -708,7 +721,7 @@ fn classify(argv: &[String], span: Range<usize>) -> Result<Vec<CredentialFileWri
             let invocation = format!(
                 "tee {}-- {}",
                 if append { "-a " } else { "" },
-                shell_words::quote(path)
+                quote_field(path)
             );
             if let Some(mut hit) =
                 shell::classify_credential_file_write(&invocation, ShellDialect::Posix)
@@ -946,7 +959,126 @@ pub(super) fn scan(command: &str, dialect: ShellDialect) -> Vec<CredentialFileWr
     if command.len() > MAX_BYTES {
         return uncertain(0..command.len());
     }
-    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+    // The shell removes a line continuation before it reads words, so
+    // `I\` + newline + `FS=@` assigns IFS and `$TA\` + newline + `RGET` reads
+    // TARGET. The grammar reads one as a word break instead (a command `I`
+    // with the argument `FS=@`), which hid both from the binding model. Scan
+    // the source as the shell reads it; every span is reported in `command`.
+    let Some((joined, offsets)) = join_line_continuations(command) else {
+        return scan_source(command);
+    };
+    let mut hits = scan_source(&joined);
+    for hit in &mut hits {
+        hit.span = offsets[hit.span.start]..offsets[hit.span.end];
+    }
+    hits
+}
+
+/// `command` with each line continuation (a backslash-newline outside single
+/// quotes, `$'…'`, comments and heredoc bodies) removed, as the shell removes
+/// it before reading words, and for each byte of that source the offset of the
+/// same byte in `command`, with one more entry for the end. `None` when
+/// nothing was removed.
+fn join_line_continuations(command: &str) -> Option<(String, Vec<usize>)> {
+    if !command.contains("\\\n") {
+        return None;
+    }
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let bodies = crate::context::heredoc_body_ranges(command, crate::context::HeredocRules::Bash);
+    let mut bodies = bodies.iter().map(|body| body.range.clone()).peekable();
+    let mut joined = Vec::with_capacity(len);
+    let mut offsets = Vec::with_capacity(len + 1);
+    let keep = |joined: &mut Vec<u8>, offsets: &mut Vec<usize>, range: Range<usize>| {
+        joined.extend_from_slice(&bytes[range.clone()]);
+        offsets.extend(range);
+    };
+    let mut removed = false;
+    let mut double_quoted = false;
+    // Open parentheses, `true` for a substitution's (`$(`, `<(`, `>(`). A
+    // word starts after the `)` of a subshell or an arithmetic command, not
+    // after a substitution's, which ends no word: `(x)#…` is a comment and
+    // `$(x)#…` a word.
+    let mut parens: Vec<bool> = Vec::new();
+    let mut after_group = false;
+    let mut i = 0usize;
+    while i < len {
+        if bodies.peek().is_some_and(|body| body.start == i) {
+            let body = bodies.next().unwrap_or(i..i);
+            keep(&mut joined, &mut offsets, body.clone());
+            i = body.end;
+            continue;
+        }
+        let word_start = after_group
+            || joined.last().is_none_or(|byte| {
+                matches!(
+                    byte,
+                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'<' | b'>'
+                )
+            });
+        let mut closes_group = false;
+        let end = match bytes[i] {
+            b'\\' if bytes.get(i + 1) == Some(&b'\n') => {
+                removed = true;
+                i += 2;
+                continue;
+            }
+            b'\\' => (i + 2).min(len),
+            b'"' => {
+                double_quoted = !double_quoted;
+                i + 1
+            }
+            b'\'' if !double_quoted => {
+                memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + at + 2)
+            }
+            b'$' if !double_quoted && bytes.get(i + 1) == Some(&b'\'') => {
+                let mut at = i + 2;
+                while at < len && bytes[at] != b'\'' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                (at + 1).min(len)
+            }
+            b'#' if !double_quoted && word_start => {
+                memchr::memchr(b'\n', &bytes[i..]).map_or(len, |at| i + at)
+            }
+            b'(' if !double_quoted => {
+                parens.push(
+                    joined
+                        .last()
+                        .is_some_and(|byte| matches!(byte, b'$' | b'<' | b'>')),
+                );
+                i + 1
+            }
+            b')' if !double_quoted => {
+                closes_group = parens.pop() == Some(false);
+                i + 1
+            }
+            _ => i + 1,
+        };
+        // A heredoc body starts after a newline, never inside these spans.
+        let end = bodies
+            .peek()
+            .map_or(end, |body| end.min(body.start.max(i + 1)));
+        keep(&mut joined, &mut offsets, i..end);
+        after_group = closes_group;
+        i = end;
+    }
+    offsets.push(len);
+    if !removed {
+        return None;
+    }
+    // Only whole ASCII pairs were removed, between whole characters.
+    String::from_utf8(joined)
+        .ok()
+        .map(|joined| (joined, offsets))
+}
+
+/// [`scan`] of a source with no line continuation left.
+fn scan_source(command: &str) -> Vec<CredentialFileWrite> {
+    let Ok(ast) = AstGrep::try_new(
+        crate::context::shell_parse_source(command).as_ref(),
+        SupportLang::Bash,
+    ) else {
         return uncertain(0..command.len());
     };
     if ast.root().get_inner_node().has_error() {
@@ -1808,6 +1940,42 @@ mod tests {
                     .any(|hit| hit.rule == rule && hit.reason == UNCERTAIN),
                 "continued wrapper options must not bind to a shorter name: {hits:?}"
             );
+        }
+    }
+
+    /// The source is read as the shell reads it: each line continuation is
+    /// removed where the shell removes one, and only there. A comment ends at
+    /// its line whatever it ends in; a `#` starts one where a word starts,
+    /// after a subshell's `)` too, but not after a substitution's.
+    #[test]
+    fn line_continuations_are_removed_where_the_shell_removes_them() {
+        for (command, joined) in [
+            ("I\\\nFS=@; tee $T", Some("IFS=@; tee $T")),
+            ("echo \"a\\\nb\"", Some("echo \"ab\"")),
+            ("echo $(x)#a\\\nb", Some("echo $(x)#ab")),
+            ("echo $((1))#a\\\nb", Some("echo $((1))#ab")),
+            ("echo 'a\\\nb'; I\\\nFS=@", Some("echo 'a\\\nb'; IFS=@")),
+            ("echo a # b\\\nI\\\nFS=@", Some("echo a # b\\\nIFS=@")),
+            ("(x)#a\\\nIFS=@", None),
+            ("((1))#a\\\nIFS=@", None),
+            (
+                "cat <<'EOF'\na\\\nEOF\nI\\\nFS=@",
+                Some("cat <<'EOF'\na\\\nEOF\nIFS=@"),
+            ),
+            ("echo a", None),
+        ] {
+            let result = join_line_continuations(command);
+            assert_eq!(
+                result.as_ref().map(|(joined, _)| joined.as_str()),
+                joined,
+                "{command:?}"
+            );
+            if let Some((joined, offsets)) = result {
+                assert_eq!(offsets.len(), joined.len() + 1, "{command:?}");
+                for (at, byte) in joined.bytes().enumerate() {
+                    assert_eq!(command.as_bytes()[offsets[at]], byte, "{command:?}");
+                }
+            }
         }
     }
 
