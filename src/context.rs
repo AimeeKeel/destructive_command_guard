@@ -247,9 +247,132 @@ impl ContextClassifier {
 
     /// Returns a `CommandSpans` structure containing classified spans.
     /// Each byte in the command will belong to exactly one span.
+    ///
+    /// A command with heredoc bodies is also read with each body taken apart
+    /// from the lines around it (see [`heredoc_body_layouts`]), so that a
+    /// quote left open in a body does not make the commands after its
+    /// terminator line look quoted. The spans are those of that reading,
+    /// except that a byte any other reading, the whole one included, gives a
+    /// kind that needs a pattern check keeps that kind: a body found where the
+    /// shell has none can show text, never hide it. A command whose readings
+    /// would take more than their budget (see [`HeredocReadBudget`]) is one
+    /// [`SpanKind::Unknown`] span: every byte of it is checked.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn classify(&self, command: &str) -> CommandSpans {
+        let mut budget = HeredocReadBudget::for_command(command);
+        self.classify_at_depth(command, 0, &mut budget)
+            .unwrap_or_else(|| {
+                let mut spans = CommandSpans::new();
+                if !command.is_empty() {
+                    spans.push(Span::new(SpanKind::Unknown, 0, command.len()));
+                }
+                spans
+            })
+    }
+
+    /// [`Self::classify`] of `command`, a body `depth` bodies deep. `None`
+    /// when the budget runs out or a body does not slice its command.
+    fn classify_at_depth(
+        &self,
+        command: &str,
+        depth: usize,
+        budget: &mut HeredocReadBudget,
+    ) -> Option<CommandSpans> {
+        budget.spend(command)?;
+        let whole = self.classify_plain(command);
+        if depth >= HEREDOC_SCAN_MAX_DEPTH {
+            return Some(whole);
+        }
+        let mut kept: Option<Vec<Span>> = None;
+        for bodies in heredoc_body_layouts(command) {
+            let by_parts = self.classify_by_parts(command, &bodies, depth, budget)?;
+            kept = Some(match kept {
+                None => keep_checked_kinds(&by_parts, whole.spans()),
+                Some(kept) => keep_checked_kinds(&kept, &by_parts),
+            });
+        }
+        let Some(kept) = kept else {
+            return Some(whole);
+        };
+        let mut spans = CommandSpans::new();
+        for span in kept {
+            spans.push(span);
+        }
+        Some(spans)
+    }
+
+    /// The spans of `command` read with `bodies` taken apart: those of the
+    /// reading with the bodies blanked, each body that follows a line of its
+    /// own replaced by the spans of its own reading. A body inside a
+    /// substitution stays part of that substitution's span. `None` when the
+    /// budget runs out or a body does not slice the command.
+    fn classify_by_parts(
+        &self,
+        command: &str,
+        bodies: &[HeredocBody],
+        depth: usize,
+        budget: &mut HeredocReadBudget,
+    ) -> Option<Vec<Span>> {
+        budget.spend(command)?;
+        let mut outside = command.as_bytes().to_vec();
+        for body in bodies {
+            outside[body.range.clone()].fill(b' ');
+        }
+        // Only whole characters were blanked (see `sanitize_mask_ranges_by_parts`).
+        let outside = String::from_utf8(outside).ok()?;
+        let mut by_parts: Vec<Span> = Vec::new();
+        let mut separate = bodies.iter().filter(|body| body.top_level).peekable();
+        let mut covered = 0usize;
+        for span in self.classify_plain(&outside).spans() {
+            let mut start = span.byte_range.start.max(covered);
+            while let Some(body) = separate.next_if(|body| body.range.start < span.byte_range.end) {
+                if start < body.range.start {
+                    by_parts.push(Span::new(span.kind, start, body.range.start));
+                }
+                self.push_body_spans(command, &body.range, depth, budget, &mut by_parts)?;
+                covered = covered.max(body.range.end);
+                start = start.max(covered);
+            }
+            if start < span.byte_range.end {
+                by_parts.push(Span::new(span.kind, start, span.byte_range.end));
+            }
+        }
+        for body in separate {
+            self.push_body_spans(command, &body.range, depth, budget, &mut by_parts)?;
+        }
+        Some(by_parts)
+    }
+
+    /// Push the spans of the body at `range` of `command`, read on its own.
+    /// `None` when the budget runs out or the range does not slice the
+    /// command.
+    fn push_body_spans(
+        &self,
+        command: &str,
+        range: &Range<usize>,
+        depth: usize,
+        budget: &mut HeredocReadBudget,
+        spans: &mut Vec<Span>,
+    ) -> Option<()> {
+        let text = command.get(range.clone())?;
+        let offset = range.start;
+        spans.extend(
+            self.classify_at_depth(text, depth + 1, budget)?
+                .spans()
+                .iter()
+                .map(|inner| {
+                    Span::new(
+                        inner.kind,
+                        inner.byte_range.start + offset,
+                        inner.byte_range.end + offset,
+                    )
+                }),
+        );
+        Some(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn classify_plain(&self, command: &str) -> CommandSpans {
         let bytes = command.as_bytes();
         let len = bytes.len();
 
@@ -440,11 +563,11 @@ impl ContextClassifier {
                             i += 2;
                             continue;
                         }
-                        // `${…}` is part of the word it is in, blanks, `;`
-                        // and `#` included: pass over it whole, so a `#`
-                        // after a blank inside it starts no comment.
+                        // `${…}` is part of the word it is in, blanks, `;`,
+                        // `#` and line ends included: pass over it whole, so
+                        // a `#` after a blank inside it starts no comment.
                         b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
-                            i = consume_braced_parameter(command, i, true).0;
+                            i = consume_braced_parameter(command, i).0;
                             continue;
                         }
                         // A carriage return or form feed is no blank to the
@@ -586,7 +709,7 @@ impl ContextClassifier {
                         b'\'' => stack.push(TokenizerState::SingleQuote),
                         b'`' => stack.push(TokenizerState::Backtick),
                         b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
-                            i = consume_braced_parameter(command, i, true).0;
+                            i = consume_braced_parameter(command, i).0;
                             continue;
                         }
                         b'#' if i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n') => {
@@ -798,6 +921,46 @@ pub(crate) fn powershell_block_comment_starts_at(bytes: &[u8], index: usize) -> 
                     b'|' | b'&' | b';' | b'(' | b'[' | b'{' | b',' | b'='
                 )
         })
+}
+
+/// `spans`, except that where a span whose kind skips pattern checks overlaps
+/// a span of `checked` whose kind requires them, the overlap takes the
+/// `checked` span's kind. Both lists are in order and without overlaps.
+fn keep_checked_kinds(spans: &[Span], checked: &[Span]) -> Vec<Span> {
+    let mut kept = Vec::with_capacity(spans.len());
+    let mut first = 0usize;
+    for span in spans {
+        if span.kind.requires_pattern_check() {
+            kept.push(span.clone());
+            continue;
+        }
+        while checked
+            .get(first)
+            .is_some_and(|other| other.byte_range.end <= span.byte_range.start)
+        {
+            first += 1;
+        }
+        let mut start = span.byte_range.start;
+        for other in checked[first..]
+            .iter()
+            .take_while(|other| other.byte_range.start < span.byte_range.end)
+            .filter(|other| other.kind.requires_pattern_check())
+        {
+            let overlap_start = other.byte_range.start.max(start);
+            let overlap_end = other.byte_range.end.min(span.byte_range.end);
+            if overlap_start < overlap_end {
+                if start < overlap_start {
+                    kept.push(Span::new(span.kind, start, overlap_start));
+                }
+                kept.push(Span::new(other.kind, overlap_start, overlap_end));
+                start = overlap_end;
+            }
+        }
+        if start < span.byte_range.end {
+            kept.push(Span::new(span.kind, start, span.byte_range.end));
+        }
+    }
+    kept
 }
 
 /// Classify a command string's execution contexts.
@@ -1290,8 +1453,118 @@ pub(crate) fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
 /// This is designed to be be used on the hot path, so it returns a borrowed view
 /// when no sanitization is required.
 #[must_use]
-#[allow(clippy::too_many_lines)] // Single-pass masking logic; refactor only if it becomes unreadable
 pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
+    let mut budget = HeredocReadBudget::for_command(command);
+    let merged = match sanitize_mask_ranges(command, 0, &mut budget) {
+        Some(merged) => merged,
+        None if budget.exhausted => heredoc_body_openers(command),
+        None => return Cow::Borrowed(command),
+    };
+    if merged.is_empty() {
+        return Cow::Borrowed(command);
+    }
+
+    let bytes = command.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut last = 0;
+    for range in merged {
+        if range.start > last {
+            out.extend_from_slice(&bytes[last..range.start]);
+        }
+        out.extend(std::iter::repeat_n(
+            b' ',
+            range.end.saturating_sub(range.start),
+        ));
+        last = range.end;
+    }
+    if last < bytes.len() {
+        out.extend_from_slice(&bytes[last..]);
+    }
+
+    String::from_utf8(out).map_or(Cow::Borrowed(command), Cow::Owned)
+}
+
+/// The sorted, merged byte ranges [`sanitize_for_pattern_matching`] blanks in
+/// `command`, a body `depth` bodies deep, or `None` when a token cannot be
+/// sliced (nothing is masked then) or the readings would take more than their
+/// budget (see [`HeredocReadBudget`]).
+///
+/// A command with heredoc bodies is also read with each body taken apart from
+/// the lines around it (see [`heredoc_body_layouts`]), so that a quote or
+/// expansion left open in a body masks nothing past its terminator line. Only
+/// what every reading masks is masked: where a body is read right, that shows
+/// the commands after it, and where the shell has no body, the reading whole
+/// still shows whatever it showed.
+fn sanitize_mask_ranges(
+    command: &str,
+    depth: usize,
+    budget: &mut HeredocReadBudget,
+) -> Option<SmallVec<[Range<usize>; 8]>> {
+    budget.spend(command)?;
+    let mut masked = plain_sanitize_mask_ranges(command)?;
+    if masked.is_empty() || depth >= HEREDOC_SCAN_MAX_DEPTH {
+        return Some(masked);
+    }
+    for bodies in heredoc_body_layouts(command) {
+        let by_parts = sanitize_mask_ranges_by_parts(command, &bodies, depth, budget)?;
+        masked = intersect_ranges(&masked, &by_parts);
+    }
+    Some(masked)
+}
+
+/// What [`sanitize_mask_ranges`] masks in `command` read with `bodies` taken
+/// apart: the lines around them read with the bodies blanked, and each body
+/// that follows a line of its own read as a script of its own. A body inside
+/// a substitution stays part of that word, which no reading masks.
+fn sanitize_mask_ranges_by_parts(
+    command: &str,
+    bodies: &[HeredocBody],
+    depth: usize,
+    budget: &mut HeredocReadBudget,
+) -> Option<SmallVec<[Range<usize>; 8]>> {
+    budget.spend(command)?;
+    let mut outside = command.as_bytes().to_vec();
+    for body in bodies {
+        outside[body.range.clone()].fill(b' ');
+    }
+    // Each body starts after a newline and ends at one or at the end of the
+    // input, so only whole characters were blanked.
+    let outside = String::from_utf8(outside).ok()?;
+    let mut by_parts: Vec<Range<usize>> = plain_sanitize_mask_ranges(&outside)?.into_vec();
+    for body in bodies.iter().filter(|body| body.top_level) {
+        let offset = body.range.start;
+        let inner = sanitize_mask_ranges(command.get(body.range.clone())?, depth + 1, budget)?;
+        by_parts.extend(
+            inner
+                .into_iter()
+                .map(|range| range.start + offset..range.end + offset),
+        );
+    }
+    by_parts.sort_by_key(|range| range.start);
+    Some(merge_ranges(&by_parts))
+}
+
+/// The ranges both sorted, merged range lists cover.
+fn intersect_ranges(left: &[Range<usize>], right: &[Range<usize>]) -> SmallVec<[Range<usize>; 8]> {
+    let mut both = SmallVec::new();
+    let (mut l, mut r) = (0, 0);
+    while l < left.len() && r < right.len() {
+        let start = left[l].start.max(right[r].start);
+        let end = left[l].end.min(right[r].end);
+        if start < end {
+            both.push(start..end);
+        }
+        if left[l].end < right[r].end {
+            l += 1;
+        } else {
+            r += 1;
+        }
+    }
+    both
+}
+
+/// [`sanitize_mask_ranges`] for `command` read whole, heredoc bodies and all.
+fn plain_sanitize_mask_ranges(command: &str) -> Option<SmallVec<[Range<usize>; 8]>> {
     // Quick-reject: if no safe-registry commands appear in the input AND no comments,
     // no masking is possible. Skip expensive tokenization entirely. This is a significant
     // optimization for heredocs and other large inputs that don't use these commands.
@@ -1300,14 +1573,18 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     let has_comment_char = command.contains('#');
     let may_have_flowctl_data = command.contains("flowctl") || command.contains("FLOWCTL");
     if !SAFE_COMMANDS_MATCHER.is_match(command) && !has_comment_char && !may_have_flowctl_data {
-        return Cow::Borrowed(command);
+        return Some(SmallVec::new());
     }
+    token_mask_ranges(command, &tokenize_command(command), may_have_flowctl_data)
+}
 
-    let tokens = tokenize_command(command);
-    if tokens.is_empty() {
-        return Cow::Borrowed(command);
-    }
-
+/// The masking pass of [`plain_sanitize_mask_ranges`] over `command`'s tokens.
+#[allow(clippy::too_many_lines)] // Single-pass masking logic; refactor only if it becomes unreadable
+fn token_mask_ranges(
+    command: &str,
+    tokens: &[SanitizeToken],
+    may_have_flowctl_data: bool,
+) -> Option<SmallVec<[Range<usize>; 8]>> {
     let mut mask_ranges: SmallVec<[Range<usize>; 8]> = SmallVec::new();
 
     // Per-segment state (segments split on shell separators like |, ;, &&, ||).
@@ -1357,9 +1634,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             continue;
         }
 
-        let Some(token_text) = token.text(command) else {
-            return Cow::Borrowed(command);
-        };
+        let token_text = token.text(command)?;
 
         // Skip line continuations (backslash at end of line)
         if token_text == "\\\n" || token_text == "\\\r\n" {
@@ -1655,32 +1930,8 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         }
     }
 
-    if mask_ranges.is_empty() {
-        return Cow::Borrowed(command);
-    }
-
-    // Merge overlapping ranges and apply masks.
     mask_ranges.sort_by_key(|r| r.start);
-    let merged = merge_ranges(&mask_ranges);
-
-    let bytes = command.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut last = 0;
-    for range in merged {
-        if range.start > last {
-            out.extend_from_slice(&bytes[last..range.start]);
-        }
-        out.extend(std::iter::repeat_n(
-            b' ',
-            range.end.saturating_sub(range.start),
-        ));
-        last = range.end;
-    }
-    if last < bytes.len() {
-        out.extend_from_slice(&bytes[last..]);
-    }
-
-    String::from_utf8(out).map_or(Cow::Borrowed(command), Cow::Owned)
+    Some(merge_ranges(&mask_ranges))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2756,10 +3007,10 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
                 has_inline_code = true;
                 i = consume_dollar_paren(command, i);
             }
-            // `${x:- #}` is one word: a blank inside the braces does not end
-            // it, so the `#` after one starts no comment.
+            // `${x:- #}` is one word: a blank or a line end inside the braces
+            // does not end it, so the `#` after one starts no comment.
             b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
-                let (end, inline) = consume_braced_parameter(command, i, true);
+                let (end, inline) = consume_braced_parameter(command, i);
                 has_inline_code |= inline;
                 i = end;
             }
@@ -2956,17 +3207,15 @@ fn consume_backticks(command: &str, start: usize) -> usize {
 /// and quotes, escapes and substitutions inside it are passed over whole, so
 /// a `}` in them closes nothing.
 ///
-/// With `line_bounded`, the word is cut at the end of its line when no `}`
-/// closes it there. The shell would read on, but a line that does not close
-/// the expansion is rarely shell syntax at all (a heredoc's body line, say),
-/// and a reader that masks a word could take the commands of the lines after
-/// it for part of this one.
+/// Like the shell, it reads on across lines to the `}` that closes it (a
+/// `#` on a later line inside it is no comment either), and to the end of
+/// the input when none does, where the shell reports a syntax error and runs
+/// nothing of the line. A heredoc body is raw text to the shell, so an
+/// expansion opened in one does not run past its terminator line: the
+/// readers take each body apart from the lines around it (see
+/// [`heredoc_body_ranges`]).
 #[must_use]
-pub(crate) fn consume_braced_parameter(
-    command: &str,
-    start: usize,
-    line_bounded: bool,
-) -> (usize, bool) {
+pub(crate) fn consume_braced_parameter(command: &str, start: usize) -> (usize, bool) {
     let bytes = command.as_bytes();
     let len = bytes.len();
 
@@ -2977,7 +3226,6 @@ pub(crate) fn consume_braced_parameter(
     let mut has_inline_code = false;
     while i < len {
         match bytes[i] {
-            b'\n' if line_bounded => return (i, has_inline_code),
             b'\\' => i = (i + 2).min(len),
             b'$' if bytes.get(i + 1) == Some(&b'{') => {
                 depth += 1;
@@ -3038,6 +3286,672 @@ pub(crate) fn consume_braced_parameter(
         }
     }
     (len, has_inline_code)
+}
+
+// =============================================================================
+// Heredoc bodies
+// =============================================================================
+
+/// How many substitutions, quotes and expansions deep the heredoc scan follows
+/// a command, and how many bodies deep the readers take bodies apart. Past
+/// either, the readers keep their plain reading of the rest.
+const HEREDOC_SCAN_MAX_DEPTH: usize = 64;
+
+/// What the readers that take heredoc bodies apart (the sanitizer and the
+/// classifier) may read for one command, in bytes: each reading of the
+/// command or of a body spends its length. An ordinary command takes a few
+/// times its length. Where bash and dash end a body at different lines, the
+/// body is read under each rule set, and a body nested in a disputed one is
+/// read once for each reading of its container, so nested disputes double the
+/// work at every level. Past the budget a reader stops and trusts none of its
+/// readings: the classifier checks every byte, and the sanitizer masks only
+/// the quotes and other openers in body text (see [`heredoc_body_openers`]).
+struct HeredocReadBudget {
+    left: usize,
+    exhausted: bool,
+}
+
+impl HeredocReadBudget {
+    /// Readings of the command's length it may take beyond the slack.
+    const LENGTHS: usize = 16;
+    /// Bytes it may read beyond its multiple of the command's length.
+    const SLACK: usize = 64 * 1024;
+
+    fn for_command(command: &str) -> Self {
+        Self {
+            left: command
+                .len()
+                .saturating_mul(Self::LENGTHS)
+                .saturating_add(Self::SLACK),
+            exhausted: false,
+        }
+    }
+
+    /// Spend a reading of `text`; `None`, from then on, once the budget is
+    /// spent.
+    fn spend(&mut self, text: &str) -> Option<()> {
+        let left = self.left.checked_sub(text.len());
+        self.left = left.unwrap_or(0);
+        self.exhausted |= left.is_none();
+        left.map(drop)
+    }
+}
+
+/// The quotes and expansion openers in the text that any rule set reads as
+/// heredoc body text, as one-byte ranges: each quote and backquote, the `$`
+/// of `$(`, `${` and `$[`, and the `(` of `<(` and `>(`.
+///
+/// What the sanitizer masks when its readings run out of budget. A body is
+/// raw text to the shell, but readers further on (segment splitting, word
+/// scans) tokenize the sanitized command as shell: left in place, an
+/// apostrophe in a body makes them take every command after the terminator
+/// line for its contents. Blanking just these keeps every word of the body,
+/// and of the command, visible to the packs. Other syntax in body text
+/// (parentheses, braces, backslashes, comment signs) is kept: it opens
+/// nothing that runs past a line, and the patterns that read a body run as a
+/// script need it.
+fn heredoc_body_openers(command: &str) -> SmallVec<[Range<usize>; 8]> {
+    let bytes = command.as_bytes();
+    let mut openers: SmallVec<[Range<usize>; 8]> = SmallVec::new();
+    for bodies in heredoc_body_layouts(command) {
+        for body in bodies {
+            openers.extend(
+                body.range
+                    .clone()
+                    .filter(|&at| match bytes[at] {
+                        b'\'' | b'"' | b'`' => true,
+                        b'$' => matches!(bytes.get(at + 1), Some(b'(' | b'{' | b'[')),
+                        b'(' => at > body.range.start && matches!(bytes[at - 1], b'<' | b'>'),
+                        _ => false,
+                    })
+                    .map(|at| at..at + 1),
+            );
+        }
+    }
+    openers.sort_by_key(|range| range.start);
+    merge_ranges(&openers)
+}
+
+/// The heredoc bodies of `command`, each with its terminator line: from the
+/// start of the line after the one that holds its operator to the end of the
+/// line that closes it (that line's newline excluded), or to the end of the
+/// input when no line closes it. In input order, at most one per operator,
+/// including bodies of operators inside `$(…)`, backquotes and process
+/// substitutions; an operator inside a body belongs to the reading of that
+/// body.
+///
+/// A body is raw text to the shell. A quote, `$(`, `${` or backquote in it
+/// opens nothing, and the line after its terminator starts fresh. A reader
+/// that tokenizes the whole command as shell takes an apostrophe in a body
+/// line (`it's`) for a quote that runs to the end of the input, and every
+/// command after the body for its contents.
+///
+/// Every `<<` (not `<<<`) outside quotes, comments and arithmetic that is
+/// followed by a delimiter word is taken for an operator. Its body ends at the
+/// first line that is exactly the delimiter after quote removal (after its
+/// leading tabs for `<<-`), as `rules` reads bodies. The readers combine a
+/// reading of the command with these bodies taken apart under each rule set
+/// with their plain reading, so that text any of them shows stays shown: a
+/// body found where the shell has none can show text, never hide it.
+pub(crate) fn heredoc_body_ranges(
+    command: &str,
+    rules: HeredocRules,
+) -> SmallVec<[HeredocBody; 2]> {
+    let bytes = command.as_bytes();
+    if memchr::memmem::find(bytes, b"<<").is_none() {
+        return SmallVec::new();
+    }
+    let mut scanner = HeredocScanner {
+        bytes,
+        rules,
+        bodies: SmallVec::new(),
+        pending: Vec::new(),
+    };
+    scanner.code(0, HeredocCodeEnd::Input, 0);
+    scanner.bodies
+}
+
+/// The heredoc body layouts of `command` a reader takes apart: bash's, and
+/// dash's where it differs (see [`HeredocRules`]); a rule set that finds no
+/// body adds none. Empty when there is no body.
+pub(crate) fn heredoc_body_layouts(command: &str) -> SmallVec<[SmallVec<[HeredocBody; 2]>; 2]> {
+    let mut layouts = SmallVec::new();
+    let bash = heredoc_body_ranges(command, HeredocRules::Bash);
+    let dash = heredoc_body_ranges(command, HeredocRules::Dash);
+    if !dash.is_empty() && dash != bash {
+        layouts.push(dash);
+    }
+    if !bash.is_empty() {
+        layouts.push(bash);
+    }
+    layouts
+}
+
+/// How a shell reads heredoc bodies. Bash and zsh read them alike; dash
+/// differs on four points. With an unquoted delimiter, a body line ending in
+/// a backslash-newline goes on to the next line in all of them, so `x\`
+/// followed by `EOF` does not end an `EOF` body; bash and zsh compare the
+/// joined line with the delimiter, so `E\` followed by `OF` ends one, while
+/// dash ends a body only at a line of its own. Bash and zsh remove `$'…'` and
+/// `$"…"` quoting from a delimiter, which dash keeps the `$` of. And bash and
+/// zsh read `((…))` and `$[…]` as arithmetic, where a `<<` is a shift: dash
+/// reads the first as nested subshells and the second as a word, and a `<<`
+/// in either as an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeredocRules {
+    Bash,
+    Dash,
+}
+
+/// One body found by [`heredoc_body_ranges`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeredocBody {
+    /// The body with its terminator line.
+    pub(crate) range: Range<usize>,
+    /// Its operator is in the command's own code, not inside a substitution,
+    /// so the body follows a line of its own.
+    pub(crate) top_level: bool,
+    /// The terminator's lines, when it is a line joined across
+    /// backslash-newlines (see [`shell_parse_source`]).
+    pub(crate) joined_terminator: Option<Range<usize>>,
+}
+
+/// A heredoc whose operator has been read and whose body starts on the line
+/// after the next line end of the code that holds it.
+struct PendingHeredoc {
+    /// What the terminator line holds: the delimiter after quote removal.
+    delimiter: Vec<u8>,
+    /// `<<-`: leading tabs are stripped from each body and terminator line.
+    strip_tabs: bool,
+    /// The delimiter is unquoted, so a body line ending in a backslash-newline
+    /// goes on to the next line.
+    continues_lines: bool,
+}
+
+impl PendingHeredoc {
+    fn is_terminator(&self, line: &[u8]) -> bool {
+        let line = if self.strip_tabs {
+            let tabs = line.iter().take_while(|byte| **byte == b'\t').count();
+            &line[tabs..]
+        } else {
+            line
+        };
+        line == self.delimiter.as_slice()
+    }
+}
+
+/// What ends the code a [`HeredocScanner::code`] call reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeredocCodeEnd {
+    /// The end of the input.
+    Input,
+    /// The `)` that closes `$(`, `<(` or `>(`.
+    Paren,
+    /// The closing backquote.
+    Backquote,
+}
+
+struct HeredocScanner<'a> {
+    bytes: &'a [u8],
+    rules: HeredocRules,
+    bodies: SmallVec<[HeredocBody; 2]>,
+    pending: Vec<PendingHeredoc>,
+}
+
+impl HeredocScanner<'_> {
+    /// Read shell code from `start` to what `end` names, recording the bodies
+    /// of the heredocs whose operators it holds. Returns the index just past
+    /// the end (the closing byte included), or the input length.
+    fn code(&mut self, start: usize, end: HeredocCodeEnd, depth: usize) -> usize {
+        let bytes = self.bytes;
+        let len = bytes.len();
+        if depth > HEREDOC_SCAN_MAX_DEPTH {
+            return len;
+        }
+        // Operators read in this code have their bodies in this code: one
+        // still pending when it ends has none.
+        let pending_floor = self.pending.len();
+        let mut parens = 0usize;
+        // Just past the `)` or `))` that closed a subshell or an arithmetic
+        // command, where a word starts; a substitution's `)` ends no word.
+        let mut group_end = usize::MAX;
+        let mut i = start;
+        while i < len {
+            let byte = bytes[i];
+            // Where a word starts, a `#` starts a comment and `((` an
+            // arithmetic command.
+            let word_start = i == start
+                || i == group_end
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'<' | b'>'
+                );
+            i = match byte {
+                b'\n' if self.pending.len() > pending_floor => {
+                    // Continue at the newline ending the last terminator line,
+                    // read again as a plain line end.
+                    self.read_bodies(i + 1, pending_floor, end == HeredocCodeEnd::Input)
+                }
+                b'\\' => (i + 2).min(len),
+                b'\'' => memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + at + 2),
+                b'$' if bytes.get(i + 1) == Some(&b'\'') => skip_ansi_c_quoted(bytes, i + 2),
+                b'$' if bytes.get(i + 1) == Some(&b'"') => self.double_quoted(i + 2, depth + 1),
+                b'"' => self.double_quoted(i + 1, depth + 1),
+                b'$' if bytes.get(i + 1) == Some(&b'(') => self.substitution(i, depth + 1),
+                b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => {
+                    self.code(i + 2, HeredocCodeEnd::Paren, depth + 1)
+                }
+                b'$' if bytes.get(i + 1) == Some(&b'{') => self.braced(i + 2, depth + 1),
+                b'$' if self.rules == HeredocRules::Bash && bytes.get(i + 1) == Some(&b'[') => {
+                    bracket_arithmetic_end(bytes, i + 2)
+                }
+                b'`' if end == HeredocCodeEnd::Backquote => {
+                    self.pending.truncate(pending_floor);
+                    return i + 1;
+                }
+                b'`' => self.code(i + 1, HeredocCodeEnd::Backquote, depth + 1),
+                b'<' => {
+                    let run = bytes[i..].iter().take_while(|b| **b == b'<').count();
+                    if run == 2 { self.operator(i) } else { i + run }
+                }
+                b'#' if word_start => {
+                    // To the end of its line, or inside backquotes to the
+                    // closing backquote if that comes first.
+                    let line_end = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |at| i + at);
+                    if end == HeredocCodeEnd::Backquote {
+                        memchr::memchr(b'`', &bytes[i..line_end]).map_or(line_end, |at| i + at)
+                    } else {
+                        line_end
+                    }
+                }
+                b'(' => {
+                    if word_start
+                        && self.rules == HeredocRules::Bash
+                        && bytes.get(i + 1) == Some(&b'(')
+                        && let Some(close) = arithmetic_end(bytes, i + 2)
+                    {
+                        group_end = close;
+                        close
+                    } else {
+                        parens += 1;
+                        i + 1
+                    }
+                }
+                b')' if end == HeredocCodeEnd::Paren && parens == 0 => {
+                    self.pending.truncate(pending_floor);
+                    return i + 1;
+                }
+                b')' => {
+                    parens = parens.saturating_sub(1);
+                    group_end = i + 1;
+                    i + 1
+                }
+                _ => i + 1,
+            };
+        }
+        self.pending.truncate(pending_floor);
+        len
+    }
+
+    /// Read a double-quoted string whose text starts at `start`; returns the
+    /// index past its closing quote. Its substitutions are code.
+    fn double_quoted(&mut self, start: usize, depth: usize) -> usize {
+        let bytes = self.bytes;
+        let len = bytes.len();
+        let mut i = start;
+        while i < len {
+            i = match bytes[i] {
+                b'"' => return i + 1,
+                b'\\' => (i + 2).min(len),
+                b'$' if bytes.get(i + 1) == Some(&b'(') => self.substitution(i, depth + 1),
+                b'$' if bytes.get(i + 1) == Some(&b'{') => self.braced(i + 2, depth + 1),
+                b'`' => self.code(i + 1, HeredocCodeEnd::Backquote, depth + 1),
+                _ => i + 1,
+            };
+        }
+        len
+    }
+
+    /// Read the `$(…)` or `$((…))` whose `$` is at `at`; returns the index
+    /// past it.
+    fn substitution(&mut self, at: usize, depth: usize) -> usize {
+        let bytes = self.bytes;
+        (bytes.get(at + 2) == Some(&b'('))
+            .then(|| arithmetic_end(bytes, at + 3))
+            .flatten()
+            .unwrap_or_else(|| self.code(at + 2, HeredocCodeEnd::Paren, depth))
+    }
+
+    /// Read a `${…}` expansion whose text starts at `start`, as
+    /// [`consume_braced_parameter`] does; returns the index past its `}`.
+    fn braced(&mut self, start: usize, depth: usize) -> usize {
+        let bytes = self.bytes;
+        let len = bytes.len();
+        let mut nesting = 1usize;
+        let mut i = start;
+        while i < len {
+            i = match bytes[i] {
+                b'\\' => (i + 2).min(len),
+                b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                    nesting += 1;
+                    i + 2
+                }
+                b'$' if bytes.get(i + 1) == Some(&b'\'') => skip_ansi_c_quoted(bytes, i + 2),
+                b'}' => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        return i + 1;
+                    }
+                    i + 1
+                }
+                b'\'' => memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + at + 2),
+                b'"' => self.double_quoted(i + 1, depth + 1),
+                b'$' if bytes.get(i + 1) == Some(&b'(') => self.substitution(i, depth + 1),
+                b'`' => self.code(i + 1, HeredocCodeEnd::Backquote, depth + 1),
+                _ => i + 1,
+            };
+        }
+        len
+    }
+
+    /// Read the heredoc operator whose `<<` is at `at`, and its delimiter
+    /// word; returns the index past them. A word quoted in any part, or with a
+    /// backslash, makes the delimiter quoted; a line continuation is removed
+    /// before the word is read, as the shell removes it.
+    fn operator(&mut self, at: usize) -> usize {
+        let bytes = self.bytes;
+        let len = bytes.len();
+        let continuation = |i: usize| bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\n');
+        let mut i = at + 2;
+        let strip_tabs = bytes.get(i) == Some(&b'-');
+        if strip_tabs {
+            i += 1;
+        }
+        while i < len && (matches!(bytes[i], b' ' | b'\t') || continuation(i)) {
+            i += if continuation(i) { 2 } else { 1 };
+        }
+        let word_start = i;
+        if bytes.get(i) == Some(&b'#') {
+            // A comment, where the word would start: a syntax error, not an
+            // operator.
+            return word_start;
+        }
+        // The delimiter is the word after quote removal; the shell does not
+        // expand it. A carriage return is no blank, so it stays in the word.
+        let mut delimiter = Vec::new();
+        let mut quoted = false;
+        while i < len {
+            match bytes[i] {
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' => break,
+                b'\\' if continuation(i) => i += 2,
+                b'\\' => {
+                    quoted = true;
+                    delimiter.extend(bytes.get(i + 1));
+                    i = (i + 2).min(len);
+                }
+                b'\'' => {
+                    quoted = true;
+                    let close = memchr::memchr(b'\'', &bytes[i + 1..]).map_or(len, |at| i + 1 + at);
+                    delimiter.extend_from_slice(&bytes[i + 1..close]);
+                    i = (close + 1).min(len);
+                }
+                b'$' if matches!(bytes.get(i + 1), Some(b'\'' | b'"')) => {
+                    quoted = true;
+                    let quote = bytes[i + 1];
+                    let mut close = i + 2;
+                    while close < len && bytes[close] != quote {
+                        close += if bytes[close] == b'\\' { 2 } else { 1 };
+                    }
+                    let close = close.min(len);
+                    let text = &bytes[i + 2..close];
+                    if self.rules == HeredocRules::Dash {
+                        delimiter.push(b'$');
+                        delimiter.extend_from_slice(text);
+                    } else {
+                        // Each escape stands for its character; the common
+                        // ones (`\'`, `\"`, `\\`) for the escaped byte.
+                        let mut escaped = false;
+                        for &byte in text {
+                            if escaped || byte != b'\\' {
+                                delimiter.push(byte);
+                                escaped = false;
+                            } else {
+                                escaped = true;
+                            }
+                        }
+                    }
+                    i = (close + 1).min(len);
+                }
+                b'"' => {
+                    quoted = true;
+                    i += 1;
+                    while i < len && bytes[i] != b'"' {
+                        if continuation(i) {
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i] == b'\\'
+                            && matches!(bytes.get(i + 1), Some(b'$' | b'`' | b'"' | b'\\'))
+                        {
+                            i += 1;
+                        }
+                        delimiter.push(bytes[i]);
+                        i += 1;
+                    }
+                    i = (i + 1).min(len);
+                }
+                byte => {
+                    delimiter.push(byte);
+                    i += 1;
+                }
+            }
+        }
+        if i == word_start {
+            // `<<` with no word after it is a syntax error, not an operator.
+            return word_start;
+        }
+        self.pending.push(PendingHeredoc {
+            delimiter,
+            strip_tabs,
+            continues_lines: !quoted,
+        });
+        i
+    }
+
+    /// Read the bodies of the heredocs pending above `pending_floor`, one
+    /// after the other from `start`, the first line after the line end that
+    /// holds their operators. Returns the index of the newline ending the last
+    /// terminator line, or the input length.
+    fn read_bodies(&mut self, start: usize, pending_floor: usize, top_level: bool) -> usize {
+        let len = self.bytes.len();
+        let mut body_start = start;
+        for heredoc in self.pending.split_off(pending_floor) {
+            let (end, joined_terminator) = self.body_end(body_start, &heredoc);
+            if end > body_start {
+                self.bodies.push(HeredocBody {
+                    range: body_start..end,
+                    top_level,
+                    joined_terminator,
+                });
+            }
+            if end >= len {
+                return len;
+            }
+            body_start = end + 1;
+        }
+        body_start - 1
+    }
+
+    /// End of the terminator line of the body that starts at `start` (its
+    /// newline excluded), or the input length when no line ends it; and the
+    /// terminator's lines when it is a line joined across backslash-newlines.
+    fn body_end(&self, start: usize, heredoc: &PendingHeredoc) -> (usize, Option<Range<usize>>) {
+        let bytes = self.bytes;
+        let len = bytes.len();
+        let line_end_from =
+            |from: usize| memchr::memchr(b'\n', &bytes[from..]).map_or(len, |at| from + at);
+        let continues = |line: &[u8]| {
+            heredoc.continues_lines
+                && line.iter().rev().take_while(|byte| **byte == b'\\').count() % 2 == 1
+        };
+        let mut line_start = start;
+        loop {
+            let mut line_end = line_end_from(line_start);
+            let joined_line = continues(&bytes[line_start..line_end]);
+            let terminates = if joined_line {
+                // One line, joined across each backslash-newline: bash and zsh
+                // compare it with the delimiter, dash ends no body at it. Past
+                // the delimiter's length it can no longer be the delimiter, but
+                // its end is still where the next line starts.
+                let limit = heredoc.delimiter.len() + 1;
+                let mut joined = Vec::new();
+                let mut piece_start = line_start;
+                loop {
+                    let piece = &bytes[piece_start..line_end];
+                    let more = continues(piece) && line_end < len;
+                    let kept = if more {
+                        &piece[..piece.len() - 1]
+                    } else {
+                        piece
+                    };
+                    if joined.len() <= limit {
+                        joined.extend_from_slice(kept);
+                    }
+                    if !more {
+                        break;
+                    }
+                    piece_start = line_end + 1;
+                    line_end = line_end_from(piece_start);
+                }
+                self.rules == HeredocRules::Bash
+                    && joined.len() <= limit
+                    && heredoc.is_terminator(&joined)
+            } else {
+                heredoc.is_terminator(&bytes[line_start..line_end])
+            };
+            if terminates {
+                return (line_end, joined_line.then_some(line_start..line_end));
+            }
+            if line_end >= len {
+                return (len, None);
+            }
+            line_start = line_end + 1;
+        }
+    }
+}
+
+/// `command` as a parser of shell syntax should read it. tree-sitter-bash
+/// ends a heredoc body at a raw line that is its delimiter, while bash and
+/// zsh, for an unquoted delimiter, compare a line joined across
+/// backslash-newlines (`E\` followed by `OF` ends an `EOF` body) and run the
+/// lines after it; read raw, those lines were body text to every analysis
+/// that starts from the parse tree. Each such terminator is written out
+/// joined, the backslash-newlines it drops moved after it as empty lines, so
+/// the parse ends the body where the shell does. Every other byte, and every
+/// offset outside those terminators, is the command's own.
+#[must_use]
+pub(crate) fn shell_parse_source(command: &str) -> Cow<'_, str> {
+    if memchr::memmem::find(command.as_bytes(), b"\\\n").is_none() {
+        return Cow::Borrowed(command);
+    }
+    let terminators: SmallVec<[Range<usize>; 2]> = heredoc_body_ranges(command, HeredocRules::Bash)
+        .into_iter()
+        .filter_map(|body| body.joined_terminator)
+        .collect();
+    if terminators.is_empty() {
+        return Cow::Borrowed(command);
+    }
+    let mut bytes = command.as_bytes().to_vec();
+    for range in terminators {
+        // An unquoted delimiter holds no backslash, so every one in the
+        // joined terminator ends one of its lines.
+        let mut line: Vec<u8> = command.as_bytes()[range.clone()]
+            .split(|byte| *byte == b'\n')
+            .flat_map(|piece| piece.strip_suffix(b"\\").unwrap_or(piece))
+            .copied()
+            .collect();
+        line.resize(range.len(), b'\n');
+        bytes[range].copy_from_slice(&line);
+    }
+    // Only ASCII bytes were moved, between whole lines.
+    String::from_utf8(bytes).map_or(Cow::Borrowed(command), Cow::Owned)
+}
+
+/// Index past the `]` closing the `$[…]` arithmetic whose text starts at
+/// `start`, where a `<<` is a shift (bash and zsh), or the input length when
+/// none does: the shell reads on for it and reports a syntax error.
+fn bracket_arithmetic_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < bytes.len() {
+        i = match bytes[i] {
+            b'[' => {
+                depth += 1;
+                i + 1
+            }
+            b']' if depth == 0 => return i + 1,
+            b']' => {
+                depth -= 1;
+                i + 1
+            }
+            b'\\' => i + 2,
+            b'\'' => memchr::memchr(b'\'', &bytes[i + 1..]).map_or(bytes.len(), |at| i + at + 2),
+            b'"' => {
+                let mut at = i + 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                at + 1
+            }
+            _ => i + 1,
+        };
+    }
+    bytes.len()
+}
+
+/// Index past the `$'…'` string whose text starts at `start`.
+fn skip_ansi_c_quoted(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && bytes[i] != b'\'' {
+        i += if bytes[i] == b'\\' { 2 } else { 1 };
+    }
+    (i + 1).min(bytes.len())
+}
+
+/// Index past the `))` closing the arithmetic whose text starts at `start`
+/// (after `$((` or `((`), where a `<<` is a shift. As bash decides it, the
+/// text is arithmetic only when the `)` that closes its own level is followed
+/// at once by another `)`; otherwise (`((cd x) && ls)`) the parentheses open
+/// nested subshells, and `None` is returned.
+fn arithmetic_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < bytes.len() {
+        i = match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i + 1
+            }
+            b')' if depth == 0 => {
+                return (bytes.get(i + 1) == Some(&b')')).then_some(i + 2);
+            }
+            b')' => {
+                depth -= 1;
+                i + 1
+            }
+            b'\\' => i + 2,
+            b'\'' => memchr::memchr(b'\'', &bytes[i + 1..]).map_or(bytes.len(), |at| i + at + 2),
+            b'"' => {
+                let mut at = i + 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                at + 1
+            }
+            _ => i + 1,
+        };
+    }
+    None
 }
 
 #[inline]
@@ -4060,6 +4974,342 @@ mod tests {
                 "{cmd:?}: {spans:?}"
             );
         }
+    }
+
+    /// The bodies, with their terminator lines, that `rules` finds.
+    fn bodies(command: &str, rules: HeredocRules) -> Vec<&str> {
+        heredoc_body_ranges(command, rules)
+            .iter()
+            .map(|body| &command[body.range.clone()])
+            .collect()
+    }
+
+    /// A heredoc body ends at the first line that is exactly its delimiter
+    /// after quote removal, as each shell reads bodies; operators are found
+    /// wherever shell code is, and nowhere else.
+    #[test]
+    fn heredoc_bodies_end_at_their_terminator_lines() {
+        for (command, expected) in [
+            ("cat > n <<'EOF'\nit's\nEOF\nrm -rf /", vec!["it's\nEOF"]),
+            ("cat <<EOF\nx\nEOF", vec!["x\nEOF"]),
+            ("cat<<\"EOF\">n\nx\nEOF\nls", vec!["x\nEOF"]),
+            ("cat <<\\EOF\nx\nEOF\nls", vec!["x\nEOF"]),
+            ("cat <<E'O'\"F\"\nx\nEOF\nls", vec!["x\nEOF"]),
+            ("cat <<'E F'\nx\nE F\nls", vec!["x\nE F"]),
+            ("cat <<''\nx\n\nls", vec!["x\n"]),
+            // `<<-` strips leading tabs, and only tabs; `<<` strips nothing.
+            ("cat <<-EOF\n\tx\n\tEOF\nls", vec!["\tx\n\tEOF"]),
+            ("cat <<-EOF\n x\n EOF\nEOF\nls", vec![" x\n EOF\nEOF"]),
+            ("cat <<EOF\nx\n\tEOF\nEOF\nls", vec!["x\n\tEOF\nEOF"]),
+            ("cat <<EOF\nx\nEOF \nEOF\nls", vec!["x\nEOF \nEOF"]),
+            // A carriage return is part of the line, and of a delimiter word.
+            ("cat <<EOF\nx\nEOF\r\nEOF\nls", vec!["x\nEOF\r\nEOF"]),
+            ("cat <<'EOF'\r\nit's\r\nEOF\r\nls", vec!["it's\r\nEOF\r"]),
+            // Bodies follow one another; the line after the operator's comes
+            // first, whatever else is on it.
+            (
+                "cat <<A; cat <<'B'\na\nA\nb's\nB\nls",
+                vec!["a\nA", "b's\nB"],
+            ),
+            ("cat <<A <<B\na\nA\nb\nB\nls", vec!["a\nA", "b\nB"]),
+            ("cat <<EOF # note\nx\nEOF\nls", vec!["x\nEOF"]),
+            ("cat <<EOF \\\n>/dev/null\nx\nEOF\nls", vec!["x\nEOF"]),
+            // Inside substitutions, and inside a subshell that only looks
+            // like arithmetic.
+            ("x=$(cat <<'EOF'\nit's\nEOF\n)\nls", vec!["it's\nEOF"]),
+            ("echo \"$(cat <<EOF\nit's\nEOF\n)\"\nls", vec!["it's\nEOF"]),
+            ("x=`cat <<EOF\nit's\nEOF\n`\nls", vec!["it's\nEOF"]),
+            ("((cat <<'EOF') )\nit's\nEOF\nls", vec!["it's\nEOF"]),
+            // An operator inside a body belongs to the reading of the body.
+            (
+                "bash <<'O'\ncat <<I\nit's\nI\nO\nls",
+                vec!["cat <<I\nit's\nI\nO"],
+            ),
+            // No terminator: the body runs to the end of the input.
+            ("cat <<EOF\nit's\nrm -rf /", vec!["it's\nrm -rf /"]),
+            // A line continuation is removed before the delimiter is read.
+            ("cat <<\\\nEOF\nx\nEOF\nls", vec!["x\nEOF"]),
+            ("cat <<E\\\nOF\nx\nEOF\nls", vec!["x\nEOF"]),
+            ("cat <<\"E\\\nOF\"\nx\nEOF\nls", vec!["x\nEOF"]),
+            // After a substitution's `)` a `#` is part of the word.
+            ("echo $(echo a)#<<EOF\nx\nEOF\nls", vec!["x\nEOF"]),
+            // With an unquoted delimiter a body line ending in a
+            // backslash-newline goes on to the next line, which therefore
+            // ends no body; with a quoted one it is a line like any other.
+            (
+                "cat <<EOF\nx\\\nEOF\nls\nEOF\nrm",
+                vec!["x\\\nEOF\nls\nEOF"],
+            ),
+            ("cat <<EOF\nx\\\\\nEOF\nls", vec!["x\\\\\nEOF"]),
+            ("cat <<'EOF'\nx\\\nEOF\nls\nEOF\nrm", vec!["x\\\nEOF"]),
+            // Not operators.
+            ("cat <<< \"it's\"\nls", vec![]),
+            ("cat <<<EOF\nEOF\nls", vec![]),
+            ("echo $((1 << 2))\n2\nls", vec![]),
+            ("echo a # <<EOF\nEOF\nls", vec![]),
+            ("echo a;#<<EOF\nEOF\nls", vec![]),
+            ("(echo a)#<<EOF\nEOF\nls", vec![]),
+            ("((1))#<<EOF\nEOF\nls", vec![]),
+            ("cat <<#EOF\n#EOF\nls", vec![]),
+            ("cat << #EOF\n#EOF\nls", vec![]),
+            ("echo '<<EOF'\nEOF\nls", vec![]),
+            ("echo \"<<EOF\"\nEOF\nls", vec![]),
+            ("echo \\<<EOF\nEOF\nls", vec![]),
+            ("cat <<\nls", vec![]),
+            ("cat <<;\nls", vec![]),
+        ] {
+            for rules in [HeredocRules::Bash, HeredocRules::Dash] {
+                assert_eq!(bodies(command, rules), expected, "{command:?} {rules:?}");
+            }
+        }
+        // Where the shells differ: bash and zsh end an unquoted body at a
+        // line joined across a backslash-newline, decode `$'…'`, and read
+        // `((…))` and `$[…]` as arithmetic.
+        for (command, bash, dash) in [
+            ("(( x = 1 << 2 ))\n2\nls", vec![], vec!["2"]),
+            ("(( x = 1 << 2 ))\nit's\n2\nls", vec![], vec!["it's\n2"]),
+            ("echo $[1<<2]\nit's\n2]\nls", vec![], vec!["it's\n2]"]),
+            ("echo $[a[1]<<2]\nx\n2]\nls", vec![], vec!["x\n2]"]),
+            (
+                "cat <<EOF\nE\\\nOF\nls\nEOF\nrm",
+                vec!["E\\\nOF"],
+                vec!["E\\\nOF\nls\nEOF"],
+            ),
+            (
+                "cat <<$'EOF'\nx\nEOF\n$EOF\nrm",
+                vec!["x\nEOF"],
+                vec!["x\nEOF\n$EOF"],
+            ),
+        ] {
+            assert_eq!(bodies(command, HeredocRules::Bash), bash, "{command:?}");
+            assert_eq!(bodies(command, HeredocRules::Dash), dash, "{command:?}");
+        }
+        let nested = heredoc_body_ranges(
+            "x=$(cat <<EOF\na\nEOF\n)\ncat <<B\nb\nB",
+            HeredocRules::Bash,
+        );
+        assert_eq!(
+            nested.iter().map(|body| body.top_level).collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    /// A quote, substitution or expansion left open in a heredoc body ends
+    /// with the body: the commands after its terminator line stay visible to
+    /// the sanitizer and are no quoted data to the classifier.
+    #[test]
+    fn a_heredoc_body_hides_nothing_after_its_terminator() {
+        let tail = "rm -rf /";
+        for body in [
+            "echo it's",
+            "it's",
+            "We don't need this.",
+            "say \"hi",
+            "run `make",
+            "value $(date",
+            "path ${HOME",
+            "# it's a note",
+            "line one's\nline two",
+        ] {
+            for (opener, terminator) in [
+                ("cat > notes.md <<'EOF'", "EOF"),
+                ("cat > notes.md <<\"EOF\"", "EOF"),
+                ("cat > notes.md <<EOF", "EOF"),
+                ("cat <<'EOF' > notes.md", "EOF"),
+                ("tee notes.md <<'EOF' >/dev/null", "EOF"),
+                ("cat>notes.md<<'EOF'", "EOF"),
+                ("cat <<'EOF' | grep x", "EOF"),
+                ("cat > notes.md <<-'EOF'", "\tEOF"),
+                ("cat >a <<'A'; cat >b <<'B'\nx's\nA", "B"),
+            ] {
+                let command = format!("{opener}\n{body}\n{terminator}\n{tail}");
+                let sanitized = sanitize_for_pattern_matching(&command);
+                assert!(sanitized.contains(tail), "{command:?} -> {sanitized:?}");
+                let at = command.rfind(tail).expect("tail");
+                assert!(
+                    !offset_is_quoted_data(&command, at),
+                    "{command:?}: {:?}",
+                    classify_command(&command)
+                );
+                assert!(
+                    classify_command(&command)
+                        .spans()
+                        .iter()
+                        .all(|span| !(span.kind == SpanKind::Comment
+                            && span.byte_range.contains(&at))),
+                    "{command:?}"
+                );
+            }
+        }
+        // Inside a substitution, and with the delimiter quoted on CRLF lines.
+        for command in [
+            "x=$(cat <<'EOF'\nit's\nEOF\n)\ngit commit -m 'done'\nrm -rf /",
+            "cat > notes.md <<'EOF'\r\nit's\r\nEOF\r\nrm -rf /",
+        ] {
+            let at = command.rfind(tail).expect("tail");
+            assert!(!offset_is_quoted_data(command, at), "{command:?}");
+            assert!(
+                sanitize_for_pattern_matching(command).contains(tail),
+                "{command:?}"
+            );
+        }
+        // What a body holds is still masked as before: an `echo` line's
+        // arguments, and a comment line.
+        for command in [
+            "cat > notes.md <<'EOF'\necho rm -rf /\nEOF\nls",
+            "cat > notes.md <<'EOF'\n# rm -rf /\nEOF\nls",
+            "bash <<'EOF'\necho 'rm -rf / is bad'\nEOF",
+        ] {
+            assert!(
+                !sanitize_for_pattern_matching(command).contains(tail),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// Where the shells disagree on where a body ends, the text after it that
+    /// any of them runs stays visible. Read under the other shell's rules, the
+    /// body ends early or late and an apostrophe in it hides that text, as it
+    /// does in the reading whole.
+    #[test]
+    fn a_disputed_heredoc_body_hides_nothing_any_shell_runs() {
+        let tail = "rm -rf /";
+        for command in [
+            // bash and zsh end the body at `E\` joined with `OF`; dash reads
+            // on to the next `EOF`.
+            "cat <<EOF\nE\\\nOF\necho it's\nEOF\nrm -rf /",
+            // dash keeps the `$` of `$'EOF'` and reads on to `$EOF`; bash and
+            // zsh end the body at `EOF`.
+            "cat <<$'EOF'\nEOF\necho it's\n$EOF\nrm -rf /",
+            // dash reads `((` as two subshells and `$[` as a word, and the
+            // `<<` in them as an operator; bash and zsh read arithmetic.
+            "(( x = 1 << 2 ))\necho it's\n2\nrm -rf /",
+            "echo $[1<<2]\necho it's\n2]\nrm -rf /",
+        ] {
+            assert!(
+                sanitize_for_pattern_matching(command).contains(tail),
+                "{command:?}"
+            );
+        }
+        for command in [
+            "cat <<EOF\nE\\\nOF\nit's\nEOF\nrm -rf /\necho 'done'",
+            "cat <<$'EOF'\nEOF\nit's\n$EOF\nrm -rf /\necho 'done'",
+            "(( x = 1 << 2 ))\nit's\n2\nrm -rf /\necho 'done'",
+        ] {
+            let at = command.rfind(tail).expect("tail");
+            assert!(!offset_is_quoted_data(command, at), "{command:?}");
+        }
+    }
+
+    /// Bodies nested in bodies that bash and dash end at different lines are
+    /// read once for each reading of their containers, which doubles the
+    /// work at every level. Past their budget the readers stop and trust no
+    /// reading: every byte is checked, and only the quotes and expansion
+    /// openers in body text are masked, so that no later tokenizer takes the
+    /// commands after a body for its contents, while the rest of the body's
+    /// syntax stays for the patterns that read it. They never run long, and
+    /// never hide what follows.
+    #[test]
+    fn nested_disputed_heredoc_bodies_stay_within_the_reading_budget() {
+        use std::fmt::Write as _;
+        const LEVELS: usize = 40;
+        let mut command = String::new();
+        for level in 0..LEVELS {
+            let _ = writeln!(command, "cat <<$'L{level}'");
+        }
+        command.push_str("echo it's $(date) ${HOME} <(ls)\nbuild() { make \\\n -j2; } # done\n");
+        for level in (0..LEVELS).rev() {
+            let _ = writeln!(command, "L{level}\n$L{level}");
+        }
+        command.push_str("rm -rf /");
+        let started = std::time::Instant::now();
+        let sanitized = sanitize_for_pattern_matching(&command);
+        assert!(sanitized.contains("rm -rf /"));
+        assert!(
+            sanitized
+                .contains("echo it s  (date)  {HOME} < ls)\nbuild() { make \\\n -j2; } # done\n"),
+            "{sanitized:?}"
+        );
+        assert!(
+            sanitized.starts_with("cat <<$'L0'\ncat <<$ L1 \n"),
+            "{sanitized:?}"
+        );
+        assert_eq!(sanitized.len(), command.len());
+        let at = command.rfind("rm -rf /").expect("tail");
+        assert!(!offset_is_quoted_data(&command, at));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the readers took {:?}",
+            started.elapsed()
+        );
+        // The budget is spent by length: an ordinary command, a few readings
+        // of its length, is far inside it.
+        let mut budget = HeredocReadBudget::for_command(&command);
+        assert!(sanitize_mask_ranges(&command, 0, &mut budget).is_none());
+        let ordinary = "cat > notes.md <<'EOF'\necho it's\nEOF\necho 'done'\nrm -rf /";
+        let mut budget = HeredocReadBudget::for_command(ordinary);
+        let masked = sanitize_mask_ranges(ordinary, 0, &mut budget).expect("within budget");
+        assert!(!masked.is_empty());
+        assert!(budget.left > HeredocReadBudget::SLACK);
+    }
+
+    /// The parse view writes each terminator bash finds by joining lines out
+    /// joined, keeping the command's length and every byte outside it; any
+    /// other command is passed through as it is.
+    #[test]
+    fn the_parse_view_writes_a_joined_terminator_out_joined() {
+        let command = "cat <<EOF >n\nE\\\nOF\nrm -rf ~\nEOF";
+        let view = shell_parse_source(command);
+        assert_eq!(view, "cat <<EOF >n\nEOF\n\n\nrm -rf ~\nEOF");
+        let at = command.find("rm").expect("rm");
+        assert_eq!(&view[at..], &command[at..]);
+        assert_eq!(
+            shell_parse_source("cat <<EOF\nE\\\nO\\\nF\nls"),
+            "cat <<EOF\nEOF\n\n\n\n\nls"
+        );
+        assert_eq!(
+            shell_parse_source("cat <<-EOF\n\tE\\\nOF\nls"),
+            "cat <<-EOF\n\tEOF\n\n\nls"
+        );
+        for command in [
+            "cat <<'EOF' >n\nE\\\nOF\nrm -rf ~\nEOF",
+            "cat <<EOF >n\nx\\\nEOF\nrm -rf ~\nEOF",
+            "echo a \\\n b",
+            "cat <<EOF\nx\nEOF",
+        ] {
+            assert!(
+                matches!(shell_parse_source(command), Cow::Borrowed(_)),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// A `${` closed on a later line is one word to the shell, its line ends
+    /// included, so a `#` on that later line starts no comment and what
+    /// follows the `}` runs.
+    #[test]
+    fn a_braced_expansion_spans_lines() {
+        for cmd in [
+            "echo ${x:-\n#}; rm -rf /",
+            "echo ${x:- a\n# b} && rm -rf /",
+            ": ${x:=\n#}\nrm -rf /",
+        ] {
+            assert!(
+                sanitize_for_pattern_matching(cmd).contains("rm -rf /"),
+                "{cmd:?}"
+            );
+            let at = cmd.rfind("rm -rf /").expect("rm");
+            assert!(
+                classify_command(cmd).spans().iter().all(
+                    |span| !span.byte_range.contains(&at) || span.kind.requires_pattern_check()
+                ),
+                "{cmd:?}: {:?}",
+                classify_command(cmd)
+            );
+        }
+        // One left open in a heredoc body ends with the body.
+        let cmd = "cat > notes.md <<'EOF'\npath ${x:-\nEOF\n# note\nrm -rf /";
+        assert!(sanitize_for_pattern_matching(cmd).contains("rm -rf /"));
     }
 
     #[test]

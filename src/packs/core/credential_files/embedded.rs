@@ -276,7 +276,10 @@ pub(super) fn scan_command(
             inspect(code, language, span, &mut hits);
         }
     };
-    let ast = AstGrep::new(segment, SupportLang::Bash);
+    let ast = AstGrep::new(
+        crate::context::shell_parse_source(segment).as_ref(),
+        SupportLang::Bash,
+    );
     let root = ast.root();
     for command in root.dfs().filter(|node| node.kind() == "command") {
         let Some(words) = command_words(&command) else {

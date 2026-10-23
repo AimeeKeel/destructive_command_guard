@@ -2880,7 +2880,10 @@ fn command_has_powershell_shape(command: &str) -> bool {
     {
         return true;
     }
-    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+    let Ok(ast) = AstGrep::try_new(
+        crate::context::shell_parse_source(command).as_ref(),
+        SupportLang::Bash,
+    ) else {
         return true;
     };
     if ast.root().get_inner_node().has_error() {

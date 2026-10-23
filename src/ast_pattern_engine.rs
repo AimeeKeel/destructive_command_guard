@@ -1723,10 +1723,15 @@ fn find_matches_ast(
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
 
-    // Parse the code
+    // Parse the code; a shell script's heredoc terminators joined across line
+    // continuations are read as the shell reads them.
     let ast = {
         let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
-        AstGrep::new(code, ast_lang)
+        if language == ScriptLanguage::Bash {
+            AstGrep::new(crate::context::shell_parse_source(code).as_ref(), ast_lang)
+        } else {
+            AstGrep::new(code, ast_lang)
+        }
     };
     let root = ast.root();
 

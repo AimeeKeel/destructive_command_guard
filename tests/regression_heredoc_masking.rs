@@ -1455,6 +1455,121 @@ EOF";
         }
     }
 
+    /// A heredoc body is raw text to the shell: a quote, substitution or
+    /// expansion it leaves open ends with it, and the lines after its
+    /// terminator run as commands. An apostrophe in a body line (`it's`) used
+    /// to read as a quote running to the end of the input, which hid every
+    /// later command; a body that is only data keeps what follows allowed.
+    #[test]
+    fn an_open_quote_in_a_heredoc_body_hides_no_later_command() {
+        let config = Config::default();
+        for body in [
+            "echo it's",
+            "We don't need this.",
+            "say \"hi",
+            "run `make",
+            "path ${HOME",
+        ] {
+            for (opener, terminator) in [
+                ("cat > notes.md <<'EOF'", "EOF"),
+                ("cat > notes.md <<\"EOF\"", "EOF"),
+                ("tee notes.md <<'EOF' >/dev/null", "EOF"),
+                ("cat > notes.md <<-'EOF'", "\tEOF"),
+                ("cat >a <<'A'; cat >b <<'B'\nx's\nA", "B"),
+                ("x=$(cat <<'EOF'", "EOF\n)"),
+            ] {
+                for (tail, denied) in [
+                    ("rm -rf ~", true),
+                    ("git reset --hard", true),
+                    ("ls -la", false),
+                ] {
+                    let command = format!("{opener}\n{body}\n{terminator}\n{tail}");
+                    let result = evaluate_detailed(&command, &config).result;
+                    assert_eq!(result.is_denied(), denied, "{command:?}: {result:?}");
+                }
+            }
+        }
+        for command in [
+            "cat > notes.md <<'EOF'\necho it's\nEOF\nrm -rf ~",
+            "cat > notes.md <<'EOF'\nWe don't need this.\nEOF\ngit reset --hard",
+        ] {
+            assert_eq!(hook_decision(command).0, "deny", "{command:?}");
+        }
+        assert_eq!(
+            hook_decision("cat > notes.md <<'EOF'\nWe don't need this.\nEOF\ngit status").0,
+            "allow"
+        );
+    }
+
+    /// With an unquoted delimiter, bash and zsh end a heredoc body at a line
+    /// they join across a backslash-newline (`E\` followed by `OF` ends an
+    /// `EOF` body), and run the lines after it as commands, up to and past a
+    /// raw `EOF` line. The parse tree and the heredoc extractor used to read
+    /// the body on to that raw line, which hid them. A quoted delimiter joins
+    /// no lines.
+    #[test]
+    fn a_terminator_joined_across_a_line_continuation_ends_the_body() {
+        let config = Config::default();
+        for (tail, denied) in [
+            ("rm -rf ~", true),
+            ("git reset --hard", true),
+            ("ls -la", false),
+        ] {
+            for (command, runs) in [
+                (format!("cat <<EOF >notes.md\nE\\\nOF\n{tail}\nEOF"), true),
+                (format!("cat <<EOF\nE\\\nOF\n{tail}\nEOF"), true),
+                (
+                    format!("tee notes.md <<EOF >/dev/null\nE\\\nOF\n{tail}\nEOF"),
+                    true,
+                ),
+                (
+                    format!("cat <<'EOF' >notes.md\nE\\\nOF\n{tail}\nEOF"),
+                    false,
+                ),
+            ] {
+                let result = evaluate_detailed(&command, &config).result;
+                assert_eq!(
+                    result.is_denied(),
+                    denied && runs,
+                    "{command:?}: {result:?}"
+                );
+            }
+        }
+        assert_eq!(
+            hook_decision("cat <<EOF >notes.md\nE\\\nOF\nrm -rf ~\nEOF").0,
+            "deny"
+        );
+    }
+
+    /// Bodies nested in bodies that bash and dash end at different lines
+    /// double the readers' work at every level, so past a few levels they
+    /// stop. An apostrophe in such a body must still hide no command after
+    /// the last terminator line, however deep the nesting.
+    #[test]
+    fn nested_disputed_bodies_hide_no_later_command_at_any_depth() {
+        use std::fmt::Write as _;
+        let config = Config::default();
+        for levels in [2usize, 8, 12, 40] {
+            let mut nested = String::new();
+            for level in 0..levels {
+                let _ = writeln!(nested, "cat <<$'L{level}'");
+            }
+            nested.push_str("echo it's\n");
+            for level in (0..levels).rev() {
+                let _ = writeln!(nested, "L{level}\n$L{level}");
+            }
+            for (tail, denied) in [("rm -rf ~", true), ("ls -la", false)] {
+                let command = format!("{nested}{tail}");
+                let result = evaluate_detailed(&command, &config).result;
+                assert_eq!(
+                    result.is_denied(),
+                    denied,
+                    "{levels} levels, {tail:?}: {result:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn issue_555_incomplete_and_rebound_shells_never_gain_a_data_exemption() {
         let python = issue_555_python_body(300);

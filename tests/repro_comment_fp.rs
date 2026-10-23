@@ -91,3 +91,35 @@ fn hash_inside_a_word_hides_nothing() {
         );
     }
 }
+
+/// A `${` that a later line closes is one word to the shell, its line ends
+/// included: a `#` on that later line is part of the word, and the command
+/// after the `}` runs. Cutting the word at the end of its first line made the
+/// `#` start a comment that hid that command.
+#[test]
+fn a_braced_expansion_closed_on_a_later_line_hides_nothing() {
+    for command in [
+        "echo ${x:-\n#}; rm -rf ~",
+        "echo ${x:- a\n# b} && git reset --hard",
+        ": ${x:=\n#}\nrm -rf ~",
+    ] {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_in(command, dialect);
+            assert!(
+                result.is_denied(),
+                "{command:?} must be denied under {dialect:?}, got {result:?}"
+            );
+        }
+    }
+    for command in [
+        "echo ${x:-\n#}; echo done",
+        "echo ${x:-\n#}; echo 'rm -rf ~'",
+        "cat > notes.md <<'EOF'\npath ${HOME\nEOF\nls -la",
+    ] {
+        let result = evaluate_in(command, ShellDialect::Posix);
+        assert!(
+            result.is_allowed(),
+            "{command:?} must stay allowed, got {result:?}"
+        );
+    }
+}

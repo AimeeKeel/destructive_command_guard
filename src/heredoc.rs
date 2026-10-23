@@ -662,8 +662,7 @@ fn blank_local_redirects(command: &str) -> Option<String> {
             // scan goes on inside it, where a substitution's redirects are.
             b'$' if bytes.get(index + 1) == Some(&b'{') => {
                 if index >= expansion_end {
-                    expansion_end =
-                        crate::context::consume_braced_parameter(command, index, false).0;
+                    expansion_end = crate::context::consume_braced_parameter(command, index).0;
                 }
                 index + 2
             }
@@ -7838,6 +7837,7 @@ fn extract_heredocs(
             start_pos,
             delimiter,
             heredoc_type,
+            !quoted,
             limits,
             start_time,
             timeout,
@@ -12189,11 +12189,56 @@ fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
     let plumbed = output_may_be_replumbed(&ast.root());
     collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error, plumbed);
     if parse_error {
-        return active_single_heredoc_fallback(command);
+        heredocs = active_single_heredoc_fallback(command)?;
+    } else {
+        heredocs.sort_by_key(|heredoc| heredoc.operator_start);
+        heredocs.dedup_by_key(|heredoc| heredoc.operator_start);
     }
-    heredocs.sort_by_key(|heredoc| heredoc.operator_start);
-    heredocs.dedup_by_key(|heredoc| heredoc.operator_start);
+    end_bodies_where_the_shell_ends_them(command, &mut heredocs);
     Some(heredocs)
+}
+
+/// Cut each body back to where bash and zsh end it, when that is earlier.
+///
+/// The parse tree, and the extractor behind the fallback, compare each raw
+/// line with the delimiter. With an unquoted delimiter bash and zsh compare a
+/// line joined across a backslash-newline instead, so `E\` followed by `OF`
+/// ends an `EOF` body there, and the lines after it, up to the raw `EOF`, run
+/// as commands. A body read on past them hid those commands from every view
+/// that masks or exempts body text. The scanner in [`crate::context`] reads
+/// bodies by those rules; a body it ends earlier is cut there (its
+/// substitution spans with it), and one it does not find is left as given.
+fn end_bodies_where_the_shell_ends_them(command: &str, heredocs: &mut [ActiveHeredoc]) {
+    let shell_bodies =
+        crate::context::heredoc_body_ranges(command, crate::context::HeredocRules::Bash);
+    for heredoc in heredocs {
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            ..
+        } = &mut heredoc.body
+        else {
+            continue;
+        };
+        // The scanner's body starts at the beginning of the body's first line.
+        let Some(shell) = shell_bodies.iter().find(|shell| {
+            shell.range.start <= *body_start
+                && *body_start <= shell.range.end
+                && !command.as_bytes()[shell.range.start..*body_start].contains(&b'\n')
+        }) else {
+            continue;
+        };
+        if shell.range.end < *body_end {
+            let end = shell.range.end.max(*body_start);
+            *body_end = end;
+            if let Some(spans) = heredoc.live_spans.as_mut() {
+                spans.retain(|span| span.start < end);
+                for span in spans.iter_mut() {
+                    span.end = span.end.min(end);
+                }
+            }
+        }
+    }
 }
 
 /// Recover the one heredoc body span tree-sitter-bash could not give us.
@@ -13763,12 +13808,78 @@ fn find_herestring_content_bounds(command: &str, after_operator: usize) -> Optio
     }
 }
 
-/// Extract the body of a heredoc, finding the terminating delimiter.
+/// The first line of `body` that bash and zsh join across backslash-newlines
+/// and then find equal to `delimiter`, as (start, end) offsets: the start of
+/// its first physical line and the end of its last (newline excluded). Only
+/// a line that a backslash-newline continues is considered; a line as it
+/// stands is the caller's check.
+fn joined_terminator_line(
+    body: &str,
+    delimiter: &str,
+    heredoc_type: HeredocType,
+) -> Option<(usize, usize)> {
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    let line_end_from =
+        |from: usize| memchr::memchr(b'\n', &bytes[from..]).map_or(len, |at| from + at);
+    let continues = |line: &[u8], end: usize| {
+        end < len && line.iter().rev().take_while(|byte| **byte == b'\\').count() % 2 == 1
+    };
+    // Past the delimiter's length a joined line can no longer be it.
+    let limit = delimiter.len() + 2;
+    let mut line_start = 0usize;
+    while line_start < len {
+        let mut line_end = line_end_from(line_start);
+        if !continues(&bytes[line_start..line_end], line_end) {
+            line_start = line_end + 1;
+            continue;
+        }
+        let mut joined: Vec<u8> = Vec::new();
+        let mut piece_start = line_start;
+        loop {
+            let piece = &bytes[piece_start..line_end];
+            let more = continues(piece, line_end);
+            let kept = if more {
+                &piece[..piece.len() - 1]
+            } else {
+                piece
+            };
+            if joined.len() <= limit {
+                joined.extend_from_slice(kept);
+            }
+            if !more {
+                break;
+            }
+            piece_start = line_end + 1;
+            line_end = line_end_from(piece_start);
+        }
+        if joined.len() <= limit {
+            let joined = String::from_utf8_lossy(&joined);
+            let joined = joined.strip_suffix('\r').unwrap_or(&joined);
+            let trimmed = match heredoc_type {
+                HeredocType::TabStripped => joined.trim_start_matches('\t'),
+                HeredocType::IndentStripped => joined.trim_start(),
+                HeredocType::Standard | HeredocType::HereString => joined,
+            };
+            if trimmed == delimiter {
+                return Some((line_start, line_end));
+            }
+        }
+        line_start = line_end + 1;
+    }
+    None
+}
+
+/// Extract the body of a heredoc, finding the terminating delimiter. With
+/// `joins_lines` (an unquoted delimiter) a body also ends at a line joined
+/// across backslash-newlines that is the delimiter.
+#[allow(clippy::too_many_arguments)]
 fn extract_heredoc_body(
     command: &str,
     start: usize,
     delimiter: &str,
     heredoc_type: HeredocType,
+    joins_lines: bool,
     limits: &ExtractionLimits,
     start_time: Instant,
     timeout: Duration,
@@ -13789,6 +13900,15 @@ fn extract_heredoc_body(
     let mut body_lines: Vec<&str> = Vec::new();
     let mut total_bytes: usize = 0;
     let mut cursor: usize = 0; // offset within body_start
+    // With an unquoted delimiter, bash and zsh compare a body line joined
+    // across backslash-newlines with the delimiter (`E\` followed by `OF`
+    // ends an `EOF` body), and run the lines after it. Each raw line is still
+    // compared as well, which ends a body no later than any shell does.
+    let joined_terminator = if joins_lines {
+        joined_terminator_line(body_start, delimiter, heredoc_type)
+    } else {
+        None
+    };
 
     for part in body_start.split_inclusive('\n') {
         // Enforce timeout inside the loop (a single heredoc can be large).
@@ -13812,11 +13932,19 @@ fn extract_heredoc_body(
             HeredocType::Standard | HeredocType::HereString => line,
         };
 
-        if trimmed == delimiter {
+        // The terminator line ends here, or, for a line that bash and zsh
+        // join with the ones after it, at the end of the last of them.
+        let terminator_end = if trimmed == delimiter {
+            Some(body_start_abs + cursor + line.len())
+        } else {
+            joined_terminator
+                .filter(|(start, _)| *start == cursor)
+                .map(|(_, end)| body_start_abs + end)
+        };
+        if let Some(terminator_end) = terminator_end {
             // End position should be accurate in the ORIGINAL command (including any indentation
             // before the delimiter). We intentionally exclude the newline after the terminator.
             let terminator_start = body_start_abs + cursor;
-            let terminator_end = terminator_start + line.len();
             let mut body_end_abs = terminator_start;
             if body_end_abs > body_start_abs {
                 let bytes = command.as_bytes();
@@ -13913,7 +14041,12 @@ type ShellAst = AstGrep<ast_grep_core::tree_sitter::StrDoc<SupportLang>>;
 /// it. A quoted executable heredoc still reaches its own language's parser.
 pub(crate) fn try_parse_shell_ast(command: &str) -> Result<ShellAst, String> {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
-    AstGrep::try_new(command, SupportLang::Bash)
+    // Heredoc terminators joined across line continuations are read as the
+    // shell reads them; the offsets of every node are the command's own.
+    AstGrep::try_new(
+        crate::context::shell_parse_source(command).as_ref(),
+        SupportLang::Bash,
+    )
 }
 
 pub(crate) fn parse_shell_ast(command: &str) -> ShellAst {
@@ -14505,6 +14638,47 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use proptest::prelude::*;
+
+    /// With an unquoted delimiter, bash and zsh end a body at a line joined
+    /// across a backslash-newline, and the lines after it are commands, which
+    /// no data mask may hide; a quoted delimiter joins no lines.
+    #[test]
+    fn a_body_ends_at_a_terminator_joined_across_a_line_continuation() {
+        for command in [
+            "cat <<EOF >notes\nE\\\nOF\nrm -rf ~\nEOF",
+            "cat <<EOF\nE\\\nOF\nrm -rf ~\nEOF",
+            "x=$(cat <<EOF\nE\\\nOF\nrm -rf ~\nEOF\n)",
+        ] {
+            let masked = mask_non_executing_heredocs(command);
+            assert!(masked.contains("rm -rf ~"), "{command:?} -> {masked:?}");
+        }
+        for command in [
+            "cat <<'EOF' >notes\nE\\\nOF\nrm -rf ~\nEOF",
+            "cat <<'EOF' >notes\nrm -rf ~\nEOF",
+        ] {
+            let masked = mask_non_executing_heredocs(command);
+            assert!(!masked.contains("rm -rf ~"), "{command:?} -> {masked:?}");
+        }
+        // The extractor ends the body there too: what it hands the analysis
+        // as the body is what the shell feeds the command.
+        for (command, body) in [
+            (
+                "python3 <<EOF\nprint(1)\nE\\\nOF\nrm -rf ~\nEOF",
+                "print(1)",
+            ),
+            (
+                "python3 <<'EOF'\nprint(1)\nE\\\nOF\nEOF",
+                "print(1)\nE\\\nOF",
+            ),
+        ] {
+            let ExtractionResult::Extracted(contents) =
+                extract_content(command, &ExtractionLimits::default())
+            else {
+                panic!("{command:?} is extracted");
+            };
+            assert_eq!(contents[0].content, body, "{command:?}");
+        }
+    }
 
     #[test]
     fn shell_command_positions_preserve_preorder_and_utf8_offsets_issue_555() {
