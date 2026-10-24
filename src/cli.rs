@@ -3039,21 +3039,16 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
     let external_paths = config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
 
-    // Auto-enable external packs and merge their keywords.
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    enabled_keywords.extend(external_store.keywords().iter().copied());
+    // Auto-enable the external packs the configuration leaves enabled (#588).
+    enabled_packs.extend(config.enabled_external_pack_ids(external_store, None));
 
-    // Build ordered pack list AFTER external packs are loaded so they're included.
+    // Build ordered pack list AFTER external packs are loaded so they're included,
+    // and merge their keywords.
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
     // Disable keyword index when external packs are present (not covered by index).
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
@@ -3358,21 +3353,14 @@ fn build_windows_payload_view(
             packs.insert(pack.clone());
         }
     }
-    for id in external_store.pack_ids() {
-        packs.insert(id.clone());
-    }
+    packs.extend(config.enabled_external_pack_ids(external_store, None));
     if &packs == base_pack_ids {
         return None;
     }
     let mut keywords = REGISTRY.collect_enabled_keywords(&packs);
-    keywords.extend(external_store.keywords().iter().copied());
     let mut ordered = REGISTRY.expand_enabled_ordered(&packs);
-    for id in external_store.pack_ids() {
-        if !ordered.contains(id) {
-            ordered.push(id.clone());
-        }
-    }
-    let index = if external_store.pack_ids().next().is_some() {
+    let has_external_packs = external_store.extend_evaluation(&packs, &mut keywords, &mut ordered);
+    let index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered)
@@ -3691,13 +3679,13 @@ fn list_packs(
         })
         .collect();
 
-    // Include external packs from custom_paths
-    // External packs are auto-enabled when loaded (same behavior as test_command_inner)
+    // Include external packs from custom_paths. Loading one enables it (if you
+    // add a pack to custom_paths, you want it active) unless `packs.disabled`
+    // names it or its category, the same rule evaluation applies (#588).
     if let Some(external_store) = get_external_packs() {
+        let enabled_external = config.enabled_external_pack_ids(external_store, None);
         for (id, pack) in external_store.iter_packs() {
-            // External packs loaded via custom_paths are always enabled by convention
-            // (if you add a pack to custom_paths, you want it active)
-            let is_enabled = true;
+            let is_enabled = enabled_external.contains(id);
             if enabled_only && !is_enabled {
                 continue;
             }
@@ -5290,28 +5278,23 @@ fn test_command(
     let allowlists =
         effective_config.apply_agent_allowlist_profile(&detection.agent, load_default_allowlists());
 
-    // Auto-enable external packs, then apply agent exclusions to those later
-    // contributions as hook mode does. Explicit `--with-packs` is re-applied
-    // last so the invocation-local override retains its established priority.
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    effective_config.remove_disabled_packs_for_agent(&mut enabled_packs, &detection.agent);
+    // Auto-enable the external packs that `packs.disabled` and the agent
+    // profile leave enabled, as hook mode does (#588). Explicit `--with-packs`
+    // is re-applied last so the invocation-local override retains its
+    // established priority.
+    enabled_packs
+        .extend(effective_config.enabled_external_pack_ids(external_store, Some(&detection.agent)));
     enabled_packs.extend(cli_extra_packs.iter().cloned());
 
     // Collect keywords only after the final pack policy is known.
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
-    enabled_keywords.extend(external_store.keywords().iter().copied());
 
     // Build ordered pack list AFTER external packs are loaded so they're included.
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
     // Disable keyword index when external packs are present (not covered by index).
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
@@ -5961,20 +5944,14 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
     let external_paths = effective_config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
 
-    // Auto-enable external packs and merge their keywords
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    enabled_keywords.extend(external_store.keywords().iter().copied());
+    // Auto-enable the external packs the configuration leaves enabled (#588)
+    enabled_packs.extend(effective_config.enabled_external_pack_ids(external_store, None));
 
-    // Build ordered pack list
+    // Build ordered pack list and merge the external packs' keywords
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
@@ -6859,9 +6836,10 @@ fn resolved_pack_listing(config: &Config) -> (Vec<String>, Vec<String>) {
         }
     }
     if let Some(store) = external {
-        for id in store.pack_ids() {
-            if !active.iter().any(|existing| existing == id) {
-                active.push(id.clone());
+        // A loaded pack is active unless `packs.disabled` turns it off (#588).
+        for id in config.enabled_external_pack_ids(store, None) {
+            if !active.contains(&id) {
+                active.push(id);
             }
         }
     }
@@ -8398,21 +8376,16 @@ fn handle_explain(
     let external_paths = effective_config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
 
-    // Auto-enable external packs and merge their keywords.
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    enabled_keywords.extend(external_store.keywords().iter().copied());
+    // Auto-enable the external packs the configuration leaves enabled (#588).
+    enabled_packs.extend(effective_config.enabled_external_pack_ids(external_store, None));
 
-    // Build ordered pack list AFTER external packs are loaded so they're included.
+    // Build ordered pack list AFTER external packs are loaded so they're
+    // included, and merge their keywords.
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
     // Disable keyword index when external packs are present (not covered by index).
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
@@ -8910,21 +8883,16 @@ fn run_single_corpus_test(
     let external_paths = effective_config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
 
-    // Auto-enable external packs and merge their keywords.
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    enabled_keywords.extend(external_store.keywords().iter().copied());
+    // Auto-enable the external packs the configuration leaves enabled (#588).
+    enabled_packs.extend(effective_config.enabled_external_pack_ids(external_store, None));
 
-    // Build ordered pack list AFTER external packs are loaded.
+    // Build ordered pack list AFTER external packs are loaded, and merge
+    // their keywords.
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
     // Disable keyword index when external packs are present.
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
@@ -11927,8 +11895,10 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     };
     // `expand_enabled_ordered` filters to registry entries, so external packs
     // were invisible here while `dcg packs` ticked them — one of the three
-    // disagreeing counts in issue #402.
-    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len() + external_store.len();
+    // disagreeing counts in issue #402. Count only those `packs.disabled`
+    // leaves enabled, as `dcg packs` does (#588).
+    let enabled_leaf_count = REGISTRY.expand_enabled_ordered(&enabled).len()
+        + config.enabled_external_pack_ids(external_store, None).len();
     if external_store.warnings().is_empty() {
         println!("{} ({} enabled)", "OK".green(), enabled_leaf_count);
     } else {
@@ -20516,21 +20486,16 @@ fn run_smoke_test(config: &Config) -> bool {
     let external_paths = config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
 
-    // Auto-enable external packs and merge their keywords.
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    enabled_keywords.extend(external_store.keywords().iter().copied());
+    // Auto-enable the external packs the configuration leaves enabled (#588).
+    enabled_packs.extend(config.enabled_external_pack_ids(external_store, None));
 
-    // Build ordered pack list AFTER external packs are loaded.
+    // Build ordered pack list AFTER external packs are loaded, and merge
+    // their keywords.
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
     // Disable keyword index when external packs are present.
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)

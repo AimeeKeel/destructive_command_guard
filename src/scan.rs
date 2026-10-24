@@ -369,21 +369,19 @@ impl ScanEvalContext {
         let external_paths = config.packs.expand_custom_paths();
         let external_store = crate::packs::load_external_packs(&external_paths);
 
-        // Auto-enable external packs and merge their keywords.
-        for id in external_store.pack_ids() {
-            enabled_packs.insert(id.clone());
-        }
-        enabled_keywords.extend(external_store.keywords().iter().copied());
+        // Auto-enable the external packs the configuration leaves enabled (#588).
+        enabled_packs.extend(config.enabled_external_pack_ids(external_store, None));
 
-        // Build ordered pack list AFTER external packs are loaded.
+        // Build ordered pack list AFTER external packs are loaded, and merge
+        // their keywords.
         let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-        for id in external_store.pack_ids() {
-            if !ordered_packs.contains(id) {
-                ordered_packs.push(id.clone());
-            }
-        }
+        let has_external_packs = external_store.extend_evaluation(
+            &enabled_packs,
+            &mut enabled_keywords,
+            &mut ordered_packs,
+        );
         // Disable keyword index when external packs are present.
-        let keyword_index = if external_store.pack_ids().next().is_some() {
+        let keyword_index = if has_external_packs {
             None
         } else {
             REGISTRY.build_enabled_keyword_index(&ordered_packs)

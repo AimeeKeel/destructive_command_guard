@@ -3324,6 +3324,40 @@ impl ExternalPackStore {
         &self.keywords
     }
 
+    /// Add the loaded packs that `enabled_packs` names to an evaluation's
+    /// keyword list and pack order (#588).
+    ///
+    /// Only packs in `enabled_packs` take part, so a pack loaded from
+    /// `custom_paths` and then disabled is never evaluated. They are added in
+    /// ID order, so every process evaluates them in the same order. Returns
+    /// whether any took part: the enabled-keyword index covers registry packs
+    /// only, so the caller must not build one when an external pack is in
+    /// the evaluation.
+    pub fn extend_evaluation(
+        &self,
+        enabled_packs: &HashSet<String>,
+        keywords: &mut Vec<&'static str>,
+        ordered_packs: &mut Vec<String>,
+    ) -> bool {
+        let mut ids: Vec<&String> = self
+            .packs
+            .keys()
+            .filter(|id| enabled_packs.contains(id.as_str()))
+            .collect();
+        ids.sort_unstable();
+        for id in &ids {
+            for keyword in self.packs[*id].keywords {
+                if !keywords.contains(keyword) {
+                    keywords.push(keyword);
+                }
+            }
+            if !ordered_packs.contains(*id) {
+                ordered_packs.push((*id).clone());
+            }
+        }
+        !ids.is_empty()
+    }
+
     /// Get warnings from pack loading.
     #[must_use]
     pub fn warnings(&self) -> &[String] {

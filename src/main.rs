@@ -725,20 +725,13 @@ fn try_deny_unparseable_payload(
 
     let allowlists = load_effective_allowlists_for_agent(config, &effective_agent);
     let mut enabled_packs: HashSet<String> = config.enabled_pack_ids_for_agent(&effective_agent);
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    config.remove_disabled_packs_for_agent(&mut enabled_packs, &effective_agent);
+    enabled_packs.extend(config.enabled_external_pack_ids(external_store, Some(&effective_agent)));
 
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
-    enabled_keywords.extend(external_store.keywords().iter().copied());
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
@@ -2440,28 +2433,21 @@ fn main() {
 
     // Auto-enable external packs: packs loaded via custom_paths are implicitly enabled.
     // This avoids requiring users to both add a path AND explicitly enable the pack ID.
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    config.remove_disabled_packs_for_agent(&mut enabled_packs, &effective_agent);
+    // `packs.disabled` and the agent profile still turn them off (#588).
+    enabled_packs.extend(config.enabled_external_pack_ids(external_store, Some(&effective_agent)));
 
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
-    // Merge external pack keywords into enabled keywords for quick rejection.
-    // This ensures commands with external pack keywords are not prematurely rejected.
-    enabled_keywords.extend(external_store.keywords().iter().copied());
 
     // Build ordered pack list and keyword index AFTER external packs are loaded,
-    // so external pack IDs are included in the evaluation iteration list.
+    // so external pack IDs are included in the evaluation iteration list. Their
+    // keywords join the quick-reject list, so commands with external pack
+    // keywords are not prematurely rejected.
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    // Append external pack IDs (not in the registry, so expand_enabled_ordered won't include them).
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
     // Keyword index only covers built-in packs; disable when external packs are present
     // to ensure the non-indexed path (which handles both built-in and external) is used.
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
@@ -3608,8 +3594,7 @@ mod tests {
         }
 
         fn evaluate_with_agent(config: &Config, agent: &Agent, command: &str) -> EvaluationResult {
-            let mut enabled_packs = config.enabled_pack_ids_for_agent(agent);
-            config.remove_disabled_packs_for_agent(&mut enabled_packs, agent);
+            let enabled_packs = config.enabled_pack_ids_for_agent(agent);
             let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
             let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
             let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);

@@ -5319,6 +5319,66 @@ impl Config {
         self.packs.clone()
     }
 
+    /// The pack configuration that applies in the current directory: a
+    /// matching `[projects]` entry's packs, else the global `[packs]`.
+    fn effective_packs_for_cwd(&self) -> PacksConfig {
+        if self.projects.is_empty() {
+            return self.packs.clone();
+        }
+        std::env::current_dir().map_or_else(
+            |_| self.packs.clone(),
+            |cwd| self.effective_packs_for_project(&cwd),
+        )
+    }
+
+    /// The packs loaded from `packs.custom_paths` that this configuration
+    /// leaves enabled, sorted by ID (#588).
+    ///
+    /// Loading a pack through `custom_paths` enables it without listing it in
+    /// `packs.enabled`, the way `system.disk` is on without being listed, so
+    /// `packs.disabled` turns it off again by its exact ID or by its category.
+    /// For an agent, the profile applies on top exactly as it does to the
+    /// built-in packs: `extra_packs` puts a disabled pack back and
+    /// `disabled_packs` removes it last. Preset names cancel only the
+    /// preset's own contribution, which never includes an external pack, so
+    /// they remove nothing here. Core packs are built in, not loaded from
+    /// `custom_paths`, so nothing here can turn them off.
+    #[must_use]
+    pub fn enabled_external_pack_ids(
+        &self,
+        store: &crate::packs::ExternalPackStore,
+        agent: Option<&crate::agent::Agent>,
+    ) -> Vec<String> {
+        fn names_pack_or_category(entries: &[String], pack_id: &str) -> bool {
+            entries.iter().any(|entry| {
+                crate::packs::preset_members(entry).is_none()
+                    && (pack_id == entry
+                        || pack_id
+                            .strip_prefix(entry.as_str())
+                            .is_some_and(|rest| rest.starts_with('.')))
+            })
+        }
+
+        if store.is_empty() {
+            return Vec::new();
+        }
+        let packs = self.effective_packs_for_cwd();
+        let profile = agent.map(|agent| self.agents.profile_for_agent(agent));
+        let mut ids: Vec<String> = store
+            .pack_ids()
+            .filter(|id| {
+                let restored =
+                    profile.is_some_and(|profile| names_pack_or_category(&profile.extra_packs, id));
+                let removed_by_profile = profile
+                    .is_some_and(|profile| names_pack_or_category(&profile.disabled_packs, id));
+                (restored || !names_pack_or_category(&packs.disabled, id)) && !removed_by_profile
+            })
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Get enabled pack IDs as a deduplicated set.
     #[must_use]
     pub fn enabled_pack_ids(&self) -> HashSet<String> {
@@ -5375,13 +5435,7 @@ impl Config {
     }
 
     fn careful_company_preset_is_requested(&self) -> bool {
-        let packs = if self.projects.is_empty() {
-            self.packs.clone()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            self.effective_packs_for_project(&cwd)
-        } else {
-            self.packs.clone()
-        };
+        let packs = self.effective_packs_for_cwd();
         packs
             .enabled
             .iter()
@@ -5451,13 +5505,7 @@ impl Config {
         windows_payload: bool,
     ) -> HashSet<String> {
         let profile = self.agents.profile_for_agent(agent);
-        let packs_config = if self.projects.is_empty() {
-            self.packs.clone()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            self.effective_packs_for_project(&cwd)
-        } else {
-            self.packs.clone()
-        };
+        let packs_config = self.effective_packs_for_cwd();
 
         // A profile can cancel a preset contribution from the base config, but
         // it must not remove member packs that were also enabled independently
@@ -5486,27 +5534,6 @@ impl Config {
         packs.insert("core".to_string());
 
         packs
-    }
-
-    /// Remove an agent profile's pack exclusions from an already-expanded set.
-    ///
-    /// [`Self::enabled_pack_ids_for_agent`] applies profile exclusions to the
-    /// configured built-in packs. Callers then auto-enable external packs, so
-    /// those later contributions need the same final exclusion pass. Core
-    /// packs remain mandatory regardless of profile settings.
-    pub fn remove_disabled_packs_for_agent(
-        &self,
-        enabled_packs: &mut HashSet<String>,
-        agent: &crate::agent::Agent,
-    ) {
-        let profile = self.agents.profile_for_agent(agent);
-        for disabled in &profile.disabled_packs {
-            if disabled == "core" || disabled.starts_with("core.") {
-                continue;
-            }
-            enabled_packs.remove(disabled);
-            enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
-        }
     }
 
     /// Apply an agent profile to already-loaded project/user/system allowlists.
