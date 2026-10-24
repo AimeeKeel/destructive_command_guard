@@ -230,16 +230,26 @@ mode a rule actually resolved to before relying on it. See
 [Configuration](docs/configuration.md) for the constraint and
 [Graduated Response](docs/graduated-response.md) for the severity ladder.
 
-On **Windows**, two additional packs are on by default so a fresh install blocks the
-catastrophic native-Windows operations with no config:
+On **native Windows**, two additional packs are on by default so a fresh install
+blocks catastrophic native-Windows operations with no config. The hook also
+activates these two packs on Linux/macOS for a request identified as Cmd or
+PowerShell by its tool label or recognized Windows command syntax:
 
-- `windows.filesystem` - cmd `del /s`, `rd /s`, `format <drive>:` and PowerShell `Remove-Item -Recurse` (with or without `-Force`; aliases included), `Clear-Content`, `Clear-RecycleBin` *(default-on **on Windows only**; opt out with `disabled = ["windows.filesystem"]` or `["windows"]`)*
-- `windows.system` - `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `cipher /w`, `bcdedit /delete` *(default-on **on Windows only**; opt out with `disabled = ["windows.system"]` or `["windows"]`)*
+- `windows.filesystem` - cmd `del /s`, `rd /s`, `format <drive>:` and PowerShell `Remove-Item -Recurse` (with or without `-Force`; aliases included), `Clear-Content`, `Clear-RecycleBin` *(opt out with `disabled = ["windows.filesystem"]` or `["windows"]`)*
+- `windows.system` - `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `cipher /w`, `bcdedit /delete` *(opt out with `disabled = ["windows.system"]` or `["windows"]`)*
+
+For example, a `powershell` hook payload or a Bash-labeled `rmdir /s /q d:\`
+request activates these protections even on Linux/macOS. Ordinary POSIX requests
+keep the three base defaults above; a generic tool label or a Windows-looking
+string alone does not establish the executing shell. Explicit pack exclusions
+still apply to this automatic activation. See [Windows protection](docs/windows.md#default-protection-on-windows)
+for shell metadata and quoting guidance.
 
 The broader `windows.misc` (`reg delete`, `net user /delete`, `wsl --unregister`, `robocopy /MIR`) and
 `windows.powershell` (registry/provider deletes, `Remove-LocalUser`, `Disable-ComputerRestore`, `Remove-VM`)
-packs are opt-in on every platform. On Unix the `windows.*` packs are registered but off by default; enable
-them (e.g. to scan committed `.ps1`/`.cmd` scripts in CI) via `[packs] enabled = ["windows"]`.
+packs are opt-in on every platform. To select Windows protection explicitly
+(e.g. to scan committed `.ps1`/`.cmd` scripts in CI), use
+`[packs] enabled = ["windows"]` or name the required sub-packs.
 
 Every other pack — including `database.postgresql` and `containers.docker` — is
 **opt-in** and is *not* active until a config file enables it. Running `dcg init`
@@ -410,8 +420,10 @@ as deliberate members of its pinned secret-store policy.
 
 ### Windows Packs
 Native-Windows (cmd.exe + PowerShell) destructive-command protection. `windows.filesystem` and
-`windows.system` are **default-on on Windows** (off/opt-in on Unix); `windows.misc` and
-`windows.powershell` are opt-in everywhere. All patterns are case-insensitive.
+`windows.system` are **default-on on native Windows** and activate for recognized
+Cmd/PowerShell hook payloads on other hosts; `windows.misc` and
+`windows.powershell` are opt-in everywhere. Ordinary POSIX requests do not activate
+the Windows packs. All patterns are case-insensitive.
 - `windows.filesystem` - Recursive/forced filesystem destruction: cmd `del /s`, `rd /s`/`rmdir /s`, `format <drive>:`; PowerShell `Remove-Item -Recurse` (with or without `-Force`; `-Force` only broadens coverage to hidden/read-only items; aliases `rm`/`del`/`rd`/`ri` included), `Clear-Content`, `Clear-RecycleBin`. Whitelists PowerShell `-WhatIf` previews only on cmdlets/aliases that honor it, plus temp-dir deletes.
 - `windows.system` - Catastrophic disk/system operations: `vssadmin delete shadows` and `wmic shadowcopy delete` (Volume Shadow Copy destruction — a ransomware hallmark), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`/`Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`.
 - `windows.misc` - Registry/account/service/WSL/copy destruction: `reg delete`, `net user|localgroup /delete`, `sc delete`, `schtasks /delete`, `wsl --unregister` (destroys a WSL distro), `robocopy /MIR` (mirror-delete).

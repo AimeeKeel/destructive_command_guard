@@ -2029,6 +2029,19 @@ pub enum DialectArg {
     Cmd,
 }
 
+impl DialectArg {
+    /// Match the hook's Windows-pack activation without changing the caller's
+    /// selected dialect. An unknown dialect needs evidence in the command;
+    /// choosing Cmd or PowerShell supplies that evidence directly.
+    fn is_windows_payload(self, command: &str) -> bool {
+        match self {
+            Self::Ps | Self::Cmd => true,
+            Self::Unknown => crate::hook::command_is_windows_shell_payload(command),
+            Self::Posix => false,
+        }
+    }
+}
+
 impl From<DialectArg> for crate::normalize::ShellDialect {
     fn from(value: DialectArg) -> Self {
         match value {
@@ -5273,8 +5286,14 @@ fn test_command(
         ))
     });
 
-    // Resolve the same agent-specific pack and allowlist policy as hook mode.
-    let mut enabled_packs = effective_config.enabled_pack_ids_for_agent(&detection.agent);
+    // Resolve the same agent-specific pack and allowlist policy as hook mode,
+    // including Windows defaults for a selected or recognized Windows payload.
+    // Host-only defaults made `test --dialect cmd` report ALLOW for commands
+    // the Cmd hook denied on Linux/macOS (#589).
+    let mut enabled_packs = effective_config.enabled_pack_ids_for_agent_and_payload(
+        &detection.agent,
+        dialect.is_windows_payload(command),
+    );
     let allowlists =
         effective_config.apply_agent_allowlist_profile(&detection.agent, load_default_allowlists());
 
@@ -8365,8 +8384,10 @@ fn handle_explain(
         },
     );
 
-    // Get enabled packs and collect keywords
-    let mut enabled_packs = effective_config.enabled_pack_ids();
+    // Explain the same Windows payload defaults used by the hook and `test`,
+    // including when the diagnostic runs on Linux/macOS (#589).
+    let mut enabled_packs =
+        effective_config.enabled_pack_ids_for_payload(dialect.is_windows_payload(command));
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let heredoc_settings = effective_config.heredoc_settings();
     let compiled_overrides = effective_config.overrides.compile();

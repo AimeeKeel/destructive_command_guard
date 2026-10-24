@@ -99,6 +99,25 @@ to the always-on `core.filesystem` / `core.git` and default-on `system.disk`):
   recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`,
   `Initialize-Disk` / `Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`.
 
+These two defaults also apply to recognized Cmd/PowerShell **hook payloads on
+Linux/macOS**. An explicit `cmd`/`cmd.exe` or `powershell`/`pwsh` tool label supplies
+that signal. The hook can also recognize Windows command syntax in a mislabeled
+`Bash` request, such as `rmdir /s /q d:\` or `Remove-Item -Recurse C:\data`.
+Ordinary POSIX requests keep the base defaults, and an unknown tool label alone
+does not activate the Windows packs. Explicit `disabled = ["windows"]` or
+individual pack exclusions still apply.
+
+Keep shell metadata and quoting faithful when testing coverage. For example,
+`cmd /c "rmdir /s /q D:\"` is a Cmd command, but the final backslash escapes its
+closing quote in Bash, leaving an unterminated string. Evaluating those bytes as
+a `Bash` call on macOS does not test native Cmd execution. Use the actual agent's
+payload and execution platform. For an isolated CLI check, select the matching
+`dcg test --dialect cmd` or `--dialect ps`; `dcg test` and `dcg explain` activate
+the same Windows default packs for these dialects on every host. Their default
+`unknown` dialect activates them only when the command has recognized Windows
+syntax. Explicit exclusions still apply. Select packs explicitly when scanning
+Windows scripts from another platform.
+
 Opt-in (registered but off until enabled, on every platform):
 
 - **`windows.misc`**: `reg delete`, `net user|localgroup /delete`, `sc delete`,

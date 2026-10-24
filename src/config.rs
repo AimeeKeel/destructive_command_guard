@@ -2210,13 +2210,13 @@ impl PacksConfig {
         // to drop all system.* packs).
         enabled.insert("system.disk".to_string());
 
-        // Windows-native packs are default-ON only on Windows: a fresh Windows
-        // install must block `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
-        // etc. with no config, while Unix pays no quick-reject cost for Windows
-        // verbs by default. The packs stay *registered* on every platform, so
-        // Unix users can still opt in (e.g. to scan committed `.ps1`/`.cmd`
-        // scripts) via `enabled = ["windows.filesystem"]`. Opt out on Windows
-        // with `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`).
+        // Windows-native packs are default-ON on Windows and for recognized
+        // Cmd/PowerShell hook payloads on any host. Ordinary Unix POSIX requests
+        // keep these verbs out of quick rejection. The packs stay registered
+        // everywhere, so users can also select them explicitly (e.g. to scan
+        // committed `.ps1`/`.cmd` scripts) via `enabled = ["windows.filesystem"]`.
+        // `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`)
+        // still excludes them when defaults are expanded for a Windows payload.
         if include_windows_defaults {
             for pack_id in ["windows.filesystem", "windows.system"] {
                 enabled.insert(pack_id.to_string());
