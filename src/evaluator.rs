@@ -11122,6 +11122,7 @@ fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
         return false;
     }
     if powershell_prefix_ends_with_execution_operator(local)
+        || powershell_prefix_dot_sources_block(local)
         || powershell_prefix_executes_scriptblock(local)
     {
         return true;
@@ -11175,6 +11176,17 @@ fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
         search_start = close + 1;
     }
     Ok(bodies)
+}
+
+/// Whether a trimmed statement prefix is the dot-source operator of the
+/// script block that follows it. `. { … }` and `.{ … }` both run the block in
+/// the current scope, like `& { … }`. The general check above wants blank
+/// space after a `.` (so `./x` and member access stay inert), which the
+/// trimmed prefix no longer has; a `.` ending a word (`$x.`) is still none.
+fn powershell_prefix_dot_sources_block(local: &str) -> bool {
+    local.strip_suffix('.').is_some_and(|before| {
+        before.is_empty() || before.ends_with(|c: char| c.is_ascii_whitespace() || c == '(')
+    })
 }
 
 fn powershell_prefix_ends_with_execution_operator(prefix: &str) -> bool {
@@ -14142,12 +14154,30 @@ fn view_exposes_extra_command_segments(command: &str, view: ShellDialect) -> boo
 const POWERSHELL_STRING_EXECUTION_SINKS: [&str; 4] =
     ["iex", "invoke-expression", "icm", "invoke-command"];
 
+/// PowerShell cmdlets (and their default aliases) that bind a command name to
+/// another command. Only the PowerShell view resolves the alias they create,
+/// and they have no POSIX or cmd.exe spelling, so `Set-Alias x Remove-Item;
+/// & x -Recurse …` is worth replaying under PowerShell (#584).
+const POWERSHELL_ALIAS_DEFINERS: [&str; 6] = [
+    "set-alias",
+    "new-alias",
+    "sal",
+    "nal",
+    "import-alias",
+    "ipal",
+];
+
 /// Whether `command` names a PowerShell string-execution sink as a whole word.
 fn names_powershell_string_execution_sink(command: &str) -> bool {
+    names_powershell_word(command, &POWERSHELL_STRING_EXECUTION_SINKS)
+}
+
+/// Whether `command` holds one of `words` (lowercase) as a whole word.
+fn names_powershell_word(command: &str, words: &[&str]) -> bool {
     let lowered = command.to_ascii_lowercase();
     lowered
         .split(|byte: char| !(byte.is_ascii_alphanumeric() || byte == '-' || byte == '_'))
-        .any(|word| POWERSHELL_STRING_EXECUTION_SINKS.contains(&word))
+        .any(|word| words.contains(&word))
 }
 
 /// Whether replaying `command` under `view` can expose an execution the POSIX
@@ -14176,7 +14206,9 @@ fn dialect_view_may_expose_hidden_execution(
     if view_decode_exposes_pack_keyword(command, view, keyword_index) {
         return true;
     }
-    view == ShellDialect::PowerShell && names_powershell_string_execution_sink(command)
+    view == ShellDialect::PowerShell
+        && (names_powershell_string_execution_sink(command)
+            || names_powershell_word(command, &POWERSHELL_ALIAS_DEFINERS))
 }
 
 /// Evaluate a command, fanning out across dialects when the caller could not
@@ -14540,7 +14572,7 @@ fn evaluate_command_in_single_dialect_view(
     let dcg_masked = {
         let _phase = phase(ProfilePhase::Normalization);
         if nested_command_depth == 0 {
-            mask_dcg_self_inspection_segments(command)
+            mask_dcg_self_inspection_segments(command, shell_dialect)
         } else {
             Cow::Borrowed(command)
         }
@@ -15734,7 +15766,19 @@ const MAX_SEGMENT_LEADING_KEYWORDS: usize = 4;
 ///    output to an executing consumer; masking the left side would hide that
 ///    from the pipeline-consumer rules, so a segment adjacent to a `|` (but not
 ///    `||`) is not masked.
-fn mask_dcg_self_inspection_segments(command: &str) -> Cow<'_, str> {
+/// 4. **dcg must stay dcg (#584).** The mask trusts the dcg name. When the
+///    rest of the command may make that name run something else (an alias
+///    or a function of that name, defined directly, by a sourced file or
+///    module, or by code computed at run time; see
+///    [`command_may_rebind_dcg`]), nothing is masked, except that a call
+///    operator described below stays visible, as it did before #584.
+///
+/// In PowerShell (and the unknown dialect, which includes PowerShell) a
+/// statement may start with the call operator, `& 'C:/…/dcg.exe' test …`.
+/// The segmenter splits that `&` off like a POSIX background operator, and a
+/// call operator left without its target is unverifiable, so it is masked
+/// with the call it starts (#584).
+fn mask_dcg_self_inspection_segments(command: &str, dialect: ShellDialect) -> Cow<'_, str> {
     // Cheap gate: skip the split work unless the binary name appears.
     if !command.contains("dcg") && !command.contains("destructive_command_guard") {
         return Cow::Borrowed(command);
@@ -15748,6 +15792,9 @@ fn mask_dcg_self_inspection_segments(command: &str) -> Cow<'_, str> {
     }
 
     let mut masked: Option<String> = None;
+    // The same mask without the call operators it took in (see restriction 4).
+    let mut without_call_operators: Option<String> = None;
+    let mut took_call_operator = false;
     for (index, &(start, end)) in ranges.iter().enumerate() {
         // Restriction 2: skip segments nested inside another segment's range.
         if ranges
@@ -15767,12 +15814,177 @@ fn mask_dcg_self_inspection_segments(command: &str) -> Cow<'_, str> {
         let Some(offset) = dcg_inspection_offset_in_segment(&command[start..end]) else {
             continue;
         };
-        let mask_start = start + offset;
+        let call_start = start + offset;
+        let buffer = without_call_operators.get_or_insert_with(|| command.to_string());
+        buffer.replace_range(call_start..end, &" ".repeat(end - call_start));
+        let mut mask_start = call_start;
+        if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown)
+            && let Some(operator) = statement_leading_call_operator(command, call_start)
+        {
+            mask_start = operator;
+            took_call_operator = true;
+        }
         let buffer = masked.get_or_insert_with(|| command.to_string());
         buffer.replace_range(mask_start..end, &" ".repeat(end - mask_start));
     }
 
-    masked.map_or(Cow::Borrowed(command), Cow::Owned)
+    // Restriction 4, judged on everything the mask leaves visible. Without
+    // the mask, `& dcg test …` reads as a plain call of whatever `dcg` names,
+    // and the PowerShell view resolves an alias only when its definition is
+    // spelled plainly, so a command that took in a call operator keeps the
+    // mask it had before #584 instead: the operator stays visible, and
+    // unverifiable.
+    match masked {
+        Some(masked) if !command_may_rebind_dcg(&masked) => Cow::Owned(masked),
+        Some(_) if took_call_operator => {
+            without_call_operators.map_or(Cow::Borrowed(command), Cow::Owned)
+        }
+        _ => Cow::Borrowed(command),
+    }
+}
+
+/// The offset of a PowerShell call operator `&` immediately before the
+/// command word at `word_start`, when that `&` starts its statement: only
+/// blanks separate it from the start of the command, a `;`, a line break, or
+/// a `&&`/`||` chain operator. A `&` that ends a previous command (a POSIX
+/// background operator, `cmd & dcg …`) or belongs to `&&` is not one.
+fn statement_leading_call_operator(command: &str, word_start: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let blank = |byte: u8| matches!(byte, b' ' | b'\t');
+    let mut index = word_start;
+    while index > 0 && blank(bytes[index - 1]) {
+        index -= 1;
+    }
+    let operator = index.checked_sub(1)?;
+    if bytes[operator] != b'&' || (operator > 0 && bytes[operator - 1] == b'&') {
+        return None;
+    }
+    let mut before = operator;
+    while before > 0 && blank(bytes[before - 1]) {
+        before -= 1;
+    }
+    let leads = before == 0
+        || matches!(bytes[before - 1], b';' | b'\n' | b'\r')
+        || (before >= 2 && matches!(&bytes[before - 2..before], b"&&" | b"||"));
+    leads.then_some(operator)
+}
+
+/// Whether the text a dcg self-inspection mask leaves visible may make a dcg
+/// name run something else (#584). Masking `dcg test …` trusts that `dcg` is
+/// dcg, which never runs its arguments. An alias or function of that name
+/// breaks the trust, so on any sign of one the caller masks nothing and every
+/// argument is judged as written (the PowerShell view then resolves the
+/// alias like any other). The signs:
+///
+/// - a `$` or a backquote anywhere: a variable, substitution or escape can
+///   assemble any word at run time, including a definer's name;
+/// - after quote and escape removal (so a definer split by quotes or
+///   escapes reads as the word it spells), in any case: a word that defines
+///   commands (`alias`, `function`, `Set-Alias`, `New-Item`, `hash`,
+///   `doskey`, …), loads definitions (`source`, `Import-Module`, …) or runs
+///   a string as code (`eval`, `iex`, `Invoke-Command`, `ScriptBlock`, …);
+///   a `function:`/`alias:` provider path; a dot-source operator; a call
+///   operator applied to an expression or script block; or a dcg name
+///   followed by `(`, as in a POSIX `dcg() { …; }` definition.
+///
+/// Over-broad on purpose: a match only withdraws the exemption.
+fn command_may_rebind_dcg(visible: &str) -> bool {
+    const DEFINERS: &[&str] = &[
+        "alias",
+        "aliases",
+        "configuration",
+        "doskey",
+        "enable",
+        "eval",
+        "executioncontext",
+        "filter",
+        "function",
+        "functions",
+        "hash",
+        "icm",
+        "iex",
+        "import-alias",
+        "import-module",
+        "import-pssession",
+        "invoke",
+        "invoke-command",
+        "invoke-expression",
+        "ipal",
+        "ipmo",
+        "nal",
+        "new-alias",
+        "new-item",
+        "new-module",
+        "ni",
+        "nmo",
+        "sal",
+        "sbp",
+        "scriptblock",
+        "set-alias",
+        "set-item",
+        "set-psbreakpoint",
+        "si",
+        "source",
+        "using",
+        "workflow",
+    ];
+    if visible.contains(['$', '`']) {
+        return true;
+    }
+    let unquoted: String = visible
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if unquoted.contains("function:") || unquoted.contains("alias:") {
+        return true;
+    }
+    // Also split the text as written: removing a backslash joins a
+    // module-qualified name (`Microsoft.PowerShell.Utility\Set-Alias`).
+    let lowered = visible.to_ascii_lowercase();
+    if [unquoted.as_str(), lowered.as_str()].iter().any(|text| {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+            .any(|piece| DEFINERS.contains(&piece))
+    }) {
+        return true;
+    }
+    let bytes = unquoted.as_bytes();
+    let blank = |byte: u8| matches!(byte, b' ' | b'\t');
+    let next_non_blank = |from: usize| bytes[from..].iter().copied().find(|&byte| !blank(byte));
+    for (at, &byte) in bytes.iter().enumerate() {
+        // A dot-source operator: a `.` word (`. ./defs.sh`, `. ($x)`,
+        // `.{ … }`), not a path (`./x`) or member access (`$x.Count`).
+        if byte == b'.'
+            && (at == 0
+                || matches!(
+                    bytes[at - 1],
+                    b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b'{' | b'!'
+                ))
+            && bytes
+                .get(at + 1)
+                .is_none_or(|&next| matches!(next, b' ' | b'\t' | b'\n' | b'\r' | b'(' | b'{'))
+        {
+            return true;
+        }
+        // A call operator applied to an expression or script block:
+        // `& ('Set-' + 'Alias')`, `&{ … }`.
+        if byte == b'&' && matches!(next_non_blank(at + 1), Some(b'(' | b'{')) {
+            return true;
+        }
+    }
+    let is_name_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.');
+    ["dcg", "destructive_command_guard"].iter().any(|name| {
+        unquoted.match_indices(name).any(|(at, _)| {
+            let mut after = at + name.len();
+            if unquoted[after..].starts_with(".exe") {
+                after += ".exe".len();
+            }
+            (at == 0 || !is_name_byte(bytes[at - 1]))
+                && !bytes.get(after).is_some_and(|&byte| is_name_byte(byte))
+                && next_non_blank(after) == Some(b'(')
+        })
+    })
 }
 
 /// Returns the byte offset within `segment` at which a dcg self-inspection call
@@ -54053,7 +54265,7 @@ mod tests {
     #[test]
     fn issue_289_c2_masks_only_the_diagnostic_segment() {
         let command = "dcg test rm -rf / && echo ok";
-        let masked = mask_dcg_self_inspection_segments(command);
+        let masked = mask_dcg_self_inspection_segments(command, ShellDialect::Posix);
         // Length-preserving: every downstream span stays valid.
         assert_eq!(masked.len(), command.len());
         // Only the diagnostic segment is blanked.
@@ -54063,7 +54275,7 @@ mod tests {
     #[test]
     fn issue_289_c2_keeps_leading_shell_keyword_visible() {
         let command = "for c in a b; do dcg test rm -rf /; done";
-        let masked = mask_dcg_self_inspection_segments(command);
+        let masked = mask_dcg_self_inspection_segments(command, ShellDialect::Posix);
         assert_eq!(masked.len(), command.len());
         assert!(masked.starts_with("for c in a b; do "), "masked: {masked}");
         assert!(masked.ends_with("; done"), "masked: {masked}");
@@ -54126,7 +54338,7 @@ mod tests {
                 "must stay evaluated as ordinary shell: {command}"
             );
             assert_eq!(
-                mask_dcg_self_inspection_segments(command).as_ref(),
+                mask_dcg_self_inspection_segments(command, ShellDialect::Posix).as_ref(),
                 command,
                 "must not be masked: {command}"
             );
@@ -54139,7 +54351,7 @@ mod tests {
         // left-hand side would hide that from the pipeline rules.
         for command in ["dcg test rm -rf / | sh", "cat cmd | dcg test rm -rf /"] {
             assert_eq!(
-                mask_dcg_self_inspection_segments(command).as_ref(),
+                mask_dcg_self_inspection_segments(command, ShellDialect::Posix).as_ref(),
                 command,
                 "pipeline member must not be masked: {command}"
             );
@@ -54151,7 +54363,8 @@ mod tests {
         }
         // `||` is a logical or, not a pipe, and is masked normally.
         assert_eq!(
-            mask_dcg_self_inspection_segments("dcg test rm -rf / || echo ok").trim(),
+            mask_dcg_self_inspection_segments("dcg test rm -rf / || echo ok", ShellDialect::Posix)
+                .trim(),
             "|| echo ok"
         );
     }
@@ -54168,7 +54381,7 @@ mod tests {
             "dcg explain \"`rm -rf /`\" && echo ok",
         ] {
             assert_eq!(
-                mask_dcg_self_inspection_segments(command).as_ref(),
+                mask_dcg_self_inspection_segments(command, ShellDialect::Posix).as_ref(),
                 command,
                 "must not be masked: {command}"
             );
@@ -54185,7 +54398,7 @@ mod tests {
         // behavior is fail-closed — the exemption does not reach in there.
         let command = "x=$(dcg test rm -rf /)";
         assert_eq!(
-            mask_dcg_self_inspection_segments(command).as_ref(),
+            mask_dcg_self_inspection_segments(command, ShellDialect::Posix).as_ref(),
             command,
             "substitutions are outside the top-level masking pass"
         );
@@ -54200,7 +54413,10 @@ mod tests {
         // Single-segment diagnostics never reach the masker; Step 2 handles
         // them and the masker leaves them byte-identical.
         let command = "dcg test rm -rf /";
-        assert_eq!(mask_dcg_self_inspection_segments(command).as_ref(), command);
+        assert_eq!(
+            mask_dcg_self_inspection_segments(command, ShellDialect::Posix).as_ref(),
+            command
+        );
         assert_eq!(
             evaluate_issue_289(command).decision,
             EvaluationDecision::Allow
@@ -54211,7 +54427,7 @@ mod tests {
     fn issue_289_c2_commands_without_dcg_are_borrowed_unchanged() {
         let command = "git reset --hard && rm -rf /";
         assert!(matches!(
-            mask_dcg_self_inspection_segments(command),
+            mask_dcg_self_inspection_segments(command, ShellDialect::Posix),
             Cow::Borrowed(_)
         ));
     }
@@ -54226,6 +54442,284 @@ mod tests {
         assert!(!segment_is_pipeline_member("a || b", 0, 1));
         assert!(!segment_is_pipeline_member("a || b", 5, 6));
         assert!(!segment_is_pipeline_member("a && b", 0, 1));
+    }
+
+    const ISSUE_584_PACKS: &[&str] = &[
+        "core.filesystem",
+        "core.git",
+        "windows.filesystem",
+        "windows.powershell",
+    ];
+
+    /// dcg#584: a PowerShell statement may start with the call operator. The
+    /// segmenter splits that `&` off like a POSIX background operator, and the
+    /// call operator left without its masked target was unverifiable.
+    #[test]
+    fn issue_584_call_operator_is_masked_with_its_dcg_call() {
+        let command =
+            "& 'C:/example/dcg.exe' test --help; & 'C:/example/dcg.exe' config --format json";
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+            let masked = mask_dcg_self_inspection_segments(command, dialect);
+            assert_eq!(masked.len(), command.len());
+            assert_eq!(
+                masked.trim(),
+                "; & 'C:/example/dcg.exe' config --format json",
+                "{dialect:?}"
+            );
+        }
+        // Elsewhere a leading `&` is no call operator; it stays visible.
+        assert!(mask_dcg_self_inspection_segments(command, ShellDialect::Posix).starts_with('&'));
+        for command in [
+            command,
+            "& \"C:/x/dcg.exe\" test --help; & \"C:/x/dcg.exe\" config --format json",
+            "& 'C:/x/dcg.exe' explain 'Remove-Item -Recurse -Force C:\\x'; Get-Date",
+            "& 'C:/x/dcg.exe' test 'Remove-Item -Recurse -Force C:\\x'; & 'C:/x/dcg.exe' config",
+            "& 'C:/x/dcg.exe' test --help && & 'C:/x/dcg.exe' config",
+            "Get-Date\n& dcg test --help",
+        ] {
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, ISSUE_584_PACKS, dialect);
+                assert_eq!(
+                    result.decision,
+                    EvaluationDecision::Allow,
+                    "{dialect:?} {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+        // The operator only joins the call it starts; every other statement
+        // is still judged.
+        for command in [
+            "& 'C:/x/dcg.exe' test --help; Remove-Item -Recurse -Force C:\\x",
+            "& 'C:/x/dcg.exe' test --help; & Remove-Item -Recurse -Force C:\\x",
+            "& 'C:/x/dcg.exe' test --help; & { Remove-Item -Recurse -Force C:\\x }",
+            "& 'C:/x/dcg.exe' test --help; . { Remove-Item -Recurse -Force C:\\x }",
+            "& 'C:/x/dcg.exe' test --help; & $v -Recurse -Force C:\\x",
+            "& 'C:/x/dcg.exe' test --help; & (Get-Command Remove-Item) -Recurse -Force C:\\x",
+            "& 'C:/x/dcg.exe' test --help | & powershell -Command -",
+            "Remove-Item -Recurse -Force C:\\x & 'C:/x/dcg.exe' test --help",
+        ] {
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, ISSUE_584_PACKS, dialect);
+                assert_eq!(
+                    result.decision,
+                    EvaluationDecision::Deny,
+                    "{dialect:?} {command:?}"
+                );
+            }
+        }
+    }
+
+    /// dcg#584: a PowerShell script block run by the dot-source operator is
+    /// executed exactly like one run by `&`.
+    #[test]
+    fn issue_584_dot_sourced_script_blocks_are_executed() {
+        for command in [
+            ". { Remove-Item -Recurse -Force C:\\x }",
+            ".{ Remove-Item -Recurse -Force C:\\x }",
+            "Get-Date; . {Remove-Item -Recurse -Force C:\\x}",
+            "if ($x) { . { git reset --hard } }",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                ISSUE_584_PACKS,
+                ShellDialect::PowerShell,
+            );
+            assert_eq!(result.decision, EvaluationDecision::Deny, "{command:?}");
+        }
+        for command in [". { Get-Date }", "$x.Count; . ./profile.ps1"] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                ISSUE_584_PACKS,
+                ShellDialect::PowerShell,
+            );
+            assert_eq!(result.decision, EvaluationDecision::Allow, "{command:?}");
+        }
+    }
+
+    /// dcg#584: the self-inspection mask trusts that a dcg name runs dcg. A
+    /// command that may make it run something else (an alias or a function
+    /// of that name) gets no mask at all, so the arguments of the
+    /// "diagnostic" are judged as written; one whose dcg call starts with a
+    /// call operator keeps that operator visible, as before #584. Plain
+    /// mentions of the name keep the mask.
+    #[test]
+    fn issue_584_a_dcg_name_the_command_may_rebind_is_never_masked() {
+        for (command, dialect) in [
+            (
+                "Set-Alias dcg Remove-Item; dcg test -Recurse -Force C:\\x",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "New-Alias dcg ri; dcg test -r -fo C:\\x",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "sal dcg ri; dcg test -r -fo C:\\x",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "$a = 'Remove-Item'; Set-Alias dcg $a; dcg test -Recurse -Force C:\\x",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "Set-Alias ('d' + 'cg') ri; dcg test -r -fo C:\\x",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "Set-Alias dcg.exe Remove-Item; dcg.exe test -Recurse -Force C:\\x",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "function dcg { Remove-Item -Recurse -Force C:\\x }; dcg test",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "Set-Item -Path Function:\\dcg -Value { ri -r -fo C:\\x }; dcg test",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "${function:dcg} = { ri -r -fo C:\\x }; dcg test",
+                ShellDialect::PowerShell,
+            ),
+            ("alias dcg='rm -rf'; dcg test /x", ShellDialect::Cmd),
+            ("doskey dcg=rd /s /q $*; dcg test C:\\x", ShellDialect::Cmd),
+            ("dcg() { rm -rf \"$2\"; }; dcg test /x", ShellDialect::Posix),
+            (
+                "dcg () { rm -rf \"$2\"; }; dcg test /x",
+                ShellDialect::Posix,
+            ),
+            ("hash -p /bin/rm dcg; dcg test -rf /x", ShellDialect::Posix),
+            // A definer spelled through quotes, escapes, variables or
+            // computed code, or definitions loaded from a file or module.
+            (
+                "\"al\"\"ias\" dcg='rm -rf'; dcg test /x",
+                ShellDialect::Posix,
+            ),
+            ("al\\ias dcg='rm -rf'; dcg test /x", ShellDialect::Posix),
+            (
+                "c=al; ${c}ias dcg='rm -rf'; dcg test /x",
+                ShellDialect::Posix,
+            ),
+            (
+                "$'\\x61lias' dcg='rm -rf'; dcg test /x",
+                ShellDialect::Posix,
+            ),
+            (
+                "eval \"al\"\"ias dcg='rm -rf'\"; dcg test /x",
+                ShellDialect::Posix,
+            ),
+            ("source ./defs.sh; dcg test -rf /x", ShellDialect::Posix),
+            (". ./defs.sh; dcg test -rf /x", ShellDialect::Posix),
+            (
+                "Microsoft.PowerShell.Utility\\Set-Alias dcg Remove-Item; dcg test -Recurse -Force C:\\x",
+                ShellDialect::PowerShell,
+            ),
+        ] {
+            assert_eq!(
+                mask_dcg_self_inspection_segments(command, dialect).as_ref(),
+                command,
+                "{dialect:?} {command:?}"
+            );
+        }
+        // A dcg call that starts with a call operator keeps the operator
+        // visible, as before #584, wherever the rest may rebind the name.
+        for command in [
+            "Set-Alias -Name dcg -Value Remove-Item; & dcg test -Recurse -Force C:\\x",
+            "Set-Al`ias dcg Remove-Item; & dcg test -Recurse -Force C:\\x",
+            "& ('Set-Al' + 'ias') dcg Remove-Item; & dcg test -Recurse -Force C:\\x",
+            ".('Set-Al' + 'ias') dcg Remove-Item; & dcg test -Recurse -Force C:\\x",
+            "iex ('Set-Al' + 'ias dcg Remove-Item'); & dcg test -Recurse -Force C:\\x",
+            "[Management.Automation.ScriptBlock]::Create('Set-Al' + 'ias dcg ri').Invoke(); & dcg test -r -fo C:\\x",
+            "Import-Module ./defs.psm1; & dcg test -Recurse -Force C:\\x",
+            ". ./defs.ps1; & dcg test -Recurse -Force C:\\x",
+        ] {
+            let operator = command.rfind("& dcg").expect("call operator");
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                let masked = mask_dcg_self_inspection_segments(command, dialect);
+                assert_eq!(masked.len(), command.len(), "{dialect:?} {command:?}");
+                assert_eq!(
+                    &masked[..=operator],
+                    &command[..=operator],
+                    "{dialect:?} {command:?}"
+                );
+                assert!(!masked.contains("dcg test"), "{dialect:?} {command:?}");
+            }
+        }
+        // The unknown dialect resolves a PowerShell alias only in its
+        // PowerShell view, which an alias definition now also opens.
+        for (command, dialects) in [
+            (
+                "Set-Alias dcg Remove-Item; dcg test -Recurse -Force C:\\x",
+                &[ShellDialect::PowerShell][..],
+            ),
+            (
+                "function dcg { Remove-Item -Recurse -Force C:\\x }; dcg test",
+                &[ShellDialect::PowerShell],
+            ),
+            (
+                "Set-Alias dcg Remove-Item; & dcg test -Recurse -Force C:\\x",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+            (
+                "sal dcg ri; & dcg test -r -fo C:\\x",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+            (
+                "function dcg { Remove-Item -Recurse -Force C:\\x }; & dcg test",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+            (
+                "Set-Al`ias dcg Remove-Item; & dcg test -Recurse -Force C:\\x",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+            (
+                "& ('Set-Al' + 'ias') dcg Remove-Item; & dcg test -Recurse -Force C:\\x",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+            (
+                ".('Set-Al' + 'ias') dcg Remove-Item; & dcg test -Recurse -Force C:\\x",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+            (
+                "iex ('Set-Al' + 'ias dcg Remove-Item'); & dcg test -Recurse -Force C:\\x",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+            (
+                "Import-Module ./defs.psm1; & dcg test -Recurse -Force C:\\x",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+            (
+                ". ./defs.ps1; & dcg test -Recurse -Force C:\\x",
+                &[ShellDialect::PowerShell, ShellDialect::Unknown],
+            ),
+        ] {
+            for &dialect in dialects {
+                let result = evaluate_with_pack_ids_in_dialect(command, ISSUE_584_PACKS, dialect);
+                assert_eq!(
+                    result.decision,
+                    EvaluationDecision::Deny,
+                    "{dialect:?} {command:?}"
+                );
+            }
+        }
+        for command in [
+            "cd ~/src/destructive_command_guard && dcg test 'rm -rf /'",
+            "dcg test 'rm -rf /' && dcg --version",
+            "cargo build --release && ./target/release/dcg explain 'git reset --hard'",
+            "git commit -m 'dcg: docs' && dcg test 'rm -rf /'",
+        ] {
+            assert_ne!(
+                mask_dcg_self_inspection_segments(command, ShellDialect::Posix).as_ref(),
+                command,
+                "{command:?}"
+            );
+            assert_eq!(
+                evaluate_issue_289(command).decision,
+                EvaluationDecision::Allow,
+                "{command:?}"
+            );
+        }
     }
 
     /// dcg#294: the unknown-dialect fan-out must never fire on the fast path.
