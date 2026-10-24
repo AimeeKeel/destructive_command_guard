@@ -4360,6 +4360,26 @@ pub(crate) fn fold_program_name_case(command: &str, enabled_keywords: &[&str]) -
         if !run.iter().any(u8::is_ascii_uppercase) {
             continue;
         }
+        // The word right after a `<<`/`<<-` heredoc operator is a delimiter,
+        // never a program name. Folding it (e.g. `PERL`/`SH`/`PHP`, which
+        // spell the recognized `perl`/`sh`/`php`) would desync the opening
+        // delimiter from its terminator, which sits in the body this view
+        // leaves alone, and the re-parse of the broken heredoc reads the body
+        // as top-level code. A here-string (`<<<`) carries data, not a
+        // delimiter, so it keeps folding as before.
+        let after_heredoc_operator = {
+            let mut p = start;
+            while p > 0 && matches!(bytes[p - 1], b' ' | b'\t') {
+                p -= 1;
+            }
+            if p > 0 && bytes[p - 1] == b'-' {
+                p -= 1;
+            }
+            p >= 2 && &bytes[p - 2..p] == b"<<" && !(p >= 3 && bytes[p - 3] == b'<')
+        };
+        if after_heredoc_operator {
+            continue;
+        }
         let name_of = |part: &[u8]| -> Vec<u8> {
             let mut name: Vec<u8> = part
                 .iter()
@@ -4570,6 +4590,34 @@ mod tests {
                 "{command:?} -> {normalized:?}"
             );
         }
+    }
+
+    /// A heredoc delimiter is left alone even when it spells a program name
+    /// (`PERL`/`SH`/`PHP`). Folding only the opening delimiter desynced it from
+    /// its terminator in the body and corrupted the re-parse, so benign
+    /// quoted-heredoc programs read as top-level writes.
+    #[test]
+    fn heredoc_delimiters_are_not_folded_even_when_they_spell_a_program_name() {
+        // No other foldable word, so the whole command has nothing to fold.
+        for command in [
+            "perl <<'PERL'\nprint 1\nPERL",
+            "bash <<'SH'\nfor i in 1 2 3; do echo hi > \"/tmp/x/$i\"; done\nSH",
+            "cat <<'PHP' | php\n<?php echo 'x'; ?>\nPHP",
+            "cat <<-'RUBY'\n\tputs 1\n\tRUBY",
+            "cat << PERL\nhi\nPERL",
+        ] {
+            assert_eq!(fold_program_name_case(command, &[]), None, "{command:?}");
+        }
+        // The leading program word still folds; only the delimiter is spared.
+        assert_eq!(
+            fold_program_name_case("PERL <<'PERL'\nx\nPERL", &[]).as_deref(),
+            Some("perl <<'PERL'\nx\nPERL"),
+        );
+        // A here-string (`<<<`) carries data, not a delimiter, so it folds.
+        assert_eq!(
+            fold_program_name_case("x <<<SH", &[]).as_deref(),
+            Some("x <<<sh"),
+        );
     }
 
     #[test]
