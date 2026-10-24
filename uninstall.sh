@@ -12,6 +12,17 @@
 #   --purge          Remove everything (overrides keep flags)
 #   --quiet          Suppress non-error output
 #
+
+# This is a bash script. Piped into another shell (`| sh` where sh is dash,
+# `| zsh`), it would fail or misbehave later, so stop here with the fix.
+# Keep this block POSIX sh: it runs before anything bash-specific is parsed.
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf '%s\n' \
+    "dcg uninstaller: this script needs bash. Pipe it to bash instead, for example:" \
+    '  curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh" | bash' >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 # Keep this resolver in sync with install.sh and the Rust CLI.

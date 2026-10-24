@@ -23,6 +23,24 @@
 #   --minisign-url URL Override the adjacent .minisig URL (including file://)
 #   --offline          Skip network preflight checks
 #
+
+# This is a bash script, and must stay parseable by macOS /bin/bash 3.2.
+# Piped into another shell (`| sh` where sh is dash, `| zsh`), it would fail
+# later with an unrelated-looking error, so stop here with the fix instead.
+# Keep this block POSIX sh: it runs before anything bash-specific is parsed.
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf '%s\n' \
+    "dcg installer: this script needs bash. Pipe it to bash instead, for example:" \
+    '  curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh" | bash' >&2
+  exit 1
+fi
+# bash run as `sh` starts in POSIX mode, which rejects the process
+# substitutions below. The script reads on command by command, so leaving
+# POSIX mode here is enough for the rest of it to parse.
+case ":${SHELLOPTS:-}:" in
+  *:posix:*) set +o posix ;;
+esac
+
 set -euo pipefail
 umask 022
 shopt -s lastpipe 2>/dev/null || true

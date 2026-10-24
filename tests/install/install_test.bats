@@ -40,7 +40,63 @@ teardown() {
             echo "$candidate ($("$candidate" -c 'echo "$BASH_VERSION"')): $output"
             return 1
         }
+        # uninstall.sh is piped to the same bash by its own one-liner.
+        run "$candidate" -n "$UNINSTALL_SCRIPT"
+        [ "$status" -eq 0 ] || {
+            echo "$candidate uninstall.sh: $output"
+            return 1
+        }
     done
+}
+
+# Feed a script on stdin to a shell, the way `curl ... | <shell>` does. Every
+# destination is pinned under the test's temp dir and only `--help` is asked
+# for, so even a broken guard cannot install anything.
+run_piped_script() {
+    local shell_cmd="$1" script="$2"
+    # shellcheck disable=SC2086 # "bash --posix" must split into two words
+    run env -i HOME="$HOME" PATH=/usr/bin:/bin DEST="$TEST_TMPDIR/dest" \
+        VERSION=v0.0.0-test $shell_cmd -s -- --help < "$script"
+}
+
+@test "install.sh and uninstall.sh piped to a non-bash shell stop with a clear message (#587)" {
+    local shells=() candidate script
+    for candidate in dash zsh ksh mksh posh; do
+        command -v "$candidate" >/dev/null 2>&1 && shells+=("$(command -v "$candidate")")
+    done
+    [ "${#shells[@]}" -gt 0 ] || skip "no non-bash shell installed"
+    for candidate in "${shells[@]}"; do
+        for script in "$INSTALL_SCRIPT" "$UNINSTALL_SCRIPT"; do
+            run_piped_script "$candidate" "$script"
+            [ "$status" -eq 1 ] || {
+                echo "$candidate $(basename "$script"): status $status: $output"
+                return 1
+            }
+            [[ "$output" == *"this script needs bash"* ]] || {
+                echo "$candidate $(basename "$script"): $output"
+                return 1
+            }
+        done
+    done
+    [ ! -e "$TEST_TMPDIR/dest" ]
+}
+
+@test "install.sh run by bash in POSIX mode (curl ... | sh where sh is bash) still runs (#587)" {
+    # POSIX-mode bash rejects process substitution, which install.sh uses, so
+    # the script must leave POSIX mode before reaching it.
+    run_piped_script "bash --posix" "$INSTALL_SCRIPT"
+    [ "$status" -eq 0 ] || {
+        echo "status $status: $output"
+        return 1
+    }
+    [[ "$output" == *"Usage: install.sh"* ]]
+    if [ -x /bin/bash ]; then
+        run_piped_script "/bin/bash --posix" "$INSTALL_SCRIPT"
+        [ "$status" -eq 0 ] || {
+            echo "/bin/bash --posix: status $status: $output"
+            return 1
+        }
+    fi
 }
 
 # ============================================================================
