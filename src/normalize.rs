@@ -2110,7 +2110,7 @@ fn decode_posix_token(token: &str, literal_word: bool) -> Option<Cow<'_, str>> {
     }
 }
 
-fn posix_dollar_expands(next: Option<char>) -> bool {
+pub(crate) fn posix_dollar_expands(next: Option<char>) -> bool {
     next.is_some_and(|ch| {
         ch.is_ascii_alphanumeric()
             || matches!(
@@ -3789,8 +3789,10 @@ fn looks_like_subcommand_word(token: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
+/// With `posix_quoting`, quotes and backslash escapes inside the word are
+/// also removed, as the POSIX shell the caller proved does.
 #[must_use]
-fn normalize_subcommand_token(token: &str) -> Option<String> {
+fn normalize_subcommand_token(token: &str, posix_quoting: bool) -> Option<String> {
     let mut out = token.to_string();
     // Strip line continuations (backslash + newline) anywhere in the token
     let mut changed = if out.contains("\\\n") || out.contains("\\\r\n") {
@@ -3825,6 +3827,24 @@ fn normalize_subcommand_token(token: &str) -> Option<String> {
                 changed = true;
             }
         }
+    }
+
+    // Quotes and escapes inside a word are removed by a POSIX shell exactly
+    // like quotes around it: `z''ap`, `z\ap` and `"z"ap` all pass `zap`. Read
+    // them the same way when the result is the same kind of plain word, or a
+    // rule (or a pack keyword) naming a subcommand, or a program a launcher
+    // runs, never sees it (#592). The shared literal-word decoder refuses any
+    // expansion or pattern, so those keep their quoting. Only for a proven
+    // POSIX shell: elsewhere `Files\git` may be a Windows path, and joining
+    // it would hide the `git` it names. That includes the generic pass that
+    // re-reads text a POSIX pass already normalized.
+    if posix_quoting
+        && out.contains(['\'', '"', '\\'])
+        && let Some(decoded) = decode_posix_literal_word(&out)
+        && looks_like_subcommand_word(&decoded)
+    {
+        out = decoded.into_owned();
+        changed = true;
     }
 
     if changed { Some(out) } else { None }
@@ -3905,7 +3925,8 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
                 && token_text.starts_with('\'')
                 && token_text.ends_with('\'');
             if !cmd_single_quoted_data
-                && let Some(replacement) = normalize_subcommand_token(token_text)
+                && let Some(replacement) =
+                    normalize_subcommand_token(token_text, dialect == ShellDialect::Posix)
             {
                 replacements.push((tok.byte_range.clone(), replacement));
             }

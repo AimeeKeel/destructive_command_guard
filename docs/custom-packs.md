@@ -230,6 +230,41 @@ entirely, improving performance.
 - Include partial matches: `rm` instead of `rm -rf`
 - Omit keywords (forces evaluation on every command)
 
+### How keywords select a custom pack
+
+A custom pack is evaluated when one of its keywords appears in the command
+text, or when a program the command runs carries one. dcg resolves each
+segment's program the same way as `executables` scoping (wrappers stripped,
+quotes and escapes removed, path reduced to its basename, extension dropped),
+and also reads the operands of launchers such as `xargs`, `find -exec`,
+`flock` and `watch`, and of wrappers it could not strip. A pack keyed on
+`mytool` is therefore selected for `"mytool"`, `my''tool` and
+`xargs my\tool`.
+
+When some segment's program cannot be known from the text, dcg cannot show
+that a pack is irrelevant, so it evaluates every enabled custom pack. That
+covers a variable (`$TOOL`), a command substitution, a glob or extended glob,
+a brace expansion, an expansion inside the word (`my${x}tool`), Bash
+`$"..."` quoting, an option where the program should be, and a wrapper chain
+or command longer than dcg reads. Keywords never need to list shell
+metacharacters.
+
+Selection only decides which packs run; a rule still has to match:
+
+- A rule that spells the program name (`mytool\s+wipe`) cannot match
+  `$TOOL wipe`. A rule on the subcommand alone (`\bwipe\b`) can, once the pack
+  is selected.
+- A rule scoped with `executables` still does not fire on a dynamic program
+  name (see [Scoping a Rule to Its Executables](#scoping-a-rule-to-its-executables)).
+- Argument text stays argument text: `echo mytool wipe` runs `echo`.
+- In a shell known to be POSIX (an agent's Bash tool, or `--dialect posix`),
+  a plain word with quotes or escapes inside it (`wi''pe`, `w\ipe`) is
+  matched as the word the shell passes, `wipe`. Elsewhere a backslash may be
+  a Windows path separator, so the word is matched as written.
+
+This applies to POSIX and unknown-dialect commands. PowerShell and cmd.exe
+commands select custom packs by their text only.
+
 ## Regex Pattern Guidelines
 
 Patterns use [fancy-regex](https://docs.rs/fancy-regex) syntax, which supports:

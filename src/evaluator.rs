@@ -15086,6 +15086,11 @@ fn evaluate_command_in_single_dialect_view(
             && force_literal_database_packs.is_empty()
             && !force_windows_filesystem
             && !force_scp_semantics
+            && !external_pack_needs_identity_selection(
+                gating_command.as_ref(),
+                shell_dialect,
+                ordered_packs,
+            )
         {
             if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
                 return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -15112,6 +15117,14 @@ fn evaluate_command_in_single_dialect_view(
                 enabled_keywords,
             )
         }
+        // The keyword gate reads text. An external pack whose program the
+        // text does not spell (a variable, a substitution, a glob, quotes
+        // inside a launcher's operand) is still owed its rules (#592).
+        && !external_pack_needs_identity_selection(
+            gating_command.as_ref(),
+            shell_dialect,
+            ordered_packs,
+        )
     {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -15221,6 +15234,11 @@ fn evaluate_command_in_single_dialect_view(
         && !should_check_original_control_plane_payload_for_any_pack(
             command_for_match,
             command,
+            ordered_packs,
+        )
+        && !external_pack_needs_identity_selection(
+            inert_redirection_gating_view(normalized.as_ref(), shell_dialect).as_ref(),
+            shell_dialect,
             ordered_packs,
         )
     {
@@ -24285,6 +24303,15 @@ fn evaluate_packs_with_allowlists_at_depth(
     let gating_command = gating_command.as_ref();
     let core_filesystem_keyword_candidate =
         crate::packs::core::filesystem::filesystem_keyword_candidate(gating_command);
+    // External packs the keyword gate skips may still be owed their rules
+    // when the program a segment runs is not spelled out in the text (#592).
+    // Resolved once, and only if some external pack needs the answer.
+    let identities = std::cell::OnceCell::new();
+    let external_identity_selects = |pack: &crate::packs::Pack| {
+        identities
+            .get_or_init(|| command_executable_identities(gating_command, shell_dialect))
+            .selects(pack)
+    };
     let candidate_pack_ids: Vec<&String> = keyword_index.map_or_else(
         || {
             ordered_packs
@@ -24322,6 +24349,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                                     command_for_packs,
                                     original_command,
                                 )
+                                || external_identity_selects(pack)
                         })
                 })
                 .collect()
@@ -24352,7 +24380,17 @@ fn evaluate_packs_with_allowlists_at_depth(
                             original_command,
                         ))
                     {
-                        return None;
+                        // An external pack has no bit in the index, so its own
+                        // keywords and the programs the command runs decide
+                        // (#402, #592).
+                        let external_selected = external_store
+                            .and_then(|store| store.get(pack_id))
+                            .is_some_and(|pack| {
+                                pack.might_match(gating_command) || external_identity_selects(pack)
+                            });
+                        if !external_selected {
+                            return None;
+                        }
                     }
                     // Try built-in registry first
                     if REGISTRY.get_entry(pack_id).is_some() {
@@ -31084,19 +31122,49 @@ fn word_is_command_prefix_syntax(word: &str) -> bool {
 /// shell never executes (`case x in *) chmod …`). After a literal `case`, words
 /// are skipped until the `)` that closes the pattern list.
 fn command_word_after_prefix_syntax(segment: &str) -> Option<String> {
+    walk_command_prefix_syntax(segment).word
+}
+
+/// What [`walk_command_prefix_syntax`] found at the front of a segment.
+struct CommandPrefixWalk {
+    /// The first real command word, still in its source spelling.
+    word: Option<String>,
+    /// The text after that word: its arguments, or a launcher's operands.
+    rest: String,
+    /// The walk stopped on one of its own bounds (the prefix-token budget, or
+    /// the wrapper-stripping limit inside it), so a missing or found word does
+    /// not prove what the segment runs (#424, #592).
+    truncated: bool,
+}
+
+/// [`command_word_after_prefix_syntax`], also reporting whether the walk was
+/// cut short by a bound rather than by the end of the prefix syntax.
+fn walk_command_prefix_syntax(segment: &str) -> CommandPrefixWalk {
     // Each iteration consumes at least one token, so the bound is a token
     // count, not a recursion depth.
     const MAX_PREFIX_TOKENS: usize = 64;
     let mut current = segment.to_string();
     let mut in_case_pattern = false;
+    let mut truncated = false;
+    let found = |word: Option<String>, truncated: bool| CommandPrefixWalk {
+        word,
+        rest: String::new(),
+        truncated,
+    };
 
     for _ in 0..MAX_PREFIX_TOKENS {
         let stripped = crate::normalize::strip_wrapper_prefixes(&current);
+        truncated |= stripped.wrapper_limit_reached;
         let text = stripped.normalized.as_ref();
-        let token = crate::normalize::tokenize_for_normalization(text)
+        let Some(token) = crate::normalize::tokenize_for_normalization(text)
             .into_iter()
-            .next()?;
-        let raw = token.text(text)?;
+            .next()
+        else {
+            return found(None, truncated);
+        };
+        let Some(raw) = token.text(text) else {
+            return found(None, truncated);
+        };
         let consumed = token.byte_range.end;
 
         match token.kind {
@@ -31109,18 +31177,26 @@ fn command_word_after_prefix_syntax(segment: &str) -> Option<String> {
                 // The remaining words form a loop header (`for name in ...`),
                 // not a command invocation. The `do` body is emitted as its
                 // own segment and resolved independently.
-                return None;
+                return found(None, truncated);
             }
             NormalizeTokenKind::Word if crate::normalize::is_env_assignment(raw) => {}
             NormalizeTokenKind::Word if in_case_pattern || is_command_prefix_reserved_word(raw) => {
                 in_case_pattern |= raw == "case";
             }
-            NormalizeTokenKind::Word => return Some(raw.to_string()),
+            NormalizeTokenKind::Word => {
+                return CommandPrefixWalk {
+                    word: Some(raw.to_string()),
+                    rest: text.get(consumed..).unwrap_or_default().to_string(),
+                    truncated,
+                };
+            }
         }
-        let remainder = text.get(consumed..)?.to_string();
-        current = remainder;
+        let Some(remainder) = text.get(consumed..) else {
+            return found(None, truncated);
+        };
+        current = remainder.to_string();
     }
-    None
+    found(None, true)
 }
 
 /// Resolve the executable name a command segment invokes, for `executables=`
@@ -31318,32 +31394,8 @@ fn segment_invokes_executable_in_dialect(
 /// option. That may admit a word that is really an option value, which only
 /// widens the scope; reading one word too few would hide the program.
 fn operand_launched_executables(segment: &str, argv0: &str) -> Vec<String> {
-    let modeled = matches!(argv0, "find" | "xargs" | "flock" | "doas" | "parallel");
-    let unmodeled = matches!(
-        argv0,
-        "watch"
-            | "strace"
-            | "ltrace"
-            | "pkexec"
-            | "run0"
-            | "chroot"
-            | "unshare"
-            | "nsenter"
-            | "setpriv"
-            | "taskset"
-            | "numactl"
-            | "firejail"
-            | "systemd-run"
-            | "fakeroot"
-            | "unbuffer"
-            | "chronic"
-            | "caffeinate"
-            | "gtimeout"
-            | "torsocks"
-            | "proxychains"
-            | "proxychains4"
-            | "valgrind"
-    );
+    let modeled = is_modeled_operand_launcher(argv0);
+    let unmodeled = is_unmodeled_operand_launcher(argv0);
     if !modeled && !unmodeled {
         return Vec::new();
     }
@@ -31459,6 +31511,41 @@ fn operand_launched_executables(segment: &str, argv0: &str) -> Vec<String> {
         return basename(word).into_iter().collect();
     }
     Vec::new()
+}
+
+/// Launchers whose option grammar [`operand_launched_executables`] models.
+fn is_modeled_operand_launcher(argv0: &str) -> bool {
+    matches!(argv0, "find" | "xargs" | "flock" | "doas" | "parallel")
+}
+
+/// Launchers that run an operand as a program but whose option grammar
+/// [`operand_launched_executables`] does not model.
+fn is_unmodeled_operand_launcher(argv0: &str) -> bool {
+    matches!(
+        argv0,
+        "watch"
+            | "strace"
+            | "ltrace"
+            | "pkexec"
+            | "run0"
+            | "chroot"
+            | "unshare"
+            | "nsenter"
+            | "setpriv"
+            | "taskset"
+            | "numactl"
+            | "firejail"
+            | "systemd-run"
+            | "fakeroot"
+            | "unbuffer"
+            | "chronic"
+            | "caffeinate"
+            | "gtimeout"
+            | "torsocks"
+            | "proxychains"
+            | "proxychains4"
+            | "valgrind"
+    )
 }
 
 fn segment_invokes_executable(segment: &str, executables: &[&str]) -> bool {
@@ -31596,6 +31683,334 @@ pub(crate) fn command_invokes_declared_executable(command: &str, executables: &[
             .get(start..end)
             .is_some_and(|segment| segment_invokes_executable(segment, executables))
     })
+}
+
+/// Segments beyond which external-pack pre-selection stops reading programs
+/// and evaluates every enabled external pack instead (#592).
+const MAX_IDENTITY_SEGMENTS: usize = 256;
+
+/// The programs a command's segments may run, as far as external-pack
+/// pre-selection can tell from the text (#592).
+///
+/// An external pack is selected by its keywords, and a keyword is usually the
+/// name of the program the pack is about. The keyword gate reads the command's
+/// text, so a program the text does not spell out (a variable, a command
+/// substitution, a glob, an expansion inside the word, quotes inside a
+/// launcher's operand) skipped the pack, and none of its rules ran. This is
+/// what the shared wrapper stripping and quote removal resolve each segment's
+/// program to, and whether some segment's program cannot be resolved at all.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExecutableIdentities {
+    /// Lower-case basenames with quotes and escapes removed: each segment's
+    /// argv0 after wrapper stripping and, behind a launcher or a wrapper the
+    /// normalizer could not strip, every operand word, since one of them may
+    /// be the program it runs.
+    names: Vec<String>,
+    /// Some segment's program is not statically known, so no pack can be shown
+    /// to be irrelevant to the command.
+    unresolved: bool,
+}
+
+impl ExecutableIdentities {
+    /// Whether pre-selection must evaluate `pack`: it cannot prove the pack
+    /// irrelevant when a program is unknown, or when a known one carries one of
+    /// the pack's keywords (the same substring test as `Pack::might_match`).
+    fn selects(&self, pack: &crate::packs::Pack) -> bool {
+        self.unresolved || self.names.iter().any(|name| pack.might_match(name))
+    }
+}
+
+/// Resolve the programs `command` may run, for external-pack pre-selection
+/// (#592).
+///
+/// POSIX and unknown dialects only: the wrapper vocabulary and the quoting
+/// read here are POSIX shell syntax. PowerShell and Cmd keep their existing
+/// selection.
+fn command_executable_identities(command: &str, dialect: ShellDialect) -> ExecutableIdentities {
+    let mut identities = ExecutableIdentities::default();
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return identities;
+    }
+    let ranges = command_segment_ranges_in_dialect(command, dialect);
+    if ranges.len() > MAX_IDENTITY_SEGMENTS || has_attached_pattern_group(command) {
+        identities.unresolved = true;
+        return identities;
+    }
+    for (start, end) in ranges {
+        match command.get(start..end) {
+            Some(segment) => record_segment_identities(segment, dialect, &mut identities),
+            None => identities.unresolved = true,
+        }
+        if identities.unresolved {
+            // Every pack is selected now; reading on cannot narrow that.
+            break;
+        }
+    }
+    identities
+}
+
+/// Record what one segment runs (#592).
+///
+/// The segment's argv0 comes from the same walk as `executables=` scoping:
+/// wrapper prefixes stripped by the shared normalizer, then compound-command
+/// syntax skipped. When that argv0 is itself a program that runs another one
+/// from its operands (a launcher such as `xargs` or `find -exec`, or a wrapper
+/// the normalizer declined to strip, such as `nice` with an option it does
+/// not model), the operands are read too, since one of them may be the real
+/// program. A bound hit on the way, a word whose value is decided at run
+/// time, or an option where the program should be leaves the program
+/// unknown.
+fn record_segment_identities(
+    segment: &str,
+    dialect: ShellDialect,
+    identities: &mut ExecutableIdentities,
+) {
+    let walk = walk_command_prefix_syntax(segment);
+    if walk.truncated {
+        identities.unresolved = true;
+        return;
+    }
+    let Some(word) = walk.word else {
+        // Assignments, a loop header or bare grouping: nothing runs here.
+        return;
+    };
+    let Some(argv0) = static_program_name(&word, dialect) else {
+        identities.unresolved = true;
+        return;
+    };
+    if argv0.starts_with('-') {
+        // An option where the program should be: the prefix before it (a
+        // `time` keyword or a wrapper with an option nobody modeled) was not
+        // understood, so the program it runs is not known.
+        identities.unresolved = true;
+        return;
+    }
+    let reads_operands = runs_operand_program(&argv0);
+    identities.names.push(argv0);
+    if !reads_operands {
+        return;
+    }
+    let rest = walk.rest.as_str();
+    let mut redirect_target_next = false;
+    for token in crate::normalize::tokenize_for_normalization(rest) {
+        if token.kind != NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(raw) = token.text(rest) else {
+            identities.unresolved = true;
+            return;
+        };
+        if std::mem::take(&mut redirect_target_next) {
+            continue;
+        }
+        if crate::normalize::starts_with_shell_redirection(raw) {
+            // `>` alone takes the next word as its target; `2>&1` and `>log`
+            // carry theirs. Neither names a program.
+            redirect_target_next = raw
+                .trim_start_matches(|ch: char| ch.is_ascii_digit())
+                .bytes()
+                .all(|byte| matches!(byte, b'<' | b'>' | b'&' | b'|'));
+            continue;
+        }
+        match static_program_name(raw, dialect) {
+            Some(name) if name.starts_with('-') => {}
+            Some(name) => identities.names.push(name),
+            None => {
+                identities.unresolved = true;
+                return;
+            }
+        }
+    }
+}
+
+/// Whether a resolved argv0 may run another program named among its operands:
+/// the launchers `executables=` scoping reads (#550), the wrapper vocabulary
+/// the shared normalizer strips when it can (a wrapper still in argv0 is one
+/// it could not strip), and the other wrappers and frontends dcg recognizes
+/// structurally.
+fn runs_operand_program(argv0: &str) -> bool {
+    is_modeled_operand_launcher(argv0)
+        || is_unmodeled_operand_launcher(argv0)
+        || crate::normalize::is_posix_execution_frontend_basename(argv0)
+        || matches!(
+            argv0,
+            "sudo"
+                | "env"
+                | "command"
+                | "builtin"
+                | "eval"
+                | "su"
+                | "sg"
+                | "runuser"
+                | "entr"
+                | "hyperfine"
+                | "script"
+                | "nix-shell"
+                | "npx"
+                | "mise-exec"
+        )
+}
+
+/// The program a POSIX word names, or `None` when its value is decided at run
+/// time (#592).
+///
+/// Quotes and escapes are removed as the shell removes them (the shared token
+/// decoder, including `$'…'`), the path is reduced to its basename, and a
+/// Windows executable extension is dropped, as `executables=` scoping reads
+/// argv0. A tilde prefix changes only the directory, so `~/bin/x` is `x`.
+/// Under the unknown dialect a `%VAR%` pair may be a Cmd expansion.
+fn static_program_name(word: &str, dialect: ShellDialect) -> Option<String> {
+    if posix_word_is_dynamic(word)
+        || dialect == ShellDialect::Unknown && word.bytes().filter(|byte| *byte == b'%').count() > 1
+    {
+        return None;
+    }
+    let value = crate::normalize::decode_posix_syntax_token(word);
+    let basename = value.rsplit('/').next().unwrap_or_default();
+    let lowered = basename.to_ascii_lowercase();
+    for extension in [".exe", ".cmd", ".bat", ".com"] {
+        if let Some(stem) = lowered.strip_suffix(extension)
+            && !stem.is_empty()
+        {
+            return Some(stem.to_string());
+        }
+    }
+    Some(lowered)
+}
+
+/// Whether a POSIX shell word's value is decided at run time rather than by
+/// its text (#592): a parameter, command, arithmetic or process substitution,
+/// a pathname pattern, a brace expansion, Bash locale translation, or quoting
+/// that never closes. Quoted and escaped bytes are literal, and `$'…'` decodes
+/// statically. `[`, `[[` and `{}` stand for themselves.
+fn posix_word_is_dynamic(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let mut index = 0;
+    let mut double = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            // The escaped byte is literal; the step below skips it.
+            b'\\' => index += 1,
+            b'\'' if !double => match bytes[index + 1..].iter().position(|byte| *byte == b'\'') {
+                Some(close) => index += close + 1,
+                None => return true,
+            },
+            b'"' => double = !double,
+            b'`' => return true,
+            b'$' => match bytes.get(index + 1) {
+                Some(b'\'') if !double => {
+                    let mut cursor = index + 2;
+                    loop {
+                        match bytes.get(cursor) {
+                            None => return true,
+                            Some(b'\\') => cursor += 2,
+                            Some(b'\'') => break,
+                            Some(_) => cursor += 1,
+                        }
+                    }
+                    index = cursor;
+                }
+                Some(b'"') if !double => return true,
+                next => {
+                    if crate::normalize::posix_dollar_expands(next.map(|byte| char::from(*byte))) {
+                        return true;
+                    }
+                }
+            },
+            b'*' | b'?' if !double => return true,
+            b'<' | b'>' if !double && bytes.get(index + 1) == Some(&b'(') => return true,
+            b'[' if !double && bytes[index + 1..].contains(&b']') => return true,
+            b'{' if !double => {
+                let rest = &bytes[index + 1..];
+                if let Some(close) = rest.iter().position(|byte| *byte == b'}') {
+                    let inner = &rest[..close];
+                    if inner.contains(&b',') || inner.windows(2).any(|pair| pair == b"..") {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    double
+}
+
+/// Whether `command` has a parenthesized group attached to a word outside
+/// quotes (#592): an extended glob (`@(…)`, `+(…)`, `!(…)`, `?(…)`, `*(…)`) or
+/// a zsh alternation (`frob(a|b)`). The segmenter reads that `(` as grouping
+/// and splits the word, so no single word shows the pattern. A function
+/// definition's `()`, a substitution's `$(`, `<(` or `>(`, and an array's
+/// `=(` are not one, and neither is anything in a heredoc body: a body that
+/// runs is evaluated as its own command.
+fn has_attached_pattern_group(command: &str) -> bool {
+    if !command.contains('(') {
+        return false;
+    }
+    let bodies = if command.contains("<<") {
+        crate::heredoc::heredoc_bodies_with_operators(command)
+    } else {
+        Vec::new()
+    };
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    let mut double = false;
+    while index < bytes.len() {
+        if let Some((body, _)) = bodies.iter().find(|(body, _)| body.contains(&index)) {
+            index = body.end;
+            continue;
+        }
+        match bytes[index] {
+            // The escaped byte is literal; the step below skips it.
+            b'\\' => index += 1,
+            b'\'' if !double => match bytes[index + 1..].iter().position(|byte| *byte == b'\'') {
+                Some(close) => index += close + 1,
+                None => return false,
+            },
+            b'"' => double = !double,
+            b'(' if !double && index > 0 && bytes.get(index + 1) != Some(&b')') => {
+                let before = bytes[index - 1];
+                if before.is_ascii_alphanumeric()
+                    || matches!(
+                        before,
+                        b'_' | b'?' | b'*' | b'+' | b'@' | b'!' | b'.' | b'-' | b'/' | b'~'
+                    )
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Whether an enabled external pack must be evaluated on `command` although
+/// the keyword gate found none of its keywords (#592).
+///
+/// Pre-selection may only widen here, never skip: a pack is left out only when
+/// every segment's program is statically known and none of them carries one
+/// of its keywords. A program that is not known selects every enabled
+/// external pack. Built-in packs keep their own keyword gates and semantic
+/// scanners.
+fn external_pack_needs_identity_selection(
+    command: &str,
+    dialect: ShellDialect,
+    ordered_packs: &[String],
+) -> bool {
+    let Some(store) = crate::packs::get_external_packs() else {
+        return false;
+    };
+    let mut enabled_external = ordered_packs
+        .iter()
+        .filter_map(|pack_id| store.get(pack_id))
+        .peekable();
+    if enabled_external.peek().is_none() {
+        return false;
+    }
+    let identities = command_executable_identities(command, dialect);
+    identities.unresolved || enabled_external.any(|pack| identities.selects(pack))
 }
 
 fn evaluate_pack_destructive_patterns(
@@ -47734,6 +48149,137 @@ mod tests {
                 .and_then(|info| info.pattern_name.as_deref()),
             Some("rm-recursive-general")
         );
+    }
+
+    #[test]
+    fn posix_program_words_static_or_decided_at_run_time_issue_592() {
+        for word in [
+            "frobtool",
+            "\"frobtool\"",
+            "'frob'tool",
+            "frob\\*tool",
+            "frob\"*\"tool",
+            "frob'$x'tool",
+            "$'frob\\x74ool'",
+            "~/bin/frobtool",
+            "frobtool$",
+            "[",
+            "[[",
+            "{}",
+            "frob{tool}",
+        ] {
+            assert!(!posix_word_is_dynamic(word), "{word:?} is literal");
+        }
+        for word in [
+            "$F",
+            "${F}",
+            "\"$F\"",
+            "frob$@tool",
+            "frob$1",
+            "frob$(echo tool)",
+            "frob`echo tool`",
+            "frob*",
+            "frob?ool",
+            "frobtoo[l]",
+            "frobtoo{l,}",
+            "frob{a..c}",
+            "$\"frobtool\"",
+            "<(frobtool)",
+            "'frobtool",
+            "\"frobtool",
+            "$'frobtool",
+        ] {
+            assert!(
+                posix_word_is_dynamic(word),
+                "{word:?} is decided at run time"
+            );
+        }
+
+        for (word, dialect, expected) in [
+            (
+                "/usr/local/bin/FrobTool.EXE",
+                ShellDialect::Posix,
+                Some("frobtool"),
+            ),
+            ("'frob'tool", ShellDialect::Posix, Some("frobtool")),
+            ("fr\\obtool", ShellDialect::Unknown, Some("frobtool")),
+            ("~/bin/frobtool", ShellDialect::Posix, Some("frobtool")),
+            ("%F%", ShellDialect::Posix, Some("%f%")),
+            ("%F%", ShellDialect::Unknown, None),
+            ("$F", ShellDialect::Posix, None),
+        ] {
+            assert_eq!(
+                static_program_name(word, dialect).as_deref(),
+                expected,
+                "program named by {word:?} under {dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_programs_resolve_through_wrappers_and_launchers_issue_592() {
+        let names = |command: &str| {
+            let identities = command_executable_identities(command, ShellDialect::Posix);
+            assert!(!identities.unresolved, "{command:?} resolves");
+            identities.names
+        };
+        assert_eq!(names("frobtool zap"), ["frobtool"]);
+        assert_eq!(names("sudo -u root FROBTOOL zap"), ["frobtool"]);
+        assert_eq!(names("ls; /opt/bin/frobtool zap"), ["ls", "frobtool"]);
+        assert!(names("xargs -n1 frob''tool zap").contains(&"frobtool".to_string()));
+        assert!(names("find . -exec fr\\obtool zap {} +").contains(&"frobtool".to_string()));
+        assert!(names("nice --unmodeled frob\"tool\" zap").contains(&"frobtool".to_string()));
+        // Redirections behind a frontend are not programs, nor are their
+        // targets, even when the target is a variable.
+        assert_eq!(names("exec >log 2>&1"), ["exec"]);
+        assert_eq!(names("exec > \"$LOG\""), ["exec"]);
+        // Words that stand for themselves. A heredoc body's parentheses are
+        // not a pattern attached to a word.
+        assert_eq!(names("[ -f x ]"), ["["]);
+        assert_eq!(
+            names("cat <<'EOF'\nprint(frob(1))\nEOF")
+                .first()
+                .map(String::as_str),
+            Some("cat")
+        );
+        let mut substituted = names("echo $(date) \"f(x)\" 'g(y)' h\\(z");
+        substituted.sort();
+        assert_eq!(substituted, ["date", "echo"]);
+
+        for command in [
+            "$F zap",
+            "true && $F zap",
+            "frobtoo[l] zap",
+            "frob${x:0:0}tool zap",
+            "xargs $F zap",
+            "find . -exec frob*ool {} +",
+            "sudo $(printf %s frob tool) zap",
+            "nice --unmodeled $F zap",
+            "time --unmodeled $F zap",
+            "frob+(t)ool zap",
+            "frob@(t|x)ool zap",
+            "frob(t|x)ool zap",
+        ] {
+            assert!(
+                command_executable_identities(command, ShellDialect::Posix).unresolved,
+                "{command:?} leaves the program unknown"
+            );
+        }
+
+        // Bounds: a wrapper chain past the stripping limit, and a command
+        // with more segments than are read, prove nothing.
+        let chain = format!("{}frobtool zap", "nice ".repeat(40));
+        assert!(command_executable_identities(&chain, ShellDialect::Posix).unresolved);
+        let segments = format!("{}frobtool zap", "true; ".repeat(MAX_IDENTITY_SEGMENTS + 1));
+        assert!(command_executable_identities(&segments, ShellDialect::Posix).unresolved);
+
+        // PowerShell and Cmd keep their existing selection.
+        for dialect in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+            assert_eq!(
+                command_executable_identities("$F zap", dialect),
+                ExecutableIdentities::default()
+            );
+        }
     }
 
     #[test]
