@@ -13,8 +13,155 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+### Fixed
+
+- **Audit universal allowlist globs as unrestricted (#545).** Doctor now
+  recognizes composite patterns such as `**/`, `**/*`, and `**/**` that match
+  every working directory, including equivalent normalized root paths.
+  Permanent grants using these patterns receive the existing actionable
+  rule and provenance warnings in project, user, and system layers. Bounded
+  patterns and temporary or inactive entries retain their classifications;
+  the audit does not change matching or rewrite grants in `--fix` mode.
+- **Inspect complete inline programs inside compound shell commands (#544).**
+  Python and JavaScript literals carried through variables remain checked
+  when the invocation has another statement, a pipeline, redirection, an
+  environment assignment, or supported trailing operands. Exact source ownership
+  is proved separately from eligibility for the documentation exemption, so
+  another shell consumer cannot suppress inspection. Static argument arrays
+  remain data, and recovered commands keep their own rule and allowlist
+  ownership. Later Node options that can replace its program cannot establish
+  executable-source ownership for the earlier argument.
+- **Follow literal execution dependencies without scanning argument data (#544).**
+  A bounded proof now follows a static string into a direct literal Python
+  `exec`/`eval` or JavaScript `eval` program that passes it to a known shell sink.
+  The recovered command retains its own rule and allowlist identity. Static
+  argv and option literals owned by named execution checks keep their data
+  roles, while callbacks, nested calls, dynamic options, and shell source
+  remain visible. Unreferenced strings and evaluated print calls are not
+  promoted to executable shell commands. Hoisted JavaScript declarations and
+  ambiguous identifier spellings withdraw the optional binding proof. The
+  POSIX eval collector respects proven interpreter stdin ownership while
+  language analysis and shell consumers retain the original source.
+- **Accept literal numeric ports in data-transfer proofs (#543).** Static
+  decimal SSH and SCP port arguments retain the existing file-data treatment.
+  Variable ports, substitutions, and unproved transport options remain visible
+  to execution checks.
+- **Review Python source selected by shell expansion (#538).** A Python `-c`
+  program supplied entirely by an unresolved shell expansion receives the
+  existing inline-launcher denial rule. The check follows Python option
+  ownership and outer shell quoting, preserving literal or escaped dollar
+  signs, statically resolved source, and `-c` text passed as script arguments.
+- **Inspect the arguments produced by executable variables (#540).** Literal
+  assignments such as `X='git reset --hard'; $X` now reach the Git rule for
+  the expanded command instead of being mistaken for one quoted executable
+  name. Quoted variable references preserve one argument, while supported
+  unquoted expansion splits fields without reinterpreting their contents as
+  shell syntax. Unknown splitting, globbing, and interpreter flags introduced
+  by expansion require review. Rule-specific grants and original source spans
+  remain attached to the command that actually needs them.
+- **Keep quoted flowctl receipt text as data (#538, #540).** Complete static
+  `gate check` and `gate receipt` command operands can contain quoted shell
+  punctuation without triggering destructive-command rules. Live expansions,
+  incomplete words, unknown options, redirects, and later commands retain
+  their execution checks. Regression cases exercise both `dcg test` and the
+  actual hook protocol. The inline extractor shares the complete receipt
+  grammar, so a dynamic `FLOWCTL` executable no longer causes static receipt
+  values to be inspected as speculative shell programs.
+- **Keep interpreter callbacks independent of outer execution grants (#544).**
+  Literal command evidence inside callbacks, assignments, and argument side
+  effects can no longer inherit an enclosing call's already-checked status.
+  Destructive commands carried through variables retain their own rule and
+  cannot be hidden by an allowlist entry for the outer execution sink. Static
+  argument arrays and option values preserve their existing data treatment.
+- **Check substitutions carried by interpreter variables (#544).** Python and
+  JavaScript literal values passed through variables or opaque calls now reach
+  the existing command evaluator, including encoded substitution markers.
+  Bounded analysis preserves source spans, language escape semantics, named
+  execution rules, and their allowlist ownership. Proven documentation in an
+  isolated inline invocation or quoted heredoc remains data; unverified or
+  incomplete analysis cannot silently approve a command.
+- **Read complete quoted heredoc delimiters (#544).** Backslash quoting and
+  adjacent quoted fragments, such as `<<D\OC` and `<<D'OC'`, now retain the
+  exact interpreter source boundary in both the extractor and bundled Bash
+  parser. Any quoted fragment correctly suppresses outer-shell expansion in
+  the body. This prevents false denials of literal documentation and keeps
+  subsequent commands visible. Unsupported delimiter syntax cannot select a
+  shorter, misleading terminator.
+- **Inspect GNU tar helpers inside shell groups (#540).** Helper discovery now
+  reaches actual tar invocations inside parentheses and brace groups, preserving
+  their original command context. Enclosing file writes or earlier state changes
+  prevent a helper from relying on stale local-file evidence, including a
+  PostgreSQL checkpoint helper whose input is overwritten by the caller's
+  redirect. Read-only groups retain the existing helper checks.
+- **Analyze scripts written by tee before execution (#540).** A quoted heredoc
+  written to literal files by `tee` and immediately run by a supported
+  interpreter now receives the same language-aware safety checks as a script
+  written by `cat`. This catches destructive Python and JavaScript filesystem
+  calls while recognizing genuine language literals and arrow operators.
+  Source identity requires an unambiguous overwrite and interpreter handoff;
+  append mode, dynamic paths, extra consumers, and outputs that replace an
+  interpreter retain conservative analysis. Ordinary data writes and the
+  existing cat-based transfer-data checks keep their behavior.
+- **Doctor audits unrestricted allowlist exceptions (#545).** Active whole-rule
+  grants with no working-directory restriction or expiration now produce
+  actionable warnings naming the rule, source layer/file, reason, and available
+  author/timestamp metadata. Destructive filesystem and Git exceptions are
+  marked high risk. The audit covers trusted project, user, and system layers,
+  preserves warnings alongside parse errors, and distinguishes scoped,
+  temporary, expired, and inactive entries using runtime semantics. Doctor
+  leaves allowlist files and matching behavior unchanged, including in `--fix`
+  mode; its JSON v1 schema and warning-only exit behavior are preserved.
+
+## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
+
+This release closes commands that ran unguarded (Claude Code's `Monitor`
+tool, wrapper and remote-shell redirects, GNU tar helper programs, archive
+extraction into credential or `.git` paths) and a long list of false
+positives reported against 0.15.2.
+
+**Claude Code users: refresh the hook after upgrading.** The hook matcher is
+now `Bash|PowerShell|Monitor`. Run `dcg install` (or `dcg doctor --fix`);
+hook self-healing does the same on its next run. Existing `Bash` or
+`Bash|PowerShell` dcg entries are migrated in place, and unrelated hooks keep
+their matchers.
+
+### Behaviour changes you may notice
+
+- **A temporary-path variable proof stops at an unmodelled assignment.**
+  0.15.2 proved `> $SP/out.txt` safe from an earlier `SP=/tmp/...` even when
+  a later assignment took its value from a command dcg does not model
+  (`N=$(python3 -c ...)`, `N=$(basename "$BIN" | cut -c1-16)`). Such
+  redirects are now denied as `core.filesystem:redirect-truncate-dynamic-path`.
+  Redirect before that assignment, or write the literal path. In a replay of
+  6,000 real agent commands this changed three verdicts from allow to deny;
+  the #536 fixes below changed one from deny to allow.
+- **GNU tar helper programs are judged.** `--checkpoint-action=exec=`,
+  `--to-command`, `--use-compress-program`/`-I`, `--info-script`/`-F`,
+  `--new-volume-script` and `--rmt-command` run code. Their payloads now go
+  through the packs; a helper dcg cannot verify is denied as
+  `core.filesystem:tar-exec-unverified`.
+- **`rm` of a path inside `.git` names the real risk.**
+  `rm .git/index.lock` is still denied under `core.filesystem:rm-protected-file`,
+  but the reason now says it deletes repository state, not a credential or
+  login-startup file, and how to clear a stale `index.lock` safely. A command
+  that also removes a credential keeps the credential reason (#533).
+- `git branch -d` is reported as `core.git:branch-delete`; see Git branch
+  rules below (#509).
+
 ### Agent integrations
 
+- **Claude Code: `Monitor` scripts are judged (#529).** Claude Code's
+  `Monitor` tool runs its `command` as a POSIX shell script. The hook matcher
+  did not include it, so those scripts never reached dcg. `dcg install`, the
+  installers, `dcg doctor --fix` and hook self-healing now write
+  `Bash|PowerShell|Monitor`.
+- **Codex: exact-command review for denials (#537).** A Codex denial now
+  carries its allow-once code in `permissionDecisionReason`, keeping Codex's
+  three-field denial JSON. The grant matches only the exact original request,
+  is single-use, and cannot be consumed by a nested payload or an altered
+  wrapper, substitution or whitespace.
+- **pi: the recipe evaluates with `--dialect posix` (#532).** Without it,
+  pi's commands were read with zsh-only rules and some were denied falsely.
 - **OpenCode: the plugin loads again (#516).** OpenCode 1.3.4 and later read
   a default export that has an `id` as a plugin module and refuse it without
   `server()`. The plugin generated by 0.15.0 through 0.15.2 exported
@@ -55,7 +202,66 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   on every row the hook writes, because the hook runs before the command and
   cannot know how it ended. NULL means unknown, not success (#515).
 
-### Detection
+### Commands that ran unguarded
+
+- **A wrapper no longer swallows a redirect (#531, #521).**
+  `nice -n > ~/.bashrc` was allowed because the wrapper parser read `>` as
+  the value of `-n`; it is now judged as the credential-file write it is. A
+  wrapper option with no operand (`nice -n >~/x`) panicked; it is now
+  rejected without a panic.
+- **A redirect in an `ssh` script is judged for the remote host (#534).** A
+  literal script piped or fed to `ssh` or to an interactive container exec
+  shell was judged against the local disk, so a local file's absence could
+  prove a remote overwrite safe. Such scripts are now judged in the receiving
+  environment's filesystem scope; an unknown producer or unbounded nested
+  dispatch fails closed.
+- **Local files are not evidence after a wrapper changes context.** Input
+  files opened after a recognised wrapper changes directory, user, home or
+  environment (`sudo -u`, `env -C`, remote and container shells) were checked
+  against the caller's files. Those inputs are now treated as unverified.
+- **Archive extraction into credentials or `.git`.** GNU/BSD `tar`, `unzip`
+  and `7z` extracting into an explicit credential or `.git` destination
+  (including bundled `C` options such as `tar xfC` and unknown member
+  lists) is denied; list, create and stdout modes are unaffected.
+- **Complete `chmod`/`chown`/`chgrp` parsing in the permissions pack.** The
+  prefix-only exemption could hide a later recursive flag, a protected
+  target, or a different operation whose option value contained safe-looking
+  text. Every option and target is now checked.
+- **Windows Git redirects keep their own rules (#492).** Allowlisting
+  `redirect-truncate-dynamic-path`, or one Git redirect, could conceal a
+  separate Git or credential write spelled with Windows separators in the
+  same command. Every truncate/append hit is now kept and judged under its
+  own rule.
+- An executable whose argument count cannot be bounded now fails closed
+  instead of having its arguments shifted.
+
+### False positives fixed
+
+- A JavaScript arrow function (`=> !x`) in a quoted heredoc is not read as a
+  redirect (#519).
+- A Python heredoc containing a regex no longer switches macOS commands to
+  Windows parsing (#520), and `^` in a `python3 -` heredoc no longer widens
+  the dialect into a PowerShell scan (#523).
+- A quoted heredoc piped to `python3`, `node`, `ruby` or `perl` is analysed
+  as that language, not as POSIX shell (#522).
+- A multi-line `for` loop with a quoted `|^` in `sed` (#524), and a quoted
+  heredoc appended to a file after `sed` read it (#525), are no longer denied
+  as `heredoc.shell:launcher-unverified`.
+- A provable loop variable after a literal path prefix (#526), and provable
+  `/tmp` values from an `&&` assignment, a chained variable, `$$`, or
+  `mktemp -d` with a `/tmp` template (#536), satisfy
+  `redirect-truncate-dynamic-path`. Resolution is bounded (eight binding
+  levels, 4096 expanded bytes, 256 segments) and still denies traversal,
+  protected names and mutated bindings.
+- An embedded process call with a non-literal argument keeps its words in
+  place; dropping it shifted the rest and produced false
+  `core.git:git-alias-semantic-unverified` denials (#527).
+- `--command "<string>"` after a variable-path `flowctl gate check`/`gate
+  receipt` is treated as receipt data, not an inline launcher. Only the
+  fixed `flowctl` gate grammar is exempt; unknown executables with
+  `--command` stay denied (#538).
+
+### Embedded code and heredocs
 
 - An inline-shell launcher quoted as prose inside another command's argument
   (`tracker comment 1 "example: bash -c 'git reset --hard' is refused"`) is no
@@ -75,6 +281,18 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   Perl backtick commands go the same way, and `qx` is recognised with any
   delimiter (`qx{…}`, `qx(…)`, `qx[…]`, …), not only `qx/…/`. Payloads the
   catalogue already reports keep their `heredoc.*` rule ids (#512).
+
+### CLI
+
+- `dcg config` (text and `--format json`) now reports every effective
+  `[general]` setting, including `unverified_decision`, `update_pin`,
+  `check_updates`, `max_hook_input_bytes`, `max_command_bytes` and
+  `max_findings_per_command`, with environment overrides applied (#530).
+- `dcg doctor` judges the Claude hook only on the keys dcg owns (`type`,
+  `command`, `shell`). A hook entry with an extra key Claude Code supports,
+  such as `timeout`, is no longer reported as misconfigured, and
+  `dcg install --force` keeps it. An `async` hook is still an error, because
+  Claude Code would not wait for its verdict (#528).
 
 ### Git branch rules
 

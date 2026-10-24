@@ -312,7 +312,11 @@ pub enum Command {
     },
 
     /// Install the hook into Claude Code settings (or another agent with
-    /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, or `--reasonix`)
+    /// `--grok`, `--agy`, `--opencode`, `--omp`, `--crush`, `--reasonix`,
+    /// `--muse`, or `--amp`)
+    ///
+    /// Claude user settings honor CLAUDE_CONFIG_DIR when non-empty, otherwise
+    /// ~/.claude/settings.json is used.
     #[command(name = "install")]
     Install {
         /// Force overwrite existing hook configuration
@@ -320,7 +324,7 @@ pub enum Command {
         force: bool,
 
         /// Install to project-level `.claude/settings.json` (in the current repo)
-        /// instead of user-level `~/.claude/settings.json`
+        /// instead of user-level settings (CLAUDE_CONFIG_DIR or ~/.claude)
         #[arg(long)]
         project: bool,
 
@@ -329,7 +333,10 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush", "reasonix"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["agy", "opencode", "omp", "crush", "reasonix", "muse", "amp"]
+        )]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -337,7 +344,10 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush", "reasonix"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "opencode", "omp", "crush", "reasonix", "muse", "amp"]
+        )]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -347,7 +357,10 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush", "reasonix"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "omp", "crush", "reasonix", "muse", "amp"]
+        )]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -356,7 +369,10 @@ pub enum Command {
         /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
         /// extension discovery is cwd-only and does not walk Git ancestors.
         /// Every OMP bash tool call is routed through dcg before execution.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush", "reasonix"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "crush", "reasonix", "muse", "amp"]
+        )]
         omp: bool,
 
         /// Install the dcg PreToolUse hook for Charm Crush by merging a
@@ -365,7 +381,10 @@ pub enum Command {
         /// and `CRUSH_GLOBAL_CONFIG`) or the repo's `crush.json` (with
         /// `--project`). Crush pipes every bash tool call to dcg's stdin and
         /// blocks the call when dcg answers `{"decision":"deny"}`.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "reasonix"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "reasonix", "muse", "amp"]
+        )]
         crush: bool,
 
         /// Install the dcg PreToolUse hook for Reasonix by merging a
@@ -375,8 +394,37 @@ pub enum Command {
         /// `.reasonix/settings.json` (with `--project`). Reasonix pipes every
         /// shell tool call to dcg's stdin and blocks it when dcg exits 2.
         /// Restart Reasonix afterwards: hooks load when a session is built.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "muse", "amp"]
+        )]
         reasonix: bool,
+
+        /// Install the dcg PreToolUse hook for Muse Code (Meta) by merging a
+        /// `hooks.PreToolUse` matcher group (matcher
+        /// `^(shell|exec_command|bash)$`, command `<dcg> --agent muse`) into
+        /// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`, keeping
+        /// `schema_version` and every other key. Muse answers a deny by
+        /// refusing the shell call. User-level only (`--project` is refused).
+        /// Start a new Muse session afterwards: hooks load at session start.
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "reasonix", "project", "amp"]
+        )]
+        muse: bool,
+
+        /// Install a native Amp plugin at
+        /// `${XDG_CONFIG_HOME:-~/.config}/amp/plugins/dcg-guard.js` (a system
+        /// plugin, covering every project) or `<repo>/.amp/plugins/dcg-guard.js`
+        /// (with `--project`). Its `tool.call` handler runs every Amp shell
+        /// command through `dcg --agent amp` and rejects the call on a deny,
+        /// on a declined review, and whenever dcg gives no verdict. Reload
+        /// Amp's plugins afterwards (#577).
+        #[arg(
+            long,
+            conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush", "reasonix", "muse"]
+        )]
+        amp: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -400,7 +448,7 @@ pub enum Command {
     },
 
     /// Remove the hook from Claude Code settings (or from Crush with `--crush`,
-    /// Reasonix with `--reasonix`)
+    /// Reasonix with `--reasonix`, Muse Code with `--muse`, Amp with `--amp`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
@@ -409,13 +457,25 @@ pub enum Command {
 
         /// Remove the dcg hook entry from `~/.config/crush/crush.json` instead
         /// of Claude Code settings
-        #[arg(long, conflicts_with_all = ["purge", "reasonix"])]
+        #[arg(long, conflicts_with_all = ["purge", "reasonix", "muse", "amp"])]
         crush: bool,
 
         /// Remove the dcg hook entry from `<Reasonix home>/settings.json`
         /// instead of Claude Code settings
-        #[arg(long, conflicts_with = "purge")]
+        #[arg(long, conflicts_with_all = ["purge", "muse", "amp"])]
         reasonix: bool,
+
+        /// Remove dcg's hook from Muse Code's
+        /// `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json` instead of
+        /// Claude Code settings
+        #[arg(long, conflicts_with_all = ["purge", "amp"])]
+        muse: bool,
+
+        /// Remove the user-level Amp plugin dcg wrote
+        /// (`${XDG_CONFIG_HOME:-~/.config}/amp/plugins/dcg-guard.js`) instead
+        /// of touching Claude Code settings; a file dcg did not write is kept
+        #[arg(long, conflicts_with = "purge")]
+        amp: bool,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -2431,9 +2491,40 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let (config, config_sources) = if needs_config_trace {
         let loaded_config = Config::load_with_report();
         (loaded_config.config, Some(loaded_config.sources))
+    } else if let Some(Command::TestCommand {
+        config: Some(path), ..
+    }) = &cli.command
+    {
+        (Config::load_with_explicit_path(path), None)
     } else {
         (Config::load(), None)
     };
+    // Diagnostics and repair-oriented config commands remain available. Other
+    // CLI operations must not report success using partially loaded policy.
+    // Explicit batch hooks have their own indexed JSONL denial contract.
+    if let Some(reason) = config.configuration_error() {
+        if !matches!(
+            &cli.command,
+            Some(
+                Command::Doctor { .. }
+                    | Command::ShowConfig { .. }
+                    | Command::Completions { .. }
+                    | Command::Hook(_)
+            )
+        ) {
+            crate::emit_stdout!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "decision": "deny",
+                    "error": { "kind": "configuration_error", "message": reason },
+                    "reason": reason,
+                })
+            );
+            crate::emit_stderr!("Error: {reason}");
+            std::process::exit(crate::exit_codes::EXIT_CONFIG_ERROR);
+        }
+    }
     crate::output::install_theme_config(&config);
     let verbosity = Verbosity::from_cli(&cli);
     let explicit_omp_agent = is_explicit_omp_agent(cli.agent.as_deref());
@@ -2478,8 +2569,14 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             omp,
             crush,
             reasonix,
+            muse,
+            amp,
         }) => {
-            if grok {
+            if amp {
+                install_amp_plugin(force, project)?;
+            } else if muse {
+                install_muse_hook(force)?;
+            } else if grok {
                 install_grok_hook(force, project)?;
             } else if agy {
                 install_antigravity_hook(force, project)?;
@@ -2506,8 +2603,14 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             purge,
             crush,
             reasonix,
+            muse,
+            amp,
         }) => {
-            if crush {
+            if amp {
+                uninstall_amp_plugin()?;
+            } else if muse {
+                uninstall_muse_hook()?;
+            } else if crush {
                 uninstall_crush_hook()?;
             } else if reasonix {
                 uninstall_reasonix_hook()?;
@@ -2555,7 +2658,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::TestCommand {
             command,
             stdin,
-            config: config_path,
+            config: _,
             with_packs,
             explain,
             format,
@@ -2575,16 +2678,9 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             validate_omp_bridge_output_agent(omp_bridge_output, robot_mode, explicit_omp_agent)?;
             let effective_format = if robot_mode { TestFormat::Json } else { format };
 
-            // Load specific config file if provided, otherwise use default
-            let effective_config = if let Some(ref path) = config_path {
-                Config::load_from_file(path).unwrap_or_else(|| {
-                    eprintln!("Warning: Failed to load config from {}", path.display());
-                    config.clone()
-                })
-            } else {
-                config.clone()
-            };
-
+            // The shared loader already selected --config, preserving
+            // system policy, environment overrides and fatal load failures.
+            let effective_config = config.clone();
             let command = if stdin {
                 read_test_command_from_stdin(
                     effective_config.general.max_command_bytes(),
@@ -2897,6 +2993,13 @@ fn write_completions(shell: CompletionShell) -> Result<(), Box<dyn std::error::E
 fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn std::error::Error>> {
     use std::io::{self, BufRead, Write};
 
+    // A broken trusted layer must deny before allowlists, external packs or
+    // policy modes can authorize a line. Preserve the batch protocol instead
+    // of emitting the generic CLI error or a host-specific hook envelope.
+    if let Some(reason) = config.configuration_error() {
+        return run_hook_configuration_error(reason);
+    }
+
     // `dcg hook` reads JSONL hook payloads from stdin and writes one result
     // line per (non-empty) input line. `--batch` is accepted for explicitness
     // but is no longer required — a single JSON object on stdin is processed as
@@ -3151,6 +3254,37 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         crate::exit_codes::EXIT_SUCCESS
     };
     Ok(exit_code)
+}
+
+/// Refuse each nonblank input with the established batch JSONL/exit-1 contract.
+/// Even malformed or non-UTF-8 inputs cannot hide a missing trusted policy.
+fn run_hook_configuration_error(reason: &str) -> Result<i32, Box<dyn std::error::Error>> {
+    use std::io::{self, BufRead, Write};
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let mut index = 0usize;
+    for line in stdin.lock().lines() {
+        if line.as_ref().is_ok_and(|text| text.trim().is_empty()) {
+            continue;
+        }
+        let can_continue = batch_read_can_continue(&line);
+        // Keep `error` a string for existing batch clients; the additive kind
+        // lets callers distinguish a configuration failure without parsing it.
+        let verdict = serde_json::json!({
+            "index": index,
+            "decision": "deny",
+            "error_kind": "configuration_error",
+            "error": reason,
+        });
+        writeln!(output, "{verdict}")?;
+        index += 1;
+        if !can_continue {
+            break;
+        }
+    }
+    Ok(crate::exit_codes::EXIT_DENIED)
 }
 
 /// Whether `BufRead::lines()` can still make progress after this outcome.
@@ -6762,6 +6896,29 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     );
     println!("  Hook self-heal: {}", config.general.self_heal_hook);
     println!("  Fail closed: {}", config.general.fail_closed);
+    // The same effective values `--format json` reports (#530).
+    println!(
+        "  Unverified decision: {}",
+        if config.unverified_denies() {
+            "deny"
+        } else {
+            "ask"
+        }
+    );
+    println!("  Update pin: {}", config.general.update_pin);
+    println!("  Check updates: {}", config.general.check_updates);
+    println!(
+        "  Max hook input bytes: {}",
+        config.general.max_hook_input_bytes()
+    );
+    println!(
+        "  Max command bytes: {}",
+        config.general.max_command_bytes()
+    );
+    println!(
+        "  Max findings per command: {}",
+        config.general.max_findings_per_command()
+    );
     println!();
     let (active_packs, unloaded_packs) = resolved_pack_listing(config);
     let keywordless: &[String] =
@@ -6921,6 +7078,17 @@ fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
             "hook_timeout_source": config.hook_timeout_source(),
             "self_heal_hook": config.general.self_heal_hook,
             "fail_closed": config.general.fail_closed,
+            // Effective values (#530): the hand-written list above used to stop
+            // here, so these settings, and their DCG_* overrides, were invisible
+            // to `dcg config --format json`. `unverified_decision` reads through
+            // `unverified_denies`, which applies `DCG_UNVERIFIED_DECISION` at
+            // use time; the size limits report their defaults when unset.
+            "unverified_decision": if config.unverified_denies() { "deny" } else { "ask" },
+            "update_pin": config.general.update_pin,
+            "check_updates": config.general.check_updates,
+            "max_hook_input_bytes": config.general.max_hook_input_bytes(),
+            "max_command_bytes": config.general.max_command_bytes(),
+            "max_findings_per_command": config.general.max_findings_per_command(),
         },
         "packs": {
             "enabled": enabled_packs,
@@ -10961,21 +11129,38 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     // Check 2: Claude Code settings file exists
     print!("Checking Claude Code settings... ");
     let settings_path = claude_settings_path();
+    let claude_settings_required = claude_config_dir_override().is_some();
     if settings_path.exists() {
         println!("{}", "OK".green());
     } else {
         println!("{}", "NOT FOUND".yellow());
-        println!("  ~/.claude/settings.json not found");
-        println!("  This is normal if Claude Code hasn't been configured yet");
+        if !claude_settings_required {
+            println!("  This is normal if Claude Code hasn't been configured yet");
+        }
         wired_to_an_agent = false;
     }
+    println!("  Settings path: {}", settings_path.display());
 
     // Check 3: Hook wiring (expanded diagnostics)
     print!("Checking hook wiring... ");
     let hook_diag = diagnose_hook_wiring();
-    issues += hook_diagnostics_issue_count(&hook_diag);
+    issues += hook_diagnostics_issue_count(&hook_diag, claude_settings_required);
 
-    if !hook_diag.settings_exists {
+    if !hook_diag.settings_exists && claude_settings_required {
+        println!("{}", "NOT REGISTERED".red());
+        println!("  The active CLAUDE_CONFIG_DIR has no settings.json or dcg hook");
+        if fix {
+            println!("  Attempting to register hook...");
+            if install_hook(false, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install' with the same CLAUDE_CONFIG_DIR");
+        }
+    } else if !hook_diag.settings_exists {
         println!("{}", "SKIPPED".yellow());
         println!("  No settings file to check");
     } else if let Some(ref err) = hook_diag.settings_error {
@@ -11082,9 +11267,9 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
     //   - GROK_* env vars present in the current process (Grok is the parent)
     //   - ~/.grok directory exists (Grok was installed at some point)
     //
-    // Grok also works via the Claude compatibility layer (~/.claude/settings.json
-    // — covered by Check 3 above). The native dcg.json gives a cleaner doctor
-    // output and avoids coupling Grok's behavior to Claude's settings file.
+    // Grok also works via the Claude compatibility layer, but always reads
+    // ~/.claude/settings.json: it does not honor CLAUDE_CONFIG_DIR. Diagnose
+    // that file independently of the active Claude settings checked above.
     let grok_session_present = std::env::var_os("GROK_SESSION_ID").is_some()
         || std::env::var_os("GROK_HOOK_EVENT").is_some()
         || std::env::var_os("GROK_WORKSPACE_ROOT").is_some();
@@ -11094,28 +11279,27 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         print!("Checking Grok hook registration... ");
 
         let user_hook = grok_user_hook_path();
-        let user_hook_exists = user_hook.exists();
-        let claude_compat_path = claude_settings_path();
-        let claude_compat_exists = claude_compat_path.exists();
+        let native_probe = probe_grok_dcg_hook_at(&user_hook);
+        let claude_compat_path = default_claude_settings_path();
+        let claude_compat_diag = diagnose_hook_wiring_at(&claude_compat_path);
 
-        if user_hook_exists {
+        if matches!(&native_probe, Ok(true)) {
             println!("{}", "OK".green());
             println!("  Found: {}", user_hook.display());
-            if claude_compat_exists {
+            if claude_compat_diag.has_grok_compatible_hook() {
                 println!(
                     "  Grok also picks up dcg from {} (Claude compatibility layer).",
                     claude_compat_path.display()
                 );
             }
-        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
+        } else if matches!(&native_probe, Ok(false))
+            && claude_compat_diag.has_grok_compatible_hook()
+        {
             // Grok will use the Claude-compat path; this still works but the
             // native path is preferred. Surface as a friendly note, not an
             // error, so users who deliberately rely on Claude-compat aren't
-            // pestered. Any non-zero hook count is fine here because the
-            // "duplicate Claude hooks" case is already reported as a WARNING
-            // by Check 3 above — from Grok's point of view the compat layer
-            // is wired up either way, so we shouldn't escalate to
-            // "NOT REGISTERED" just because the Claude side has duplicates.
+            // pestered. Duplicate working hooks still protect Grok, but an
+            // async, malformed, or missing-executable hook does not.
             println!("{}", "OK (via Claude compat)".green());
             println!(
                 "  No native ~/.grok/hooks/dcg.json — Grok will pick up dcg from {}.",
@@ -11126,31 +11310,32 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 user_hook.display()
             );
         } else {
-            println!("{}", "NOT REGISTERED".yellow());
-            // Reached only when Grok is in use AND neither the native hook nor
-            // the Claude-compat path is wired — the guard is not guarding.
-            // This branch already incremented `fixed` on a successful repair;
-            // without the matching `issues` increment the summary verdict
-            // (`issues == 0 || (fix && fixed == issues)`) was corrupted in
-            // both directions: an unrelated unfixed issue could be masked, and
-            // a fully repaired machine could still report failure.
-            //
-            // `collect_doctor_report` carries the same check (id `grok_hook`)
-            // so `--strict` cannot give one answer for `--format json` and a
-            // different one here.
+            if let Err(error) = native_probe {
+                println!("{}", "INVALID".red());
+                println!("  {}: {error}", user_hook.display());
+            } else {
+                println!("{}", "NOT REGISTERED".yellow());
+            }
+            // Existing native configuration must be valid even if Claude
+            // compatibility is wired. Keep issue/fix accounting in sync with
+            // `collect_doctor_report`, and verify repairs before claiming success.
             issues += 1;
             if fix {
                 println!("  Attempting native install...");
-                if install_grok_hook(false, false).is_ok() {
-                    println!("  {}", "Fixed!".green());
-                    fixed += 1;
-                } else {
-                    println!("  {}", "Failed to fix".red());
+                match install_grok_hook_at(&user_hook, false)
+                    .and_then(|_| probe_grok_dcg_hook_at(&user_hook))
+                {
+                    Ok(true) => {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    }
+                    Ok(false) => println!("  {}", "Failed to fix: native hook is absent".red()),
+                    Err(error) => println!("  {}: {error}", "Failed to fix".red()),
                 }
             } else {
                 println!("  → Run 'dcg install --grok' to register the native hook");
                 println!(
-                    "    (or 'dcg install' for the Claude-compat path at {})",
+                    "    Grok's Claude-compat settings: {}",
                     claude_compat_path.display()
                 );
             }
@@ -11235,6 +11420,90 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         }
     }
 
+    // Check 3b1c: Muse Code hook registration (#572). Muse reads hooks only
+    // from its own settings.json. `collect_doctor_report` carries the same
+    // check (id `muse_hook`).
+    if muse_appears_in_use() {
+        print!("Checking Muse Code hook registration... ");
+        let settings_path = muse_user_settings_path();
+        match probe_muse_user_settings() {
+            Ok(MuseHookProbe::Current) => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", settings_path.display());
+            }
+            Ok(probe @ (MuseHookProbe::Missing | MuseHookProbe::Stale)) => {
+                if probe == MuseHookProbe::Stale {
+                    println!("{}", "STALE".yellow());
+                    println!(
+                        "  dcg is registered without the {MUSE_SHELL_MATCHER} matcher or \
+                         --agent muse"
+                    );
+                } else {
+                    println!("{}", "NOT REGISTERED".yellow());
+                }
+                issues += 1;
+                if fix {
+                    println!("  Attempting install...");
+                    if install_muse_hook_at(&settings_path, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!(
+                        "  → Run 'dcg install --muse' to register the hook in {}",
+                        settings_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                println!("{}", "INVALID".red());
+                issues += 1;
+                println!("  {err}");
+                println!("  → Fix the JSON by hand, then run 'dcg install --muse'");
+            }
+        }
+    }
+
+    // Check 3b1d: Amp plugin registration (#577). Amp runs no hooks; its
+    // plugin is the only guard. `collect_doctor_report` carries the same
+    // check (id `amp_plugin`).
+    if amp_appears_in_use() {
+        print!("Checking Amp plugin registration... ");
+        let plugin_path = amp_system_plugin_path();
+        match probe_amp_plugin(&plugin_path) {
+            AmpPluginProbe::Current => {
+                println!("{}", "OK".green());
+                println!("  Found: {}", plugin_path.display());
+            }
+            probe @ (AmpPluginProbe::OwnedStale | AmpPluginProbe::MissingOrUnowned) => {
+                if probe == AmpPluginProbe::OwnedStale {
+                    println!("{}", "STALE".yellow());
+                    println!(
+                        "  {} is dcg-owned but differs from what this dcg writes",
+                        plugin_path.display()
+                    );
+                } else {
+                    println!("{}", "NOT INSTALLED".yellow());
+                }
+                issues += 1;
+                if fix {
+                    println!("  Attempting install...");
+                    if install_amp_plugin_at(&plugin_path, false).is_ok() {
+                        println!("  {}", "Fixed!".green());
+                        fixed += 1;
+                    } else {
+                        println!("  {}", "Failed to fix".red());
+                    }
+                } else {
+                    println!("  → Run 'dcg install --amp' to write the plugin");
+                    println!("    (Amp shell commands are NOT guarded until it is installed)");
+                }
+            }
+        }
+    }
+
     // Check 3b2: Codex hook registration AND enablement (#368). Codex loads
     // PreToolUse hooks from ~/.codex/hooks.json but only RUNS a hook the user
     // has approved: a `[hooks.state."<file>:pre_tool_use:<i>:<j>"]` entry in
@@ -11283,15 +11552,18 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                     }
                 } else {
                     println!(
-                        "  → Run 'dcg doctor --fix' to set enabled = true, or edit \
-                         ~/.codex/config.toml"
+                        "  → Run 'dcg doctor --fix' to set enabled = true, or edit {}",
+                        codex_file_display("config.toml")
                     );
                 }
             }
             CodexHookProbe::HooksFileMissing => {
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
-                println!("  Codex is in use but ~/.codex/hooks.json does not exist");
+                println!(
+                    "  Codex is in use but {} does not exist",
+                    codex_file_display("hooks.json")
+                );
                 println!(
                     "  → Re-run the dcg install script to register the hook, then start \
                      Codex once to approve it"
@@ -11302,8 +11574,8 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 println!("{}", "NOT REGISTERED".yellow());
                 issues += 1;
                 println!(
-                    "  ~/.codex/hooks.json loads, but has no dcg PreToolUse command hook \
-                     that selects Bash"
+                    "  {} loads, but has no dcg PreToolUse command hook that selects Bash",
+                    codex_file_display("hooks.json")
                 );
                 println!(
                     "  → Re-run the dcg install script to register it, then start Codex \
@@ -11315,8 +11587,8 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
                 println!("{}", "MISPLACED".red());
                 issues += 1;
                 println!(
-                    "  A dcg hook is in ~/.codex/hooks.json but not where Codex runs it for \
-                     shell commands:"
+                    "  A dcg hook is in {} but not where Codex runs it for shell commands:",
+                    codex_file_display("hooks.json")
                 );
                 println!("  {detail}");
                 println!(
@@ -11344,14 +11616,20 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             CodexHookProbe::HooksFileInvalid(err) => {
                 println!("{}", "ERROR".red());
                 issues += 1;
-                println!("  ~/.codex/hooks.json is not valid JSON: {err}");
+                println!(
+                    "  {} is not valid JSON: {err}",
+                    codex_file_display("hooks.json")
+                );
                 println!("  Codex loads none of its hooks");
                 println!("  → Fix the JSON by hand, or move it aside and re-run the installer");
             }
             CodexHookProbe::HooksFileRejected(err) => {
                 println!("{}", "REJECTED BY CODEX".red());
                 issues += 1;
-                println!("  Codex rejects ~/.codex/hooks.json: {err}");
+                println!(
+                    "  Codex rejects {}: {err}",
+                    codex_file_display("hooks.json")
+                );
                 println!(
                     "  It loads NONE of the file's hooks, so the dcg hook never reaches trust \
                      review"
@@ -11774,23 +12052,26 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
 
     // Check 8: Allowlist discovery + validation
     print!("Checking allowlist entries... ");
-    let allowlist_diag = diagnose_allowlists();
+    let allowlist_diag = diagnose_allowlists(config);
     if allowlist_diag.total_errors > 0 {
         println!("{}", "INVALID".red());
         issues += allowlist_diag.total_errors;
         for msg in &allowlist_diag.error_messages {
             println!("  {msg}");
         }
-        println!("  → Run 'dcg allowlist validate' for details");
+        for msg in &allowlist_diag.warning_messages {
+            println!("  {msg}");
+        }
+        println!("  → {ALLOWLIST_DOCTOR_REMEDIATION}");
     } else if allowlist_diag.total_warnings > 0 {
         println!("{}", "WARNING".yellow());
         for msg in &allowlist_diag.warning_messages {
             println!("  {msg}");
         }
-        println!("  → Run 'dcg allowlist validate' for details");
+        println!("  → {ALLOWLIST_DOCTOR_REMEDIATION}");
     } else if allowlist_diag.layers_found == 0 {
         println!("{}", "NONE".yellow().dimmed());
-        println!("  No allowlist files found (project or user)");
+        println!("  No allowlist files found (project, user, or system)");
         println!("  → Use 'dcg allow <rule-id> -r \"reason\"' to create one");
     } else {
         println!(
@@ -12044,6 +12325,7 @@ fn collect_doctor_report(
 
     // Check 2: Claude settings file exists
     let settings_path = claude_settings_path();
+    let claude_settings_required = claude_config_dir_override().is_some();
     let (status, message) = if settings_path.exists() {
         (
             DoctorCheckStatus::Ok,
@@ -12052,7 +12334,7 @@ fn collect_doctor_report(
     } else {
         (
             DoctorCheckStatus::Warning,
-            "settings.json not found (Claude Code not configured)".to_string(),
+            format!("settings.json not found at {}", settings_path.display()),
         )
     };
     checks.push(DoctorCheck {
@@ -12066,10 +12348,10 @@ fn collect_doctor_report(
 
     // Check 3: Hook wiring
     let hook_diag = diagnose_hook_wiring();
-    issues += hook_diagnostics_issue_count(&hook_diag);
+    issues += hook_diagnostics_issue_count(&hook_diag, claude_settings_required);
     let mut hook_fixed = false;
     let hook_repair = if fix
-        && hook_diag.settings_exists
+        && (hook_diag.settings_exists || claude_settings_required)
         && hook_diag.settings_error.is_none()
         && hook_diag.has_issues()
     {
@@ -12077,12 +12359,23 @@ fn collect_doctor_report(
     } else {
         None
     };
-    let (status, message, remediation) = if !hook_diag.settings_exists {
-        (
-            DoctorCheckStatus::Skipped,
-            "No settings file to check".to_string(),
-            None,
-        )
+    let (status, message, remediation) = if !hook_diag.settings_exists && hook_repair.is_none() {
+        if claude_settings_required {
+            (
+                DoctorCheckStatus::Error,
+                format!(
+                    "No dcg hook in active Claude settings at {}",
+                    settings_path.display()
+                ),
+                Some("Run 'dcg install' with the same CLAUDE_CONFIG_DIR".to_string()),
+            )
+        } else {
+            (
+                DoctorCheckStatus::Skipped,
+                "No settings file to check".to_string(),
+                None,
+            )
+        }
     } else if let Some(ref err) = hook_diag.settings_error {
         (
             DoctorCheckStatus::Error,
@@ -12170,6 +12463,17 @@ fn collect_doctor_report(
             None,
         )
     };
+    if hook_fixed && !hook_diag.settings_exists {
+        // A missing explicit configuration may have been created above.
+        // Keep JSON and the rich summary aligned with the repaired state.
+        if let Some(check) = checks
+            .iter_mut()
+            .find(|check| check.id == "claude_settings")
+        {
+            check.status = DoctorCheckStatus::Ok;
+            check.message = format!("settings.json found at {}", settings_path.display());
+        }
+    }
     checks.push(DoctorCheck {
         id: "hook_wiring",
         name: "Hook wiring",
@@ -12421,16 +12725,22 @@ fn collect_doctor_report(
     });
 
     // Check 8: Allowlist discovery + validation
-    let allowlist_diag = diagnose_allowlists();
+    let allowlist_diag = diagnose_allowlists(config);
     let (status, message, remediation) = if allowlist_diag.total_errors > 0 {
         issues += allowlist_diag.total_errors;
         (
             DoctorCheckStatus::Error,
             format!(
                 "Allowlist errors: {}",
-                allowlist_diag.error_messages.join("; ")
+                allowlist_diag
+                    .error_messages
+                    .iter()
+                    .chain(&allowlist_diag.warning_messages)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
-            Some("Run 'dcg allowlist validate' for details".to_string()),
+            Some(ALLOWLIST_DOCTOR_REMEDIATION.to_string()),
         )
     } else if allowlist_diag.total_warnings > 0 {
         (
@@ -12439,12 +12749,12 @@ fn collect_doctor_report(
                 "Allowlist warnings: {}",
                 allowlist_diag.warning_messages.join("; ")
             ),
-            Some("Run 'dcg allowlist validate' for details".to_string()),
+            Some(ALLOWLIST_DOCTOR_REMEDIATION.to_string()),
         )
     } else if allowlist_diag.layers_found == 0 {
         (
             DoctorCheckStatus::Warning,
-            "No allowlist files found (project or user)".to_string(),
+            "No allowlist files found (project, user, or system)".to_string(),
             Some("Use 'dcg allow <rule-id> -r \"reason\"' to create one".to_string()),
         )
     } else {
@@ -12515,30 +12825,56 @@ fn collect_doctor_report(
     let grok_home_exists = grok_home.as_ref().is_some_and(|p| p.exists() && p.is_dir());
     if grok_session_present || grok_home_exists {
         let user_hook = grok_user_hook_path();
-        let claude_compat_exists = claude_settings_path().exists();
+        let native_probe = probe_grok_dcg_hook_at(&user_hook);
+        let claude_compat_path = default_claude_settings_path();
+        let claude_compat_diag = diagnose_hook_wiring_at(&claude_compat_path);
         let mut grok_fixed = false;
-        let (status, message, remediation) = if user_hook.exists() {
+        let (status, message, remediation) = if matches!(&native_probe, Ok(true)) {
             (
                 DoctorCheckStatus::Ok,
                 format!("Native Grok hook found at {}", user_hook.display()),
                 None,
             )
-        } else if claude_compat_exists && hook_diag.dcg_hook_count >= 1 {
+        } else if matches!(&native_probe, Ok(false))
+            && claude_compat_diag.has_grok_compatible_hook()
+        {
             // Wired via the Claude compatibility layer. Deliberately not an
             // error: users who rely on compat should not be pestered.
             (
                 DoctorCheckStatus::Ok,
-                "No native ~/.grok/hooks/dcg.json; Grok picks up dcg from the Claude \
-                 compatibility layer"
-                    .to_string(),
+                format!(
+                    "No native ~/.grok/hooks/dcg.json; Grok picks up dcg from {} \
+                     (Claude compatibility layer; ignores CLAUDE_CONFIG_DIR)",
+                    claude_compat_path.display()
+                ),
                 Some("Run 'dcg install --grok' for a native hook".to_string()),
             )
         } else {
-            // Grok is in use and the guard is wired NOWHERE for it.
+            // A native file that cannot protect Grok must not be masked by
+            // Claude compatibility or reported fixed merely because it was written.
             issues += 1;
-            if fix && install_grok_hook(false, false).is_ok() {
-                fixed += 1;
-                grok_fixed = true;
+            let mut message = match native_probe {
+                Err(error) => format!(
+                    "Invalid native Grok hook at {}: {error}",
+                    user_hook.display()
+                ),
+                Ok(_) => "Grok is in use but dcg is registered neither natively nor via the \
+                          Claude compatibility layer"
+                    .to_string(),
+            };
+            if fix {
+                match install_grok_hook_at(&user_hook, false)
+                    .and_then(|_| probe_grok_dcg_hook_at(&user_hook))
+                {
+                    Ok(true) => {
+                        fixed += 1;
+                        grok_fixed = true;
+                    }
+                    Ok(false) => message.push_str("; repair left the native hook absent"),
+                    Err(error) => message = format!("{message}; repair failed: {error}"),
+                }
+            }
+            if grok_fixed {
                 (
                     DoctorCheckStatus::Ok,
                     format!("Installed native Grok hook at {}", user_hook.display()),
@@ -12547,10 +12883,11 @@ fn collect_doctor_report(
             } else {
                 (
                     DoctorCheckStatus::Error,
-                    "Grok is in use but dcg is registered neither natively nor via the \
-                     Claude compatibility layer"
-                        .to_string(),
-                    Some("Run 'dcg install --grok'".to_string()),
+                    message,
+                    Some(format!(
+                        "Review {} and run 'dcg install --grok'",
+                        user_hook.display()
+                    )),
                 )
             }
         };
@@ -12672,6 +13009,127 @@ fn collect_doctor_report(
         });
     }
 
+    // Muse Code hook registration (#572). Mirrored in `doctor_pretty`.
+    if muse_appears_in_use() {
+        let mut muse_fixed = false;
+        let settings_path = muse_user_settings_path();
+        let (status, message, remediation) = match probe_muse_user_settings() {
+            Ok(MuseHookProbe::Current) => (
+                DoctorCheckStatus::Ok,
+                format!(
+                    "Muse Code dcg hook registered in {}",
+                    settings_path.display()
+                ),
+                None,
+            ),
+            Ok(probe @ (MuseHookProbe::Missing | MuseHookProbe::Stale)) => {
+                issues += 1;
+                if fix && install_muse_hook_at(&settings_path, false).is_ok() {
+                    fixed += 1;
+                    muse_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        format!(
+                            "Installed Muse Code dcg hook in {}",
+                            settings_path.display()
+                        ),
+                        None,
+                    )
+                } else if probe == MuseHookProbe::Stale {
+                    (
+                        DoctorCheckStatus::Warning,
+                        format!(
+                            "{} registers dcg without the {MUSE_SHELL_MATCHER} matcher or \
+                             --agent muse, so some Muse shell calls or the [agents.muse] \
+                             profile may be missed",
+                            settings_path.display()
+                        ),
+                        Some("Run 'dcg install --muse'".to_string()),
+                    )
+                } else {
+                    (
+                        DoctorCheckStatus::Error,
+                        format!(
+                            "Muse Code is in use but {} has no dcg PreToolUse hook — its \
+                             shell tool calls are not guarded",
+                            settings_path.display()
+                        ),
+                        Some("Run 'dcg install --muse'".to_string()),
+                    )
+                }
+            }
+            Err(err) => {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    err,
+                    Some("Fix the JSON by hand, then run 'dcg install --muse'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "muse_hook",
+            name: "Muse Code hook registration",
+            status,
+            message,
+            remediation,
+            fixed: muse_fixed,
+        });
+    }
+
+    // Amp plugin registration (#577). Mirrored in `doctor_pretty`.
+    if amp_appears_in_use() {
+        let mut amp_fixed = false;
+        let plugin_path = amp_system_plugin_path();
+        let probe = probe_amp_plugin(&plugin_path);
+        let (status, message, remediation) = if probe == AmpPluginProbe::Current {
+            (
+                DoctorCheckStatus::Ok,
+                format!("Amp dcg plugin found at {}", plugin_path.display()),
+                None,
+            )
+        } else {
+            issues += 1;
+            if fix && install_amp_plugin_at(&plugin_path, false).is_ok() {
+                fixed += 1;
+                amp_fixed = true;
+                (
+                    DoctorCheckStatus::Ok,
+                    format!("Wrote Amp dcg plugin at {}", plugin_path.display()),
+                    None,
+                )
+            } else if probe == AmpPluginProbe::OwnedStale {
+                (
+                    DoctorCheckStatus::Warning,
+                    format!(
+                        "Amp plugin at {} is dcg-owned but differs from what this dcg writes \
+                         (edited, or written by another dcg version)",
+                        plugin_path.display()
+                    ),
+                    Some("Run 'dcg install --amp'".to_string()),
+                )
+            } else {
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "Amp is in use but {} is not dcg's plugin — its shell commands are \
+                         not guarded",
+                        plugin_path.display()
+                    ),
+                    Some("Run 'dcg install --amp'".to_string()),
+                )
+            }
+        };
+        checks.push(DoctorCheck {
+            id: "amp_plugin",
+            name: "Amp plugin registration",
+            status,
+            message,
+            remediation,
+            fixed: amp_fixed,
+        });
+    }
+
     // Codex hook registration AND enablement (#368). Mirrored in
     // `doctor_pretty` — see the renderer-parity note above the Grok block. A
     // hook that is registered in hooks.json but untrusted (no [hooks.state]
@@ -12722,11 +13180,10 @@ fn collect_doctor_report(
                     (
                         DoctorCheckStatus::Error,
                         format!("Codex dcg hook is trusted but 'enabled = false' ({state_key})"),
-                        Some(
-                            "Run 'dcg doctor --fix' to set enabled = true, or edit \
-                             ~/.codex/config.toml"
-                                .to_string(),
-                        ),
+                        Some(format!(
+                            "Run 'dcg doctor --fix' to set enabled = true, or edit {}",
+                            codex_file_display("config.toml")
+                        )),
                     )
                 }
             }
@@ -12734,9 +13191,11 @@ fn collect_doctor_report(
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
-                    "Codex is in use but ~/.codex/hooks.json does not exist — its shell \
-                     commands are not guarded"
-                        .to_string(),
+                    format!(
+                        "Codex is in use but {} does not exist — its shell commands are not \
+                         guarded",
+                        codex_file_display("hooks.json")
+                    ),
                     Some(
                         "Re-run the dcg install script to register the hook, then start \
                          Codex once to approve it"
@@ -12748,9 +13207,11 @@ fn collect_doctor_report(
                 issues += 1;
                 (
                     DoctorCheckStatus::Error,
-                    "~/.codex/hooks.json loads, but has no dcg PreToolUse command hook that \
-                     selects Bash — Codex shell commands are not guarded"
-                        .to_string(),
+                    format!(
+                        "{} loads, but has no dcg PreToolUse command hook that selects Bash — \
+                         Codex shell commands are not guarded",
+                        codex_file_display("hooks.json")
+                    ),
                     Some(
                         "Re-run the dcg install script to register it, then start Codex \
                          once to approve the hook"
@@ -12763,8 +13224,9 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "A dcg hook is in ~/.codex/hooks.json but not where Codex runs it \
-                         for shell commands: {detail}"
+                        "A dcg hook is in {} but not where Codex runs it for shell commands: \
+                         {detail}",
+                        codex_file_display("hooks.json")
                     ),
                     Some(
                         "Register it under hooks.PreToolUse as {\"matcher\": \"Bash\", \
@@ -12796,8 +13258,8 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "~/.codex/hooks.json is not valid JSON ({err}); Codex loads none of \
-                         its hooks"
+                        "{} is not valid JSON ({err}); Codex loads none of its hooks",
+                        codex_file_display("hooks.json")
                     ),
                     Some(
                         "Fix the JSON by hand, or move it aside and re-run the installer"
@@ -12810,9 +13272,10 @@ fn collect_doctor_report(
                 (
                     DoctorCheckStatus::Error,
                     format!(
-                        "Codex rejects ~/.codex/hooks.json ({err}), so it loads NONE of the \
-                         file's hooks — the dcg hook never reaches trust review and there is \
-                         no approval prompt to accept"
+                        "Codex rejects {} ({err}), so it loads NONE of the file's hooks — the \
+                         dcg hook never reaches trust review and there is no approval prompt to \
+                         accept",
+                        codex_file_display("hooks.json")
                     ),
                     Some(
                         "Make the file match Codex's schema: only a top-level \"hooks\" object \
@@ -13178,10 +13641,12 @@ fn quoted_hook_program(command: &str) -> Option<String> {
     None
 }
 
-fn command_token_looks_like_path(token: &str) -> bool {
-    token.starts_with(['/', '\\'])
-        || token.as_bytes().get(1).is_some_and(|byte| *byte == b':')
-        || token.contains(['/', '\\'])
+fn command_token_is_windows_drive_path(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
 }
 
 fn is_dcg_program_basename(program: &str) -> bool {
@@ -13229,7 +13694,16 @@ fn dcg_command_program(cmd: &str) -> Option<String> {
     }
 
     let first = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    if command_token_looks_like_path(first) {
+    if is_dcg_program_basename(first) {
+        return Some(first.to_string());
+    }
+
+    // Recover the old unquoted Windows drive-path form, where spaces can be
+    // part of a directory name. Never apply that heuristic to Unix commands:
+    // `/usr/bin/logger /opt/dcg` runs logger, and its hook must remain untouched.
+    // Another rooted path, executable, option, or shell operator before the
+    // dcg leaf is command syntax rather than one legacy executable path.
+    if command_token_is_windows_drive_path(first) {
         let leaf_start = trimmed
             .rfind(['/', '\\'])
             .map_or(0, |separator| separator + 1);
@@ -13237,20 +13711,27 @@ fn dcg_command_program(cmd: &str) -> Option<String> {
         let leaf_program = leaf.split_whitespace().next().unwrap_or(leaf);
         if is_dcg_program_basename(leaf_program) {
             let prefix = &trimmed[..leaf_start];
-            let has_prior_executable = prefix.split_whitespace().any(|token| {
-                let normalized = token.trim_matches(['\'', '"']).to_ascii_lowercase();
-                [".exe", ".cmd", ".bat", ".ps1"]
-                    .iter()
-                    .any(|extension| normalized.ends_with(extension))
-            });
-            if !has_prior_executable {
+            let has_command_syntax =
+                prefix.contains([
+                    '\'', '"', ';', '|', '&', '<', '>', '$', '`', '\n', '\r', '\t',
+                ]) || prefix.split_whitespace().enumerate().any(|(index, token)| {
+                    let normalized = token.to_ascii_lowercase();
+                    [".exe", ".com", ".cmd", ".bat", ".ps1", ".sh", ".py", ".js"]
+                        .iter()
+                        .any(|extension| normalized.ends_with(extension))
+                        || (index > 0
+                            && (command_token_is_windows_drive_path(token)
+                                || token.starts_with(['/', '\\', '-'])
+                                || token.contains('=')))
+                });
+            if !has_command_syntax {
                 let end = leaf_start + leaf_program.len();
                 return Some(trimmed[..end].to_string());
             }
         }
     }
 
-    is_dcg_program_basename(first).then(|| first.to_string())
+    None
 }
 
 fn is_dcg_command(cmd: &str) -> bool {
@@ -13325,6 +13806,97 @@ fn is_dcg_hook_entry_for_matcher(entry: &serde_json::Value, matcher: &str) -> bo
 /// value onto the repaired hook.
 const DCG_OWNED_HOOK_KEYS: &[&str] = &["type", "command", "shell"];
 
+/// Parse an operator-owned settings document without discarding duplicate keys.
+///
+/// `serde_json::Value` normally keeps only the last value for an object key.
+/// A repair must not turn an ambiguous `onFailure`, `hooks`, or unrelated user
+/// setting into a single silently chosen policy. Check every object, including
+/// those nested in arrays, while retaining serde_json's syntax and depth limits.
+fn parse_hook_settings_json(content: &str) -> serde_json::Result<serde_json::Value> {
+    struct SettingsValue(serde_json::Value);
+    struct SettingsVisitor;
+
+    impl<'de> serde::Deserialize<'de> for SettingsValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(SettingsVisitor)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for SettingsVisitor {
+        type Value = SettingsValue;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("JSON settings with unique object keys")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::Bool(value)))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::Number(value.into())))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::Number(value.into())))
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            serde_json::Number::from_f64(value)
+                .map(|number| SettingsValue(serde_json::Value::Number(number)))
+                .ok_or_else(|| E::custom("non-finite number in hook settings"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::String(value.to_owned())))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::String(value)))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(SettingsValue(serde_json::Value::Null))
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(SettingsValue(value)) = sequence.next_element()? {
+                values.push(value);
+            }
+            Ok(SettingsValue(serde_json::Value::Array(values)))
+        }
+
+        fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut values = serde_json::Map::new();
+            while let Some(key) = object.next_key::<String>()? {
+                if values.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate object key {key:?} in hook settings"
+                    )));
+                }
+                let SettingsValue(value) = object.next_value()?;
+                values.insert(key, value);
+            }
+            Ok(SettingsValue(serde_json::Value::Object(values)))
+        }
+    }
+
+    serde_json::from_str::<SettingsValue>(content).map(|value| value.0)
+}
+
 /// Whether `hook` is the dcg hook `desired_hook` describes, judged on the
 /// dcg-owned keys only.
 ///
@@ -13338,29 +13910,49 @@ fn hook_has_dcg_identity(hook: &serde_json::Value, desired_hook: &serde_json::Va
             .all(|key| hook.get(key) == desired_hook.get(key))
 }
 
-/// Rebuild the hook object dcg will write, keeping host-owned fields from the
-/// hook it replaces (#345).
+/// Rebuild the hook object dcg will write, keeping host-owned fields from every
+/// registration it replaces (#345, #582).
 ///
-/// `desired_hook` supplies every dcg-owned key; `previous` (the dcg hook found
-/// in the existing settings, if any) supplies the rest. dcg-owned keys absent
-/// from `desired_hook` are dropped even when `previous` has them, so identity
-/// always ends up exactly as dcg defines it for this platform.
-fn merge_host_owned_hook_fields(
+/// Duplicate registrations may each carry part of the operator's policy. Merge
+/// compatible values, but refuse conflicts instead of choosing a policy by file
+/// order. Desired host fields are defaults; only dcg-owned keys are refreshed.
+fn merge_host_owned_hook_fields<'a>(
     desired_hook: serde_json::Value,
-    previous: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let Some(previous) = previous.and_then(serde_json::Value::as_object) else {
-        return desired_hook;
-    };
+    previous: impl Iterator<Item = &'a serde_json::Value>,
+    owned_keys: &[&str],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let serde_json::Value::Object(desired) = desired_hook else {
-        return desired_hook;
+        return Ok(desired_hook);
     };
-    let mut merged = previous.clone();
-    for key in DCG_OWNED_HOOK_KEYS {
-        merged.remove(*key);
+    let mut merged = serde_json::Map::new();
+    for hook in previous {
+        let Some(fields) = hook.as_object() else {
+            continue;
+        };
+        for (key, value) in fields {
+            if owned_keys.contains(&key.as_str()) {
+                continue;
+            }
+            if let Some(existing) = merged.get(key) {
+                if existing != value {
+                    return Err(format!(
+                        "Conflicting dcg hook field '{key}'; leaving settings unchanged"
+                    )
+                    .into());
+                }
+            } else {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
     }
-    merged.extend(desired);
-    serde_json::Value::Object(merged)
+    for (key, value) in desired {
+        if owned_keys.contains(&key.as_str()) {
+            merged.insert(key, value);
+        } else {
+            merged.entry(key).or_insert(value);
+        }
+    }
+    Ok(serde_json::Value::Object(merged))
 }
 
 fn is_exact_hook_entry_for_matcher(
@@ -13377,8 +13969,8 @@ fn is_exact_hook_entry_for_matcher(
             .and_then(serde_json::Value::as_array)
             .is_some_and(|hooks| {
                 hooks
-                    .iter()
-                    .any(|hook| hook_has_dcg_identity(hook, desired_hook))
+                    .first()
+                    .is_some_and(|hook| hook_has_dcg_identity(hook, desired_hook))
             })
 }
 
@@ -13424,34 +14016,42 @@ fn install_dcg_hook_for_matcher(
         "hooks": []
     });
 
+    // Validate and build locally. A malformed entry or conflicting duplicate
+    // must not partially mutate the caller's settings, even under --force.
     let settings_obj = settings
-        .as_object_mut()
+        .as_object()
         .ok_or("Invalid settings format (expected JSON object)")?;
+    let hooks_obj = settings_obj
+        .get("hooks")
+        .map(|hooks| {
+            hooks
+                .as_object()
+                .ok_or("Invalid hooks format (expected JSON object)")
+        })
+        .transpose()?;
+    let pre_tool_use = hooks_obj
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .map(|entries| {
+            entries
+                .as_array()
+                .ok_or("Invalid PreToolUse hooks format (expected JSON array)")
+        })
+        .transpose()?;
 
-    let hooks_value = settings_obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks_obj = hooks_value
-        .as_object_mut()
-        .ok_or("Invalid hooks format (expected JSON object)")?;
-
-    let pre_tool_use_value = hooks_obj
-        .entry("PreToolUse")
-        .or_insert_with(|| serde_json::json!([]));
-
-    let pre_tool_use = pre_tool_use_value
-        .as_array_mut()
-        .ok_or("Invalid PreToolUse hooks format (expected JSON array)")?;
-
-    let original = pre_tool_use.clone();
+    let original = pre_tool_use.cloned().unwrap_or_default();
+    let previous_hooks = original
+        .iter()
+        .filter_map(|entry| entry.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|hook| {
+            hook.get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_dcg_command)
+        });
+    let desired_hook =
+        merge_host_owned_hook_fields(desired_hook, previous_hooks, DCG_OWNED_HOOK_KEYS)?;
     let mut canonical_entry = None;
     let mut retained_entries = Vec::with_capacity(original.len());
-    // The dcg hook being replaced, so its host-owned fields (`timeout`, ...)
-    // survive the rewrite (#345). A hook under the canonical matcher is the
-    // best template; one under a legacy matcher is the fallback.
-    let mut previous_canonical_hook: Option<serde_json::Value> = None;
-    let mut previous_legacy_hook: Option<serde_json::Value> = None;
 
     for mut entry in original {
         let entry_matcher = entry
@@ -13472,14 +14072,10 @@ fn install_dcg_hook_for_matcher(
             };
             let original_len = entry_hooks.len();
             entry_hooks.retain(|hook| {
-                let is_dcg = hook
+                !hook
                     .get("command")
                     .and_then(|command| command.as_str())
-                    .is_some_and(is_dcg_command);
-                if is_dcg && previous_canonical_hook.is_none() {
-                    previous_canonical_hook = Some(hook.clone());
-                }
-                !is_dcg
+                    .is_some_and(is_dcg_command)
             });
             let keep_duplicate = entry_hooks.len() == original_len || !entry_hooks.is_empty();
 
@@ -13493,28 +14089,29 @@ fn install_dcg_hook_for_matcher(
 
         let is_legacy_entry =
             legacy_matchers.contains(&entry_matcher.as_deref().unwrap_or_default());
+        if is_legacy_entry
+            && entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .is_none()
+        {
+            return Err(format!(
+                "Invalid legacy {} matcher hooks format (expected JSON array)",
+                entry_matcher.as_deref().unwrap_or_default()
+            )
+            .into());
+        }
         let drop_entry = match entry.get_mut("hooks") {
             None | Some(serde_json::Value::Null) => false,
             Some(value) => match value.as_array_mut() {
-                None if is_legacy_entry => {
-                    return Err(format!(
-                        "Invalid legacy {} matcher hooks format (expected JSON array)",
-                        entry_matcher.as_deref().unwrap_or_default()
-                    )
-                    .into());
-                }
                 None => false,
                 Some(entry_hooks) => {
                     let original_len = entry_hooks.len();
                     entry_hooks.retain(|hook| {
-                        let is_dcg = hook
+                        !hook
                             .get("command")
                             .and_then(|command| command.as_str())
-                            .is_some_and(is_dcg_command);
-                        if is_dcg && previous_legacy_hook.is_none() {
-                            previous_legacy_hook = Some(hook.clone());
-                        }
-                        !is_dcg
+                            .is_some_and(is_dcg_command)
                     });
                     entry_hooks.len() < original_len && entry_hooks.is_empty()
                 }
@@ -13526,9 +14123,6 @@ fn install_dcg_hook_for_matcher(
         }
     }
 
-    let previous_hook = previous_canonical_hook.or(previous_legacy_hook);
-    let desired_hook = merge_host_owned_hook_fields(desired_hook, previous_hook.as_ref());
-
     let mut canonical_entry = canonical_entry.unwrap_or(hook_config);
     canonical_entry["hooks"]
         .as_array_mut()
@@ -13536,31 +14130,60 @@ fn install_dcg_hook_for_matcher(
         .insert(0, desired_hook);
     retained_entries.insert(0, canonical_entry);
 
-    let changed = force || *pre_tool_use != retained_entries;
+    let changed = force || pre_tool_use.is_none_or(|entries| *entries != retained_entries);
     if changed {
-        *pre_tool_use = retained_entries;
+        let hooks = settings
+            .as_object_mut()
+            .expect("validated settings object")
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}));
+        hooks["PreToolUse"] = serde_json::Value::Array(retained_entries);
     }
     Ok(changed)
+}
+
+/// Persist native installer settings without changing the platform's existing
+/// permission contract. Unix can preserve mode bits during an atomic replace;
+/// Windows needs an ACL-preserving replacement API before taking that path.
+fn write_installer_hook_settings(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        write_settings_atomic(path, content)
+    }
+    #[cfg(not(unix))]
+    {
+        // Keep the existing file's ACL by retaining the native installer's
+        // in-place write. Renaming a fresh staging file over it would instead
+        // install the staging file's inherited ACL.
+        std::fs::write(path, content)?;
+        Ok(())
+    }
 }
 
 /// Install the dcg hook entry into Claude Code settings without printing.
 fn install_hook_silent(force: bool) -> Result<bool, Box<dyn std::error::Error>> {
     let settings_path = claude_settings_path();
 
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        if let Some(parent) = settings_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let mut settings = match std::fs::read_to_string(&settings_path) {
+        Ok(content) => parse_hook_settings_json(&content)?,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error.into()),
     };
 
     let changed = install_dcg_hook_into_settings(&mut settings, force)?;
     if changed {
         let content = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(&settings_path, content)?;
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_installer_hook_settings(&settings_path, &content)?;
     }
     Ok(changed)
 }
@@ -13643,7 +14266,7 @@ fn uninstall_dcg_hook_from_settings(
 ///
 /// When `project` is `true`, writes to `.claude/settings.json` inside the
 /// current git repository root instead of the user-level
-/// `~/.claude/settings.json`.
+/// settings selected by `CLAUDE_CONFIG_DIR` (default `~/.claude/settings.json`).
 ///
 /// This is a wrapper around `install_dcg_hook_into_settings` that handles the
 /// file I/O and error reporting.
@@ -13660,16 +14283,16 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
         claude_settings_path()
     };
 
-    // Read existing settings or create new
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        // Create parent directory if needed
-        if let Some(parent) = settings_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    // Only a genuinely missing file is a fresh install. Read errors and broken
+    // managed symlinks must not turn an operator's configuration into defaults.
+    let mut settings = match std::fs::read_to_string(&settings_path) {
+        Ok(content) => parse_hook_settings_json(&content)?,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error.into()),
     };
 
     let changed = install_dcg_hook_into_settings(&mut settings, force)?;
@@ -13696,7 +14319,10 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
 
     // Write back
     let content = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&settings_path, content)?;
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_installer_hook_settings(&settings_path, &content)?;
 
     let level = if project { "project" } else { "user" };
     println!("{}", "Hook installed successfully!".green().bold());
@@ -13744,6 +14370,137 @@ fn build_grok_hook_config() -> std::io::Result<serde_json::Value> {
     }))
 }
 
+/// Check the native Grok document before treating it as installed.
+///
+/// Only an absent file permits Claude-compatibility fallback. Existing invalid
+/// settings must remain visible to the operator, including ambiguous JSON that
+/// a normal `Value` parse would silently reduce to its last policy value.
+fn probe_grok_dcg_hook_at(hook_path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let content = match std::fs::read_to_string(hook_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !hook_path.is_symlink() => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let settings = parse_hook_settings_json(&content)?;
+    let settings = settings
+        .as_object()
+        .ok_or("Invalid native Grok settings (expected JSON object)")?;
+    let hooks = settings
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("Invalid native Grok hooks (expected JSON object)")?;
+    let entries = hooks
+        .get("PreToolUse")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Invalid native Grok PreToolUse hooks (expected JSON array)")?;
+    let defaults = build_grok_hook_config()?;
+    let desired_hook = &defaults["hooks"]["PreToolUse"][0]["hooks"][0];
+    let mut dcg_hook_count = 0;
+
+    for entry in entries {
+        let entry = entry
+            .as_object()
+            .ok_or("Invalid native Grok PreToolUse entry (expected JSON object)")?;
+        let matcher = entry
+            .get("matcher")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or("Invalid native Grok matcher (expected string)")
+            })
+            .transpose()?;
+        let handlers = entry
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("Invalid native Grok matcher hooks (expected JSON array)")?;
+        for hook in handlers {
+            let fields = hook
+                .as_object()
+                .ok_or("Invalid native Grok hook (expected JSON object)")?;
+            let hook_type = fields
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Invalid native Grok hook type (expected string)")?;
+            let command = fields.get("command").and_then(serde_json::Value::as_str);
+            if hook_type == "command" && command.is_none_or(str::is_empty) {
+                return Err("Invalid native Grok hook command (expected nonempty string)".into());
+            }
+            let current_identity = hook_has_dcg_identity(hook, desired_hook);
+            if !current_identity && !command.is_some_and(is_dcg_command) {
+                continue;
+            }
+            dcg_hook_count += 1;
+            if !matches!(matcher, Some("Bash" | "run_terminal_cmd")) {
+                return Err("Native Grok dcg hook does not match the shell tool".into());
+            }
+            if !current_identity {
+                return Err("Native Grok dcg hook has a stale or invalid command identity".into());
+            }
+            if fields
+                .get("async")
+                .is_some_and(|value| value != &serde_json::Value::Bool(false))
+            {
+                return Err("Native Grok dcg hook must execute synchronously".into());
+            }
+        }
+    }
+
+    match dcg_hook_count {
+        1 => Ok(true),
+        0 => Err("Native Grok hook file does not register dcg".into()),
+        _ => Err("Native Grok hook file contains duplicate dcg registrations".into()),
+    }
+}
+
+/// Repair Grok's Claude-compatible hook registration without replacing the
+/// operator's failure policy, timeout, or other hook and file settings.
+fn install_grok_hook_into_settings(
+    settings: &mut serde_json::Value,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let defaults = build_grok_hook_config()?;
+    let changed = install_dcg_hook_for_matcher(
+        settings,
+        force,
+        "Bash",
+        &["run_terminal_cmd"],
+        defaults["hooks"]["PreToolUse"][0]["hooks"][0].clone(),
+    )?;
+
+    // Add file metadata only after validation succeeds. Existing descriptions
+    // belong to the operator, just like the shared merger's hook defaults.
+    if settings.get("description").is_none() {
+        settings["description"] = defaults["description"].clone();
+        return Ok(true);
+    }
+    Ok(changed)
+}
+
+fn install_grok_hook_at(
+    hook_path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut settings = match std::fs::read_to_string(hook_path) {
+        Ok(content) => parse_hook_settings_json(&content)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !hook_path.is_symlink() => {
+            serde_json::json!({})
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let changed = install_grok_hook_into_settings(&mut settings, force)?;
+    if changed {
+        let content = serde_json::to_string_pretty(&settings)?;
+        if let Some(parent) = hook_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_installer_hook_settings(hook_path, &content)?;
+    }
+    Ok(changed)
+}
+
 /// Install the dcg hook into Grok's hook directory.
 ///
 /// Writes a self-contained `dcg.json` to `~/.grok/hooks/` (user-level) or
@@ -13751,8 +14508,11 @@ fn build_grok_hook_config() -> std::io::Result<serde_json::Value> {
 /// `*.json` in those directories and merges them at session start, so we
 /// don't touch `user-settings.json` or `settings.json`.
 ///
-/// Returns `Err` if the file cannot be written or, for project installs, if
-/// the current directory is not inside a git repository.
+/// Existing files are merged even without `--force`; force never discards
+/// operator-owned settings or overrides conflicting failure policies.
+///
+/// Returns `Err` if the file cannot be read, parsed, merged, or written or,
+/// for project installs, if the current directory is not inside a git repository.
 fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -13762,7 +14522,7 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
         grok_user_hook_path()
     };
 
-    if hook_path.exists() && !force {
+    if !install_grok_hook_at(&hook_path, force)? {
         println!(
             "{} Grok hook already exists at {}",
             "Hook already installed!".yellow(),
@@ -13771,14 +14531,6 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
         println!("Use --force to reinstall");
         return Ok(());
     }
-
-    if let Some(parent) = hook_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let body = build_grok_hook_config()?;
-    let content = serde_json::to_string_pretty(&body)?;
-    std::fs::write(&hook_path, content)?;
 
     let level = if project { "project" } else { "user" };
     println!("{}", "Grok hook installed successfully!".green().bold());
@@ -13831,18 +14583,13 @@ fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn st
     // ~/.gemini/config/hooks.json and leaves a symlink at the old path. If the
     // canonical file is itself a symlink (or the old path exists as a real
     // file), prefer editing the real target so we don't clobber the symlink.
-    let mut settings: serde_json::Value = if hooks_path.exists() {
-        let content = std::fs::read_to_string(&hooks_path)?;
-        if content.trim().is_empty() {
+    let mut settings = match std::fs::read_to_string(&hooks_path) {
+        Ok(content) if content.trim().is_empty() => serde_json::json!({}),
+        Ok(content) => parse_hook_settings_json(&content)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !hooks_path.is_symlink() => {
             serde_json::json!({})
-        } else {
-            serde_json::from_str(&content)?
         }
-    } else {
-        if let Some(parent) = hooks_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        serde_json::json!({})
+        Err(error) => return Err(error.into()),
     };
 
     let changed = install_antigravity_hook_into_settings(&mut settings, force)?;
@@ -13853,7 +14600,10 @@ fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn st
     }
 
     let content = serde_json::to_string_pretty(&settings)?;
-    std::fs::write(&hooks_path, content)?;
+    if let Some(parent) = hooks_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_installer_hook_settings(&hooks_path, &content)?;
 
     let level = if project { "project" } else { "user" };
     println!(
@@ -14056,57 +14806,46 @@ fn remove_dcg_hooks_from_crush_hooks(
 ///
 /// Stale dcg entries under any spelling of the event key are removed, the
 /// fresh entry is inserted at the front of `hooks.PreToolUse` (Crush resolves
-/// hooks in config order; first deny wins), and host-owned fields from the
-/// entry being replaced are kept. Returns `Ok(true)` when the config changed
+/// hooks in config order; first deny wins), and compatible host-owned fields
+/// from every replaced entry are kept. Returns `Ok(true)` when the config changed
 /// (always `true` with `force`).
 ///
 /// # Errors
 ///
-/// Returns an error if the config, its `hooks`, or a `PreToolUse` value has an
-/// unexpected JSON shape.
+/// Returns an error without changing the config if its shape is unexpected
+/// or duplicate dcg entries disagree on an operator-owned field.
 fn install_crush_hook_into_config(
     config: &mut serde_json::Value,
     force: bool,
     desired_entry: serde_json::Value,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let config_obj = config
-        .as_object_mut()
-        .ok_or("Invalid crush.json format (expected JSON object)")?;
-    let hooks = config_obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    let original = hooks.clone();
-
-    let previous = remove_dcg_hooks_from_crush_hooks(hooks)?;
-    let desired_keys: Vec<String> = desired_entry
         .as_object()
-        .map(|desired| desired.keys().cloned().collect())
-        .unwrap_or_default();
-    let mut merged = match previous.as_ref().and_then(serde_json::Value::as_object) {
-        Some(previous) => {
-            // Owned keys the new entry still carries are overwritten in place
-            // below, so a re-install keeps the key order it wrote the first
-            // time; removing and re-inserting them moved them after `name` and
-            // `timeout`, rewriting an unchanged crush.json on every --force.
-            let mut merged = previous.clone();
-            for key in DCG_OWNED_CRUSH_HOOK_KEYS {
-                if !desired_keys.iter().any(|desired| desired == key) {
-                    merged.remove(*key);
-                }
-            }
-            merged
-        }
-        None => serde_json::Map::new(),
-    };
-    if let serde_json::Value::Object(desired) = desired_entry {
-        for (key, value) in desired {
-            // dcg-owned keys are always refreshed; host-owned defaults
-            // (`name`, `timeout`) only fill gaps so user edits survive.
-            if DCG_OWNED_CRUSH_HOOK_KEYS.contains(&key.as_str()) || !merged.contains_key(&key) {
-                merged.insert(key, value);
-            }
+        .ok_or("Invalid crush.json format (expected JSON object)")?;
+    let original = config_obj.get("hooks");
+    let mut hooks = original.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let hooks_obj = hooks
+        .as_object()
+        .ok_or("Invalid hooks format in crush.json (expected JSON object)")?;
+    let mut previous = Vec::new();
+    for (key, value) in hooks_obj {
+        if is_crush_pre_tool_use_key(key) {
+            let entries = value.as_array().ok_or_else(|| {
+                format!("Invalid hooks.{key} format in crush.json (expected JSON array)")
+            })?;
+            previous.extend(
+                entries
+                    .iter()
+                    .filter(|entry| crush_hook_entry_is_dcg(entry)),
+            );
         }
     }
+    let merged = merge_host_owned_hook_fields(
+        desired_entry,
+        previous.into_iter(),
+        DCG_OWNED_CRUSH_HOOK_KEYS,
+    )?;
+    remove_dcg_hooks_from_crush_hooks(&mut hooks)?;
 
     let entries = hooks
         .as_object_mut()
@@ -14115,9 +14854,13 @@ fn install_crush_hook_into_config(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .ok_or("Invalid hooks.PreToolUse format in crush.json (expected JSON array)")?;
-    entries.insert(0, serde_json::Value::Object(merged));
+    entries.insert(0, merged);
 
-    Ok(force || *hooks != original)
+    let changed = force || original != Some(&hooks);
+    if changed {
+        config["hooks"] = hooks;
+    }
+    Ok(changed)
 }
 
 /// Remove dcg's hook entries from an in-memory Crush config. Returns
@@ -14141,7 +14884,7 @@ fn read_crush_config(
     if content.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    Ok(serde_json::from_str(&content)?)
+    Ok(parse_hook_settings_json(&content)?)
 }
 
 /// Install the dcg hook into Crush's config (#388).
@@ -14189,19 +14932,26 @@ fn install_crush_hook_at(
     config_path: &std::path::Path,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut config = if config_path.exists() {
-        read_crush_config(config_path)?
-    } else {
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let mut config = match read_crush_config(config_path) {
+        Ok(config) => config,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && !config_path.is_symlink() =>
+        {
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error),
     };
 
     let changed = install_crush_hook_into_config(&mut config, force, crush_dcg_hook_entry()?)?;
     if changed {
         let content = serde_json::to_string_pretty(&config)?;
-        std::fs::write(config_path, content)?;
+        write_installer_hook_settings(config_path, &content)?;
     }
     Ok(changed)
 }
@@ -14271,6 +15021,10 @@ const REASONIX_SHELL_MATCH: &str = "bash|pwsh";
 
 /// The `hooks` key Reasonix reads for pre-execution hooks.
 const REASONIX_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
+
+/// Only the command and tool match belong to dcg. Every other field belongs
+/// to the operator and must survive repair, including fields added by Reasonix.
+const DCG_OWNED_REASONIX_HOOK_KEYS: &[&str] = &["command", "match"];
 
 /// Reasonix home (#358), resolved as `reasonixHomeDir` in Reasonix's
 /// `internal/config/paths.go` resolves it.
@@ -14489,7 +15243,8 @@ fn reasonix_hook_entry_is_dcg(entry: &serde_json::Value) -> bool {
 ///
 /// Stale dcg entries are removed and the fresh one is inserted first:
 /// Reasonix runs a scope's hooks in array order and stops at the first block.
-/// A user's own `timeout` or `description` on the previous dcg entry is kept.
+/// Operator-owned fields from every replaced dcg entry are kept. Conflicting
+/// duplicate policies are refused rather than resolved by their array order.
 /// Returns `Ok(true)` when the settings changed (always `true` with `force`).
 ///
 /// # Errors
@@ -14503,7 +15258,7 @@ fn install_reasonix_hook_into_settings(
     desired_entry: serde_json::Value,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let settings_obj = settings
-        .as_object_mut()
+        .as_object()
         .ok_or("Invalid Reasonix settings.json (expected a JSON object with a \"hooks\" key)")?;
     if !settings_obj.contains_key("hooks") && settings_obj.contains_key(REASONIX_PRE_TOOL_USE_EVENT)
     {
@@ -14514,36 +15269,48 @@ fn install_reasonix_hook_into_settings(
         );
     }
     let hooks = settings_obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    let original = hooks.clone();
+        .get("hooks")
+        .map(|hooks| {
+            hooks
+                .as_object()
+                .ok_or("Invalid hooks format in Reasonix settings.json (expected JSON object)")
+        })
+        .transpose()?;
     let entries = hooks
-        .as_object_mut()
-        .ok_or("Invalid hooks format in Reasonix settings.json (expected JSON object)")?
-        .entry(REASONIX_PRE_TOOL_USE_EVENT)
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut()
-        .ok_or("Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)")?;
-
+        .and_then(|hooks| hooks.get(REASONIX_PRE_TOOL_USE_EVENT))
+        .map(|entries| {
+            entries.as_array().ok_or(
+                "Invalid hooks.PreToolUse format in Reasonix settings.json (expected JSON array)",
+            )
+        })
+        .transpose()?;
     let previous = entries
-        .iter()
-        .find(|entry| reasonix_hook_entry_is_dcg(entry))
-        .cloned();
-    entries.retain(|entry| !reasonix_hook_entry_is_dcg(entry));
-    let mut entry = desired_entry;
-    if let (Some(previous), Some(entry)) = (
-        previous.as_ref().and_then(serde_json::Value::as_object),
-        entry.as_object_mut(),
-    ) {
-        for key in ["timeout", "description"] {
-            if let Some(value) = previous.get(key) {
-                entry.insert(key.to_string(), value.clone());
-            }
-        }
-    }
-    entries.insert(0, entry);
+        .into_iter()
+        .flatten()
+        .filter(|entry| reasonix_hook_entry_is_dcg(entry));
+    let merged =
+        merge_host_owned_hook_fields(desired_entry, previous, DCG_OWNED_REASONIX_HOOK_KEYS)?;
+    let mut updated_entries = vec![merged];
+    updated_entries.extend(
+        entries
+            .into_iter()
+            .flatten()
+            .filter(|entry| !reasonix_hook_entry_is_dcg(entry))
+            .cloned(),
+    );
 
-    Ok(force || *hooks != original)
+    // Publish the completed merge only after all validation succeeds, so a
+    // conflict cannot partly remove the guard even for in-memory callers.
+    let changed = force || entries.is_none_or(|entries| *entries != updated_entries);
+    if changed {
+        let hooks = settings
+            .as_object_mut()
+            .expect("validated settings object")
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}));
+        hooks[REASONIX_PRE_TOOL_USE_EVENT] = serde_json::Value::Array(updated_entries);
+    }
+    Ok(changed)
 }
 
 /// Remove dcg's entries from an in-memory Reasonix settings object. Returns
@@ -14572,7 +15339,7 @@ fn read_reasonix_settings(
     if content.trim().is_empty() {
         return Ok(serde_json::json!({}));
     }
-    Ok(serde_json::from_str(&content)?)
+    Ok(parse_hook_settings_json(&content)?)
 }
 
 /// Merge dcg's hook entry into the Reasonix settings at `path` without
@@ -14582,18 +15349,26 @@ fn install_reasonix_hook_at(
     path: &std::path::Path,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut settings = if path.exists() {
-        read_reasonix_settings(path)?
-    } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let mut settings = match read_reasonix_settings(path) {
+        Ok(settings) => settings,
+        Err(error)
+            if !path.is_symlink()
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            serde_json::json!({})
         }
-        serde_json::json!({})
+        Err(error) => return Err(error),
     };
     let entry = reasonix_dcg_hook_entry_for_executable(&current_dcg_executable()?, cfg!(windows))?;
     let changed = install_reasonix_hook_into_settings(&mut settings, force, entry)?;
     if changed {
-        std::fs::write(path, serde_json::to_string_pretty(&settings)?)?;
+        let content = serde_json::to_string_pretty(&settings)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_installer_hook_settings(path, &content)?;
     }
     Ok(changed)
 }
@@ -14670,6 +15445,865 @@ fn reasonix_appears_in_use() -> bool {
     reasonix_home().is_dir() || reasonix_user_settings_path().is_file()
 }
 
+// ---------------------------------------------------------------------------
+// Muse Code (Meta) hook registration (#572)
+// ---------------------------------------------------------------------------
+//
+// Muse Code reads user hooks from the `hooks` block of
+// `${XDG_CONFIG_HOME:-$HOME/.config}/muse/settings.json`, which must carry
+// `"schema_version": 1` (an unknown version or a missing key fails every Muse
+// command at startup), and discovers them at session start
+// (https://dev.meta.ai/docs/muse-code/configuration,
+// https://dev.meta.ai/docs/muse-code/extending). A `PreToolUse` matcher group
+// is `{"matcher": <regex>, "hooks": [{"type": "command", "command": ...}]}`;
+// Muse rejects unknown matcher-group fields, so dcg writes only those keys.
+// Hook commands run in a cleared environment, which is why the command
+// carries `--agent muse` instead of relying on an environment marker.
+
+/// The settings event key Muse runs before a tool call.
+const MUSE_PRE_TOOL_USE_EVENT: &str = "PreToolUse";
+
+/// The `matcher` (a regex) of dcg's Muse matcher group: the tool names Muse's
+/// own bundled tooling treats as shell tools.
+const MUSE_SHELL_MATCHER: &str = "^(shell|exec_command|bash)$";
+
+/// The only `settings.json` schema version Muse Code documents.
+const MUSE_SETTINGS_SCHEMA_VERSION: u64 = 1;
+
+/// Keys of dcg's Muse handler that dcg owns. Anything else an operator put on
+/// the handler (a timeout, an `onFailure` fallback) is carried across
+/// reinstalls, as for Claude Code (#345).
+const MUSE_DCG_OWNED_HANDLER_KEYS: &[&str] = &["type", "command"];
+
+/// Muse Code's config root: `$XDG_CONFIG_HOME/muse` when that is an absolute
+/// path, else `~/.config/muse` (the XDG rule Muse's own guidance states;
+/// relative values are ignored, as the XDG spec requires).
+fn muse_config_dir() -> std::path::PathBuf {
+    muse_config_dir_for(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        &crate::config::home_dir().unwrap_or_default(),
+    )
+}
+
+fn muse_config_dir_for(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    xdg_config_home
+        .map(std::path::Path::new)
+        .filter(|path| path.is_absolute())
+        .map_or_else(|| home.join(".config"), std::path::Path::to_path_buf)
+        .join("muse")
+}
+
+fn muse_user_settings_path() -> std::path::PathBuf {
+    muse_config_dir().join("settings.json")
+}
+
+/// The hook command dcg registers with Muse: the absolute dcg path (quoted
+/// only when it needs it) followed by `--agent muse`.
+fn muse_dcg_hook_command_for_executable(
+    executable: &std::path::Path,
+    windows: bool,
+) -> std::io::Result<String> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "dcg hook executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dcg hook executable path is not valid UTF-8: {}",
+                executable.display()
+            ),
+        )
+    })?;
+    let program = if !windows {
+        posix_quote_hook_program(executable)
+    } else if executable.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '\\' | '/' | ':' | '_' | '-' | '.')
+    }) {
+        executable.to_string()
+    } else {
+        format!("\"{executable}\"")
+    };
+    Ok(format!("{program} --agent muse"))
+}
+
+fn muse_handler_is_dcg(handler: &serde_json::Value) -> bool {
+    handler
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_dcg_command)
+}
+
+/// Whether a dcg handler command carries `--agent muse`, without which dcg
+/// would answer Muse as if it were Codex and ignore an `[agents.muse]` profile.
+fn muse_command_names_muse_agent(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    tokens.windows(2).any(|pair| {
+        pair[0] == "--agent" && crate::agent::Agent::from_name(pair[1]) == crate::agent::Agent::Muse
+    }) || tokens.iter().any(|token| {
+        token
+            .strip_prefix("--agent=")
+            .is_some_and(|name| crate::agent::Agent::from_name(name) == crate::agent::Agent::Muse)
+    })
+}
+
+/// Validate (and, when absent, supply) Muse's required `schema_version`.
+fn ensure_muse_schema_version(
+    settings: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match settings.get("schema_version") {
+        None => {
+            settings.insert(
+                "schema_version".to_string(),
+                serde_json::json!(MUSE_SETTINGS_SCHEMA_VERSION),
+            );
+            Ok(())
+        }
+        Some(version) if version.as_u64() == Some(MUSE_SETTINGS_SCHEMA_VERSION) => Ok(()),
+        Some(version) => Err(format!(
+            "Muse Code settings.json declares schema_version {version}; dcg only knows \
+             schema_version {MUSE_SETTINGS_SCHEMA_VERSION} and will not edit it"
+        )
+        .into()),
+    }
+}
+
+/// Remove dcg's handlers from every `PreToolUse` matcher group, dropping a
+/// group only when dcg's removal emptied it (a group the user left empty is
+/// theirs). Returns the first removed dcg handler to signal that a removal
+/// occurred; install collects every handler's policy before calling this.
+fn strip_dcg_from_muse_groups(
+    groups: &mut Vec<serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut previous = None;
+    let mut emptied_by_dcg = Vec::with_capacity(groups.len());
+    for group in groups.iter_mut() {
+        let emptied = group
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_array_mut)
+            .is_some_and(|handlers| {
+                if previous.is_none() {
+                    previous = handlers
+                        .iter()
+                        .find(|handler| muse_handler_is_dcg(handler))
+                        .and_then(serde_json::Value::as_object)
+                        .cloned();
+                }
+                let before = handlers.len();
+                handlers.retain(|handler| !muse_handler_is_dcg(handler));
+                handlers.len() != before && handlers.is_empty()
+            });
+        emptied_by_dcg.push(emptied);
+    }
+    let mut emptied = emptied_by_dcg.into_iter();
+    groups.retain(|_| !emptied.next().unwrap_or(false));
+    previous
+}
+
+/// Install (or refresh) dcg's matcher group in an in-memory Muse settings
+/// object. dcg's group goes first; every other group, handler and key is kept.
+/// Returns `Ok(true)` when the settings changed (always with `force`).
+///
+/// # Errors
+///
+/// A shape dcg does not understand (not an object, an unknown
+/// `schema_version`, a non-object `hooks`, a non-array `PreToolUse`) is
+/// refused untouched: dcg never rewrites what it cannot read.
+fn install_muse_hook_into_settings(
+    settings: &mut serde_json::Value,
+    force: bool,
+    command: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // Work on a candidate so validation errors, including conflicting policies
+    // on duplicate registrations, cannot even partially mutate the caller.
+    let mut candidate = settings.clone();
+    let settings_obj = candidate
+        .as_object_mut()
+        .ok_or("Invalid Muse Code settings.json (expected a JSON object)")?;
+    ensure_muse_schema_version(settings_obj)?;
+    let groups = settings_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("Invalid hooks in Muse Code settings.json (expected a JSON object)")?
+        .entry(MUSE_PRE_TOOL_USE_EVENT)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse in Muse Code settings.json (expected a JSON array)")?;
+
+    for group in groups.iter() {
+        let group = group
+            .as_object()
+            .ok_or("Invalid Muse Code PreToolUse matcher group (expected a JSON object)")?;
+        if group.get("matcher").is_some_and(|value| !value.is_string()) {
+            return Err("Invalid Muse Code PreToolUse matcher (expected a string)".into());
+        }
+        let handlers = group
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("Invalid Muse Code PreToolUse matcher hooks (expected a JSON array)")?;
+        if handlers.iter().any(|handler| !handler.is_object()) {
+            return Err("Invalid Muse Code PreToolUse handler (expected a JSON object)".into());
+        }
+    }
+
+    let previous = groups
+        .iter()
+        .filter_map(|group| group.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|handler| muse_handler_is_dcg(handler));
+    let handler = merge_host_owned_hook_fields(
+        serde_json::json!({"type": "command", "command": command}),
+        previous,
+        MUSE_DCG_OWNED_HANDLER_KEYS,
+    )?;
+
+    // Keep the first canonical group's metadata and its unrelated handlers in
+    // the same scope. Other groups keep their own matchers when dcg leaves.
+    let mut canonical = groups
+        .iter()
+        .position(|group| {
+            group.get("matcher").and_then(serde_json::Value::as_str) == Some(MUSE_SHELL_MATCHER)
+        })
+        .map(|index| groups.remove(index))
+        .unwrap_or_else(|| serde_json::json!({"matcher": MUSE_SHELL_MATCHER, "hooks": []}));
+    let canonical_handlers = canonical["hooks"]
+        .as_array_mut()
+        .expect("validated canonical hooks array");
+    canonical_handlers.retain(|handler| !muse_handler_is_dcg(handler));
+    canonical_handlers.insert(0, handler);
+    let _ = strip_dcg_from_muse_groups(groups);
+    groups.insert(0, canonical);
+
+    let changed = force || candidate != *settings;
+    if changed {
+        *settings = candidate;
+    }
+    Ok(changed)
+}
+
+/// Remove dcg's handlers from an in-memory Muse settings object. Returns
+/// `Ok(true)` when at least one was removed.
+fn uninstall_dcg_hook_from_muse_settings(
+    settings: &mut serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(groups) = settings
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut(MUSE_PRE_TOOL_USE_EVENT))
+    else {
+        return Ok(false);
+    };
+    let groups = groups
+        .as_array_mut()
+        .ok_or("Invalid hooks.PreToolUse in Muse Code settings.json (expected a JSON array)")?;
+    Ok(strip_dcg_from_muse_groups(groups).is_some())
+}
+
+/// Read Muse's settings. An empty file reads as `{}`; anything that is not
+/// strict JSON is an error, never a fresh start.
+fn read_muse_settings(
+    path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    parse_hook_settings_json(&content).map_err(|error| {
+        format!(
+            "{} is not valid JSON ({error}); fix it by hand, then retry",
+            path.display()
+        )
+        .into()
+    })
+}
+
+/// Merge dcg's hook into the Muse settings at `path` without printing (shared
+/// by `dcg install --muse` and `dcg doctor --fix`). Returns `Ok(true)` when the
+/// file was (re)written.
+fn install_muse_hook_at(
+    path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut settings = match read_muse_settings(path) {
+        Ok(settings) => settings,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && !path.is_symlink() =>
+        {
+            serde_json::json!({})
+        }
+        Err(error) => return Err(error),
+    };
+    let command = muse_dcg_hook_command_for_executable(&current_dcg_executable()?, cfg!(windows))?;
+    let changed = install_muse_hook_into_settings(&mut settings, force, &command)?;
+    if changed {
+        let mut content = serde_json::to_string_pretty(&settings)?;
+        content.push('\n');
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_settings_atomic(path, &content)?;
+    }
+    Ok(changed)
+}
+
+/// Install the dcg hook into Muse Code's user settings (#572).
+fn install_muse_hook(force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = muse_user_settings_path();
+    if !install_muse_hook_at(&path, force)? {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+    println!(
+        "{}",
+        "Muse Code hook installed successfully!".green().bold()
+    );
+    println!("Settings updated (user): {}", path.display());
+    println!();
+    println!(
+        "{}",
+        "Start a new Muse Code session for the change to take effect (hooks are \
+         discovered at session start)."
+            .yellow()
+    );
+    Ok(())
+}
+
+/// Remove dcg's hook from Muse Code's user settings (#572).
+fn uninstall_muse_hook() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = muse_user_settings_path();
+    if !path.exists() {
+        println!(
+            "{} {}",
+            "No Muse Code settings found at".yellow(),
+            path.display()
+        );
+        return Ok(());
+    }
+    let mut settings = read_muse_settings(&path)?;
+    if uninstall_dcg_hook_from_muse_settings(&mut settings)? {
+        let mut content = serde_json::to_string_pretty(&settings)?;
+        content.push('\n');
+        write_settings_atomic(&path, &content)?;
+        println!("{}", "Muse Code hook removed successfully!".green().bold());
+        println!("Settings updated: {}", path.display());
+    } else {
+        println!("{}", "No dcg hook found in Muse Code settings.".yellow());
+    }
+    Ok(())
+}
+
+/// What `dcg doctor` finds in Muse Code's user settings.
+#[derive(Debug, PartialEq, Eq)]
+enum MuseHookProbe {
+    /// No dcg handler in any `PreToolUse` group (or no settings file).
+    Missing,
+    /// dcg's group, with the matcher and `--agent muse` dcg installs.
+    Current,
+    /// A dcg handler exists but not in the form dcg installs (another
+    /// matcher, or no `--agent muse`), so some shell calls or the Muse
+    /// profile may be missed.
+    Stale,
+}
+
+fn probe_muse_settings(settings: &serde_json::Value) -> MuseHookProbe {
+    let Some(groups) = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(MUSE_PRE_TOOL_USE_EVENT))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return MuseHookProbe::Missing;
+    };
+    let mut found = false;
+    for group in groups {
+        let matcher_is_current =
+            group.get("matcher").and_then(serde_json::Value::as_str) == Some(MUSE_SHELL_MATCHER);
+        let handlers = group
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten();
+        for handler in handlers.filter(|handler| muse_handler_is_dcg(handler)) {
+            found = true;
+            let names_muse = handler
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(muse_command_names_muse_agent);
+            if matcher_is_current && names_muse {
+                return MuseHookProbe::Current;
+            }
+        }
+    }
+    if found {
+        MuseHookProbe::Stale
+    } else {
+        MuseHookProbe::Missing
+    }
+}
+
+/// Probe the user-level Muse settings. `Err` means the file exists but cannot
+/// be read as JSON.
+fn probe_muse_user_settings() -> Result<MuseHookProbe, String> {
+    let path = muse_user_settings_path();
+    if !path.exists() {
+        return Ok(MuseHookProbe::Missing);
+    }
+    let settings = read_muse_settings(&path).map_err(|error| error.to_string())?;
+    Ok(probe_muse_settings(&settings))
+}
+
+/// Whether Muse Code is plausibly in use: its config directory exists or a
+/// `muse` executable is on `PATH`.
+fn muse_appears_in_use() -> bool {
+    muse_config_dir().is_dir() || which_executable("muse").is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Amp (ampcode.com) plugin (#577)
+// ---------------------------------------------------------------------------
+//
+// Amp does not ask before running tools; its documented way to control tool
+// use is a plugin (https://ampcode.com/docs/tools, "Permissions"). Amp loads
+// system plugins from `$XDG_CONFIG_HOME/amp/plugins/` (else
+// `~/.config/amp/plugins/`, `%USERPROFILE%\.config\amp\plugins\` on Windows)
+// and project plugins from `<project root>/.amp/plugins/`, runs them with
+// Bun, and calls each plugin's `tool.call` handler before a tool runs; a
+// `reject-and-continue` result blocks the call and shows its message to the
+// agent (https://ampcode.com/docs/customize/plugins,
+// https://ampcode.com/docs/plugin-api). Amp's older `amp.permissions`
+// delegate helper is no longer in its settings schema, so the plugin is the
+// integration point.
+
+/// Ownership marker embedded in the generated Amp plugin (#577). The installer
+/// refuses to overwrite a plugin file without it, and the uninstaller removes
+/// only a file that carries it.
+pub(crate) const AMP_PLUGIN_MARKER: &str = "dcg-amp-plugin";
+
+/// The plugin's file name in an Amp plugin directory.
+const AMP_PLUGIN_FILE_NAME: &str = "dcg-guard.js";
+
+/// Placeholder in [`AMP_PLUGIN_TEMPLATE`] for the dcg path, written as a JSON
+/// string literal (also a JavaScript one; the plugin spawns dcg without a
+/// shell).
+const AMP_PLUGIN_DCG_BIN_PLACEHOLDER: &str = "@DCG_BIN@";
+
+/// The generated Amp plugin. Its handler never throws: Amp does not document
+/// what a throwing `tool.call` handler means, so every path, including a dcg
+/// that gives no verdict, returns `allow` or `reject-and-continue`, and every
+/// failure rejects unless `DCG_BRIDGE_CRASH_DECISION=allow`.
+const AMP_PLUGIN_TEMPLATE: &str = r#"// dcg-amp-plugin: generated by `dcg install --amp`; do not edit.
+// Routes Amp shell tool calls through dcg (Destructive Command Guard) before
+// they run. Remove with `dcg uninstall --amp`.
+// Docs: https://github.com/Dicklesworthstone/destructive_command_guard
+//
+// Amp calls a plugin's `tool.call` handler before every tool call and blocks
+// the call when the handler returns `reject-and-continue`
+// (https://ampcode.com/docs/plugin-api). Amp does not document what a
+// throwing handler means, so this handler never throws: every path, including
+// a dcg that fails, returns a verdict, and a failure blocks.
+import { spawnSync } from "node:child_process";
+import { statSync } from "node:fs";
+
+export const description = "dcg (Destructive Command Guard): checks every shell command with dcg before Amp runs it, and blocks destructive ones.";
+
+const DCG_BIN = @DCG_BIN@;
+
+// Amp's shell tools; `shellCommandFromToolCall` recognizes "a Bash or
+// shell_command tool call". The names are checked too, so a missing or
+// failing helper cannot turn a shell call into an unchecked one.
+const SHELL_TOOLS = new Set(["Bash", "shell_command"]);
+
+const ALLOW = { action: "allow" };
+
+function reject(message) {
+  return { action: "reject-and-continue", message };
+}
+
+function log(amp, message) {
+  try {
+    amp.logger.log(message);
+  } catch {
+    try {
+      console.error(message);
+    } catch {}
+  }
+}
+
+// dcg's own boolean spelling for environment flags.
+function envFlag(name) {
+  const value = process.env[name];
+  return typeof value === "string" && ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
+}
+
+// dcg could not give a verdict: it could not be started, was killed (a
+// signal, or this plugin's timeout), exited non-zero, or printed something
+// that is not a verdict. That is not an allow. Block, unless the operator
+// opted out with DCG_BRIDGE_CRASH_DECISION=allow.
+function noVerdict(amp, detail) {
+  const setting = process.env.DCG_BRIDGE_CRASH_DECISION;
+  if (typeof setting === "string" && setting.trim().toLowerCase() === "allow") {
+    log(amp, `[dcg] Amp guard got no verdict from dcg (${detail}); allowed because DCG_BRIDGE_CRASH_DECISION=allow`);
+    return ALLOW;
+  }
+  log(amp, `[dcg] Amp guard got no verdict from dcg (${detail}); blocking`);
+  return reject(`Blocked by dcg: the command could not be verified because dcg gave no verdict (${detail}). Set DCG_BRIDGE_CRASH_DECISION=allow to let commands through when dcg fails.`);
+}
+
+function isDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// The shell call in `event`, or null when the tool is not a shell tool.
+// Every command-bearing string is collected: the helper's command and the
+// raw `cmd` / `command` inputs, so one cannot hide another.
+function shellCall(amp, event) {
+  const tool = typeof event?.tool === "string" ? event.tool : "";
+  const input = event?.input !== null && typeof event?.input === "object" ? event.input : {};
+  let shell = SHELL_TOOLS.has(tool);
+  const commands = [];
+  let dir;
+  let helped = null;
+  try {
+    helped = amp?.helpers?.shellCommandFromToolCall?.(event) ?? null;
+  } catch (err) {
+    log(amp, `[dcg] shellCommandFromToolCall failed for ${JSON.stringify(tool)}: ${err}`);
+  }
+  if (helped !== null && typeof helped === "object") {
+    shell = true;
+    if (typeof helped.command === "string" && helped.command.length > 0) commands.push(helped.command);
+    if (typeof helped.dir === "string" && helped.dir.length > 0) dir = helped.dir;
+  }
+  for (const key of ["cmd", "command"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.length > 0 && !commands.includes(value)) commands.push(value);
+  }
+  if (!shell && commands.length > 0) {
+    log(amp, `[dcg] Unrecognized command-bearing Amp tool ${JSON.stringify(tool)}; checking its command instead of skipping protection`);
+    shell = true;
+  }
+  if (!shell) return null;
+  if (dir === undefined && typeof input.cwd === "string" && input.cwd.length > 0) dir = input.cwd;
+  return { tool, commands, dir };
+}
+
+// The tool name dcg judges the command under. On macOS/Linux Amp's shell is
+// POSIX. On Windows the shell behind the tool is not documented, so the
+// generic `shell` name makes dcg evaluate the command under every dialect.
+const DCG_TOOL_NAME = process.platform === "win32" ? "shell" : "Bash";
+
+// Ask dcg about one command. Returns { verdict: "allow" | "deny" | "ask",
+// reason } or { failure } when dcg gave no verdict.
+function askDcg(command, dir) {
+  const options = {
+    input: JSON.stringify({ tool_name: DCG_TOOL_NAME, tool_input: { command }, dcg_explicit_verdict: true }),
+    encoding: "utf8",
+    env: { ...process.env },
+    timeout: 10000,
+    maxBuffer: 4 * 1024 * 1024,
+  };
+  if (dir !== undefined && isDirectory(dir)) options.cwd = dir;
+  let result;
+  try {
+    result = spawnSync(process.env.DCG_BIN || DCG_BIN, ["--agent", "amp"], options);
+  } catch (err) {
+    return { failure: `dcg could not be started: ${err}` };
+  }
+  if (!result) return { failure: "dcg could not be started: no result" };
+  // Never started: Node reports status null, Bun leaves it undefined.
+  if (result.error && result.status == null && !result.signal) {
+    return { failure: `dcg could not be started: ${result.error}` };
+  }
+
+  const text = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  let decision = null;
+  if (text) {
+    try {
+      decision = JSON.parse(text);
+    } catch {
+      decision = null;
+    }
+  }
+  const specific = decision !== null && typeof decision === "object" ? decision.hookSpecificOutput : undefined;
+  const verdict = specific !== null && typeof specific === "object" ? specific.permissionDecision : undefined;
+  // A blocking verdict stands whatever happened to the process afterwards.
+  if (verdict === "deny" || verdict === "ask") {
+    const reason = typeof specific.permissionDecisionReason === "string" && specific.permissionDecisionReason.length > 0
+      ? specific.permissionDecisionReason
+      : "Blocked by dcg";
+    return { verdict, reason };
+  }
+
+  const stderr = typeof result.stderr === "string" ? result.stderr.trim().slice(-500) : "";
+  const tail = stderr ? `: ${stderr}` : "";
+  if (result.signal) {
+    const timedOut = result.error && result.error.code === "ETIMEDOUT" ? ", timed out" : "";
+    return { failure: `dcg was killed by ${result.signal}${timedOut}${tail}` };
+  }
+  if (result.status !== 0) return { failure: `dcg exited ${result.status}${tail}` };
+  if (!text) return { failure: `dcg exited 0 with nothing on stdout${tail}` };
+  if (decision !== null && typeof decision === "object" && decision.dcg_verdict === "allow") return { verdict: "allow" };
+  return { failure: "dcg stdout was not a verdict" };
+}
+
+// dcg asked for review: Amp's confirmation dialog is that review. A dialog
+// that cannot be shown (no UI, e.g. `amp -x`) or is dismissed is a refusal.
+async function review(ctx, command, reason) {
+  let confirmed = false;
+  try {
+    confirmed = await ctx.ui.confirm({
+      title: "dcg: review this command",
+      message: `${command}\n\n${reason}`,
+      confirmButtonText: "Run",
+    });
+  } catch (err) {
+    return reject(`${reason}\n(dcg asked for review and no one could answer: ${err?.message ?? err})`);
+  }
+  return confirmed === true ? ALLOW : reject(`${reason}\n(declined in review)`);
+}
+
+async function guard(amp, event, ctx) {
+  // dcg's escape hatch: dcg itself exits before reading its input.
+  if (envFlag("DCG_BYPASS")) return ALLOW;
+  const call = shellCall(amp, event);
+  if (call === null) return ALLOW;
+  if (call.commands.length === 0) {
+    return reject(`Blocked by dcg: this Amp ${call.tool || "shell"} call carries no command string dcg can read, so it was not verified. Check Amp/dcg compatibility.`);
+  }
+  let pending = null;
+  for (const command of call.commands) {
+    const answer = askDcg(command, call.dir);
+    if (answer.failure !== undefined) {
+      const outcome = noVerdict(amp, answer.failure);
+      if (outcome.action !== "allow") return outcome;
+      continue;
+    }
+    if (answer.verdict === "deny") return reject(answer.reason);
+    if (answer.verdict === "ask" && pending === null) pending = { command, reason: answer.reason };
+  }
+  return pending === null ? ALLOW : review(ctx, pending.command, pending.reason);
+}
+
+export default function (amp) {
+  // Fail to load, visibly, rather than load without a guard.
+  if (typeof amp?.on !== "function") {
+    throw new Error("[dcg] Incompatible Amp plugin API (no amp.on); shell command protection could not be activated.");
+  }
+  amp.on("tool.call", async (event, ctx) => {
+    try {
+      return await guard(amp, event, ctx);
+    } catch (err) {
+      return noVerdict(amp, `the dcg Amp plugin failed: ${err}`);
+    }
+  });
+}
+"#;
+
+/// Amp's system plugin path: `$XDG_CONFIG_HOME/amp/plugins/dcg-guard.js` when
+/// `XDG_CONFIG_HOME` is set, else `~/.config/amp/plugins/dcg-guard.js` on
+/// every platform (Amp documents `%USERPROFILE%\.config\amp\plugins` on
+/// Windows).
+fn amp_system_plugin_path() -> std::path::PathBuf {
+    amp_system_plugin_path_for(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        &crate::config::home_dir().unwrap_or_default(),
+    )
+}
+
+fn amp_system_plugin_path_for(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    xdg_config_home
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join(".config"), std::path::PathBuf::from)
+        .join("amp")
+        .join("plugins")
+        .join(AMP_PLUGIN_FILE_NAME)
+}
+
+/// Amp's project plugin path: `<repo root>/.amp/plugins/dcg-guard.js`.
+fn project_amp_plugin_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    Ok(repo_root
+        .join(".amp")
+        .join("plugins")
+        .join(AMP_PLUGIN_FILE_NAME))
+}
+
+/// The plugin source for `executable`.
+fn build_amp_plugin_source(executable: &std::path::Path) -> std::io::Result<String> {
+    let path_literal = executable_javascript_literal(executable)?;
+    Ok(AMP_PLUGIN_TEMPLATE.replacen(AMP_PLUGIN_DCG_BIN_PLACEHOLDER, &path_literal, 1))
+}
+
+/// Fidelity of an installed Amp plugin against what this dcg would write.
+#[derive(Debug, PartialEq, Eq)]
+enum AmpPluginProbe {
+    /// No file, unreadable, or not dcg-owned (no marker).
+    MissingOrUnowned,
+    /// dcg-owned and byte-identical to the canonical source for the dcg path
+    /// the plugin itself embeds.
+    Current,
+    /// dcg-owned but different: edited, stubbed, or written by another dcg
+    /// version.
+    OwnedStale,
+}
+
+/// Compare an installed Amp plugin with the canonical source, rebuilt around
+/// the dcg path the plugin embeds (so a plugin installed from another dcg
+/// location is not flagged for the path alone).
+fn probe_amp_plugin(path: &std::path::Path) -> AmpPluginProbe {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return AmpPluginProbe::MissingOrUnowned;
+    };
+    if !content.contains(AMP_PLUGIN_MARKER) {
+        return AmpPluginProbe::MissingOrUnowned;
+    }
+    let embedded_path = content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("const DCG_BIN = ")
+            .and_then(|rest| rest.strip_suffix(';'))
+            .and_then(|literal| serde_json::from_str::<String>(literal).ok())
+    });
+    match embedded_path {
+        Some(dcg_path) => match build_amp_plugin_source(std::path::Path::new(&dcg_path)) {
+            Ok(canonical) if canonical == content => AmpPluginProbe::Current,
+            _ => AmpPluginProbe::OwnedStale,
+        },
+        None => AmpPluginProbe::OwnedStale,
+    }
+}
+
+/// Write dcg's plugin to `path` without printing (shared by `dcg install
+/// --amp` and `dcg doctor --fix`). Returns `Ok(true)` when the file was
+/// written: always with `force`, otherwise only when it was missing or
+/// differed. A file without dcg's marker is never overwritten.
+fn install_amp_plugin_at(
+    path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let source = build_amp_plugin_source(&current_dcg_executable()?)?;
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            if !existing.contains(AMP_PLUGIN_MARKER) {
+                return Err(format!(
+                    "{} exists but was not generated by dcg (missing the '{AMP_PLUGIN_MARKER}' \
+                     marker). Refusing to overwrite a user-owned plugin — move it aside or merge \
+                     the dcg guard into it manually.",
+                    path.display()
+                )
+                .into());
+            }
+            if existing == source && !force {
+                return Ok(false);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("cannot read {}: {error}", path.display()).into());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_settings_atomic(path, &source)?;
+    Ok(true)
+}
+
+/// Install the native Amp plugin (#577).
+fn install_amp_plugin(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = if project {
+        project_amp_plugin_path()?
+    } else {
+        amp_system_plugin_path()
+    };
+    if !install_amp_plugin_at(&path, force)? {
+        println!("{}", "Plugin already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+    let level = if project { "project" } else { "user" };
+    println!("{}", "Amp plugin installed successfully!".green().bold());
+    println!("Plugin written ({level}): {}", path.display());
+    println!();
+    println!(
+        "{}",
+        "Reload Amp's plugins (Ctrl+O, then `plugins: reload`) or restart Amp; \
+         `amp plugins list` shows whether it loaded."
+            .yellow()
+    );
+    Ok(())
+}
+
+/// Remove the user-level Amp plugin, but only a file dcg wrote (#577).
+fn uninstall_amp_plugin() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let path = amp_system_plugin_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "{} {}",
+                "No dcg Amp plugin found at".yellow(),
+                path.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display()).into()),
+    };
+    if !content.contains(AMP_PLUGIN_MARKER) {
+        return Err(format!(
+            "{} was not generated by dcg (missing the '{AMP_PLUGIN_MARKER}' marker); \
+             leaving it in place",
+            path.display()
+        )
+        .into());
+    }
+    std::fs::remove_file(&path)?;
+    println!("{}", "Amp plugin removed successfully!".green().bold());
+    println!("Removed: {}", path.display());
+    if let Ok(project_path) = project_amp_plugin_path() {
+        if project_path.is_file() {
+            println!(
+                "A project copy remains at {}; delete it there if you no longer want it.",
+                project_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether Amp is plausibly in use: its config directory exists or an `amp`
+/// executable is on `PATH`.
+fn amp_appears_in_use() -> bool {
+    amp_system_plugin_path()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .is_some_and(std::path::Path::is_dir)
+        || which_executable("amp").is_some()
+}
+
 /// Ownership marker embedded in the generated OpenCode plugin (#318).
 ///
 /// The installer refuses to overwrite a plugin file that lacks this marker
@@ -14742,7 +16376,7 @@ fn build_opencode_plugin_source(executable: &std::path::Path) -> std::io::Result
     let path_literal = executable_javascript_literal(executable)?;
     Ok(format!(
         r#"// {OPENCODE_PLUGIN_MARKER}: generated by `dcg install --opencode` — do not edit.
-// Routes every OpenCode bash tool call through dcg (Destructive Command
+// Routes OpenCode shell command calls through dcg (Destructive Command
 // Guard) before execution. Remove with `uninstall.sh` or by deleting this
 // file. Docs: https://github.com/Dicklesworthstone/destructive_command_guard
 //
@@ -14848,13 +16482,30 @@ function dcgDenyReason(command) {{
   return noVerdict("dcg stdout was not a verdict");
 }}
 
+// OpenCode v1 names its shell tool "bash"; v2 uses "shell" (#547).
+// Guard command-bearing tools after a future rename too, and make that
+// fallback visible instead of silently skipping execution protection.
+function guardTool(tool, args) {{
+  if (envFlag("DCG_BYPASS")) return;
+  const knownShell = tool === "bash" || tool === "shell";
+  const hasCommand = args !== null && typeof args === "object" && "command" in args;
+  if (!knownShell && !hasCommand) return;
+  if (!knownShell) {{
+    console.error(`[dcg] Unrecognized command-bearing OpenCode tool ${{JSON.stringify(tool)}}; checking its command instead of skipping protection`);
+  }}
+  const command = hasCommand ? args.command : undefined;
+  if (typeof command !== "string" || command.trim().length === 0) {{
+    throw new Error("Blocked by dcg: incompatible OpenCode shell payload; expected a non-empty command string. Check OpenCode/DCG compatibility.");
+  }}
+  const reason = dcgDenyReason(command);
+  if (reason) throw new Error(reason);
+}}
+
 // OpenCode v1 hook map, command in `output.args`.
 function v1Hooks() {{
   return {{
     "tool.execute.before": async (input, output) => {{
-      if (!input || input.tool !== "bash") return;
-      const reason = dcgDenyReason(output?.args?.command);
-      if (reason) throw new Error(reason);
+      guardTool(input?.tool, output?.args);
     }},
   }};
 }}
@@ -14868,10 +16519,11 @@ export default {{
   server: async () => v1Hooks(),
   // OpenCode v2: `setup(ctx)` registers the hook, command in `event.input`.
   async setup(ctx) {{
+    if (typeof ctx?.tool?.hook !== "function") {{
+      throw new Error("[dcg] Incompatible OpenCode v2 tool hook API; command protection could not be activated.");
+    }}
     await ctx.tool.hook("execute.before", async (event) => {{
-      if (!event || event.tool !== "bash") return;
-      const reason = dcgDenyReason(event.input && event.input.command);
-      if (reason) throw new Error(reason);
+      guardTool(event?.tool, event?.input);
     }});
   }},
 }};
@@ -14973,21 +16625,47 @@ fn probe_opencode_plugin(path: &std::path::Path) -> OpencodePluginProbe {
 // Codex hook registration + enablement probe (#368)
 // ---------------------------------------------------------------------------
 
+/// Codex's state directory. Codex documents that it "stores its local state
+/// under `CODEX_HOME` (defaults to `~/.codex`)", so a set, non-empty
+/// `CODEX_HOME` is where its user hooks and config live (#539).
+fn codex_home_override() -> Option<std::path::PathBuf> {
+    codex_home_from_env_value(std::env::var_os("CODEX_HOME"))
+}
+
+/// An empty `CODEX_HOME` is treated as unset, as Codex does.
+fn codex_home_from_env_value(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    value
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn codex_home_dir() -> std::path::PathBuf {
+    codex_home_override()
+        .unwrap_or_else(|| crate::config::home_dir().unwrap_or_default().join(".codex"))
+}
+
+/// How doctor names a file in Codex's state directory: the conventional
+/// `~/.codex/<name>`, or the real path when `CODEX_HOME` moves it.
+fn codex_file_display(name: &str) -> String {
+    codex_file_display_in(codex_home_override().as_deref(), name)
+}
+
+fn codex_file_display_in(codex_home: Option<&std::path::Path>, name: &str) -> String {
+    codex_home.map_or_else(
+        || format!("~/.codex/{name}"),
+        |dir| dir.join(name).display().to_string(),
+    )
+}
+
 /// User-level Codex hooks file (written by the dcg install script).
 fn codex_hooks_json_path() -> std::path::PathBuf {
-    crate::config::home_dir()
-        .unwrap_or_default()
-        .join(".codex")
-        .join("hooks.json")
+    codex_home_dir().join("hooks.json")
 }
 
 /// User-level Codex configuration, which carries the `[hooks.state]` trust
 /// and enablement table.
 fn codex_config_toml_path() -> std::path::PathBuf {
-    crate::config::home_dir()
-        .unwrap_or_default()
-        .join(".codex")
-        .join("config.toml")
+    codex_home_dir().join("config.toml")
 }
 
 /// Whether this machine appears to run Codex: its config directory exists or
@@ -15271,7 +16949,7 @@ fn probe_codex_dcg_hook_at(
     // Two-stage parse so a syntax error and a schema rejection get different
     // remedies: the first is a broken file, the second is a well-formed file
     // Codex refuses to load.
-    let json: serde_json::Value = match serde_json::from_str(&raw) {
+    let json = match parse_hook_settings_json(&raw) {
         Ok(json) => json,
         Err(err) => return CodexHookProbe::HooksFileInvalid(err.to_string()),
     };
@@ -15412,9 +17090,11 @@ pub(crate) const OMP_EXTENSION_MARKER: &str = "dcg-omp-extension";
 ///
 /// dcg's ordinary evaluator deadline is 1 second and the broad Windows preset
 /// defaults to 3 seconds, but an operator may configure a larger deadline.
-/// Keep this pathological-hang backstop generous enough not to compete with
-/// those evaluator budgets while still bounding a wedged child at the bridge.
-pub(crate) const OMP_CHILD_EVALUATION_TIMEOUT_MS: u64 = 30_000;
+/// Keep this pathological-hang backstop generous enough for those budgets,
+/// but shorter than OMP's default 30-second tool_call handler deadline. Its
+/// own watchdog must fire first so an operator sees dcg's failure diagnostic
+/// rather than a generic host handler timeout (#563).
+pub(crate) const OMP_CHILD_EVALUATION_TIMEOUT_MS: u64 = 25_000;
 
 /// Maximum time to drain stdout/stderr after Bun reports child termination.
 ///
@@ -15429,7 +17109,8 @@ pub(crate) const OMP_CHILD_PIPE_DRAIN_GRACE_MS: u64 = 250;
 /// Bun's native child timeout normally settles first. The extra two drain
 /// windows cover signal/reap propagation plus one bounded post-exit drain; if
 /// the exit capability itself never settles, this outer watchdog still closes
-/// the local observation boundary.
+/// the local observation boundary. Total is 25_500 ms, leaving 4_500 ms for
+/// the handler to finish under OMP's default 30_000 ms ceiling.
 pub(crate) const OMP_CHILD_OBSERVATION_TIMEOUT_MS: u64 =
     OMP_CHILD_EVALUATION_TIMEOUT_MS + 2 * OMP_CHILD_PIPE_DRAIN_GRACE_MS;
 
@@ -15764,12 +17445,15 @@ const DCG_OBSERVATION_ABORTED = Symbol("dcg-child-observation-aborted");
 // that the unverified posture may still turn into a block. A dcg that started
 // and then died (a signal, or an exit status dcg never uses for a verdict)
 // without a blocking verdict is a "crash": it blocks unless
-// DCG_BRIDGE_CRASH_DECISION=allow.
+// DCG_BRIDGE_CRASH_DECISION=allow. Exit 0/2 with empty, malformed or unknown
+// stdout is UNVERIFIED, not an allow: only an explicit robot JSON allow is
+// proof of a clean decision. The infrastructure row logs the failure and
+// honors DCG_UNVERIFIED_DECISION=deny (#564).
 const DCG_CHILD_TRANSITIONS: Record<DcgChildOutcome, Record<DcgParsedVerdict, DcgBridgeAction>> = {{
   "spawn-throw": {{ empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
-  "exit-0": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
+  "exit-0": {{ empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-1": {{ empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }},
-  "exit-2": {{ empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }},
+  "exit-2": {{ empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }},
   "exit-other": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
   "signal": {{ empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }},
 }};
@@ -16745,9 +18429,17 @@ const DCG_PROFILE_CHECK_MARKER: &str = "# dcg: warn if the Claude Code hook was 
 /// missing although it is installed (#503), and the warning's own advice —
 /// `dcg install` — is where the stale block gets repaired.
 #[cfg(any(windows, test))]
-const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction SilentlyContinue) -and
+    ((-not [string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) -or
+     (Test-Path -LiteralPath (Join-Path (Join-Path $HOME '.claude') 'settings.json') -PathType Leaf))) {
   try {
-    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgClaudeDir = $env:CLAUDE_CONFIG_DIR
+    if ([string]::IsNullOrEmpty($dcgClaudeDir)) { $dcgClaudeDir = Join-Path $HOME '.claude' }
+    elseif ($dcgClaudeDir -eq '~') { $dcgClaudeDir = $HOME }
+    elseif ($dcgClaudeDir.StartsWith('~/') -or $dcgClaudeDir.StartsWith('~\')) { $dcgClaudeDir = Join-Path $HOME $dcgClaudeDir.Substring(2) }
+    if (-not (Split-Path -Path $dcgClaudeDir -IsAbsolute)) { $dcgClaudeDir = Join-Path (Get-Location).ProviderPath $dcgClaudeDir }
+    $dcgSettings = Join-Path $dcgClaudeDir 'settings.json'
+    $dcgCfg = if (Test-Path -LiteralPath $dcgSettings -PathType Leaf) { Get-Content -Raw -LiteralPath $dcgSettings | ConvertFrom-Json } else { $null }
     $dcgHas = $false
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
@@ -16758,7 +18450,7 @@ const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction Silen
         if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
       }
     }
-    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+    if (-not $dcgHas) { Write-Host "[dcg] Hook missing from $dcgSettings - run: dcg install" -ForegroundColor Yellow }
   } catch { }
 }"#;
 
@@ -16869,11 +18561,24 @@ fn repair_powershell_profile_checks() -> Vec<std::path::PathBuf> {
 const DCG_SHELL_CHECK_SNIPPET: &str = r#"
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
-  if [ -f "$HOME/.claude/settings.json" ] && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
-       "$HOME/.claude/settings.json" &>/dev/null; then
-    printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
-  fi
+  (
+    dcg_claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    case "$dcg_claude_dir" in
+      "~") dcg_claude_dir="$HOME" ;;
+      "~/"*) dcg_claude_dir="$HOME/${dcg_claude_dir#"~/"}" ;;
+    esac
+    case "$dcg_claude_dir" in
+      /*) ;;
+      *) dcg_claude_dir="$PWD/$dcg_claude_dir" ;;
+    esac
+    dcg_claude_settings="${dcg_claude_dir%/}/settings.json"
+    if { [ -n "${CLAUDE_CONFIG_DIR:-}" ] || [ -f "$dcg_claude_settings" ]; } && \
+       { [ ! -f "$dcg_claude_settings" ] || \
+         ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
+           "$dcg_claude_settings" &>/dev/null; }; then
+      printf '\033[1;33m[dcg] Hook missing from %s — run: dcg install\033[0m\n' "$dcg_claude_settings"
+    fi
+  )
 fi
 "#;
 
@@ -16881,11 +18586,12 @@ fi
 #[cfg(unix)]
 const DCG_SHELL_CHECK_MARKER: &str = "# dcg: warn if hook was silently removed";
 
-/// Check whether a shell RC file already contains the DCG startup check.
+/// Check whether a shell RC file contains the current DCG startup check.
+/// A marker alone may belong to a stale check of the wrong settings file.
 #[cfg(unix)]
 fn rc_has_dcg_check(path: &std::path::Path) -> bool {
     if let Ok(content) = std::fs::read_to_string(path) {
-        content.contains(DCG_SHELL_CHECK_MARKER)
+        content.contains(DCG_SHELL_CHECK_SNIPPET.trim_start_matches('\n'))
     } else {
         false
     }
@@ -17160,7 +18866,7 @@ fn uninstall_hook(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     // Read existing settings
     let content = std::fs::read_to_string(&settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+    let mut settings = parse_hook_settings_json(&content)?;
 
     // Remove dcg hooks (fail if settings structure is unexpected).
     let removed = uninstall_dcg_hook_from_settings(&mut settings)?;
@@ -17859,12 +19565,44 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Get the path to user-level Claude Code settings (`~/.claude/settings.json`).
-fn claude_settings_path() -> std::path::PathBuf {
+/// The fixed Claude-compatible location used by integrations such as Grok,
+/// which do not honor Claude Code's `CLAUDE_CONFIG_DIR` environment variable.
+fn default_claude_settings_path() -> std::path::PathBuf {
     crate::config::home_dir()
         .unwrap_or_default()
         .join(".claude")
         .join("settings.json")
+}
+
+/// A non-empty override is explicit intent to use Claude Code, even when its
+/// directory/settings file does not exist yet. Do not trim: spaces are valid
+/// path characters, and an invalid override must never select the default.
+fn claude_config_dir_override() -> Option<std::path::PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Get the active user-level Claude Code settings. Expand only a leading `~`
+/// path component (never `~user`, variables, or shell expressions) and resolve
+/// relative values against the working directory, without requiring the
+/// destination to exist. Native path components preserve non-UTF-8 filenames
+/// on Unix and recognize both separators on Windows.
+fn claude_settings_path() -> std::path::PathBuf {
+    let Some(mut directory) = claude_config_dir_override() else {
+        return default_claude_settings_path();
+    };
+    if let Ok(rest) = directory.strip_prefix("~") {
+        if let Some(home) = crate::config::home_dir() {
+            directory = home.join(rest);
+        }
+    }
+    if directory.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            directory = cwd.join(directory);
+        }
+    }
+    directory.join("settings.json")
 }
 
 /// Get the path to project-level Claude Code settings (`.claude/settings.json`
@@ -17985,29 +19723,26 @@ fn which_executable(name: &str) -> Option<std::path::PathBuf> {
 #[allow(dead_code)]
 fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
     let settings_path = claude_settings_path();
-    if !settings_path.exists() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(&settings_path)?;
-    let settings: serde_json::Value = serde_json::from_str(&content)?;
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(content) => content,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let settings = parse_hook_settings_json(&content)?;
     let desired_hook = claude_dcg_hook()?;
 
-    let registered = settings
-        .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
-        .and_then(|arr| arr.as_array())
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, &desired_hook)
-            })
-        });
-
-    Ok(registered)
+    Ok(settings_has_exact_dcg_hook(&settings, &desired_hook))
 }
 
-/// Ensure the DCG hook is registered in `~/.claude/settings.json` with the
-/// current absolute executable path.
+/// Ensure the DCG hook is registered in the active Claude Code settings with
+/// the current absolute executable path.
+///
+/// Other detected integrations retain the default Claude-compatible location
+/// they have historically used.
 ///
 /// This is the self-healing mechanism that protects against Claude Code
 /// silently overwriting `settings.json` mid-session (removing the DCG hook),
@@ -18024,7 +19759,14 @@ fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
 ///   parse + array scan (typically < 1ms).
 /// - **Idempotent**: safe to call on every invocation.
 pub fn ensure_hook_registered() {
-    if let Err(e) = ensure_hook_registered_inner() {
+    ensure_hook_registered_for_agent(&crate::agent::detect_agent());
+}
+
+/// Self-heal using the host identified by the hook payload when available.
+/// Known clients that do not honor `CLAUDE_CONFIG_DIR` retain
+/// their fixed default location even when that variable is inherited.
+pub fn ensure_hook_registered_for_agent(agent: &crate::agent::Agent) {
+    if let Err(e) = ensure_hook_registered_inner(agent) {
         // Fail-open: log warning but never block the hook pipeline.
         crate::emit_stderr!("[dcg] Warning: self-heal check failed: {e}");
     }
@@ -18032,8 +19774,13 @@ pub fn ensure_hook_registered() {
 
 /// Inner implementation for `ensure_hook_registered` that returns errors
 /// so the outer function can swallow them for fail-open behavior.
-fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
-    let settings_path = claude_settings_path();
+fn ensure_hook_registered_inner(
+    agent: &crate::agent::Agent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let settings_path = match agent {
+        crate::agent::Agent::ClaudeCode | crate::agent::Agent::Unknown => claude_settings_path(),
+        _ => default_claude_settings_path(),
+    };
     let lock_path = self_heal_lock_path(&settings_path);
     ensure_hook_registered_at(&settings_path, &lock_path)
 }
@@ -18068,21 +19815,50 @@ fn self_heal_lock_path(settings_path: &std::path::Path) -> std::path::PathBuf {
     config_dir().join(format!("selfheal-{hex8}.lock"))
 }
 
-/// True if `settings` already contains the exact desired dcg hook entry for
-/// the Claude shell matcher.
+/// True if the canonical registration is first and is the only dcg hook in
+/// PreToolUse. Operator fields do not mark it stale, but duplicates must still
+/// be reconciled so a later registration's policy is not silently ignored.
 fn settings_has_exact_dcg_hook(
     settings: &serde_json::Value,
     desired_hook: &serde_json::Value,
 ) -> bool {
-    settings
+    let Some(entries) = settings
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|arr| arr.as_array())
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, desired_hook)
-            })
-        })
+    else {
+        return false;
+    };
+    if !entries.first().is_some_and(|entry| {
+        is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, desired_hook)
+    }) {
+        return false;
+    }
+
+    let mut dcg_count = 0;
+    for entry in entries {
+        if let Some(hooks) = entry.get("hooks").and_then(serde_json::Value::as_array) {
+            dcg_count += hooks
+                .iter()
+                .filter(|hook| {
+                    hook.get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_dcg_command)
+                })
+                .count();
+            if dcg_count > 1 {
+                return false;
+            }
+        } else {
+            let matcher = entry.get("matcher").and_then(serde_json::Value::as_str);
+            if matcher == Some(CLAUDE_SHELL_MATCHER)
+                || matcher.is_some_and(|value| LEGACY_CLAUDE_SHELL_MATCHERS.contains(&value))
+            {
+                return false;
+            }
+        }
+    }
+    dcg_count == 1
 }
 
 /// Try to take an exclusive advisory lock on `lock_path` with a small bounded
@@ -18135,34 +19911,64 @@ fn try_acquire_self_heal_lock(
 ///   manager). Renaming over the link would orphan the managed target and
 ///   silently detach the file from the user's source of truth, so the write
 ///   resolves the link first and replaces the real file.
-/// - **Permissions are preserved.** settings.json can hold API keys in `env`
-///   blocks; a `chmod 600` file must not come back world-readable 0644 just
-///   because dcg repaired a hook entry.
+/// - **Unix ownership and mode bits are preserved.** settings.json can hold API
+///   keys in `env` blocks; a `chmod 600` file must remain private and readable by
+///   its original owner even when a different user repairs its hook entry.
+///   On Linux/Android, preserve extended attributes as well, including POSIX
+///   ACLs: mode bits alone cannot express a restrictive ACL's access policy.
 fn write_settings_atomic(
     path: &std::path::Path,
     content: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    write_settings_atomic_with_metadata(path, content, copy_file_permissions)
+}
+
+/// Keep the metadata step injectable so failures before publication can be
+/// tested without relying on privileges or filesystem-specific write failures.
+fn write_settings_atomic_with_metadata(
+    path: &std::path::Path,
+    content: &str,
+    copy_metadata: impl FnOnce(
+        &std::path::Path,
+        &std::fs::File,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
     // Resolve symlinks so the rename lands on the real file, and so the temp
-    // file shares its filesystem. A path that cannot be canonicalized (does
-    // not exist yet) keeps its literal form.
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // file shares its filesystem. Only a genuinely missing path may keep its
+    // literal form; an unreadable target or broken managed symlink is an error.
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
+            path.to_path_buf()
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let temp_name = format!(".dcg-settings-{}.tmp", std::process::id());
     let temp_path = parent.join(&temp_name);
 
-    // Every failure after this point must remove the temp file: a failed
-    // write/sync used to leave `.dcg-settings-<pid>.tmp` behind forever.
-    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        {
-            let mut temp_file = std::fs::File::create(&temp_path)?;
-            temp_file.write_all(content.as_bytes())?;
-            temp_file.sync_all()?; // Ensure data is flushed to disk
-        }
+    // Never truncate a pre-existing staging file or follow a staging symlink.
+    // Creation happens outside cleanup: only a file we created is ours to
+    // remove. On Unix, start private before any sensitive settings are written.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp_file = options.open(&temp_path)?;
 
-        copy_file_permissions(&target, &temp_path)?;
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        // Keep content private until it is complete. Writes and ownership
+        // changes can clear security attributes, so copy metadata afterwards.
+        temp_file.write_all(content.as_bytes())?;
+        copy_metadata(&target, &temp_file)?;
+        temp_file.sync_all()?; // Ensure data is flushed to disk
+        drop(temp_file);
 
         // Atomic rename (on Unix this is atomic; on Windows `std::fs::rename`
         // replaces the existing file via MOVEFILE_REPLACE_EXISTING).
@@ -18178,28 +19984,123 @@ fn write_settings_atomic(
     write_result
 }
 
-/// Copy `from`'s permission bits onto `to` so an atomic temp+rename replace
-/// does not silently widen a restrictive mode (e.g. a `chmod 600`
-/// settings.json or allowlist).
+/// Copy Unix ownership and permissions onto an open staging file. Linux and
+/// Android also preserve readable extended attributes, including POSIX ACLs,
+/// and remove attributes inherited by the stage that the original did not have.
 ///
-/// A missing/unreadable source is not an error: there is nothing to preserve,
-/// and the temp file's default mode is the correct outcome. On non-Unix this
-/// is a no-op — Windows permissions live in ACLs that `std::fs` cannot carry
-/// across, and `rename` does not reset them the way a fresh file would.
+/// Only a missing source has nothing to preserve. Metadata read/copy failures
+/// must abort before the caller publishes the stage. Other Unix platforms keep
+/// their ownership/mode behavior; their distinct ACL APIs are not covered here.
+/// On non-Unix this is a no-op; Windows ACLs require a separate platform API.
 #[allow(clippy::unnecessary_wraps)] // the non-unix arm still needs the Result shape
 fn copy_file_permissions(
     from: &std::path::Path,
-    to: &std::path::Path,
+    to: &std::fs::File,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
-        if let Ok(metadata) = std::fs::metadata(from) {
-            std::fs::set_permissions(to, metadata.permissions())?;
+        use std::os::unix::fs::MetadataExt;
+
+        let source = match std::fs::File::open(from) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !from.is_symlink() => {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = source.metadata()?;
+        let staged = to.metadata()?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let attributes = read_file_xattrs(&source)?;
+
+        if (metadata.uid(), metadata.gid()) != (staged.uid(), staged.gid()) {
+            rustix::fs::fchown(
+                to,
+                Some(rustix::fs::Uid::from_raw(metadata.uid())),
+                Some(rustix::fs::Gid::from_raw(metadata.gid())),
+            )?;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        reconcile_file_xattrs(to, attributes.as_ref())?;
+
+        // Ownership changes can clear mode bits. Restore them only after the
+        // original security labels and ACL are installed: chmod first could
+        // briefly grant group access that the original ACL explicitly denied.
+        to.set_permissions(metadata.permissions())?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if read_file_xattrs(to)? != attributes {
+            return Err(
+                "Staged file security attributes changed while restoring permissions".into(),
+            );
         }
     }
     #[cfg(not(unix))]
     {
         let _ = (from, to);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type FileXattrs = std::collections::BTreeMap<std::ffi::CString, Vec<u8>>;
+
+/// Snapshot attributes through the opened inode. Linux limits both the name
+/// list and each value to 64 KiB; one reused buffer also preserves empty and
+/// non-UTF-8 values without allocating 64 KiB for every small attribute.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_file_xattrs(file: &std::fs::File) -> std::io::Result<Option<FileXattrs>> {
+    let mut names = vec![0_u8; 65_536];
+    let length = match rustix::fs::flistxattr(file, names.as_mut_slice()) {
+        Ok(length) => length,
+        Err(rustix::io::Errno::NOTSUP) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    names.truncate(length);
+
+    let mut attributes = FileXattrs::new();
+    let mut value = vec![0_u8; 65_536];
+    for name in names.split_inclusive(|byte| *byte == 0) {
+        let name = std::ffi::CStr::from_bytes_with_nul(name)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let length = rustix::fs::fgetxattr(file, name, value.as_mut_slice())?;
+        attributes.insert(name.to_owned(), value[..length].to_vec());
+    }
+    Ok(Some(attributes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reconcile_file_xattrs(file: &std::fs::File, source: Option<&FileXattrs>) -> std::io::Result<()> {
+    let staged = read_file_xattrs(file)?;
+    let (source, staged) = match (source, staged.as_ref()) {
+        (Some(source), Some(staged)) => (source, staged),
+        (None, None) => return Ok(()), // The shared filesystem has no xattr support.
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Cannot preserve security attributes across different xattr support",
+            ));
+        }
+    };
+
+    let mut names: Vec<_> = source.keys().chain(staged.keys()).collect();
+    names.sort_unstable();
+    names.dedup();
+    // Security labels must be restored before the access ACL can grant readers
+    // access to the stage. Its initial mode 0600 masks inherited group entries.
+    names.sort_by_key(|name| name.as_bytes() == b"system.posix_acl_access");
+    for name in names {
+        match (source.get(name), staged.get(name)) {
+            (Some(value), Some(old)) if value == old => {}
+            (Some(value), _) => {
+                rustix::fs::fsetxattr(
+                    file,
+                    name.as_c_str(),
+                    value,
+                    rustix::fs::XattrFlags::empty(),
+                )?;
+            }
+            (None, _) => rustix::fs::fremovexattr(file, name.as_c_str())?,
+        }
     }
     Ok(())
 }
@@ -18210,18 +20111,21 @@ fn ensure_hook_registered_at(
     settings_path: &std::path::Path,
     lock_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !settings_path.exists() {
-        // No settings.json at all — nothing to heal. The user hasn't run
-        // `dcg install` yet, or Claude Code hasn't been configured.
-        return Ok(());
-    }
-
-    let desired_hook = claude_dcg_hook()?;
-
     // Fast path (lock-free): if the hook is present, nothing to do. This is
     // the common case on every hook invocation, so it stays a read + parse.
-    let content = std::fs::read_to_string(settings_path)?;
-    let settings: serde_json::Value = serde_json::from_str(&content)?;
+    let content = match std::fs::read_to_string(settings_path) {
+        Ok(content) => content,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            // A genuinely missing file means the user has not installed the
+            // hook yet. An unavailable managed target must instead be reported.
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let desired_hook = claude_dcg_hook()?;
+    let settings = parse_hook_settings_json(&content)?;
     if settings_has_exact_dcg_hook(&settings, &desired_hook) {
         return Ok(());
     }
@@ -18237,7 +20141,7 @@ fn ensure_hook_registered_at(
     // Re-read under the lock so the modification applies to the freshest
     // snapshot (a concurrent healer may have already repaired the file).
     let content = std::fs::read_to_string(settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+    let mut settings = parse_hook_settings_json(&content)?;
     if settings_has_exact_dcg_hook(&settings, &desired_hook) {
         return Ok(());
     }
@@ -18288,6 +20192,23 @@ struct HookDiagnostics {
 
 #[allow(dead_code)]
 impl HookDiagnostics {
+    /// Whether this file can synchronously guard Grok's shell commands.
+    ///
+    /// Grok aliases its terminal tools to Bash, so the legacy Claude matchers
+    /// still protect it. Multiple working entries are redundant but remain
+    /// effective; active Claude wiring still requires the current matcher.
+    fn has_grok_compatible_hook(&self) -> bool {
+        self.settings_valid
+            && self.settings_error.is_none()
+            && self.dcg_hook_count > 0
+            && self
+                .wrong_matcher_hooks
+                .iter()
+                .all(|matcher| LEGACY_CLAUDE_SHELL_MATCHERS.contains(&matcher.as_str()))
+            && self.misconfigured_hooks.is_empty()
+            && self.missing_executable_hooks.is_empty()
+    }
+
     fn is_healthy(&self) -> bool {
         self.settings_valid
             && self.dcg_hook_count == 1
@@ -18306,31 +20227,39 @@ impl HookDiagnostics {
     }
 }
 
-fn hook_diagnostics_issue_count(diagnostics: &HookDiagnostics) -> usize {
-    usize::from(diagnostics.settings_exists && diagnostics.has_issues())
+fn hook_diagnostics_issue_count(diagnostics: &HookDiagnostics, settings_required: bool) -> usize {
+    usize::from((diagnostics.settings_exists || settings_required) && diagnostics.has_issues())
 }
 
 /// Diagnose hook wiring in detail.
 #[allow(dead_code)]
 fn diagnose_hook_wiring() -> HookDiagnostics {
-    let mut diag = HookDiagnostics::default();
     let settings_path = claude_settings_path();
+    diagnose_hook_wiring_at(&settings_path)
+}
 
-    if !settings_path.exists() {
-        return diag;
-    }
-    diag.settings_exists = true;
+/// Diagnose a particular settings file so Grok's fixed compatibility source
+/// cannot accidentally reuse the active Claude Code configuration's verdict.
+fn diagnose_hook_wiring_at(settings_path: &std::path::Path) -> HookDiagnostics {
+    let mut diag = HookDiagnostics::default();
 
     // Read and parse settings
-    let content = match std::fs::read_to_string(&settings_path) {
+    let content = match std::fs::read_to_string(settings_path) {
         Ok(c) => c,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !settings_path.is_symlink() =>
+        {
+            return diag;
+        }
         Err(e) => {
+            diag.settings_exists = true;
             diag.settings_error = Some(format!("Failed to read settings: {e}"));
             return diag;
         }
     };
+    diag.settings_exists = true;
 
-    let settings: serde_json::Value = match serde_json::from_str(&content) {
+    let settings = match parse_hook_settings_json(&content) {
         Ok(s) => s,
         Err(e) => {
             diag.settings_error = Some(format!("Invalid JSON: {e}"));
@@ -18375,7 +20304,6 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     }
 
                     let hook_object = hook.as_object();
-                    let expected_property_count = if cfg!(windows) { 3 } else { 2 };
                     let type_is_command =
                         hook.get("type").and_then(serde_json::Value::as_str) == Some("command");
                     let is_synchronous =
@@ -18385,15 +20313,24 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     } else {
                         hook.get("shell").is_none()
                     };
-                    let exact_owned_shape =
-                        hook_object.is_some_and(|object| object.len() == expected_property_count);
-                    if !type_is_command || !is_synchronous || !shell_is_safe || !exact_owned_shape {
+                    // Judged on dcg-owned keys only, exactly as install and
+                    // hook-mode self-heal judge it (#528, #345): a host- or
+                    // operator-owned field such as `"timeout": 10` is carried
+                    // forward by `dcg install --force`, so counting it as a
+                    // defect produced a finding no remedy could clear. The one
+                    // host key that changes enforcement, `async`, is still
+                    // checked above.
+                    if hook_object.is_none()
+                        || !type_is_command
+                        || !is_synchronous
+                        || !shell_is_safe
+                    {
                         diag.misconfigured_hooks.push(format!(
                             "{cmd} (expected a synchronous command hook with the platform-safe shell)"
                         ));
                     }
                     match &desired_hook {
-                        Ok(expected) if hook != expected => {
+                        Ok(expected) if !hook_has_dcg_identity(hook, expected) => {
                             diag.misconfigured_hooks.push(format!(
                                 "{cmd} (hook does not invoke this dcg executable with \
                                  platform-safe quoting)"
@@ -18631,7 +20568,7 @@ fn run_smoke_test(config: &Config) -> bool {
 /// Allowlist validation diagnostics for doctor command.
 #[derive(Debug, Default)]
 struct AllowlistDiagnostics {
-    /// Number of allowlist layers found (project/user)
+    /// Number of allowlist layers found (project/user/system)
     layers_found: usize,
     /// Total error count
     total_errors: usize,
@@ -18643,10 +20580,17 @@ struct AllowlistDiagnostics {
     warning_messages: Vec<String>,
 }
 
-/// Diagnose allowlist health across project and user layers.
-fn diagnose_allowlists() -> AllowlistDiagnostics {
-    use crate::allowlist::{AllowSelector, AllowlistLayer};
+const ALLOWLIST_DOCTOR_REMEDIATION: &str = "Review the named allowlist file. Restrict working directories with paths (--path), \
+     set expires_at (--expires), or remove obsolete entries; use 'dcg allow-once' for \
+     one-off exceptions. Run 'dcg allowlist validate' for project/user validation; \
+     inspect system entries in their source file.";
 
+/// None denotes a synthetic namespace with dynamically generated rule names.
+type DoctorAllowlistRules =
+    std::collections::HashMap<String, Option<std::collections::HashSet<&'static str>>>;
+
+/// Diagnose the same persistent allowlist layers the evaluator loads.
+fn diagnose_allowlists(config: &Config) -> AllowlistDiagnostics {
     let mut diag = AllowlistDiagnostics::default();
 
     // An inactive repository allowlist is intentionally absent from the
@@ -18662,80 +20606,186 @@ fn diagnose_allowlists() -> AllowlistDiagnostics {
         ));
     }
 
-    // Load all allowlists
+    let active_rules = doctor_allowlist_active_rules(config);
     let allowlist = crate::allowlist::load_default_allowlists();
-
-    // Check each layer
     for loaded in &allowlist.layers {
-        // Skip system layer in doctor (less common)
-        if loaded.layer == AllowlistLayer::System {
-            continue;
-        }
-
-        // Count as found if path exists
-        let path = match loaded.layer {
-            AllowlistLayer::Agent => continue,
-            AllowlistLayer::Project => allowlist_path_for_layer(AllowlistLayer::Project),
-            AllowlistLayer::User => crate::allowlist::user_allowlist_path(),
-            AllowlistLayer::System => continue,
-        };
-
-        if !path.exists() {
-            continue;
-        }
-
-        diag.layers_found += 1;
-        let layer_label = loaded.layer.label();
-
-        // Report parse errors
-        for err in &loaded.file.errors {
-            diag.total_errors += 1;
-            diag.error_messages
-                .push(format!("{layer_label}: {}", err.message));
-        }
-
-        // Check entries
-        for (idx, entry) in loaded.file.entries.iter().enumerate() {
-            let entry_num = idx + 1;
-
-            // Check for expired entries
-            if let Some(expires_at) = &entry.expires_at {
-                if is_expired(expires_at) {
-                    diag.total_warnings += 1;
-                    diag.warning_messages.push(format!(
-                        "{layer_label}: entry {entry_num} expired ({expires_at})"
-                    ));
-                }
-            }
-
-            // Check for risky regex patterns without acknowledgement
-            if matches!(entry.selector, AllowSelector::RegexPattern(_)) && !entry.risk_acknowledged
-            {
-                diag.total_warnings += 1;
-                diag.warning_messages.push(format!(
-                    "{layer_label}: entry {entry_num} uses regex without risk_acknowledged"
-                ));
-            }
-
-            // Check for overly broad wildcards
-            if let AllowSelector::Rule(rule_id) = &entry.selector {
-                if rule_id.pack_id == "*" {
-                    diag.total_errors += 1;
-                    diag.error_messages.push(format!(
-                        "{layer_label}: entry {entry_num} uses dangerous global wildcard (*:*)"
-                    ));
-                } else if rule_id.pattern_name == "*" {
-                    diag.total_warnings += 1;
-                    diag.warning_messages.push(format!(
-                        "{layer_label}: entry {entry_num} uses pack wildcard ({}:*)",
-                        rule_id.pack_id
-                    ));
-                }
-            }
+        if loaded.layer != AllowlistLayer::Agent && loaded.path.exists() {
+            diagnose_allowlist_layer(loaded, &active_rules, &mut diag);
         }
     }
 
     diag
+}
+
+/// Resolve enabled rule inventories once. Guidance includes semantic filesystem
+/// rules as well as regex rules; heredoc refinements have dynamic identities.
+fn doctor_allowlist_active_rules(config: &Config) -> DoctorAllowlistRules {
+    use crate::heredoc::ScriptLanguage;
+
+    let mut active = DoctorAllowlistRules::new();
+    // Windows payloads enable their default packs on Unix too. Doctor audits
+    // persistent grants that can affect either supported shell dialect.
+    for pack_id in REGISTRY.expand_enabled_ordered(&config.enabled_pack_ids_for_payload(true)) {
+        if let Some(pack) = REGISTRY.get(&pack_id) {
+            active.insert(pack_id, Some(pack.guidance_rule_names().collect()));
+        }
+    }
+    let external = load_external_packs(&config.packs.expand_custom_paths());
+    for (pack_id, pack) in external.iter_packs() {
+        active.insert(pack_id.clone(), Some(pack.guidance_rule_names().collect()));
+    }
+
+    // Executable-text sinks are checked even when optional heredoc scanning
+    // is disabled. Do not mistake these synthetic namespaces for inert rules.
+    for pack_id in ["heredoc.posix", "heredoc.shell", "heredoc.powershell"] {
+        active.insert(pack_id.to_string(), None);
+    }
+
+    let settings = config.heredoc_settings();
+    if settings.enabled {
+        for (pack_id, language) in [
+            ("heredoc.bash", ScriptLanguage::Bash),
+            ("heredoc.go", ScriptLanguage::Go),
+            ("heredoc.php", ScriptLanguage::Php),
+            ("heredoc.python", ScriptLanguage::Python),
+            ("heredoc.ruby", ScriptLanguage::Ruby),
+            ("heredoc.perl", ScriptLanguage::Perl),
+            ("heredoc.javascript", ScriptLanguage::JavaScript),
+            ("heredoc.typescript", ScriptLanguage::TypeScript),
+        ] {
+            if settings
+                .allowed_languages
+                .as_ref()
+                .is_none_or(|languages| languages.contains(&language))
+            {
+                active.insert(pack_id.to_string(), None);
+            }
+        }
+    }
+
+    active
+}
+
+fn diagnose_allowlist_layer(
+    loaded: &crate::allowlist::LoadedAllowlistLayer,
+    active_rules: &DoctorAllowlistRules,
+    diag: &mut AllowlistDiagnostics,
+) {
+    diag.layers_found += 1;
+    let source = format!("{}: {}", loaded.layer.label(), loaded.path.display());
+
+    for err in &loaded.file.errors {
+        diag.total_errors += 1;
+        let entry = err
+            .entry_index
+            .map_or_else(String::new, |idx| format!("entry {}: ", idx + 1));
+        diag.error_messages
+            .push(format!("{source}: {entry}{}", err.message));
+    }
+
+    // Parsing drops invalid entries. Keep the original [[allow]] ordinal so a
+    // malformed earlier row cannot make remediation point at the wrong entry.
+    let rejected: std::collections::HashSet<_> = loaded
+        .file
+        .errors
+        .iter()
+        .filter_map(|err| err.entry_index)
+        .collect();
+    let mut source_index = 0;
+    for entry in &loaded.file.entries {
+        while rejected.contains(&source_index) {
+            source_index += 1;
+        }
+        let entry_num = source_index + 1;
+        source_index += 1;
+        let location = format!("{source}: entry {entry_num}");
+
+        // Share timestamp/date-only/TTL semantics with matching, including its
+        // fail-closed treatment of an uncomputable TTL.
+        if crate::allowlist::is_expired(entry) {
+            diag.total_warnings += 1;
+            diag.warning_messages.push(format!(
+                "{location} expired or has unusable expiration metadata \
+                 (expires_at={:?}, ttl={:?}, added_at={:?})",
+                entry.expires_at, entry.ttl, entry.added_at
+            ));
+        }
+
+        if matches!(entry.selector, AllowSelector::RegexPattern(_)) && !entry.risk_acknowledged {
+            diag.total_warnings += 1;
+            diag.warning_messages
+                .push(format!("{location} uses regex without risk_acknowledged"));
+        }
+
+        if let Some(warning) = unrestricted_allowlist_warning(entry, active_rules) {
+            diag.total_warnings += 1;
+            diag.warning_messages.push(format!("{location}: {warning}"));
+        } else if let AllowSelector::Rule(rule_id) = &entry.selector {
+            if rule_id.pack_id == "*" {
+                diag.total_errors += 1;
+                diag.error_messages
+                    .push(format!("{location} uses dangerous global wildcard (*:*)"));
+            } else if rule_id.pattern_name == "*" {
+                diag.total_warnings += 1;
+                diag.warning_messages.push(format!(
+                    "{location} uses pack wildcard ({}:*)",
+                    rule_id.pack_id
+                ));
+            }
+        }
+    }
+}
+
+/// Audit whole-rule grants, not exact commands or regex selectors. Eligibility
+/// deliberately follows parsed runtime semantics: e.g. environments/context
+/// metadata does not enforce a restriction, and session=false is indefinite.
+fn unrestricted_allowlist_warning(
+    entry: &AllowEntry,
+    active_rules: &DoctorAllowlistRules,
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let AllowSelector::Rule(rule_id) = &entry.selector else {
+        return None;
+    };
+    let rule_is_active = active_rules.get(&rule_id.pack_id).is_some_and(|names| {
+        names.as_ref().is_none_or(|names| {
+            (rule_id.pattern_name == "*" && !names.is_empty())
+                || names.contains(rule_id.pattern_name.as_str())
+        })
+    });
+    if rule_id.pack_id == "*"
+        || !rule_is_active
+        || !crate::allowlist::entry_has_unrestricted_path_scope(entry)
+        || entry.expires_at.is_some()
+        || entry.ttl.is_some()
+        || entry.session == Some(true)
+        || !crate::allowlist::is_entry_valid(entry)
+    {
+        return None;
+    }
+
+    let risk = match rule_id.pack_id.as_str() {
+        "core.filesystem" | "windows.filesystem" => {
+            "HIGH RISK: bypasses destructive filesystem protection"
+        }
+        "core.git" => "HIGH RISK: bypasses destructive Git protection",
+        _ => "bypasses this rule's protection",
+    };
+    let mut warning = format!(
+        "active globally scoped, indefinite allowlist exception for rule {rule_id}: \
+         {risk}; all working directories, no expiration; reason={:?}",
+        entry.reason
+    );
+    // Debug quoting preserves malformed provenance without allowing control
+    // characters to forge extra diagnostic lines or terminal escape sequences.
+    if let Some(added_by) = &entry.added_by {
+        let _ = write!(warning, "; added_by={added_by:?}");
+    }
+    if let Some(added_at) = &entry.added_at {
+        let _ = write!(warning, "; added_at={added_at:?}");
+    }
+    Some(warning)
 }
 // Allowlist CLI implementation
 // ============================================================================
@@ -19375,6 +21425,7 @@ fn handle_allow_once_clear(
                 "pending_wiped={pending_wiped}, allow_once_wiped={allow_once_wiped}, flags=all:{} pending:{} allow_once:{}",
                 args.all, args.pending, args.allow_once
             ),
+            &config.logging.redaction,
         );
     }
 
@@ -19451,6 +21502,7 @@ fn handle_allow_once_revoke(
                 "target={}, full_hash={}, pending_removed={}, allow_once_removed={}",
                 args.target, full_hash, pending_removed, allow_once_removed
             ),
+            &config.logging.redaction,
         );
     }
 
@@ -20387,7 +22439,10 @@ fn write_allowlist(
     // Preserve the existing file's permissions: a temp+rename replace
     // otherwise resets a deliberately restrictive mode (e.g. `chmod 600`) to
     // the process umask default.
-    copy_file_permissions(path, &temp_path)?;
+    let staged_file = std::fs::OpenOptions::new().write(true).open(&temp_path)?;
+    copy_file_permissions(path, &staged_file)?;
+    staged_file.sync_all()?;
+    drop(staged_file);
 
     // Create a backup before replacing the file so we can recover from write failures.
     let backup_path = backup_allowlist_file(path)?;
@@ -21993,6 +24048,330 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         assert_ne!(command, "dcg");
     }
 
+    #[test]
+    fn grok_hook_diagnostics_accept_current_native_and_legacy_matchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        assert!(!probe_grok_dcg_hook_at(&hook_path).unwrap());
+
+        for matcher in ["Bash", "run_terminal_cmd"] {
+            let mut settings = build_grok_hook_config().unwrap();
+            settings["hooks"]["PreToolUse"][0]["matcher"] = matcher.into();
+            let hook = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            hook["timeout"] = 15.into();
+            hook["onFailure"] = "block".into();
+            hook["future"] = serde_json::json!({"policy": ["operator-owned"]});
+            settings["hooks"]["PreToolUse"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "matcher": "Write", "hooks": [{"type": "command", "command": "audit"}]
+                }));
+            let original = serde_json::to_vec(&settings).unwrap();
+            std::fs::write(&hook_path, &original).unwrap();
+
+            assert!(probe_grok_dcg_hook_at(&hook_path).unwrap());
+            assert_eq!(std::fs::read(&hook_path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn grok_hook_diagnostics_reject_invalid_and_ambiguous_files_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        let fixtures: &[&[u8]] = &[
+            b"{",
+            b"\xff",
+            b"[]",
+            br#"{"hooks": []}"#,
+            br#"{"hooks": {"PreToolUse": {}}}"#,
+            br#"{"hooks": {"PreToolUse": [null]}}"#,
+            br#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": null}]}}"#,
+            br#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [null]}]}}"#,
+            br#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "dcg", "onFailure": "block", "onFailure": "continue"}]}]}}"#,
+            br#"{"hooks": {}, "hooks": {"PreToolUse": []}}"#,
+            br#"{"operator": [{"policy": "block", "policy": "continue"}]}"#,
+        ];
+        for original in fixtures {
+            std::fs::write(&hook_path, original).unwrap();
+            assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+            assert_eq!(std::fs::read(&hook_path).unwrap(), *original);
+        }
+        assert!(probe_grok_dcg_hook_at(dir.path()).is_err());
+    }
+
+    #[test]
+    fn grok_hook_diagnostics_reject_nonprotecting_native_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        let defaults = build_grok_hook_config().unwrap();
+        let mut fixtures = vec![serde_json::json!({"hooks": {"PreToolUse": []}})];
+        for (field, value) in [
+            ("type", serde_json::json!("prompt")),
+            ("command", serde_json::json!("/stale/dcg")),
+            ("command", serde_json::json!(null)),
+            ("async", serde_json::json!(true)),
+            ("async", serde_json::json!("false")),
+        ] {
+            let mut settings = defaults.clone();
+            settings["hooks"]["PreToolUse"][0]["hooks"][0][field] = value;
+            fixtures.push(settings);
+        }
+        let mut wrong_matcher = defaults.clone();
+        wrong_matcher["hooks"]["PreToolUse"][0]["matcher"] = "Write".into();
+        fixtures.push(wrong_matcher);
+        let mut duplicate = defaults.clone();
+        let mut second_hook = defaults["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+        duplicate["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"] = "block".into();
+        second_hook["onFailure"] = "continue".into();
+        duplicate["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_hook);
+        fixtures.push(duplicate);
+
+        for settings in fixtures {
+            let original = serde_json::to_vec(&settings).unwrap();
+            std::fs::write(&hook_path, &original).unwrap();
+            assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+            assert_eq!(std::fs::read(&hook_path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn grok_hook_diagnostics_verify_repairs_without_weakening_failure_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        std::fs::write(
+            &hook_path,
+            br#"{"hooks": {"PreToolUse": [{"matcher": "run_terminal_cmd", "hooks": [{"type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+
+        for force in [false, false, true] {
+            install_grok_hook_at(&hook_path, force).unwrap();
+            assert!(probe_grok_dcg_hook_at(&hook_path).unwrap());
+            let settings =
+                parse_hook_settings_json(&std::fs::read_to_string(&hook_path).unwrap()).unwrap();
+            let hook = &settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            assert_eq!(hook["onFailure"], "block");
+            assert_eq!(hook["timeout"], 15);
+        }
+
+        let mut settings = build_grok_hook_config().unwrap();
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = true.into();
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"] = "block".into();
+        std::fs::write(&hook_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        install_grok_hook_at(&hook_path, true).unwrap();
+        assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+        let after =
+            parse_hook_settings_json(&std::fs::read_to_string(&hook_path).unwrap()).unwrap();
+        assert_eq!(after, settings, "repair must not override operator policy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_hook_diagnostics_reject_dangling_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        let target = dir.path().join("missing.json");
+        std::os::unix::fs::symlink(&target, &hook_path).unwrap();
+        assert!(probe_grok_dcg_hook_at(&hook_path).is_err());
+        assert_eq!(std::fs::read_link(&hook_path).unwrap(), target);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn grok_hook_policy_install_preserves_duplicate_fields_and_unrelated_settings() {
+        let mut settings = serde_json::json!({
+            "description": "Operator-managed safety hooks",
+            "operator": {"team": "security"},
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "label": "canonical", "hooks": [
+                        {"type": "command", "command": "bash-audit", "timeout": 7},
+                        {"type": "command", "command": "/old/dcg", "timeout": 15, "shell": "stale"}
+                    ]},
+                    {"matcher": "run_terminal_cmd", "label": "keep this scope", "hooks": [
+                        {"type": "command", "command": "\"C:\\old tools\\dcg.exe\"", "onFailure": "block", "future": {"enabled": true}},
+                        {"type": "command", "command": "terminal-audit"}
+                    ]},
+                    {"matcher": "Write", "hooks": [
+                        {"type": "command", "command": "dcg", "statusMessage": "Checking safety"}
+                    ]}
+                ],
+                "PostToolUse": [{"matcher": "*", "hooks": [{"command": "after-audit"}]}]
+            }
+        });
+        let original = settings.clone();
+        assert!(install_grok_hook_into_settings(&mut settings, false).unwrap());
+
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "only one dcg registration remains");
+        assert_eq!(entries[0]["matcher"], "Bash");
+        assert_eq!(entries[0]["label"], "canonical");
+        let hook = &entries[0]["hooks"][0];
+        let defaults = build_grok_hook_config().unwrap();
+        assert!(hook_has_dcg_identity(
+            hook,
+            &defaults["hooks"]["PreToolUse"][0]["hooks"][0]
+        ));
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(
+            hook["timeout"], 15,
+            "operator timeout overrides the default"
+        );
+        assert_eq!(hook["future"], serde_json::json!({"enabled": true}));
+        assert_eq!(hook["statusMessage"], "Checking safety");
+        assert_eq!(
+            entries[0]["hooks"][1],
+            original["hooks"]["PreToolUse"][0]["hooks"][0]
+        );
+        assert_eq!(entries[1]["matcher"], "run_terminal_cmd");
+        assert_eq!(entries[1]["label"], "keep this scope");
+        assert_eq!(
+            entries[1]["hooks"],
+            serde_json::json!([{"type": "command", "command": "terminal-audit"}])
+        );
+        assert_eq!(settings["description"], original["description"]);
+        assert_eq!(settings["operator"], original["operator"]);
+        assert_eq!(
+            settings["hooks"]["PostToolUse"],
+            original["hooks"]["PostToolUse"]
+        );
+
+        let repaired = settings.clone();
+        for force in [false, true, false] {
+            assert_eq!(
+                install_grok_hook_into_settings(&mut settings, force).unwrap(),
+                force
+            );
+            assert_eq!(settings, repaired);
+        }
+    }
+
+    #[test]
+    fn grok_hook_policy_install_uses_defaults_for_a_new_file() {
+        let mut settings = serde_json::json!({});
+        assert!(install_grok_hook_into_settings(&mut settings, false).unwrap());
+        assert_eq!(settings, build_grok_hook_config().unwrap());
+        assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 5);
+        assert!(!install_grok_hook_into_settings(&mut settings, false).unwrap());
+    }
+
+    #[test]
+    fn grok_hook_policy_install_refuses_conflicts_and_malformed_settings_without_mutation() {
+        let fixtures = [
+            serde_json::json!([]),
+            serde_json::json!({"hooks": []}),
+            serde_json::json!({"hooks": {"PreToolUse": {}}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash"}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": "invalid"}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "run_terminal_cmd", "hooks": null}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"command": "dcg", "onFailure": "block"}]},
+                {"matcher": "run_terminal_cmd", "hooks": [{"command": "/old/dcg", "onFailure": "continue"}]}
+            ]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"command": "dcg", "timeout": 15}]},
+                {"matcher": "Write", "hooks": [{"command": "/old/dcg", "timeout": 5}]}
+            ]}}),
+        ];
+        for fixture in fixtures {
+            for force in [false, true] {
+                let mut settings = fixture.clone();
+                assert!(install_grok_hook_into_settings(&mut settings, force).is_err());
+                assert_eq!(
+                    settings, fixture,
+                    "failed repair must leave settings intact"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_hook_policy_failed_staging_preserves_the_blocking_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        let original = serde_json::to_vec(&serde_json::json!({
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                "type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"
+            }]}]}
+        }))
+        .unwrap();
+        std::fs::write(&hook_path, &original).unwrap();
+        let stage_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::write(&stage_path, b"foreign staged content").unwrap();
+
+        for force in [false, true] {
+            assert!(install_grok_hook_at(&hook_path, force).is_err());
+            assert_eq!(std::fs::read(&hook_path).unwrap(), original);
+            assert_eq!(
+                std::fs::read(&stage_path).unwrap(),
+                b"foreign staged content"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_hook_policy_install_preserves_unix_owner_and_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook_path = dir.path().join("dcg.json");
+        std::fs::write(
+            &hook_path,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"
+                }]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        if std::fs::metadata(&hook_path).unwrap().uid() == 0 {
+            match chown(&hook_path, Some(65534), Some(65534)) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::InvalidInput
+                            | std::io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    eprintln!(
+                        "cross-owner fixture unavailable: {error}; checking same-owner preservation"
+                    );
+                }
+                Err(error) => panic!("prepare cross-owner Grok fixture: {error}"),
+            }
+        } else {
+            eprintln!("cross-owner fixture requires root; checking same-owner preservation");
+        }
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let original = std::fs::metadata(&hook_path).unwrap();
+
+        for force in [false, true] {
+            assert!(install_grok_hook_at(&hook_path, force).unwrap());
+            let installed = std::fs::metadata(&hook_path).unwrap();
+            assert_eq!(installed.uid(), original.uid());
+            assert_eq!(installed.gid(), original.gid());
+            assert_eq!(installed.permissions().mode() & 0o777, 0o640);
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+            assert_eq!(
+                settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+                "block"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn posix_hook_quoting_round_trips_shell_metacharacters() {
@@ -22030,6 +24409,34 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
             "dcg used as another executable's argument is not a dcg-owned hook"
         );
         assert!(!is_dcg_command(r"& 'C:\unterminated\dcg.exe"));
+    }
+
+    #[test]
+    fn dcg_hook_command_parser_preserves_other_programs_with_dcg_path_arguments() {
+        for command in [
+            "/usr/bin/logger /opt/dcg",
+            "/usr/bin/logger relative/dcg",
+            "/usr/bin/logger -- /opt/dcg",
+            "logger /opt/dcg",
+            "/usr/bin/logger; /opt/dcg",
+            r"C:\tools\logger C:\opt\dcg.exe",
+            r"C:\tools\logger.exe relative\dcg.exe",
+            r"C:\tools\logger --config relative\dcg.exe",
+            r"C:\tools\logger & relative\dcg.exe",
+        ] {
+            assert!(
+                !is_dcg_command(command),
+                "a dcg path argument does not make the hook DCG-owned: {command}"
+            );
+        }
+        assert_eq!(
+            dcg_command_program("/opt/dcg --log /other/dcg"),
+            Some("/opt/dcg".to_string())
+        );
+        assert_eq!(
+            dcg_command_program(r"C:\tools\dcg.exe --log C:\other\dcg.exe"),
+            Some(r"C:\tools\dcg.exe".to_string())
+        );
     }
 
     // ---- Crush installer (#388) -------------------------------------------
@@ -22202,6 +24609,132 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
             install_crush_hook_into_config(&mut config, false, crush_entry_for("/opt/dcg"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn install_crush_hook_policy_merges_all_aliases_and_repeats_without_loss() {
+        let audit = serde_json::json!({
+            "matcher": "^write$", "command": "/usr/bin/logger /opt/dcg", "name": "audit"
+        });
+        let policy = serde_json::json!({
+            "matcher": "bash", "command": "/old/dcg", "onFailure": "block", "timeout": 15
+        });
+        let extra = serde_json::json!({
+            "matcher": ".*", "command": "/older/dcg", "name": "operator-guard",
+            "env": {"DCG_HOOK_TIMEOUT_MS": "4000"}, "enabled": false
+        });
+        for (first, second) in [(&policy, &extra), (&extra, &policy)] {
+            let mut config = serde_json::json!({
+                "options": {"debug": true},
+                "hooks": {
+                    "PreToolUse": [first, audit],
+                    "pre_tool_use": [second],
+                    "PostToolUse": [{"command": "notify"}]
+                }
+            });
+            let original = config.clone();
+            assert!(
+                install_crush_hook_into_config(&mut config, false, crush_entry_for("/new/dcg"))
+                    .expect("compatible duplicate policies")
+            );
+            let entries = crush_pre_tool_use(&config);
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0]["onFailure"], "block");
+            assert_eq!(entries[0]["timeout"], 15);
+            assert_eq!(entries[0]["name"], "operator-guard");
+            assert_eq!(entries[0]["enabled"], false);
+            assert_eq!(entries[0]["env"], extra["env"]);
+            assert_eq!(entries[0]["matcher"], CRUSH_SHELL_MATCHER);
+            assert_eq!(
+                entries[0]["command"],
+                crush_entry_for("/new/dcg")["command"]
+            );
+            assert_eq!(entries[1], audit);
+            assert_eq!(config["hooks"]["pre_tool_use"], serde_json::json!([]));
+            assert_eq!(config["options"], original["options"]);
+            assert_eq!(
+                config["hooks"]["PostToolUse"],
+                original["hooks"]["PostToolUse"]
+            );
+            let repaired = serde_json::to_string_pretty(&config).unwrap();
+            for force in [false, true, false] {
+                assert_eq!(
+                    install_crush_hook_into_config(&mut config, force, crush_entry_for("/new/dcg"))
+                        .expect("repeat install"),
+                    force
+                );
+                assert_eq!(serde_json::to_string_pretty(&config).unwrap(), repaired);
+            }
+        }
+    }
+
+    #[test]
+    fn install_crush_hook_policy_conflicts_and_malformed_aliases_leave_config_untouched() {
+        for (key, first, second) in [
+            (
+                "onFailure",
+                serde_json::json!("block"),
+                serde_json::json!("continue"),
+            ),
+            ("timeout", serde_json::json!(15), serde_json::json!(5)),
+            ("enabled", serde_json::json!(false), serde_json::json!(0)),
+            (
+                "env",
+                serde_json::json!({"POLICY": "strict"}),
+                serde_json::json!({"POLICY": "audit"}),
+            ),
+        ] {
+            for force in [false, true] {
+                let mut first_hook = serde_json::json!({"matcher": "bash", "command": "/old/dcg"});
+                first_hook[key] = first.clone();
+                let mut second_hook = serde_json::json!({"matcher": ".*", "command": "/older/dcg"});
+                second_hook[key] = second.clone();
+                let mut config = serde_json::json!({
+                    "hooks": {"PreToolUse": [first_hook], "PRE_TOOL_USE": [second_hook]}
+                });
+                let original = config.clone();
+                let error =
+                    install_crush_hook_into_config(&mut config, force, crush_entry_for("/new/dcg"))
+                        .expect_err("conflicting operator fields must not be guessed");
+                assert!(error.to_string().contains(key), "{error}");
+                assert_eq!(config, original);
+            }
+        }
+        for force in [false, true] {
+            let mut config = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{"command": "/old/dcg", "onFailure": "block"}],
+                    "pre_tool_use": {"command": "/other/dcg", "timeout": 15}
+                }
+            });
+            let original = config.clone();
+            assert!(
+                install_crush_hook_into_config(&mut config, force, crush_entry_for("/new/dcg"))
+                    .is_err()
+            );
+            assert_eq!(
+                config, original,
+                "validate every alias before removing any hook"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_crush_hook_policy_failed_staging_preserves_blocking_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crush.json");
+        let original = br#"{"hooks":{"PreToolUse":[{"matcher":"bash","command":"/old/dcg","onFailure":"block","timeout":15}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let stage = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::write(&stage, b"foreign staged content").unwrap();
+        for force in [false, true] {
+            assert!(install_crush_hook_at(&path, force).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(&stage).unwrap(), b"foreign staged content");
+        }
     }
 
     #[test]
@@ -22487,6 +25020,154 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         }
     }
 
+    #[test]
+    fn reasonix_hook_policy_merges_every_registration_and_survives_repeats() {
+        let desired = reasonix_entry_for(&host_abs("/new/dcg"));
+        let first = serde_json::json!({
+            "match": "bash", "command": "/old/dcg", "timeout": 15000,
+            "description": "operator policy", "onFailure": "block"
+        });
+        let second = serde_json::json!({
+            "match": "pwsh", "command": "dcg --legacy", "onFailure": "block",
+            "env": {"DCG_STRICT": "1"}, "future": {"enabled": true},
+            "shell": "operator shell", "type": "operator type"
+        });
+        let unrelated = serde_json::json!({
+            "match": "write_file", "command": "/usr/bin/logger /opt/dcg", "timeout": 2500
+        });
+        for previous in [
+            vec![first.clone(), unrelated.clone(), second.clone()],
+            vec![second.clone(), unrelated.clone(), first.clone()],
+        ] {
+            let mut settings = serde_json::json!({
+                "theme": "operator theme",
+                "hooks": {"PreToolUse": previous, "Stop": [{"command": "audit-stop"}]}
+            });
+            assert!(
+                install_reasonix_hook_into_settings(&mut settings, false, desired.clone()).unwrap()
+            );
+            let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0]["command"], desired["command"]);
+            assert_eq!(entries[0]["match"], REASONIX_SHELL_MATCH);
+            assert_eq!(entries[0]["timeout"], 15000);
+            assert_eq!(entries[0]["description"], "operator policy");
+            assert_eq!(entries[0]["onFailure"], "block");
+            assert_eq!(entries[0]["env"], second["env"]);
+            assert_eq!(entries[0]["future"], second["future"]);
+            assert_eq!(entries[0]["shell"], "operator shell");
+            assert_eq!(entries[0]["type"], "operator type");
+            assert_eq!(entries[1], unrelated);
+            assert_eq!(settings["theme"], "operator theme");
+            assert_eq!(settings["hooks"]["Stop"][0]["command"], "audit-stop");
+            let repaired = serde_json::to_vec(&settings).unwrap();
+            for force in [false, true, false] {
+                assert_eq!(
+                    install_reasonix_hook_into_settings(&mut settings, force, desired.clone())
+                        .unwrap(),
+                    force
+                );
+                assert_eq!(serde_json::to_vec(&settings).unwrap(), repaired);
+            }
+        }
+    }
+
+    #[test]
+    fn reasonix_hook_policy_refuses_conflicting_duplicate_fields_without_mutation() {
+        for (key, first_value, second_value) in [
+            (
+                "onFailure",
+                serde_json::json!("block"),
+                serde_json::json!("continue"),
+            ),
+            ("timeout", serde_json::json!(15000), serde_json::json!(5000)),
+            ("future", serde_json::json!(false), serde_json::json!(0)),
+            (
+                "env",
+                serde_json::json!({"POLICY": "strict"}),
+                serde_json::json!({"POLICY": "observe"}),
+            ),
+        ] {
+            let mut first = serde_json::json!({"command": "dcg", "match": "bash"});
+            first[key] = first_value;
+            let mut second = serde_json::json!({"command": "/old/dcg", "match": "pwsh"});
+            second[key] = second_value;
+            for previous in [
+                vec![first.clone(), second.clone()],
+                vec![second.clone(), first.clone()],
+            ] {
+                let original = serde_json::json!({"hooks": {"PreToolUse": previous}});
+                for force in [false, true] {
+                    let mut settings = original.clone();
+                    let error = install_reasonix_hook_into_settings(
+                        &mut settings,
+                        force,
+                        reasonix_entry_for(&host_abs("/new/dcg")),
+                    )
+                    .unwrap_err();
+                    assert!(error.to_string().contains(key), "{error}");
+                    assert_eq!(settings, original, "failed repair must not mutate policy");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reasonix_hook_policy_read_and_validation_errors_preserve_existing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let fixtures: &[&[u8]] = &[
+            b"{\"hooks\":",
+            b"\xff",
+            b"null",
+            b"{\"PreToolUse\":[]}",
+            b"{\"hooks\":null}",
+            b"{\"hooks\":{\"PreToolUse\":{}}}",
+            br#"{"hooks":{"PreToolUse":[{"command":"dcg","onFailure":"block"},{"command":"/old/dcg","onFailure":"continue"}]}}"#,
+        ];
+        for original in fixtures {
+            std::fs::write(&path, original).unwrap();
+            for force in [false, true] {
+                assert!(install_reasonix_hook_at(&path, force).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), *original);
+            }
+        }
+        let directory_path = dir.path().join("unreadable-settings.json");
+        std::fs::create_dir(&directory_path).unwrap();
+        assert!(install_reasonix_hook_at(&directory_path, true).is_err());
+        assert!(directory_path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reasonix_hook_policy_refuses_dangling_links_and_failed_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let dangling_path = dir.path().join("dangling.json");
+        let missing_target = dir.path().join("missing.json");
+        std::os::unix::fs::symlink(&missing_target, &dangling_path).unwrap();
+        for force in [false, true] {
+            assert!(install_reasonix_hook_at(&dangling_path, force).is_err());
+            assert_eq!(std::fs::read_link(&dangling_path).unwrap(), missing_target);
+            assert!(!missing_target.exists());
+        }
+
+        let path = dir.path().join("settings.json");
+        let original = br#"{"hooks":{"PreToolUse":[{"command":"dcg","match":"bash","onFailure":"block","timeout":15000}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let staging_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::write(&staging_path, b"foreign staging content").unwrap();
+        for force in [false, true] {
+            assert!(install_reasonix_hook_at(&path, force).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(
+                std::fs::read(&staging_path).unwrap(),
+                b"foreign staging content"
+            );
+        }
+    }
+
     /// #358: the Windows command form is a double-quoted path, which Reasonix
     /// hands to `cmd.exe /d /s /c "<command>"`; dcg must recognize it as its
     /// own on reinstall and uninstall.
@@ -22501,6 +25182,416 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
             reasonix_dcg_hook_entry_for_executable(std::path::Path::new("dcg"), false).is_err(),
             "a relative path is never written"
         );
+    }
+
+    // ---- #572: Muse Code hook registration ---------------------------------
+
+    const MUSE_TEST_COMMAND: &str = "/opt/dcg/bin/dcg --agent muse";
+
+    /// An absolute path on this platform (`/x` is not absolute on Windows).
+    fn muse_test_absolute(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
+    #[test]
+    fn muse_config_dir_follows_absolute_xdg_config_home_only() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            muse_config_dir_for(None, home),
+            std::path::PathBuf::from("/home/u/.config/muse")
+        );
+        let xdg = muse_test_absolute("/xdg");
+        assert_eq!(
+            muse_config_dir_for(Some(std::ffi::OsStr::new(&xdg)), home),
+            std::path::PathBuf::from(&xdg).join("muse")
+        );
+        for ignored in ["", "relative/xdg"] {
+            assert_eq!(
+                muse_config_dir_for(Some(std::ffi::OsStr::new(ignored)), home),
+                std::path::PathBuf::from("/home/u/.config/muse"),
+                "XDG_CONFIG_HOME={ignored:?} is not an absolute path and is ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn muse_hook_command_names_the_agent_and_quotes_only_when_needed() {
+        let exe = muse_test_absolute("/opt/dcg/bin/dcg");
+        let plain =
+            muse_dcg_hook_command_for_executable(std::path::Path::new(&exe), false).unwrap();
+        assert_eq!(plain, format!("{exe} --agent muse"));
+        assert!(is_dcg_command(&plain));
+        assert!(muse_command_names_muse_agent(&plain));
+
+        let exe = muse_test_absolute("/opt/my tools/dcg");
+        let spaced =
+            muse_dcg_hook_command_for_executable(std::path::Path::new(&exe), false).unwrap();
+        assert_eq!(spaced, format!("\"{exe}\" --agent muse"));
+        assert!(is_dcg_command(&spaced));
+
+        let exe = muse_test_absolute("/Users/Jane Doe/dcg.exe");
+        let windows =
+            muse_dcg_hook_command_for_executable(std::path::Path::new(&exe), true).unwrap();
+        assert_eq!(windows, format!("\"{exe}\" --agent muse"));
+        assert!(is_dcg_command(&windows));
+        let exe = muse_test_absolute("/Users/jane/.local/bin/dcg.exe");
+        assert_eq!(
+            muse_dcg_hook_command_for_executable(std::path::Path::new(&exe), true).unwrap(),
+            format!("{exe} --agent muse"),
+            "a path without spaces needs no quotes in any shell"
+        );
+
+        assert!(
+            muse_dcg_hook_command_for_executable(std::path::Path::new("dcg"), false).is_err(),
+            "a relative path is never written"
+        );
+        assert!(muse_command_names_muse_agent("/x/dcg --agent=muse-code"));
+        assert!(!muse_command_names_muse_agent("/x/dcg"));
+        assert!(!muse_command_names_muse_agent("/x/dcg --agent codex"));
+    }
+
+    #[test]
+    fn muse_install_creates_a_versioned_settings_document() {
+        let mut settings = serde_json::json!({});
+        assert!(install_muse_hook_into_settings(&mut settings, false, MUSE_TEST_COMMAND).unwrap());
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "schema_version": 1,
+                "hooks": {"PreToolUse": [{
+                    "matcher": "^(shell|exec_command|bash)$",
+                    "hooks": [{"type": "command", "command": MUSE_TEST_COMMAND}],
+                }]},
+            })
+        );
+        assert_eq!(probe_muse_settings(&settings), MuseHookProbe::Current);
+        // Idempotent without --force, rewritten with it.
+        assert!(!install_muse_hook_into_settings(&mut settings, false, MUSE_TEST_COMMAND).unwrap());
+        assert!(install_muse_hook_into_settings(&mut settings, true, MUSE_TEST_COMMAND).unwrap());
+    }
+
+    #[test]
+    fn muse_install_keeps_user_state_and_refreshes_only_dcg() {
+        let mut settings = serde_json::json!({
+            "schema_version": 1,
+            "model": "muse-spark-1.2",
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "^write_file$", "hooks": [{"type": "command", "command": "audit-writes"}]},
+                    {"matcher": "^(shell|exec_command)$", "hooks": [
+                        {"type": "command", "command": "/old/bin/dcg --agent muse", "timeout_ms": 9000},
+                        {"type": "command", "command": "shell-logger"}
+                    ]},
+                    {"matcher": "^shell$", "hooks": [{"type": "command", "command": "/old/bin/dcg"}]},
+                    {"matcher": "^empty$", "hooks": []}
+                ],
+                "SessionStart": [{"hooks": [{"type": "command", "command": "hello"}]}]
+            }
+        });
+        assert_eq!(probe_muse_settings(&settings), MuseHookProbe::Stale);
+        assert!(install_muse_hook_into_settings(&mut settings, false, MUSE_TEST_COMMAND).unwrap());
+        assert_eq!(settings["model"], "muse-spark-1.2");
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "hello"
+        );
+        let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            groups,
+            &vec![
+                serde_json::json!({"matcher": "^(shell|exec_command|bash)$", "hooks": [
+                    {"type": "command", "command": MUSE_TEST_COMMAND, "timeout_ms": 9000}
+                ]}),
+                serde_json::json!({"matcher": "^write_file$", "hooks": [
+                    {"type": "command", "command": "audit-writes"}
+                ]}),
+                // The user's handler stays in its own group; dcg's left it.
+                serde_json::json!({"matcher": "^(shell|exec_command)$", "hooks": [
+                    {"type": "command", "command": "shell-logger"}
+                ]}),
+                // A group the user left empty is not dcg's to remove.
+                serde_json::json!({"matcher": "^empty$", "hooks": []}),
+            ],
+            "{settings:#}"
+        );
+        assert_eq!(probe_muse_settings(&settings), MuseHookProbe::Current);
+
+        assert!(uninstall_dcg_hook_from_muse_settings(&mut settings).unwrap());
+        assert_eq!(probe_muse_settings(&settings), MuseHookProbe::Missing);
+        let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 3, "{settings:#}");
+        assert_eq!(settings["schema_version"], 1);
+        assert!(!uninstall_dcg_hook_from_muse_settings(&mut settings).unwrap());
+    }
+
+    #[test]
+    fn muse_install_refuses_shapes_it_cannot_read() {
+        for (label, mut settings) in [
+            ("array root", serde_json::json!([])),
+            ("future schema", serde_json::json!({"schema_version": 2})),
+            ("string schema", serde_json::json!({"schema_version": "1"})),
+            (
+                "hooks array",
+                serde_json::json!({"schema_version": 1, "hooks": []}),
+            ),
+            (
+                "PreToolUse object",
+                serde_json::json!({"schema_version": 1, "hooks": {"PreToolUse": {}}}),
+            ),
+        ] {
+            let before = settings.clone();
+            assert!(
+                install_muse_hook_into_settings(&mut settings, true, MUSE_TEST_COMMAND).is_err(),
+                "{label} must be refused"
+            );
+            if before.is_object() && before.get("schema_version").is_some() {
+                assert_eq!(settings, before, "{label} must be left untouched");
+            }
+        }
+        // A missing schema_version is supplied: Muse requires it.
+        let mut unversioned = serde_json::json!({"model": "m"});
+        assert!(
+            install_muse_hook_into_settings(&mut unversioned, false, MUSE_TEST_COMMAND).unwrap()
+        );
+        assert_eq!(unversioned["schema_version"], 1);
+        assert_eq!(unversioned["model"], "m");
+    }
+
+    #[test]
+    fn muse_hook_policy_merges_every_registration_and_preserves_scopes_on_repeat() {
+        let fixture = serde_json::json!({
+            "schema_version": 1,
+            "model": "operator-model",
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": MUSE_SHELL_MATCHER, "operator_note": "keep", "hooks": [
+                        {"type": "command", "command": "canonical-audit"},
+                        {"type": "command", "command": "/old/dcg --agent muse", "timeout_ms": 15000}
+                    ]},
+                    {"matcher": "^shell$", "hooks": [
+                        {"type": "command", "command": "dcg", "onFailure": "block"},
+                        {"type": "command", "command": "shell-audit"}
+                    ]},
+                    {"matcher": "^exec_command$", "hooks": [
+                        {"type": "command", "command": "/stale/dcg", "onFailure": "block",
+                         "env": {"DCG_HOOK_TIMEOUT_MS": "5000"}, "future_policy": [true, "retain"]}
+                    ]}
+                ],
+                "SessionStart": [{"hooks": [{"type": "command", "command": "hello"}]}]
+            }
+        });
+        for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+            let mut settings = fixture.clone();
+            settings["hooks"]["PreToolUse"] = serde_json::Value::Array(
+                order
+                    .map(|index| fixture["hooks"]["PreToolUse"][index].clone())
+                    .to_vec(),
+            );
+            assert!(
+                install_muse_hook_into_settings(&mut settings, false, MUSE_TEST_COMMAND).unwrap()
+            );
+            assert_eq!(settings["model"], fixture["model"]);
+            assert_eq!(
+                settings["hooks"]["SessionStart"],
+                fixture["hooks"]["SessionStart"]
+            );
+            let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(groups.len(), 2, "duplicate-only groups are removed");
+            assert_eq!(groups[0]["matcher"], MUSE_SHELL_MATCHER);
+            assert_eq!(groups[0]["operator_note"], "keep");
+            let handler = &groups[0]["hooks"][0];
+            assert_eq!(handler["type"], "command");
+            assert_eq!(handler["command"], MUSE_TEST_COMMAND);
+            assert_eq!(handler["timeout_ms"], 15000);
+            assert_eq!(handler["onFailure"], "block");
+            assert_eq!(
+                handler["env"],
+                serde_json::json!({"DCG_HOOK_TIMEOUT_MS": "5000"})
+            );
+            assert_eq!(
+                handler["future_policy"],
+                serde_json::json!([true, "retain"])
+            );
+            assert_eq!(groups[0]["hooks"][1]["command"], "canonical-audit");
+            assert_eq!(groups[1]["matcher"], "^shell$");
+            assert_eq!(
+                groups[1]["hooks"],
+                serde_json::json!([{"type": "command", "command": "shell-audit"}])
+            );
+
+            let repaired = settings.clone();
+            for force in [false, true, false] {
+                assert_eq!(
+                    install_muse_hook_into_settings(&mut settings, force, MUSE_TEST_COMMAND)
+                        .unwrap(),
+                    force
+                );
+                assert_eq!(settings, repaired);
+            }
+        }
+    }
+
+    #[test]
+    fn muse_hook_policy_conflicts_refuse_without_adding_a_schema_version() {
+        for (field, left, right) in [
+            (
+                "onFailure",
+                serde_json::json!("block"),
+                serde_json::json!("continue"),
+            ),
+            (
+                "timeout_ms",
+                serde_json::json!(15000),
+                serde_json::json!(5000),
+            ),
+            (
+                "future_policy",
+                serde_json::json!(false),
+                serde_json::json!(0),
+            ),
+        ] {
+            for reverse in [false, true] {
+                for force in [false, true] {
+                    let mut first = serde_json::json!({"type": "command", "command": "dcg"});
+                    first[field] = left.clone();
+                    let mut second = serde_json::json!({"type": "command", "command": "/old/dcg"});
+                    second[field] = right.clone();
+                    let mut handlers = vec![first, second];
+                    if reverse {
+                        handlers.reverse();
+                    }
+                    let mut settings = serde_json::json!({
+                        "model": "operator-model",
+                        "hooks": {"PreToolUse": [{"matcher": MUSE_SHELL_MATCHER, "hooks": handlers}]}
+                    });
+                    let before = settings.clone();
+                    let error =
+                        install_muse_hook_into_settings(&mut settings, force, MUSE_TEST_COMMAND)
+                            .expect_err("conflicting policy must not be resolved by order");
+                    assert!(error.to_string().contains(field), "{error}");
+                    assert_eq!(
+                        settings, before,
+                        "failed repair must leave the entire object intact"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn muse_hook_policy_malformed_groups_refuse_without_mutation() {
+        for fixture in [
+            serde_json::json!({"hooks": []}),
+            serde_json::json!({"hooks": {"PreToolUse": {}}}),
+            serde_json::json!({"hooks": {"PreToolUse": [null]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": MUSE_SHELL_MATCHER}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "^shell$", "hooks": null}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": 7, "hooks": [{"command": "dcg"}]}]}}),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": MUSE_SHELL_MATCHER, "hooks": ["dcg"]}]}}),
+        ] {
+            for force in [false, true] {
+                let mut settings = fixture.clone();
+                assert!(
+                    install_muse_hook_into_settings(&mut settings, force, MUSE_TEST_COMMAND)
+                        .is_err()
+                );
+                assert_eq!(
+                    settings, fixture,
+                    "failed validation must not add schema_version or hooks"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn muse_hook_policy_failed_staging_and_broken_symlink_preserve_existing_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let original = br#"{"schema_version":1,"hooks":{"PreToolUse":[{"matcher":"^shell$","hooks":[{"type":"command","command":"dcg","onFailure":"block"}]}]}}"#;
+        std::fs::write(&settings_path, original).unwrap();
+        let stage_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::write(&stage_path, b"foreign staged content").unwrap();
+        for force in [false, true] {
+            assert!(install_muse_hook_at(&settings_path, force).is_err());
+            assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+            assert_eq!(
+                std::fs::read(&stage_path).unwrap(),
+                b"foreign staged content"
+            );
+        }
+
+        let broken_dir = tempfile::tempdir().unwrap();
+        let broken_path = broken_dir.path().join("settings.json");
+        let missing_target = broken_dir.path().join("operator-settings.json");
+        symlink(&missing_target, &broken_path).unwrap();
+        for force in [false, true] {
+            assert!(install_muse_hook_at(&broken_path, force).is_err());
+            assert_eq!(std::fs::read_link(&broken_path).unwrap(), missing_target);
+            assert!(!missing_target.exists());
+        }
+    }
+
+    // ---- #577: Amp plugin --------------------------------------------------
+
+    #[test]
+    fn amp_plugin_path_follows_xdg_config_home() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            amp_system_plugin_path_for(None, home),
+            std::path::PathBuf::from("/home/u/.config/amp/plugins/dcg-guard.js")
+        );
+        assert_eq!(
+            amp_system_plugin_path_for(Some(std::ffi::OsStr::new("")), home),
+            std::path::PathBuf::from("/home/u/.config/amp/plugins/dcg-guard.js"),
+            "an empty XDG_CONFIG_HOME is unset"
+        );
+        assert_eq!(
+            amp_system_plugin_path_for(Some(std::ffi::OsStr::new("/xdg")), home),
+            std::path::PathBuf::from("/xdg/amp/plugins/dcg-guard.js")
+        );
+    }
+
+    #[test]
+    fn amp_plugin_source_embeds_the_dcg_path_once_and_probes_current() {
+        let exe = std::path::Path::new("/opt/my \"tools\"/dcg");
+        let source = build_amp_plugin_source(exe).unwrap();
+        assert!(source.starts_with(&format!("// {AMP_PLUGIN_MARKER}:")));
+        assert!(!source.contains(AMP_PLUGIN_DCG_BIN_PLACEHOLDER));
+        assert_eq!(
+            source.matches("const DCG_BIN = ").count(),
+            1,
+            "exactly one embedded path"
+        );
+        assert!(source.contains(r#"const DCG_BIN = "/opt/my \"tools\"/dcg";"#));
+        assert!(source.contains("amp.on(\"tool.call\""));
+        let description = source
+            .lines()
+            .find_map(|line| line.strip_prefix("export const description = \""))
+            .and_then(|rest| rest.strip_suffix("\";"))
+            .expect("a one-line static description");
+        assert!(
+            description.chars().count() <= 300,
+            "Amp ignores longer descriptions"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dcg-guard.js");
+        assert_eq!(probe_amp_plugin(&path), AmpPluginProbe::MissingOrUnowned);
+        std::fs::write(&path, &source).unwrap();
+        assert_eq!(probe_amp_plugin(&path), AmpPluginProbe::Current);
+        std::fs::write(&path, source.replace("timeout: 10000", "timeout: 1")).unwrap();
+        assert_eq!(probe_amp_plugin(&path), AmpPluginProbe::OwnedStale);
+        std::fs::write(&path, "export default function (amp) {}\n").unwrap();
+        assert_eq!(probe_amp_plugin(&path), AmpPluginProbe::MissingOrUnowned);
     }
 
     #[test]
@@ -23457,6 +26548,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23483,6 +26576,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(force);
@@ -23509,6 +26604,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23535,6 +26632,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23561,6 +26660,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23587,6 +26688,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23613,6 +26716,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(!force);
@@ -23639,6 +26744,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(force);
@@ -23665,6 +26772,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(force);
@@ -23691,6 +26800,8 @@ if ($errors.Count -ne 0) {
             omp,
             crush,
             reasonix: _,
+            muse: _,
+            amp: _,
         }) = cli.command
         {
             assert!(force);
@@ -23732,10 +26843,105 @@ if ($errors.Count -ne 0) {
             ("--crush", "--agy"),
             ("--crush", "--opencode"),
             ("--crush", "--omp"),
+            ("--muse", "--grok"),
+            ("--muse", "--agy"),
+            ("--muse", "--opencode"),
+            ("--muse", "--omp"),
+            ("--muse", "--crush"),
+            ("--muse", "--reasonix"),
         ] {
             assert!(
                 Cli::try_parse_from(["dcg", "install", left, right]).is_err(),
                 "install must reject conflicting targets {left} and {right}"
+            );
+        }
+    }
+
+    /// #572: `--muse` parses on install and uninstall; Muse has no project
+    /// hooks target dcg writes, so `--project` is refused rather than ignored.
+    #[test]
+    fn test_cli_parse_install_and_uninstall_muse() {
+        let cli = Cli::parse_from(["dcg", "install", "--muse", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            muse,
+            reasonix,
+            ..
+        }) = cli.command
+        {
+            assert!(force);
+            assert!(!project);
+            assert!(muse);
+            assert!(!reasonix);
+        } else {
+            unreachable!("Expected Install command");
+        }
+        assert!(Cli::try_parse_from(["dcg", "install", "--muse", "--project"]).is_err());
+
+        let cli = Cli::parse_from(["dcg", "uninstall", "--muse"]);
+        if let Some(Command::Uninstall {
+            purge,
+            crush,
+            reasonix,
+            muse,
+            amp,
+        }) = cli.command
+        {
+            assert!(muse);
+            assert!(!purge && !crush && !reasonix && !amp);
+        } else {
+            unreachable!("Expected Uninstall command");
+        }
+        for other in ["--purge", "--crush", "--reasonix", "--amp"] {
+            assert!(
+                Cli::try_parse_from(["dcg", "uninstall", "--muse", other]).is_err(),
+                "uninstall --muse must reject {other}"
+            );
+        }
+    }
+
+    /// #577: `--amp` parses on install (with or without `--project`) and on
+    /// uninstall, and conflicts with every other target.
+    #[test]
+    fn test_cli_parse_install_and_uninstall_amp() {
+        let cli = Cli::parse_from(["dcg", "install", "--amp", "--project", "--force"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            amp,
+            muse,
+            ..
+        }) = cli.command
+        {
+            assert!(force && project && amp && !muse);
+        } else {
+            unreachable!("Expected Install command");
+        }
+        for other in [
+            "--grok",
+            "--agy",
+            "--opencode",
+            "--omp",
+            "--crush",
+            "--reasonix",
+            "--muse",
+        ] {
+            assert!(
+                Cli::try_parse_from(["dcg", "install", "--amp", other]).is_err(),
+                "install --amp must reject {other}"
+            );
+        }
+        let cli = Cli::parse_from(["dcg", "uninstall", "--amp"]);
+        if let Some(Command::Uninstall { amp, purge, .. }) = cli.command {
+            assert!(amp && !purge);
+        } else {
+            unreachable!("Expected Uninstall command");
+        }
+        for other in ["--purge", "--crush", "--reasonix", "--muse"] {
+            assert!(
+                Cli::try_parse_from(["dcg", "uninstall", "--amp", other]).is_err(),
+                "uninstall --amp must reject {other}"
             );
         }
     }
@@ -24131,6 +27337,30 @@ if ($errors.Count -ne 0) {
         assert!(!codex_command_is_dcg(""));
     }
 
+    /// #539: doctor reads Codex's files from `CODEX_HOME` when it is set,
+    /// and names them by that real path; unset or empty means `~/.codex`.
+    #[test]
+    fn codex_home_override_moves_the_probed_files_539() {
+        assert_eq!(codex_home_from_env_value(None), None);
+        assert_eq!(
+            codex_home_from_env_value(Some(std::ffi::OsString::new())),
+            None
+        );
+        let custom = std::path::PathBuf::from("/srv/codex-home");
+        assert_eq!(
+            codex_home_from_env_value(Some(custom.clone().into_os_string())),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            codex_file_display_in(None, "hooks.json"),
+            "~/.codex/hooks.json"
+        );
+        assert_eq!(
+            codex_file_display_in(Some(&custom), "config.toml"),
+            custom.join("config.toml").display().to_string()
+        );
+    }
+
     #[test]
     fn codex_enable_fix_flips_existing_entry_only_368() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -24273,6 +27503,22 @@ if ($errors.Count -ne 0) {
         assert!(
             source.contains("ctx.tool.hook(\"execute.before\""),
             "v2 registers hooks through ctx.tool.hook"
+        );
+        assert!(
+            source.contains("tool === \"bash\" || tool === \"shell\""),
+            "v1 bash and v2 shell tools must both be guarded"
+        );
+        assert!(
+            source.contains("Unrecognized command-bearing OpenCode tool"),
+            "future command-bearing tool renames must fail visible rather than bypass dcg"
+        );
+        assert!(
+            source.contains("incompatible OpenCode shell payload"),
+            "known shell tools with malformed command payloads must block"
+        );
+        assert!(
+            source.contains("Incompatible OpenCode v2 tool hook API"),
+            "v2 setup must fail visibly when the interception API is unavailable"
         );
 
         // v2 migrated Bun -> Node, so `Bun` is undefined there. Bun implements
@@ -24526,9 +27772,14 @@ if ($errors.Count -ne 0) {
                     > crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS,
                 "the bridge backstop must leave headroom above the largest shipped evaluator default"
             );
+            // OMP's default tool_call timeout is 30_000ms; reserve at least
+            // four seconds for the extension to finish after its watchdog.
+            const OMP_DEFAULT_HANDLER_TIMEOUT_MS: u64 = 30_000;
+            const REQUIRED_HANDLER_MARGIN_MS: u64 = 4_000;
             assert!(
-                OMP_CHILD_EVALUATION_TIMEOUT_MS <= 60_000,
-                "a wedged evaluator must not stall an OMP bash call for more than one minute"
+                OMP_CHILD_OBSERVATION_TIMEOUT_MS + REQUIRED_HANDLER_MARGIN_MS
+                    <= OMP_DEFAULT_HANDLER_TIMEOUT_MS,
+                "the generated guard watchdog must beat OMP's host handler timeout"
             );
         }
         assert!(source.contains(&format!(
@@ -24923,9 +28174,9 @@ if ($errors.Count -ne 0) {
         assert!(source.contains("const DCG_CHILD_TRANSITIONS:"));
         for row in [
             r#""spawn-throw": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
-            r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
+            r#""exit-0": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
             r#""exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" }"#,
-            r#""exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#,
+            r#""exit-2": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#,
             r#""exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
             r#""signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" }"#,
         ] {
@@ -25197,9 +28448,9 @@ const verdictFixtures = {
 } as const;
 const expectedActions = {
   "spawn-throw": { empty: "infrastructure", malformed: "infrastructure", allow: "infrastructure", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
-  "exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
+  "exit-0": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
   "exit-1": { empty: "block", malformed: "block", allow: "block", deny: "block", ask: "block", indeterminate: "block", unknown: "block" },
-  "exit-2": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" },
+  "exit-2": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" },
   "exit-other": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
   "signal": { empty: "crash", malformed: "crash", allow: "crash", deny: "block", ask: "block", indeterminate: "block", unknown: "crash" },
 } as const;
@@ -25426,7 +28677,7 @@ const recordUnhandledRejection = (reason: unknown): void => {
 process.on("unhandledRejection", recordUnhandledRejection);
 (performance as unknown as { now: () => number }).now = (): number => virtualNowMs;
 
-// Execute production watchdog branches without waiting 30 seconds. Clearing a
+// Execute production watchdog branches without waiting 25 seconds. Clearing a
 // known watchdog transfers ownership to at most one rearm, so a shortened
 // absolute-deadline delay is still recognized. Advancing the monotonic virtual
 // clock by the requested delay keeps deadline arithmetic faithful while wall
@@ -25481,7 +28732,7 @@ globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>): void => {
   if (activeChild.spawnError) throw new Error(activeChild.spawnError);
   if (observedExecutable === undefined) observedExecutable = argv[0];
   equal(argv[0], observedExecutable, "callback/spawn/executable-stability");
-  equal(options.timeout, 30_000, "callback/spawn/parent-timeout");
+  equal(options.timeout, 25_000, "callback/spawn/parent-timeout");
   equal(options.killSignal, "SIGKILL", "callback/spawn/kill-signal");
   const record: SpawnRecord = {
     argv: [...argv],
@@ -25605,7 +28856,7 @@ globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>): void => {
       () => { record.stderrCancelCalls += 1; },
     ),
     // Model Bun's native timeout without making the certificate wait for the
-    // production 30-second ceiling. The exact configured value and kill
+    // production 25-second ceiling. The exact configured value and kill
     // signal are asserted above, so removing either production option turns
     // this replay red before the compressed timer can resolve.
     exited: Promise.all([childExit, stdinCollected]).then(([exitCode]) => exitCode),
@@ -25701,7 +28952,7 @@ try {
   equal(replay.spawns[0]!.stdin, " \t", "callback/whitespace-allow/stdin-bytes");
   equal(replay.spawns[0]!.cwd, process.cwd(), "callback/whitespace-allow/cwd");
   equal(replay.spawns[0]!.argv.slice(1), ["--robot", "test", "--stdin", "--agent", "omp", "--dialect", "posix", "--format", "json", "--omp-bridge-output"], "callback/whitespace-allow/argv");
-  equal(replay.spawns[0]!.timeout, 30_000, "callback/whitespace-allow/parent-timeout");
+  equal(replay.spawns[0]!.timeout, 25_000, "callback/whitespace-allow/parent-timeout");
   equal(replay.spawns[0]!.killSignal, "SIGKILL", "callback/whitespace-allow/kill-signal");
   equal(replay.errors, ["[dcg] OMP guard dcg stderr: allow diagnostic"], "callback/whitespace-allow/diagnostics");
 
@@ -25791,6 +29042,24 @@ try {
   equal(replay.result, undefined, "callback/allow-then-stdout-fault/result");
   check(replay.errors.some(error => error.includes("stdout read failed: Error: after apparent allow")), "callback/allow-then-stdout-fault/diagnostic");
 
+
+  // The default posture still permits unavailable verdicts, but the child
+  // must never vanish silently. A missing robot frame always logs diagnostic.
+  for (const [caseId, exitCode] of [
+    ["callback/zero-empty-visible", 0],
+    ["callback/two-empty-visible", 2],
+  ] as const) {
+    replay = await invoke(
+      caseId,
+      { toolName: "bash", input: { command: "echo safe" } },
+      { stdout: "", exitCode },
+    );
+    equal(replay.result, undefined, `${caseId}/default-unverified-posture`);
+    equal(replay.errors, [
+      `[dcg] OMP guard infrastructure failure (exit ${exitCode})`,
+    ], `${caseId}/diagnostic`);
+  }
+
   replay = await invoke(
     "callback/malformed-exit-zero-visible",
     { toolName: "bash", input: { command: "echo safe" } },
@@ -25825,7 +29094,7 @@ try {
     { stdout: "", stderr: JSON.stringify({ decision: "deny", reason: "wrong channel" }), exitCode: 0 },
   );
   equal(replay.result, undefined, "callback/stderr-json-is-diagnostic/result");
-  equal(replay.errors, ["[dcg] OMP guard dcg stderr: {\"decision\":\"deny\",\"reason\":\"wrong channel\"}"], "callback/stderr-json-is-diagnostic/diagnostics");
+  equal(replay.errors, ["[dcg] OMP guard infrastructure failure (exit 0): {\"decision\":\"deny\",\"reason\":\"wrong channel\"}"], "callback/stderr-json-is-diagnostic/diagnostics");
 
   replay = await invoke(
     "callback/exit-one-stderr-only",
@@ -26181,7 +29450,7 @@ try {
   equal(replay.watchdogFires, 1, "callback/exit-one-tick-before-hard-deadline/watchdog-fire-count");
   equal(replay.peakWatchdogs, 1, "callback/exit-one-tick-before-hard-deadline/peak-active-watchdog");
   equal(replay.errors, [
-    "[dcg] OMP guard infrastructure failure (exit 0): child observation exceeded the 30500-millisecond outer deadline",
+    "[dcg] OMP guard infrastructure failure (exit 0): child observation exceeded the 25500-millisecond outer deadline",
   ], "callback/exit-one-tick-before-hard-deadline/diagnostic-exactly-once");
   const absoluteDeadlineDiagnostics = [...diagnostics];
   const absoluteDeadlineFires = watchdogFireCount;
@@ -26224,7 +29493,7 @@ try {
   equal(replay.watchdogSchedules, 1, "callback/hard-deadline-after-deny/one-watchdog-at-a-time");
   equal(replay.watchdogFires, 1, "callback/hard-deadline-after-deny/watchdog-fire-count");
   equal(replay.errors, [
-    "[dcg] OMP guard infrastructure failure (exit status unavailable): child observation exceeded the 30500-millisecond outer deadline",
+    "[dcg] OMP guard infrastructure failure (exit status unavailable): child observation exceeded the 25500-millisecond outer deadline",
   ], "callback/hard-deadline-after-deny/no-unobserved-signal-diagnostic");
   const settledDiagnostics = [...diagnostics];
   const settledWatchdogFires = watchdogFireCount;
@@ -26302,6 +29571,31 @@ try {
   // infrastructure outcome into a block; `ask` keeps the #346 fail-open.
   process.env.DCG_UNVERIFIED_DECISION = " Deny ";
   try {
+
+    // #564: no stdout or unparsable stdout on exit 0/2 is unverified.
+    // The strict posture must block, with one visible error per invocation.
+    for (const [caseId, exitCode, stdout, detail] of [
+      ["callback/strict-zero-empty", 0, "", ""],
+      ["callback/strict-zero-malformed", 0, "{", ": dcg stdout was malformed"],
+      ["callback/strict-zero-unknown", 0, '{"decision":"future"}', ": dcg stdout carried an unrecognized decision"],
+      ["callback/strict-two-empty", 2, "", ""],
+      ["callback/strict-two-malformed", 2, "{", ": dcg stdout was malformed"],
+      ["callback/strict-two-unknown", 2, '{"decision":"future"}', ": dcg stdout carried an unrecognized decision"],
+    ] as const) {
+      replay = await invoke(
+        caseId,
+        { toolName: "bash", input: { command: "echo safe" } },
+        { stdout, exitCode },
+      );
+      equal(replay.result, {
+        block: true,
+        reason: `Blocked by dcg: the command could not be verified (dcg infrastructure failure (exit ${exitCode})) and DCG_UNVERIFIED_DECISION=deny`,
+      }, `${caseId}/result`);
+      equal(replay.errors, [
+        `[dcg] OMP guard infrastructure failure (exit ${exitCode})${detail}`,
+      ], `${caseId}/diagnostics`);
+    }
+
     replay = await invoke(
       "callback/spawn-throw-unverified-deny",
       { toolName: "bash", input: { command: "echo safe" } },
@@ -26762,8 +30056,8 @@ console.log(JSON.stringify({
             .map(str::to_string)
         );
 
-        let exit_zero_row = r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "allow" }"#;
-        let mutated_exit_zero_row = r#""exit-0": { empty: "allow", malformed: "allow", allow: "allow", deny: "allow", ask: "block", indeterminate: "block", unknown: "allow" }"#;
+        let exit_zero_row = r#""exit-0": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "block", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#;
+        let mutated_exit_zero_row = r#""exit-0": { empty: "infrastructure", malformed: "infrastructure", allow: "allow", deny: "allow", ask: "block", indeterminate: "block", unknown: "infrastructure" }"#;
         assert_eq!(
             source.matches(exit_zero_row).count(),
             1,
@@ -29954,14 +33248,15 @@ exclude = ["target/**"]
         };
         assert!(!diag.is_healthy());
         assert!(diag.has_issues());
-        assert_eq!(hook_diagnostics_issue_count(&diag), 1);
+        assert_eq!(hook_diagnostics_issue_count(&diag, false), 1);
     }
 
     #[test]
     fn hook_diagnostics_missing_settings_is_skipped_not_an_issue() {
         let diag = HookDiagnostics::default();
         assert!(!diag.settings_exists);
-        assert_eq!(hook_diagnostics_issue_count(&diag), 0);
+        assert_eq!(hook_diagnostics_issue_count(&diag, false), 0);
+        assert_eq!(hook_diagnostics_issue_count(&diag, true), 1);
     }
 
     #[test]
@@ -30010,6 +33305,169 @@ exclude = ["target/**"]
         };
         assert!(!diag.is_healthy());
         assert!(diag.has_issues());
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_respects_runtime_scope_and_lifetime() {
+        use crate::allowlist::{LoadedAllowlistLayer, parse_allowlist_toml};
+
+        let active_rules = doctor_allowlist_active_rules(&Config::default());
+        for (metadata, expect_warning) in [
+            ("", true),
+            ("paths = []", true),
+            ("paths = [\"*\"]", true),
+            ("paths = [\"/reviewed/**\", \"*\"]", true),
+            ("paths = [\"**\"]", true),
+            ("paths = [\"**/\"]", true),
+            ("paths = [\"**/*\"]", true),
+            ("paths = [\"**/**\"]", true),
+            (r"paths = ['\\?/**']", true),
+            ("paths = [\"/reviewed/**\"]", false),
+            ("paths = [\"/tmp/**\"]", false),
+            ("paths = [\"**/reviewed/**\"]", false),
+            ("paths = [\"**/*/\"]", false),
+            ("paths = [\"/**\"]", cfg!(unix)),
+            ("paths = [\"/**/*\"]", cfg!(unix)),
+            ("session = false", true),
+            ("session = true\nsession_id = \"bounded-session\"", false),
+            ("expires_at = \"2099-12-31\"", false),
+            ("expires_at = \"2000-01-01\"", false),
+            ("ttl = \"1h\"\nadded_at = \"2099-01-01\"", false),
+            ("ttl = \"1h\"\nadded_at = \"2000-01-01\"", false),
+            ("ttl = \"1h\"", false),
+            ("ttl = \"1h\"\nadded_at = \"bad-timestamp\"", false),
+            ("added_at = \"bad-timestamp\"", true),
+            ("expires_at = 123", true),
+            ("ttl = 123", true),
+            ("session = \"true\"", true),
+            ("paths = [\"**/*\"]\nexpires_at = \"2099-12-31\"", false),
+            ("paths = [\"**/*\"]\nexpires_at = \"2000-01-01\"", false),
+            ("paths = [\"**/*\"]\nttl = \"1h\"", false),
+            (
+                "paths = [\"**/*\"]\nsession = true\nsession_id = \"bounded-session\"",
+                false,
+            ),
+        ] {
+            let path = std::path::PathBuf::from("doctor-allowlist.toml");
+            let file = parse_allowlist_toml(
+                AllowlistLayer::User,
+                &path,
+                &format!(
+                    "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"review\"\n{metadata}\n"
+                ),
+            );
+            assert!(file.errors.is_empty(), "{metadata}: {:?}", file.errors);
+            assert_eq!(file.entries.len(), 1, "{metadata}");
+            let mut diag = AllowlistDiagnostics::default();
+            diagnose_allowlist_layer(
+                &LoadedAllowlistLayer {
+                    layer: AllowlistLayer::User,
+                    path,
+                    file,
+                },
+                &active_rules,
+                &mut diag,
+            );
+            let warnings = diag.warning_messages.join("; ");
+            assert_eq!(
+                warnings.contains("active globally scoped, indefinite"),
+                expect_warning,
+                "{metadata}: {warnings}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_uses_concrete_enabled_rules_and_synthetic_namespaces() {
+        let mut config = Config::default();
+        config.packs.enabled = vec![
+            "core".to_string(),
+            "containers.docker".to_string(),
+            "made.up".to_string(),
+        ];
+        config.packs.disabled = vec!["containers.docker".to_string()];
+        config.heredoc.enabled = Some(false);
+        let rules = doctor_allowlist_active_rules(&config);
+        assert!(!rules.contains_key("core"));
+        assert!(!rules.contains_key("made.up"));
+        assert!(!rules.contains_key("containers.docker"));
+        assert!(rules.contains_key("windows.filesystem"));
+        let filesystem = rules["core.filesystem"].as_ref().unwrap();
+        assert!(filesystem.contains("rm-rf-root-home"));
+        assert!(filesystem.contains("tar-exec-unverified"));
+        assert!(!filesystem.contains("rm-rf-root"));
+        assert!(rules.contains_key("heredoc.posix"));
+        assert!(rules.contains_key("heredoc.shell"));
+        assert!(rules.contains_key("heredoc.powershell"));
+        assert!(!rules.contains_key("heredoc.python"));
+        assert!(!rules.contains_key("heredoc.madeup"));
+
+        config.heredoc.enabled = Some(true);
+        config.heredoc.languages = Some(vec!["python".to_string()]);
+        let rules = doctor_allowlist_active_rules(&config);
+        assert!(rules.contains_key("heredoc.python"));
+        assert!(!rules.contains_key("heredoc.ruby"));
+        assert!(rules.contains_key("heredoc.posix"));
+
+        config.packs.disabled.push("windows.filesystem".to_string());
+        assert!(!doctor_allowlist_active_rules(&config).contains_key("windows.filesystem"));
+    }
+
+    #[test]
+    fn doctor_allowlist_audit_keeps_source_ordinals_and_escapes_provenance() {
+        use crate::allowlist::{LoadedAllowlistLayer, parse_allowlist_toml};
+
+        let path = std::path::PathBuf::from("system-allowlist.toml");
+        let file = parse_allowlist_toml(
+            AllowlistLayer::System,
+            &path,
+            r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "rejected expiry"
+expires_at = "bad-expiry"
+
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "review\nforged diagnostic"
+added_by = "reviewer\u001b[31m"
+added_at = "not-a-timestamp"
+
+[[allow]]
+rule = "core.git:reset-hard"
+
+[[allow]]
+rule = "core.filesystem:rm-rf-general"
+reason = "filesystem exception"
+added_at = 2026-08-01T12:00:00Z
+"#,
+        );
+        let mut diag = AllowlistDiagnostics::default();
+        diagnose_allowlist_layer(
+            &LoadedAllowlistLayer {
+                layer: AllowlistLayer::System,
+                path,
+                file,
+            },
+            &doctor_allowlist_active_rules(&Config::default()),
+            &mut diag,
+        );
+        assert_eq!(diag.layers_found, 1);
+        assert_eq!(diag.total_errors, 2);
+        assert_eq!(diag.total_warnings, 2);
+        assert!(diag.error_messages[0].contains("entry 1"));
+        assert!(diag.error_messages[1].contains("entry 3"));
+        let git = &diag.warning_messages[0];
+        assert!(git.contains("system: system-allowlist.toml: entry 2"));
+        assert!(git.contains("HIGH RISK: bypasses destructive Git protection"));
+        assert!(git.contains(r"review\nforged diagnostic"));
+        assert!(git.contains(r"reviewer\u{1b}[31m"));
+        assert!(git.contains("not-a-timestamp"));
+        assert!(!git.contains(['\n', '\r', '\u{1b}']));
+        let filesystem = &diag.warning_messages[1];
+        assert!(filesystem.contains("entry 4"));
+        assert!(filesystem.contains("destructive filesystem protection"));
+        assert!(filesystem.contains("2026-08-01T12:00:00Z"));
     }
 
     #[test]
@@ -30758,6 +34216,471 @@ exclude = ["target/**"]
             .expect("a dcg hook under the canonical matcher")
     }
 
+    fn duplicated_dcg_policy_settings() -> serde_json::Value {
+        let mut canonical = claude_dcg_hook().unwrap();
+        canonical["future"] =
+            serde_json::json!({"values": [null, false, 0, [], {}], "policy": "Strict"});
+        serde_json::json!({
+            "model": "operator-model",
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": CLAUDE_SHELL_MATCHER,
+                        "label": "canonical metadata",
+                        "hooks": [
+                            canonical,
+                            {"type": "command", "command": "canonical-audit"}
+                        ]
+                    },
+                    {
+                        "matcher": "Bash",
+                        "label": "legacy metadata",
+                        "hooks": [
+                            {"type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"},
+                            {"type": "command", "command": "bash-audit", "timeout": 7}
+                        ]
+                    },
+                    {
+                        "matcher": "Write",
+                        "hooks": [
+                            {
+                                "type": "prompt", "command": "\"C:\\old installation\\dcg.exe\"",
+                                "shell": "foreign-shell", "statusMessage": "Checking safety",
+                                "future": {"policy": "Strict", "values": [null, false, 0, [], {}]}
+                            },
+                            {"type": "command", "command": "write-audit"}
+                        ]
+                    },
+                    {"matcher": "Read", "hooks": [{"command": ["dcg"]}, {"command": "dcg-audit"}]}
+                ],
+                "PostToolUse": [{"matcher": "Write", "hooks": [{"command": "formatter"}]}]
+            }
+        })
+    }
+
+    #[test]
+    fn native_settings_json_parser_refuses_duplicate_keys_at_every_depth() {
+        for content in [
+            r#"{"onFailure":"block","onFailure":"continue"}"#,
+            r#"{"timeout":15,"timeout":15}"#,
+            r#"{"hooks":{},"hooks":{}}"#,
+            r#"{"hooks":{"PreToolUse":[],"PreToolUse":[]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"onFailure":"block","on\u0046ailure":"continue"}]}]}}"#,
+            r#"{"operator":{"policy":[{"enabled":true,"enabled":false}]}}"#,
+            r#"{"\u0061":1,"a":2}"#,
+            r#"{"":1,"":2}"#,
+        ] {
+            let error = parse_hook_settings_json(content).expect_err("ambiguous settings");
+            assert!(
+                error.to_string().contains("duplicate object key"),
+                "{error}"
+            );
+            assert!(error.line() > 0 && error.column() > 0, "{error}");
+        }
+    }
+
+    #[test]
+    fn native_settings_json_parser_preserves_unique_values_and_existing_depth_limits() {
+        let content = r#"{
+            "hooks":{"PreToolUse":[
+                {"matcher":"Bash","hooks":[{"type":"command","command":"dcg","onFailure":"block"}]},
+                {"matcher":"Write","hooks":[{"type":"command","command":"audit","onFailure":"continue"}]}
+            ]},
+            "values":[null,true,false,-9223372036854775808,18446744073709551615,-0.0,1.25,1e308,-1e-100,"quote\" and unicode \u2603"],
+            "$serde_json::private::Number":"literal operator data",
+            "operator":{"onFailure":"keep","nested":{"onFailure":"keep too"}}
+        }"#;
+        let expected: serde_json::Value = serde_json::from_str(content).unwrap();
+        let parsed = parse_hook_settings_json(content).unwrap();
+        assert_eq!(parsed, expected);
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+
+        for depth in [16, 128, 256] {
+            let nested = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            let standard = serde_json::from_str::<serde_json::Value>(&nested);
+            let strict = parse_hook_settings_json(&nested);
+            assert_eq!(strict.is_ok(), standard.is_ok(), "depth {depth}");
+            if let (Ok(strict), Ok(standard)) = (strict, standard) {
+                assert_eq!(strict, standard);
+            }
+        }
+        for malformed in [
+            "",
+            "NaN",
+            "Infinity",
+            "1e999",
+            "{} true",
+            "{\"hooks\":[]",
+            "[1,]",
+        ] {
+            assert!(parse_hook_settings_json(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn native_settings_json_self_heal_refuses_ambiguity_even_when_last_hook_is_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("settings.lock");
+        let current = serde_json::json!({"PreToolUse": [{
+            "matcher": CLAUDE_SHELL_MATCHER, "hooks": [claude_dcg_hook().unwrap()]
+        }]});
+        let original = format!(
+            "{{\"hooks\":{{\"PreToolUse\":[{{\"hooks\":[{{\"onFailure\":\"block\"}}]}}]}},\"hooks\":{current}}}"
+        );
+        std::fs::write(&settings_path, &original).unwrap();
+        for _ in 0..2 {
+            let error = ensure_hook_registered_at(&settings_path, &lock_path).unwrap_err();
+            assert!(
+                error.to_string().contains("duplicate object key"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), original);
+        }
+        let diagnostics = diagnose_hook_wiring_at(&settings_path);
+        assert!(diagnostics.settings_exists);
+        assert!(!diagnostics.settings_valid);
+        assert!(
+            diagnostics
+                .settings_error
+                .unwrap()
+                .contains("duplicate object key")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_settings_json_self_heal_and_diagnostics_report_broken_managed_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let target = dir.path().join("unavailable-settings.json");
+        let lock_path = dir.path().join("settings.lock");
+        std::os::unix::fs::symlink(&target, &settings_path).unwrap();
+        assert!(ensure_hook_registered_at(&settings_path, &lock_path).is_err());
+        let diagnostics = diagnose_hook_wiring_at(&settings_path);
+        assert!(diagnostics.settings_exists);
+        assert!(!diagnostics.settings_valid);
+        assert!(diagnostics.settings_error.is_some());
+        assert_eq!(std::fs::read_link(&settings_path).unwrap(), target);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn native_hook_policy_unions_all_duplicates_without_widening_siblings() {
+        let desired = claude_dcg_hook().unwrap();
+        for force in [false, true] {
+            for reversed in [false, true] {
+                let mut settings = duplicated_dcg_policy_settings();
+                if reversed {
+                    settings["hooks"]["PreToolUse"]
+                        .as_array_mut()
+                        .unwrap()
+                        .reverse();
+                }
+                assert!(install_dcg_hook_into_settings(&mut settings, force).unwrap());
+                let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+                assert_eq!(entries.len(), 4);
+                assert_eq!(entries[0]["matcher"], CLAUDE_SHELL_MATCHER);
+                assert_eq!(entries[0]["label"], "canonical metadata");
+                assert_eq!(entries[0]["hooks"][1]["command"], "canonical-audit");
+                let hook = &entries[0]["hooks"][0];
+                assert!(hook_has_dcg_identity(hook, &desired));
+                assert_eq!(hook["timeout"], 15, "force={force}, reversed={reversed}");
+                assert_eq!(hook["onFailure"], "block");
+                assert_eq!(hook["statusMessage"], "Checking safety");
+                assert_eq!(
+                    hook["future"],
+                    serde_json::json!({"values": [null, false, 0, [], {}], "policy": "Strict"})
+                );
+                assert_eq!(
+                    entries
+                        .iter()
+                        .flat_map(|entry| entry["hooks"].as_array().unwrap())
+                        .filter(|hook| hook["command"].as_str().is_some_and(is_dcg_command))
+                        .count(),
+                    1
+                );
+                let bash = entries
+                    .iter()
+                    .find(|entry| entry["matcher"] == "Bash")
+                    .unwrap();
+                assert_eq!(bash["label"], "legacy metadata");
+                assert_eq!(
+                    bash["hooks"],
+                    serde_json::json!([{"type": "command", "command": "bash-audit", "timeout": 7}])
+                );
+                let write = entries
+                    .iter()
+                    .find(|entry| entry["matcher"] == "Write")
+                    .unwrap();
+                assert_eq!(
+                    write["hooks"],
+                    serde_json::json!([{"type": "command", "command": "write-audit"}])
+                );
+                let read = entries
+                    .iter()
+                    .find(|entry| entry["matcher"] == "Read")
+                    .unwrap();
+                assert_eq!(
+                    read["hooks"],
+                    serde_json::json!([{"command": ["dcg"]}, {"command": "dcg-audit"}])
+                );
+                assert_eq!(settings["model"], "operator-model");
+                assert_eq!(
+                    settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+                    "formatter"
+                );
+
+                let installed = settings.clone();
+                assert_eq!(
+                    install_dcg_hook_into_settings(&mut settings, force).unwrap(),
+                    force
+                );
+                assert_eq!(settings, installed, "repeat keeps the complete policy");
+                assert!(settings_has_exact_dcg_hook(&settings, &desired));
+            }
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_conflicts_preserve_input_and_file() {
+        let desired = claude_dcg_hook().unwrap();
+        for (field, left, right) in [
+            (
+                "onFailure",
+                serde_json::json!("block"),
+                serde_json::json!("continue"),
+            ),
+            ("timeout", serde_json::json!(15), serde_json::json!(30)),
+            (
+                "future",
+                serde_json::json!({"enabled": false}),
+                serde_json::json!({"enabled": 0}),
+            ),
+            ("future", serde_json::json!([]), serde_json::json!(null)),
+            (
+                "future",
+                serde_json::json!([1, 2]),
+                serde_json::json!([2, 1]),
+            ),
+        ] {
+            let mut current = desired.clone();
+            current[field] = left;
+            let mut duplicate = serde_json::json!({"type": "command", "command": "dcg"});
+            duplicate[field] = right;
+            let original = serde_json::json!({
+                "hooks": {"PreToolUse": [
+                    {"matcher": CLAUDE_SHELL_MATCHER, "hooks": [current]},
+                    {"matcher": "Write", "hooks": [duplicate]}
+                ]}
+            });
+            assert!(!settings_has_exact_dcg_hook(&original, &desired));
+            for force in [false, true] {
+                let mut settings = original.clone();
+                let error = install_dcg_hook_into_settings(&mut settings, force).unwrap_err();
+                assert!(
+                    error.to_string().contains(field),
+                    "conflict must name {field}: {error}"
+                );
+                assert_eq!(
+                    settings, original,
+                    "a conflict must not partially edit settings"
+                );
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let settings_path = dir.path().join("settings.json");
+            let lock_path = dir.path().join("selfheal.lock");
+            let bytes = serde_json::to_vec(&original).unwrap();
+            std::fs::write(&settings_path, &bytes).unwrap();
+            let error = ensure_hook_registered_at(&settings_path, &lock_path).unwrap_err();
+            assert!(error.to_string().contains(field));
+            assert_eq!(std::fs::read(&settings_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_currentness_requires_one_canonical_first_hook() {
+        let desired = claude_dcg_hook().unwrap();
+        let canonical =
+            serde_json::json!({"matcher": CLAUDE_SHELL_MATCHER, "hooks": [desired.clone()]});
+        let other = serde_json::json!({"matcher": "Read", "hooks": [{"command": "read-audit"}]});
+        for entries in [
+            serde_json::json!([canonical.clone(), {"matcher": "Bash", "hooks": [{"command": "dcg", "onFailure": "block"}]}]),
+            serde_json::json!([{"matcher": CLAUDE_SHELL_MATCHER, "hooks": [desired.clone(), desired.clone()]}]),
+            serde_json::json!([other.clone(), canonical]),
+            serde_json::json!([{"matcher": CLAUDE_SHELL_MATCHER, "hooks": [{"command": "canonical-audit"}, desired.clone()]}]),
+            serde_json::json!([{"matcher": "bash|powershell|monitor", "hooks": [desired.clone()]}]),
+        ] {
+            let mut settings = serde_json::json!({"hooks": {"PreToolUse": entries}});
+            assert!(!settings_has_exact_dcg_hook(&settings, &desired));
+            assert!(install_dcg_hook_into_settings(&mut settings, false).unwrap());
+            assert!(settings_has_exact_dcg_hook(&settings, &desired));
+            assert_eq!(
+                settings["hooks"]["PreToolUse"][0]["matcher"],
+                CLAUDE_SHELL_MATCHER
+            );
+            assert!(hook_has_dcg_identity(
+                &settings["hooks"]["PreToolUse"][0]["hooks"][0],
+                &desired
+            ));
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_malformed_owned_entries_preserve_input_and_file() {
+        let desired = claude_dcg_hook().unwrap();
+        for matcher in [CLAUDE_SHELL_MATCHER, "Bash", "Bash|PowerShell"] {
+            for malformed_hooks in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!("not an array")),
+                Some(serde_json::json!({"command": "dcg", "onFailure": "block"})),
+            ] {
+                let mut malformed = serde_json::json!({"matcher": matcher});
+                if let Some(hooks) = malformed_hooks {
+                    malformed["hooks"] = hooks;
+                }
+                let original = serde_json::json!({"hooks": {"PreToolUse": [
+                    {"matcher": CLAUDE_SHELL_MATCHER, "hooks": [desired.clone()]},
+                    malformed
+                ]}});
+                assert!(!settings_has_exact_dcg_hook(&original, &desired));
+                for force in [false, true] {
+                    let mut settings = original.clone();
+                    let error = install_dcg_hook_into_settings(&mut settings, force).unwrap_err();
+                    assert!(error.to_string().contains("hooks format"));
+                    assert_eq!(
+                        settings, original,
+                        "malformed settings must not be partially repaired"
+                    );
+                }
+
+                let dir = tempfile::tempdir().unwrap();
+                let settings_path = dir.path().join("settings.json");
+                let lock_path = dir.path().join("selfheal.lock");
+                let bytes = serde_json::to_vec(&original).unwrap();
+                std::fs::write(&settings_path, &bytes).unwrap();
+                assert!(ensure_hook_registered_at(&settings_path, &lock_path).is_err());
+                assert_eq!(std::fs::read(&settings_path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_self_heal_repairs_duplicates_and_retains_block_on_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let original = duplicated_dcg_policy_settings();
+        std::fs::write(&settings_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        let repaired = std::fs::read(&settings_path).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&repaired).unwrap();
+        let hook = canonical_dcg_hook(&settings);
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(hook["timeout"], 15);
+        assert_eq!(
+            hook["future"],
+            original["hooks"]["PreToolUse"][2]["hooks"][0]["future"]
+        );
+        assert!(settings_has_exact_dcg_hook(
+            &settings,
+            &claude_dcg_hook().unwrap()
+        ));
+
+        ensure_hook_registered_at(&settings_path, &lock_path).unwrap();
+        assert_eq!(std::fs::read(&settings_path).unwrap(), repaired);
+    }
+
+    #[test]
+    fn native_hook_policy_failed_staging_preserves_valid_blocking_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let lock_path = dir.path().join("selfheal.lock");
+        let original = serde_json::to_vec(&duplicated_dcg_policy_settings()).unwrap();
+        std::fs::write(&settings_path, &original).unwrap();
+        let occupied_stage = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        std::fs::create_dir(&occupied_stage).unwrap();
+
+        assert!(ensure_hook_registered_at(&settings_path, &lock_path).is_err());
+        assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        assert!(
+            occupied_stage.is_dir(),
+            "a foreign directory must not be removed during cleanup"
+        );
+    }
+
+    #[test]
+    fn native_hook_policy_atomic_write_refuses_an_existing_stage_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let stage_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        let original = br#"{"onFailure":"block"}"#;
+        std::fs::write(&settings_path, original).unwrap();
+        std::fs::write(&stage_path, b"foreign staged content").unwrap();
+
+        assert!(write_settings_atomic(&settings_path, "{\"updated\":true}").is_err());
+        assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(&stage_path).unwrap(),
+            b"foreign staged content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_hook_policy_atomic_write_refuses_a_stage_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let stage_path = dir
+            .path()
+            .join(format!(".dcg-settings-{}.tmp", std::process::id()));
+        let foreign = dir.path().join("foreign.json");
+        let original = br#"{"onFailure":"block"}"#;
+        std::fs::write(&settings_path, original).unwrap();
+        std::fs::write(&foreign, b"foreign settings").unwrap();
+        std::os::unix::fs::symlink(&foreign, &stage_path).unwrap();
+
+        assert!(write_settings_atomic(&settings_path, "{\"updated\":true}").is_err());
+        assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign settings");
+        assert!(
+            std::fs::symlink_metadata(&stage_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn native_hook_policy_antigravity_preserves_later_duplicate_fields() {
+        let desired = antigravity_dcg_hook().unwrap();
+        let mut settings = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": ANTIGRAVITY_SHELL_MATCHER, "hooks": [desired.clone()]},
+            {"matcher": "Write", "hooks": [{"type": "command", "command": "dcg", "onFailure": "block", "timeout": 15}]}
+        ]}});
+        assert!(install_antigravity_hook_into_settings(&mut settings, true).unwrap());
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["matcher"], ANTIGRAVITY_SHELL_MATCHER);
+        let hook = &entries[0]["hooks"][0];
+        assert!(hook_has_dcg_identity(hook, &desired));
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(hook["timeout"], 15);
+        let repaired = settings.clone();
+        assert!(!install_antigravity_hook_into_settings(&mut settings, false).unwrap());
+        assert_eq!(settings, repaired);
+    }
+
     #[test]
     fn self_heal_keeps_operator_timeout_when_hook_is_current() {
         // Regression for #345: an operator-set `timeout` on the current dcg
@@ -31030,6 +34953,193 @@ exclude = ["target/**"]
             "restrictive mode must survive the atomic write"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"new\": true}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_group_denied_acl(owner: u32) -> Vec<u8> {
+        // Linux's posix_acl_xattr ABI: version 2, then little-endian
+        // (tag, permissions, id) entries. Group mode bits reflect the mask,
+        // not group::---, so losing this ACL widens access despite mode 0640.
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 0x06_u16, u32::MAX), // user::rw-
+            (0x02, 0x04, owner),            // named user:r--
+            (0x04, 0x00, u32::MAX),         // group::---
+            (0x10, 0x04, u32::MAX),         // mask::r--
+            (0x20, 0x00, u32::MAX),         // other::---
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        acl
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn write_settings_atomic_preserves_access_acl_and_xattrs_on_repeated_repairs() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&duplicated_dcg_policy_settings()).unwrap(),
+        )
+        .unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        let acl = linux_group_denied_acl(original.metadata().unwrap().uid());
+        for (name, value) in [
+            (c"system.posix_acl_access", acl.as_slice()),
+            (c"user.dcg_policy", b"operator policy".as_slice()),
+            (c"user.dcg_binary", [0_u8, 255, 1, 0].as_slice()),
+            (c"user.dcg_empty", [].as_slice()),
+        ] {
+            rustix::fs::fsetxattr(&original, name, value, rustix::fs::XattrFlags::empty()).unwrap();
+        }
+        let original_attributes = read_file_xattrs(&original).unwrap().unwrap();
+        assert_eq!(
+            original_attributes.get(c"system.posix_acl_access"),
+            Some(&acl)
+        );
+        assert_eq!(original.metadata().unwrap().mode() & 0o777, 0o640);
+
+        for _ in 0..2 {
+            let mut settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            install_dcg_hook_into_settings(&mut settings, true).unwrap();
+            write_settings_atomic(&path, &serde_json::to_string_pretty(&settings).unwrap())
+                .unwrap();
+
+            let updated = std::fs::File::open(&path).unwrap();
+            assert_eq!(updated.metadata().unwrap().mode() & 0o777, 0o640);
+            assert_eq!(
+                read_file_xattrs(&updated).unwrap().as_ref(),
+                Some(&original_attributes),
+                "ACLs and binary/empty operator attributes must survive every replacement"
+            );
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(canonical_dcg_hook(&settings)["onFailure"], "block");
+            assert_eq!(canonical_dcg_hook(&settings)["timeout"], 15);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn write_settings_atomic_does_not_add_an_inherited_access_acl() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let content = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg","onFailure":"block","timeout":15}]}]}}"#;
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        // Add a directory default ACL only after the original file exists.
+        // Each new stage inherits it; the original has no access ACL to copy.
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let acl = linux_group_denied_acl(directory.metadata().unwrap().uid());
+        rustix::fs::fsetxattr(
+            &directory,
+            c"system.posix_acl_default",
+            &acl,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let before = std::fs::metadata(&path).unwrap();
+            write_settings_atomic(&path, content).unwrap();
+            let updated = std::fs::File::open(&path).unwrap();
+            assert_ne!(before.ino(), updated.metadata().unwrap().ino());
+            assert_eq!(updated.metadata().unwrap().mode() & 0o777, 0o640);
+            assert_eq!(
+                rustix::fs::fgetxattr(&updated, c"system.posix_acl_access", &mut [0_u8; 128]),
+                Err(rustix::io::Errno::NODATA),
+                "a parent default ACL must not change the original file's access policy"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_settings_atomic_metadata_failure_preserves_previous_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original_content = br#"{"onFailure":"block","timeout":15}"#;
+        std::fs::write(&path, original_content).unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let acl = linux_group_denied_acl(original.metadata().unwrap().uid());
+            rustix::fs::fsetxattr(
+                &original,
+                c"system.posix_acl_access",
+                &acl,
+                rustix::fs::XattrFlags::empty(),
+            )
+            .unwrap();
+            rustix::fs::fsetxattr(
+                &original,
+                c"user.dcg_policy",
+                b"keep policy",
+                rustix::fs::XattrFlags::empty(),
+            )
+            .unwrap();
+        }
+        let original_metadata = original.metadata().unwrap();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let original_attributes = read_file_xattrs(&original).unwrap();
+        let result = write_settings_atomic_with_metadata(
+            &path,
+            r#"{"onFailure":"block","timeout":30}"#,
+            |source, stage| {
+                assert_eq!(stage.metadata()?.mode() & 0o777, 0o600);
+                copy_file_permissions(source, stage)?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected metadata copy failure",
+                )
+                .into())
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected metadata copy failure")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original_content);
+        let after = std::fs::File::open(&path).unwrap();
+        let after_metadata = after.metadata().unwrap();
+        assert_eq!(after_metadata.ino(), original_metadata.ino());
+        assert_eq!(after_metadata.uid(), original_metadata.uid());
+        assert_eq!(after_metadata.gid(), original_metadata.gid());
+        assert_eq!(after_metadata.mode(), original_metadata.mode());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(read_file_xattrs(&after).unwrap(), original_attributes);
+        assert!(
+            !dir.path()
+                .join(format!(".dcg-settings-{}.tmp", std::process::id()))
+                .exists()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_file_permissions_refuses_unavailable_managed_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("missing-settings.json");
+        let managed_link = dir.path().join("managed-settings.json");
+        std::os::unix::fs::symlink(&source, &managed_link).unwrap();
+        let stage_path = dir.path().join("stage.json");
+        let stage = std::fs::File::create(&stage_path).unwrap();
+
+        assert!(copy_file_permissions(&source, &stage).is_ok());
+        assert!(copy_file_permissions(&managed_link, &stage).is_err());
     }
 
     #[test]

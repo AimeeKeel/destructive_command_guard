@@ -167,6 +167,105 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
     }
 }
 
+/// Whether a recognized wrapper invalidates evidence from the caller's cwd or
+/// home. This observes the existing normalization proof; it never strips an
+/// additional wrapper or changes the command used for pattern matching.
+///
+/// The result belongs to the wrapped process. A redirect on the outside of
+/// `env -C other command < local.sql` is still opened by the caller's shell.
+pub(crate) fn wrapper_changes_filesystem_context(command: &str) -> bool {
+    wrapper_changes_filesystem_context_at_depth(command, 0)
+}
+
+fn wrapper_changes_filesystem_context_at_depth(command: &str, depth: usize) -> bool {
+    // Split-string options can contain further env options or wrappers. The
+    // bound is independent of normalization's own wrapper iteration limit.
+    if depth >= 8 {
+        return true;
+    }
+    let normalized = strip_wrapper_prefixes(command);
+    normalized.wrapper_limit_reached
+        || normalized
+            .stripped_wrappers
+            .iter()
+            .any(|wrapper| match wrapper.wrapper_type {
+                "sudo" | "mise-exec" => true,
+                "assignment" => assignment_changes_filesystem_context(&wrapper.stripped_text),
+                "env" => {
+                    let text = wrapper.stripped_text.trim_start();
+                    let options_start = text.find(char::is_whitespace).unwrap_or(text.len());
+                    env_prefix_changes_filesystem_context(&text[options_start..], depth, false)
+                }
+                "exec" => {
+                    let tokens = tokenize_for_normalization(&wrapper.stripped_text);
+                    let mut changed = false;
+                    let _ =
+                        exec_wrapper_command_index(&wrapper.stripped_text, &tokens, &mut changed);
+                    changed
+                }
+                _ => false,
+            })
+}
+
+fn home_environment_name(name: &str) -> bool {
+    matches!(name, "HOME" | "USERPROFILE" | "HOMEDRIVE" | "HOMEPATH")
+}
+
+fn filesystem_context_env_name(raw: &str) -> bool {
+    let raw = raw.trim();
+    let decoded = decode_posix_syntax_token(raw);
+    // An unresolved unset operand could expand to one of these names. A
+    // successfully decoded quoted literal such as '$HOME' is ordinary data.
+    (matches!(&decoded, Cow::Borrowed(_)) && raw.contains(['$', '`']))
+        || decoded.contains(['*', '?', '['])
+        || home_environment_name(decoded.as_ref())
+        || decoded == "PSQLRC"
+}
+
+fn assignment_changes_filesystem_context(raw: &str) -> bool {
+    let decoded = decode_posix_syntax_token(raw);
+    let Some((name, _)) = decoded.split_once('=') else {
+        return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let name = name.split_once('[').map_or(name, |(name, _)| name);
+    // Explicit PSQLRC assignments already have their own file-source proof.
+    (matches!(&decoded, Cow::Borrowed(_)) && name.contains(['$', '`']))
+        || home_environment_name(name)
+}
+
+fn env_prefix_changes_filesystem_context(rest: &str, depth: usize, inspect_command: bool) -> bool {
+    if depth >= 8 {
+        return true;
+    }
+    let bytes = rest.as_bytes();
+    let mut changed = false;
+    let parsed = parse_env_options(rest, bytes, 0, &mut changed);
+    if changed {
+        return true;
+    }
+    match parsed {
+        EnvParseResult::Continue(index) => {
+            let end = parse_env_assignments(bytes, index);
+            let assignments = &rest[index..end];
+            tokenize_for_normalization(assignments)
+                .iter()
+                .filter_map(|token| token.text(assignments))
+                .any(assignment_changes_filesystem_context)
+                || (inspect_command
+                    && !rest[end..].trim().is_empty()
+                    && wrapper_changes_filesystem_context_at_depth(&rest[end..], depth + 1))
+        }
+        EnvParseResult::SplitString(_, remaining) => {
+            env_prefix_changes_filesystem_context(&remaining, depth + 1, true)
+        }
+        // The main parser has already accepted the actual wrapper. If a
+        // nested split-string option cannot be proved, no local file proof is
+        // valid; this does not change normalization of that nested command.
+        EnvParseResult::Abort => true,
+    }
+}
+
 /// Strip `sudo` prefix with its options.
 ///
 /// Handles: `-E`, `-H`, `-n`, `-k`, `-K`, `-S`, `-s`, `-b`, `-i`, `-P`, `-A`, `-B`,
@@ -365,7 +464,8 @@ fn strip_env(command: &str) -> Option<(String, StrippedWrapper)> {
     let mut idx = 0;
 
     // Phase 1: Parse options (including -S/--split-string special case)
-    match parse_env_options(rest, bytes, idx) {
+    let mut filesystem_context_changed = false;
+    match parse_env_options(rest, bytes, idx, &mut filesystem_context_changed) {
         EnvParseResult::Continue(new_idx) => idx = new_idx,
         EnvParseResult::Abort => return None,
         EnvParseResult::SplitString(idx, remaining) => {
@@ -415,7 +515,12 @@ enum EnvParseResult {
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult {
+fn parse_env_options(
+    rest: &str,
+    bytes: &[u8],
+    mut idx: usize,
+    filesystem_context_changed: &mut bool,
+) -> EnvParseResult {
     let consume_env_arg = |mut idx: usize| -> Option<usize> {
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
             idx += 1;
@@ -454,6 +559,7 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
         let word = &rest[word_start..word_end];
         if word == "-" {
             // A lone "-" implies -i (ignore environment)
+            *filesystem_context_changed = true;
             idx = word_end;
             continue;
         }
@@ -476,20 +582,26 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
                     if value_opt.is_some() {
                         return EnvParseResult::Abort;
                     }
+                    *filesystem_context_changed |= name == "--ignore-environment";
                     idx = word_end;
                     continue;
                 }
                 "--unset" | "--chdir" | "--file" | "--argv0" | "--ignore-signal" => {
+                    *filesystem_context_changed |= matches!(name, "--chdir" | "--file");
                     if let Some(value) = value_opt {
                         if token_has_shell_effect(value.as_bytes()) {
                             return EnvParseResult::Abort;
                         }
+                        *filesystem_context_changed |=
+                            name == "--unset" && filesystem_context_env_name(value);
                         idx = word_end;
                         continue;
                     }
                     let Some(next_idx) = consume_env_arg(word_end) else {
                         return EnvParseResult::Abort;
                     };
+                    *filesystem_context_changed |=
+                        name == "--unset" && filesystem_context_env_name(&rest[word_end..next_idx]);
                     idx = next_idx;
                     continue;
                 }
@@ -538,6 +650,7 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
             let flag = word_bytes[pos] as char;
             match flag {
                 'i' | '0' | 'v' => {
+                    *filesystem_context_changed |= flag == 'i';
                     pos += 1;
                 }
                 'S' => {
@@ -572,15 +685,20 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
                     return EnvParseResult::SplitString(idx, remaining);
                 }
                 'u' | 'P' | 'C' | 'f' | 'a' => {
+                    *filesystem_context_changed |= matches!(flag, 'C' | 'f');
                     if pos + 1 < word_bytes.len() {
                         if token_has_shell_effect(&word_bytes[pos + 1..]) {
                             return EnvParseResult::Abort;
                         }
+                        *filesystem_context_changed |=
+                            flag == 'u' && filesystem_context_env_name(&word[pos + 1..]);
                         idx = word_end;
                     } else {
                         let Some(next_idx) = consume_env_arg(word_end) else {
                             return EnvParseResult::Abort;
                         };
+                        *filesystem_context_changed |=
+                            flag == 'u' && filesystem_context_env_name(&rest[word_end..next_idx]);
                         idx = next_idx;
                     }
                     pos = word_bytes.len();
@@ -910,7 +1028,11 @@ fn wrapper_terminal_option(word: &str) -> bool {
     matches!(word, "-h" | "--help" | "-V" | "--version")
 }
 
-fn exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+fn exec_wrapper_command_index(
+    command: &str,
+    tokens: &[NormalizeToken],
+    filesystem_context_changed: &mut bool,
+) -> Option<usize> {
     let mut index = 1usize;
     while let Some(word) = wrapper_word(command, tokens, index) {
         if word == "--" {
@@ -924,6 +1046,7 @@ fn exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Optio
         if word.strip_prefix('-').is_some_and(|flags| {
             !flags.is_empty() && flags.bytes().all(|b| matches!(b, b'c' | b'l'))
         }) {
+            *filesystem_context_changed |= word.contains('c');
             index += 1;
             continue;
         }
@@ -1411,8 +1534,9 @@ pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'s
     let tokens = tokenize_for_normalization(trimmed);
     let executable = wrapper_word(trimmed, &tokens, 0)?;
     let basename = executable.rsplit(['/', '\\']).next().unwrap_or(&executable);
+    let mut filesystem_context_changed = false;
     let command_index = match basename {
-        "exec" => exec_wrapper_command_index(trimmed, &tokens)?,
+        "exec" => exec_wrapper_command_index(trimmed, &tokens, &mut filesystem_context_changed)?,
         "nohup" => {
             let word = wrapper_word(trimmed, &tokens, 1)?;
             if word == "--" {
@@ -1491,7 +1615,23 @@ pub(crate) fn starts_with_shell_redirection(s: &str) -> bool {
 }
 
 #[must_use]
-pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
+pub fn consume_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
+    consume_word_token_inner(bytes, i, len, false)
+}
+
+/// Consume one POSIX argv word, excluding adjacent local redirections.
+/// Normalization deliberately keeps redirections in its token view; program
+/// extraction needs the argv boundary, but must use the same quote walker.
+pub(crate) fn consume_posix_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
+    consume_word_token_inner(bytes, i, len, true)
+}
+
+fn consume_word_token_inner(
+    bytes: &[u8],
+    mut i: usize,
+    len: usize,
+    stop_at_redirect: bool,
+) -> usize {
     while i < len {
         let b = bytes[i];
 
@@ -1509,7 +1649,14 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
             continue;
         }
 
+        if stop_at_redirect && matches!(b, b'<' | b'>') {
+            break;
+        }
+
         if b == b'&' && i + 1 < len && bytes[i + 1] == b'>' {
+            if stop_at_redirect {
+                break;
+            }
             i += 2;
             if i < len && bytes[i] == b'>' {
                 i += 1;
@@ -1522,6 +1669,32 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
         }
 
         match b {
+            b'$' if i + 1 < len && bytes[i + 1] == b'\'' => {
+                // ANSI-C quotes are one segment of the same word. An escaped
+                // apostrophe does not end that segment (issue #570).
+                i += 2;
+                while i < len && bytes[i] != b'\'' {
+                    i = if bytes[i] == b'\\' {
+                        (i + 2).min(len)
+                    } else {
+                        i + 1
+                    };
+                }
+                i = (i + 1).min(len);
+            }
+            b'`' => {
+                // Preserve a complete substitution for the fallible decoder;
+                // never pretend the prefix before its whitespace is static.
+                i += 1;
+                while i < len && bytes[i] != b'`' {
+                    i = if bytes[i] == b'\\' {
+                        (i + 2).min(len)
+                    } else {
+                        i + 1
+                    };
+                }
+                i = (i + 1).min(len);
+            }
             b'\\' => {
                 // Handle CRLF escape (consumes 3 bytes: \, \r, \n)
                 if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
@@ -1811,12 +1984,24 @@ enum PosixQuote {
 }
 
 pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
+    decode_posix_token(token, false).unwrap_or(Cow::Borrowed(token))
+}
+
+/// The value of a literal POSIX argv word. Unlike the syntax matching view,
+/// failure is explicit: expansions, translation, and malformed quoting must
+/// not be mistaken for a completely recovered inline program (issue #570).
+pub(crate) fn decode_posix_literal_word(token: &str) -> Option<Cow<'_, str>> {
+    decode_posix_token(token, true)
+}
+
+fn decode_posix_token(token: &str, literal_word: bool) -> Option<Cow<'_, str>> {
     if !token
         .as_bytes()
         .iter()
         .any(|byte| matches!(*byte, b'\'' | b'"' | b'\\' | b'$' | b'`' | b'<' | b'>'))
     {
-        return Cow::Borrowed(token);
+        return (!literal_word || !token.contains(['*', '?', '[', '{', '~']))
+            .then_some(Cow::Borrowed(token));
     }
 
     let mut output = String::with_capacity(token.len());
@@ -1840,9 +2025,7 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     changed = true;
                 }
                 '\\' => {
-                    let Some(escaped) = chars.next() else {
-                        return Cow::Borrowed(token);
-                    };
+                    let escaped = chars.next()?;
                     match escaped {
                         '\n' => changed = true,
                         '\r' if chars.peek() == Some(&'\n') => {
@@ -1861,8 +2044,10 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                         }
                     }
                 }
-                '$' => return Cow::Borrowed(token),
-                '`' => return Cow::Borrowed(token),
+                '$' if literal_word && !posix_dollar_expands(chars.peek().copied()) => {
+                    output.push('$');
+                }
+                '$' | '`' => return None,
                 other => output.push(other),
             },
             PosixQuote::Unquoted => match ch {
@@ -1875,9 +2060,7 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     changed = true;
                 }
                 '\\' => {
-                    let Some(escaped) = chars.next() else {
-                        return Cow::Borrowed(token);
-                    };
+                    let escaped = chars.next()?;
                     changed = true;
                     match escaped {
                         '\n' => {}
@@ -1890,11 +2073,14 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                 '$' if chars.peek() == Some(&'\'') => {
                     chars.next();
                     if decode_ansi_c_quoted(&mut chars, &mut output).is_err() {
-                        return Cow::Borrowed(token);
+                        return None;
                     }
                     changed = true;
                 }
                 '$' if chars.peek() == Some(&'"') => {
+                    if literal_word {
+                        return None; // The locale may replace the program.
+                    }
                     // Bash locale-translation quoting has double-quote shell
                     // semantics after translation. Literal option spellings
                     // are deterministic; nested expansions still fail open.
@@ -1902,23 +2088,36 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     quote = PosixQuote::Double;
                     changed = true;
                 }
-                '$' => return Cow::Borrowed(token),
-                '`' => return Cow::Borrowed(token),
-                '<' | '>' if chars.peek() == Some(&'(') => return Cow::Borrowed(token),
+                '$' if literal_word && !posix_dollar_expands(chars.peek().copied()) => {
+                    output.push('$');
+                }
+                '$' | '`' => return None,
+                '<' | '>' if literal_word || chars.peek() == Some(&'(') => return None,
+                '*' | '?' | '[' | '{' | '~' if literal_word => return None,
                 other => output.push(other),
             },
         }
     }
 
     if quote != PosixQuote::Unquoted {
-        return Cow::Borrowed(token);
+        return None;
     }
 
     if changed {
-        Cow::Owned(output)
+        Some(Cow::Owned(output))
     } else {
-        Cow::Borrowed(token)
+        Some(Cow::Borrowed(token))
     }
+}
+
+fn posix_dollar_expands(next: Option<char>) -> bool {
+    next.is_some_and(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '_' | '(' | '{' | '[' | '$' | '?' | '!' | '#' | '@' | '*' | '-'
+            )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2542,6 +2741,7 @@ pub(crate) fn tokenize_for_shell_dialect(command: &str, dialect: ShellDialect) -
 }
 
 fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
     let mut tokens = NormalizeTokens::new();
@@ -2639,6 +2839,7 @@ fn cmd_line_continuation_end(bytes: &[u8], i: usize, len: usize) -> Option<usize
 }
 
 fn tokenize_cmd_raw(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
     let mut tokens = NormalizeTokens::new();
@@ -3004,6 +3205,7 @@ fn cmd_byte_is_caret_escaped(bytes: &[u8], index: usize) -> bool {
 
 #[must_use]
 pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
 
@@ -3874,7 +4076,14 @@ fn decode_segment_command_words_in_dialect(command: &str, dialect: ShellDialect)
 
         segment_has_command = true;
         if word != raw {
-            replacements.push((token.byte_range.clone(), word.to_string()));
+            // A case-insensitive filesystem runs the same program for a name
+            // in any case, and the escapes can spell it in another one
+            // (`$'\x52\x4d'` is `RM`, which runs `rm`). Its base name is read
+            // in lower case, as the packs spell it.
+            let base = word.rfind('/').map_or(0, |slash| slash + 1);
+            let mut decoded = word.to_string();
+            decoded[base..].make_ascii_lowercase();
+            replacements.push((token.byte_range.clone(), decoded));
         }
     }
 
@@ -3961,6 +4170,7 @@ fn normalize_decoded_command(command: &str, dialect: ShellDialect) -> Cow<'_, st
 #[inline]
 #[must_use]
 pub fn normalize_command_in_dialect(cmd: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    let _phase = crate::perf::PhaseTimer::start("normalization");
     match dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
             let stripped = strip_wrapper_prefixes(cmd);
@@ -3986,6 +4196,198 @@ pub fn normalize_command_in_dialect(cmd: &str, dialect: ShellDialect) -> Cow<'_,
 #[inline]
 pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     normalize_command_in_dialect(cmd, ShellDialect::Unknown)
+}
+
+/// Program names dcg recognizes by their own analysis rather than by a pack
+/// keyword: wrappers and frontends that run the command after them, shells,
+/// interpreters and runners whose argument is a command or a program, and
+/// remote shells. Lower case.
+const STRUCTURAL_PROGRAM_NAMES: &[&str] = &[
+    // Wrappers and frontends.
+    "sudo",
+    "doas",
+    "su",
+    "sg",
+    "runuser",
+    "env",
+    "command",
+    "builtin",
+    "exec",
+    "eval",
+    "time",
+    "nohup",
+    "nice",
+    "ionice",
+    "setsid",
+    "timeout",
+    "stdbuf",
+    "chrt",
+    "busybox",
+    "xargs",
+    "parallel",
+    "watch",
+    "entr",
+    "flock",
+    "hyperfine",
+    "script",
+    "nix-shell",
+    "npx",
+    "mise",
+    "mise-exec",
+    "find",
+    // Shells and interpreters.
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "mksh",
+    "yash",
+    "ash",
+    "fish",
+    "csh",
+    "tcsh",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "nodejs",
+    "bun",
+    "deno",
+    "tclsh",
+    "wish",
+    "expect",
+    "julia",
+    "osascript",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "sed",
+    // Remote shells and copies.
+    "ssh",
+    "scp",
+    "sftp",
+    "mosh",
+    "rsync",
+];
+
+/// Interpreters that are also run by a versioned name (`python3.12`).
+const VERSIONED_INTERPRETER_NAMES: &[&str] = &[
+    "python", "pypy", "node", "ruby", "perl", "php", "lua", "luajit",
+];
+
+/// Whether lower-case `name` names a program that an enabled pack keys on or
+/// that dcg's own analysis recognizes.
+fn is_recognized_program_name(name: &[u8], enabled_keywords: &[&str]) -> bool {
+    let unversioned = {
+        let digits = name
+            .iter()
+            .rev()
+            .take_while(|byte| byte.is_ascii_digit() || **byte == b'.')
+            .count();
+        &name[..name.len() - digits]
+    };
+    STRUCTURAL_PROGRAM_NAMES
+        .iter()
+        .any(|known| known.as_bytes() == name)
+        || VERSIONED_INTERPRETER_NAMES
+            .iter()
+            .any(|known| known.as_bytes() == unversioned)
+        || enabled_keywords
+            .iter()
+            .any(|keyword| keyword.as_bytes().eq_ignore_ascii_case(name))
+}
+
+/// `command` with every program name it spells in a case other than lower
+/// case folded to lower case, or `None` when it spells none.
+///
+/// A case-insensitive filesystem (macOS by default, Windows) runs `/bin/rm`
+/// for `RM`, `Rm` or `/bin/RM`, and every name the packs and the shell
+/// analysis compare is a lower-case one, so `RM -rf ~` or `sSH host '…'`
+/// matched nothing. The evaluator also reads this view, on every platform:
+/// a name that is folded runs the same program in it.
+///
+/// A program name here is a word (a run of letters, digits and `._+-`, with
+/// quotes and backslashes inside it removed, as the shell removes them, and a
+/// `.exe` suffix ignored) whose lower-case form an enabled pack keys on or
+/// dcg's own analysis recognizes (see [`STRUCTURAL_PROGRAM_NAMES`]). The last
+/// part of a word a backslash splits counts too, as a Windows path ends in
+/// it. Arguments that are no program name keep their case: unlike program
+/// names, they mean what their case says. Heredoc bodies are left as they
+/// are: a body is data, or a script read on its own (where this applies
+/// again), and folding its words could only cost time. Only text that every
+/// shell reads as a body is left out (see
+/// [`crate::context::undisputed_heredoc_body_ranges`]): what one shell reads
+/// as a body may be commands to another.
+///
+/// Length preserving (ASCII case folding), so every range in the view is the
+/// same range in `command`.
+#[must_use]
+pub(crate) fn fold_program_name_case(command: &str, enabled_keywords: &[&str]) -> Option<String> {
+    let bytes = command.as_bytes();
+    if !bytes.iter().any(u8::is_ascii_uppercase) {
+        return None;
+    }
+    let is_name_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-');
+    let is_transparent = |byte: u8| matches!(byte, b'\'' | b'"' | b'\\');
+    let mut bodies = crate::context::undisputed_heredoc_body_ranges(command)
+        .into_iter()
+        .peekable();
+    let mut folded: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(body) = bodies.peek() {
+            if i >= body.end {
+                bodies.next();
+                continue;
+            }
+            if i >= body.start {
+                i = body.end;
+                continue;
+            }
+        }
+        if !is_name_byte(bytes[i]) && !is_transparent(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let limit = bodies.peek().map_or(bytes.len(), |body| body.start);
+        while i < limit && (is_name_byte(bytes[i]) || is_transparent(bytes[i])) {
+            i += 1;
+        }
+        let run = &bytes[start..i];
+        if !run.iter().any(u8::is_ascii_uppercase) {
+            continue;
+        }
+        let name_of = |part: &[u8]| -> Vec<u8> {
+            let mut name: Vec<u8> = part
+                .iter()
+                .filter(|byte| !is_transparent(**byte))
+                .map(u8::to_ascii_lowercase)
+                .collect();
+            if name.len() > 4 && name.ends_with(b".exe") {
+                name.truncate(name.len() - 4);
+            }
+            name
+        };
+        let fold = if is_recognized_program_name(&name_of(run), enabled_keywords) {
+            Some(start..i)
+        } else {
+            // A Windows path: the part after its last backslash.
+            run.iter()
+                .rposition(|byte| *byte == b'\\')
+                .map(|at| start + at + 1..i)
+                .filter(|last| {
+                    let name = name_of(&bytes[last.clone()]);
+                    !name.is_empty() && is_recognized_program_name(&name, enabled_keywords)
+                })
+        };
+        if let Some(range) = fold {
+            folded.get_or_insert_with(|| bytes.to_vec())[range].make_ascii_lowercase();
+        }
+    }
+    folded.map(|view| String::from_utf8(view).expect("ASCII case folding keeps UTF-8"))
 }
 
 /// Strip leading backslash from the first command token.
@@ -4112,6 +4514,60 @@ mod tests {
             assert!(
                 !strip_wrapper_prefixes(command).was_normalized(),
                 "informational/process mode was treated as command execution: {command}"
+            );
+        }
+    }
+
+    /// Program names a pack keys on or the analysis recognizes are folded to
+    /// lower case wherever a word spells one, through quotes, backslashes, a
+    /// directory and a `.exe` suffix; flags, other words and heredoc bodies
+    /// keep their case, and the view keeps the command's length.
+    #[test]
+    fn program_names_fold_to_lower_case() {
+        let keywords = ["rm", "git", "dd"];
+        for (command, folded) in [
+            ("RM -rf ~", "rm -rf ~"),
+            ("Rm -rf ~", "rm -rf ~"),
+            ("/bin/RM -rf ~", "/bin/rm -rf ~"),
+            ("\"RM\" -rf ~", "\"rm\" -rf ~"),
+            ("R\\M -rf ~", "r\\m -rf ~"),
+            ("C:\\Tools\\RM.EXE -rf x", "C:\\Tools\\rm.exe -rf x"),
+            ("SUDO RM -rf ~", "sudo rm -rf ~"),
+            ("echo ~ | XARGS RM -rf", "echo ~ | xargs rm -rf"),
+            ("sSH host 'RM -rf ~'", "ssh host 'rm -rf ~'"),
+            ("Python3.12 -c 'x'", "python3.12 -c 'x'"),
+            ("DD if=/dev/zero of=/dev/sda", "dd if=/dev/zero of=/dev/sda"),
+            (
+                "cat <<'EOF' >notes\nRM -rf ~\nEOF\nRM x",
+                "cat <<'EOF' >notes\nRM -rf ~\nEOF\nrm x",
+            ),
+        ] {
+            let view = fold_program_name_case(command, &keywords);
+            assert_eq!(view.as_deref(), Some(folded), "{command:?}");
+            assert_eq!(folded.len(), command.len());
+        }
+        for command in [
+            "rm -RF ~",
+            "git branch -D Feature",
+            "RM_DIR=build make",
+            "LS -la",
+            "Get-ChildItem -Path C:\\",
+            "rm -rf ~",
+            "cat <<'EOF'\nRM -rf ~\nEOF",
+        ] {
+            assert_eq!(
+                fold_program_name_case(command, &keywords),
+                None,
+                "{command:?}"
+            );
+        }
+        // A command word spelled with escapes is read with its base name in
+        // lower case too.
+        for command in ["$'\\x52\\x4d' -rf ~", "/bin/$'\\x52M' -rf ~"] {
+            let normalized = normalize_command_in_dialect(command, ShellDialect::Posix);
+            assert!(
+                normalized.contains("rm -rf ~"),
+                "{command:?} -> {normalized:?}"
             );
         }
     }
@@ -5126,6 +5582,99 @@ mod tests {
             );
             assert_eq!(result.normalized, expected, "for {cmd}");
         }
+    }
+
+    #[test]
+    fn wrapper_filesystem_context_tracks_cwd_home_and_environment_changes() {
+        for command in [
+            "sudo psql -X -f safe.sql",
+            "sudo -D /elsewhere -u other psql -X -f safe.sql",
+            "command /usr/bin/env -C /elsewhere psql -X -f safe.sql",
+            "env -C/elsewhere psql -X -f safe.sql",
+            "env -vC '/another directory' psql -X -f safe.sql",
+            "env --chdir=/elsewhere psql -X -f safe.sql",
+            "env --chdir /elsewhere psql -X -f safe.sql",
+            "env HOME=/elsewhere psql -c 'SELECT 1'",
+            "HOME=/elsewhere command psql -c 'SELECT 1'",
+            "env -- HOME=/elsewhere psql -c 'SELECT 1'",
+            "env USERPROFILE=/elsewhere psql -c 'SELECT 1'",
+            "env -i psql -c 'SELECT 1'",
+            "env --ignore-environment psql -c 'SELECT 1'",
+            "env -u HOME psql -c 'SELECT 1'",
+            "env -uHOMEPATH psql -c 'SELECT 1'",
+            "env --unset=HOMEDRIVE psql -c 'SELECT 1'",
+            "env --unset 'HOME' psql -c 'SELECT 1'",
+            "env -u PSQLRC psql -c 'SELECT 1'",
+            "env -u \"$NAME\" psql -c 'SELECT 1'",
+            "env -u H* psql -c 'SELECT 1'",
+            "env -f environment.txt psql -c 'SELECT 1'",
+            "env --file=environment.txt psql -c 'SELECT 1'",
+            "exec -c psql -c 'SELECT 1'",
+            "exec -lc -a label psql -c 'SELECT 1'",
+            "mise exec -- psql -c 'SELECT 1'",
+        ] {
+            assert!(wrapper_changes_filesystem_context(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn wrapper_filesystem_context_respects_option_operands_and_command_boundaries() {
+        for command in [
+            "psql -X -c 'SELECT 1'",
+            "printf '%s' 'env -C /elsewhere HOME=/elsewhere sudo'",
+            "command psql -X -c 'SELECT 1'",
+            "nice -n 5 psql -X -c 'SELECT 1'",
+            "env LABEL=value psql -X -f safe.sql",
+            "env LABEL='HOME=/elsewhere' psql -X -f safe.sql",
+            "env '$HOME'=value psql -X -f safe.sql",
+            "env PSQLRC=safe.psql psql -c 'SELECT 1'",
+            "PSQLRC=safe.psql psql -c 'SELECT 1'",
+            "env -u LABEL psql -X -f safe.sql",
+            "env -u -C psql -X -f safe.sql",
+            "env -u--chdir psql -X -f safe.sql",
+            "env --unset=-C psql -X -f safe.sql",
+            "env -a -C psql -X -f safe.sql",
+            "env --argv0 HOME psql -X -f safe.sql",
+            "env --ignore-signal -C psql -X -f safe.sql",
+            "env -u '$HOME' psql -X -f safe.sql",
+            "env -- psql -X -c '--chdir=/elsewhere'",
+            "env -- -C /elsewhere psql -X -f safe.sql",
+            "env LABEL=value psql -X -c 'HOME=/elsewhere'",
+            "exec -l psql -X -c 'SELECT 1'",
+            "exec -a -c psql -X -c 'SELECT 1'",
+            "exec -- psql -X -c 'SELECT 1'",
+            "mise list --current",
+        ] {
+            assert!(!wrapper_changes_filesystem_context(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn wrapper_filesystem_context_bounds_split_string_analysis_without_new_normalization() {
+        for command in [
+            "env -S '-C /elsewhere psql -X -f safe.sql'",
+            "env --split-string='HOME=/elsewhere psql -c SELECT'",
+            "env -S '-u LABEL env -C /elsewhere psql -X -f safe.sql'",
+            "env -S 'exec -c psql -c SELECT'",
+            "env -S '--unknown-option psql -X -f safe.sql'",
+        ] {
+            assert!(wrapper_changes_filesystem_context(command), "{command}");
+        }
+        for command in [
+            "env -S 'psql -X -f safe.sql'",
+            "env -S '-u LABEL psql -X -f safe.sql'",
+            "env -S '-a -C psql -X -f safe.sql'",
+            "env -S '-- psql -X -c --chdir=/elsewhere'",
+        ] {
+            assert!(!wrapper_changes_filesystem_context(command), "{command}");
+        }
+        assert_eq!(
+            strip_wrapper_prefixes("env -S '-C /elsewhere psql -X -f safe.sql'").normalized,
+            "-C /elsewhere psql -X -f safe.sql",
+            "context observation must not add a new normalization rule"
+        );
+        let beyond_wrapper_limit = format!("{}psql -X -f safe.sql", "command ".repeat(40));
+        assert!(wrapper_changes_filesystem_context(&beyond_wrapper_limit));
     }
 
     #[test]

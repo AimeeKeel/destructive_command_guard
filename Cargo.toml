@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.15.2"
+version = "0.15.3"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -65,7 +65,10 @@ tokio = { version = "1.52", features = ["rt-multi-thread"] }
 rayon = { version = "1.11", optional = true }
 
 # AST-based pattern matching for heredoc/inline-script content
-ast-grep-core = "0.45"
+# SupportLang crosses this crate's Language/LanguageExt trait boundary. Keep
+# the core compatible with the vendored language adapter below; two semver
+# incompatible core versions produce distinct traits and cannot interoperate.
+ast-grep-core = "0.45.3"
 # The Bash grammar carries dcg's #442/#461 fixes (scanner memory safety on glibc;
 # explicit stdin descriptors and mixed file/here-string redirections). It used to
 # arrive through `[patch.crates-io]`, which `cargo publish` drops, so a crates.io
@@ -111,10 +114,15 @@ tru = "0.2.2"
 rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-# Safe `gethostname()` for the history `hostname` column (#514). nix is already
-# compiled in through ctrlc; this only turns on its `hostname` feature, so no
-# new crate enters the graph and `#![forbid(unsafe_code)]` still holds here.
-nix = { version = "0.31", default-features = false, features = ["hostname"] }
+# Safe `gethostname()` for the history `hostname` column (#514), and safe
+# `getrusage()` so a deadline miss can report the CPU time the hook got (#571).
+# nix is already compiled in through ctrlc; this only turns on two of its
+# features, so no new crate enters the graph and `#![forbid(unsafe_code)]`
+# still holds here.
+nix ={ version = "0.31", default-features = false, features = ["hostname", "resource"] }
+# Safe descriptor-based ownership and Linux extended-attribute preservation
+# during atomic settings replacement. Already present in the dependency graph.
+rustix = { version = "1.1.5", features = ["fs"] }
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.8", features = ["build", "cargo", "rustc"] }

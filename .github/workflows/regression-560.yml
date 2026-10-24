@@ -1,0 +1,59 @@
+name: Issue 560 source-boundary regressions
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - tests/repro_560_source_boundaries.rs
+      - .github/workflows/regression-560.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly-2026-08-31
+        with:
+          components: rustfmt, clippy
+      - name: Build the actual classifier
+        id: build
+        run: cargo build --locked --bin dcg
+      - name: Preserve exact source for reproducibility
+        if: always()
+        run: |
+          git rev-parse HEAD > source-sha.txt
+          git archive --format=tar HEAD > source.tar
+      - name: Run literal-budget and executable-source unit regressions
+        run: |
+          set -o pipefail
+          cargo test --locked --lib ast_matcher::tests:: -- --nocapture --test-threads=1 2>&1 | tee regression-560-unit.log
+      - name: Run CLI and hook boundary regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          cargo test --locked --test repro_560_source_boundaries -- --nocapture --test-threads=1 2>&1 | tee regression-560.log
+      - name: Preserve native binary and regression evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-560-${{ github.sha }}
+          retention-days: 7
+          path: |
+            source-sha.txt
+            source.tar
+            target/debug/dcg
+            regression-560-unit.log
+            regression-560.log

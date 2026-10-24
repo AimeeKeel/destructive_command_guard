@@ -1,0 +1,220 @@
+name: Flowctl receipt command-data verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/flowctl-command-data-verification.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flowctl-command-data-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'Dicklesworthstone/destructive_command_guard'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RCH_ENABLED: '0'
+      RUST_BACKTRACE: '1'
+      PATCH_BLOB: f1650462660a9ed1981a50b9416a72f554782584
+      PROVENANCE_PATCH_BLOB: ac040c397880978731cce0f20027d2cc0a8caab0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record the exact base and activate the pinned toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p target/flowctl-538
+          git rev-parse HEAD > target/flowctl-538/base-revision.txt
+          test "$(git rev-parse HEAD:src/context.rs)" = 4bb2a61161c127233351181e61693acc623753cf
+          test "$(git rev-parse HEAD:src/evaluator.rs)" = 8d0bfb6f8e1d3a998d73791e2a1f6d297b2d5728
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          brew install bash jq
+          echo "HARNESS_BASH=$(brew --prefix bash)/bin/bash" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: flowctl-538-fixed-argv-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: Retrieve and check the fixed-argv source patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PATCH_BLOB" --jq .content \
+            | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' \
+            > "$RUNNER_TEMP/flowctl-538.patch"
+          test "$(git hash-object "$RUNNER_TEMP/flowctl-538.patch")" = "$PATCH_BLOB"
+          cp "$RUNNER_TEMP/flowctl-538.patch" target/flowctl-538/reviewed.patch
+          git apply --check "$RUNNER_TEMP/flowctl-538.patch"
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PROVENANCE_PATCH_BLOB" --jq .content \
+            | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' \
+            > "$RUNNER_TEMP/flowctl-538-provenance.patch"
+          test "$(git hash-object "$RUNNER_TEMP/flowctl-538-provenance.patch")" = "$PROVENANCE_PATCH_BLOB"
+          cp "$RUNNER_TEMP/flowctl-538-provenance.patch" target/flowctl-538/provenance.patch
+
+      - name: Reproduce both reported failures before the implementation change
+        run: |
+          set -euo pipefail
+          git apply --include=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
+          for name in reported_variable_assignment_is_data reported_variable_receipt_is_data; do
+            set +e
+            cargo test --locked --test repro_538_flowctl_command_data "$name" -- --exact \
+              2>&1 | tee "target/flowctl-538/baseline-$name.log"
+            result=${PIPESTATUS[0]}
+            set -e
+            test "$result" -eq 101
+            grep -F "test $name ... FAILED" "target/flowctl-538/baseline-$name.log"
+            grep -F 'test result: FAILED. 0 passed; 1 failed;' "target/flowctl-538/baseline-$name.log"
+          done
+
+      - name: Apply the implementation and format the touched source
+        run: |
+          set -euo pipefail
+          git apply --check --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
+          git apply --exclude=tests/repro_538_flowctl_command_data.rs "$RUNNER_TEMP/flowctl-538.patch"
+          git apply --check "$RUNNER_TEMP/flowctl-538-provenance.patch"
+          git apply "$RUNNER_TEMP/flowctl-538-provenance.patch"
+          rustfmt --edition 2024 --config skip_children=true \
+            src/context.rs src/evaluator.rs tests/repro_538_flowctl_command_data.rs
+
+      - name: Run focused real-binary and existing launcher/context regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked --test repro_538_flowctl_command_data \
+            2>&1 | tee target/flowctl-538/regression.log
+          cargo test --locked --lib context:: -- --test-threads=1 \
+            2>&1 | tee target/flowctl-538/context.log
+          cargo test --locked --lib inline_launcher -- --test-threads=1 \
+            2>&1 | tee target/flowctl-538/launchers.log
+          cargo test --locked --test repro_459_argv_split_spawns \
+            2>&1 | tee target/flowctl-538/argv-spawns.log
+          for log in regression context launchers argv-spawns; do
+            grep -E 'test result: ok\. [1-9][0-9]* passed;' "target/flowctl-538/$log.log"
+          done
+
+      - name: Check all targets, Clippy, formatting, and real hook protocols
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets 2>&1 | tee target/flowctl-538/check.log
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee target/flowctl-538/clippy.log
+          cargo fmt --all --check 2>&1 | tee target/flowctl-538/fmt.log
+          cargo build --locked --bin dcg 2>&1 | tee target/flowctl-538/build.log
+          "$HARNESS_BASH" scripts/e2e_harness_matrix.sh --binary "$PWD/target/debug/dcg" \
+            2>&1 | tee target/flowctl-538/harness.log
+          git diff --check
+
+      - name: Publish only the verified source directly to unchanged main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repository = os.environ['GITHUB_REPOSITORY']
+          if repository != 'Dicklesworthstone/destructive_command_guard' or os.environ['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Refusing publication outside the authorized repository/main branch')
+
+          def api(path, payload=None, method='POST'):
+              args = ['gh', 'api']
+              if payload is not None:
+                  args += ['--method', method, '--input', '-']
+              args += [f'repos/{repository}/{path}']
+              result = subprocess.run(args, input=None if payload is None else json.dumps(payload),
+                                      text=True, check=True, capture_output=True)
+              return json.loads(result.stdout)
+
+          paths = ['src/context.rs', 'src/evaluator.rs', 'tests/repro_538_flowctl_command_data.rs']
+          parent = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if parent != os.environ['GITHUB_SHA']:
+              raise SystemExit('Checked-out source does not match the triggering revision')
+          if api('git/ref/heads/main')['object']['sha'] != parent:
+              raise SystemExit('Main advanced during verification; refusing to overwrite concurrent changes')
+          manifest = {
+              'base_commit': parent,
+              'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'patch_blob': os.environ['PATCH_BLOB'],
+              'provenance_patch_blob': os.environ['PROVENANCE_PATCH_BLOB'],
+              'files': [],
+          }
+          for path in paths:
+              blob = api('git/blobs', {
+                  'encoding': 'base64',
+                  'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode('ascii'),
+              })
+              expected = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if blob['sha'] != expected:
+                  raise SystemExit(f'blob hash mismatch for {path}')
+              manifest['files'].append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']})
+          tree = api('git/trees', {'base_tree': manifest['base_tree'], 'tree': manifest['files']})
+          message = (
+              'fix: distinguish fixed-argv flowctl receipt data from inline launchers (#538)\n\n'
+              'Share a bounded gate check/receipt data contract between the sanitizer and '
+              'launcher classifier. Recognize documented quoted scalar spellings, not bare '
+              'executable expansions or array-produced arguments. Keep substitutions, '
+              'redirections, extra flags and unknown executables conservative, including '
+              'the substitution projection\'s dynamic placeholders. Reuse the '
+              'existing wrapper grammar and retain unknown attached-code flag denials.\n\n'
+              'Validated paired before/after reproductions, real-binary regression cases, '
+              'existing context and launcher tests, argv-spawn regressions, all-target '
+              'check and Clippy, formatting, and real hook protocols.\n\n'
+              f'Validation: https://github.com/{repository}/actions/runs/{os.environ["GITHUB_RUN_ID"]}\n\n'
+              'Fixes #538'
+          )
+          commit = api('git/commits', {'message': message, 'tree': tree['sha'], 'parents': [parent]})
+          # A non-force update also rejects a race after the head check above.
+          api('git/refs/heads/main', {'sha': commit['sha'], 'force': False}, method='PATCH')
+          manifest['source_commit'] = commit['sha']
+          encoded = json.dumps(manifest, sort_keys=True)
+          pathlib.Path('target/flowctl-538/verified-source.json').write_text(encoded + '\n')
+          print('FLOWCTL538_VERIFIED_SOURCE=' + encoded)
+          PY
+
+      - name: Retain exact source and diagnostics
+        if: always()
+        run: |
+          mkdir -p target/flowctl-538
+          git rev-parse HEAD > target/flowctl-538/checked-out-revision.txt
+          git diff --binary > target/flowctl-538/uncommitted.patch
+          if test -f tests/repro_538_flowctl_command_data.rs; then
+            tar -czf target/flowctl-538/source.tar.gz \
+              src/context.rs src/evaluator.rs tests/repro_538_flowctl_command_data.rs
+          fi
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: flowctl-538-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/flowctl-538/
+          if-no-files-found: error

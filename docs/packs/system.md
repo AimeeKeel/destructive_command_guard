@@ -199,7 +199,6 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `chmod-non-recursive` | `chmod\s+(?!-[rR])(?:\d{3,4}\|[ugoa][+-][rwxXst]+)\s+[^/~$"']` |
 | `stat` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?stat\b` |
 | `ls-perms` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?ls\b.*-[a-zA-Z]*l` |
 | `getfacl` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?getfacl\b` |
@@ -260,6 +259,8 @@ Commands containing these keywords are checked against this pack:
 - `upstart`
 - `shutdown`
 - `reboot`
+- `modprobe`
+- `rmmod`
 
 ### Safe Patterns (Allowed)
 
@@ -289,6 +290,9 @@ These patterns match potentially destructive commands:
 | `shutdown` | shutdown will power off or restart the system. | critical |
 | `reboot` | reboot will restart the system. | critical |
 | `init-level` | init 0 shuts down, init 6 reboots the system. | critical |
+| `modprobe-remove` | Unloading a kernel module on a running host can crash or wedge the kernel. | high |
+| `rmmod` | Unloading a kernel module on a running host can crash or wedge the kernel. | high |
+| `ssh-remote-module-unload` | Unloading a kernel module on a remote host can crash or wedge its kernel. | high |
 
 ### Allowlist Guidance
 

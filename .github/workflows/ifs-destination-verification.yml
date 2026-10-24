@@ -1,0 +1,245 @@
+name: Native IFS destination verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ifs-destination-verification.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ifs-558-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'Dicklesworthstone/destructive_command_guard' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RCH_ENABLED: '0'
+      RUST_BACKTRACE: '1'
+      SOURCE_BLOB: 494a1b4bc5203def4960a96bf48f5e4f0442b0c1
+      SOURCE_CORRECTIONS_BLOB: 25f68cd11226b0a8a070e5cae70357b423c804ed
+      EVALUATOR_PATCH_BLOB: fbce7f0942c8e197f625bb5ca483e78877b59ccd
+      TEST_PATCH_BLOB: f3de543f5f30c816c344aef2b0c89085be92ba77
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pin source and activate the repository toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p target/ifs-558
+          git rev-parse HEAD > target/ifs-558/base-revision.txt
+          test "$(git rev-parse HEAD:src/evaluator.rs)" = 35bfd39dd56471b5d5878fccdba3f459be22409f
+          test "$(git rev-parse HEAD:tests/repro_538_flowctl_command_data.rs)" = 8b09db636bc05d3f26ec9d97a11def1b21840c2f
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          brew install bash jq
+          echo "HARNESS_BASH=$(brew --prefix bash)/bin/bash" >> "$GITHUB_ENV"
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: ifs-558-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ifs-558-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-
+            flowctl-538-fixed-argv-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Retrieve the exact reviewed source and regression patches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fetch_blob() {
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$1" --jq .content \
+              | python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))' > "$2"
+            test "$(git hash-object "$2")" = "$1"
+          }
+          fetch_blob "$SOURCE_BLOB" target/ifs-558/word_splitting.rs
+          fetch_blob "$SOURCE_CORRECTIONS_BLOB" target/ifs-558/scope-corrections.patch
+          fetch_blob "$EVALUATOR_PATCH_BLOB" target/ifs-558/evaluator.patch
+          fetch_blob "$TEST_PATCH_BLOB" target/ifs-558/tests.patch
+          git apply --check target/ifs-558/evaluator.patch
+          git apply --check target/ifs-558/tests.patch
+
+      - name: Reproduce the native false negative before changing implementation
+        id: baseline
+        run: |
+          set -euo pipefail
+          git apply target/ifs-558/tests.patch
+          set +e
+          cargo test --locked --test repro_538_flowctl_command_data reported_rebound_ifs_destination_558 \
+            -- --exact --test-threads=1 2>&1 | tee target/ifs-558/baseline.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 101
+          grep -F 'reported_rebound_ifs_destination_558 ... FAILED' target/ifs-558/baseline.log
+          grep -F 'test result: FAILED. 0 passed; 1 failed;' target/ifs-558/baseline.log
+          grep -F 'Result: ALLOWED' target/ifs-558/baseline.log
+
+      - name: Apply and format the bounded native expansion model
+        run: |
+          set -euo pipefail
+          mkdir -p src/evaluator
+          test ! -e src/evaluator/word_splitting.rs
+          cp target/ifs-558/word_splitting.rs src/evaluator/word_splitting.rs
+          git apply --check target/ifs-558/scope-corrections.patch
+          git apply target/ifs-558/scope-corrections.patch
+          git apply --check target/ifs-558/evaluator.patch
+          git apply target/ifs-558/evaluator.patch
+          rustfmt --edition 2024 --config skip_children=true \
+            src/evaluator.rs src/evaluator/word_splitting.rs tests/repro_538_flowctl_command_data.rs
+          git add --intent-to-add src/evaluator/word_splitting.rs
+
+      - name: Check field boundaries against Bash and run native CLI and hook regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib evaluator::word_splitting:: -- --test-threads=1 \
+            2>&1 | tee target/ifs-558/splitting.log
+          cargo test --locked --test repro_538_flowctl_command_data \
+            --test repro_498_warn_masks_later_deny --test repro_459_argv_split_spawns \
+            -- --test-threads=1 2>&1 | tee target/ifs-558/regressions.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed;' target/ifs-558/splitting.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed;' target/ifs-558/regressions.log
+
+      - name: Run existing evaluator and core policy coverage
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib evaluator:: -- --test-threads=1 \
+            2>&1 | tee target/ifs-558/evaluator.log
+          cargo test --locked --lib packs::core:: -- --test-threads=1 \
+            2>&1 | tee target/ifs-558/core.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed;' target/ifs-558/evaluator.log
+          grep -E 'test result: ok\. [1-9][0-9]* passed;' target/ifs-558/core.log
+
+      - name: Check all targets, Clippy, formatting and real hook protocols
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets 2>&1 | tee target/ifs-558/check.log
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee target/ifs-558/clippy.log
+          cargo fmt --all --check 2>&1 | tee target/ifs-558/fmt.log
+          cargo build --locked --bin dcg 2>&1 | tee target/ifs-558/build.log
+          "$HARNESS_BASH" scripts/e2e_harness_matrix.sh --binary "$PWD/target/debug/dcg" \
+            2>&1 | tee target/ifs-558/harness.log
+          git diff --check
+
+      - name: Publish only tested source directly to unchanged main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          repository = os.environ['GITHUB_REPOSITORY']
+          if repository != 'Dicklesworthstone/destructive_command_guard' or os.environ['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Refusing publication outside the authorized repository/main branch')
+
+          def api(path, payload=None, method='POST'):
+              args = ['gh', 'api']
+              if payload is not None:
+                  args += ['--method', method, '--input', '-']
+              args += [f'repos/{repository}/{path}']
+              result = subprocess.run(args, input=None if payload is None else json.dumps(payload),
+                                      text=True, check=True, capture_output=True)
+              return json.loads(result.stdout)
+
+          paths = ['src/evaluator.rs', 'src/evaluator/word_splitting.rs', 'tests/repro_538_flowctl_command_data.rs']
+          parent = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if parent != os.environ['GITHUB_SHA'] or api('git/ref/heads/main')['object']['sha'] != parent:
+              raise SystemExit('Main advanced during verification; refusing to overwrite concurrent work')
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          if set(changed) != set(paths):
+              raise SystemExit(f'Unexpected changed source paths: {changed}')
+          manifest = {
+              'base_commit': parent,
+              'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'source_blob': os.environ['SOURCE_BLOB'],
+              'source_corrections_blob': os.environ['SOURCE_CORRECTIONS_BLOB'],
+              'evaluator_patch_blob': os.environ['EVALUATOR_PATCH_BLOB'],
+              'test_patch_blob': os.environ['TEST_PATCH_BLOB'],
+              'files': [],
+          }
+          for path in paths:
+              blob = api('git/blobs', {
+                  'encoding': 'base64',
+                  'content': base64.b64encode(pathlib.Path(path).read_bytes()).decode('ascii'),
+              })
+              expected = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if blob['sha'] != expected:
+                  raise SystemExit(f'Blob hash mismatch for {path}')
+              manifest['files'].append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']})
+          tree = api('git/trees', {'base_tree': manifest['base_tree'], 'tree': manifest['files']})
+          message = (
+              'fix: evaluate rebound IFS argument fields through native policy (#558)\n\n'
+              'Carry bounded literal bindings and IFS across straight-line assignments, '
+              'split unquoted scalar arguments using POSIX whitespace/non-whitespace '
+              'rules, and preserve quoted argv boundaries. Refuse unproven splitting '
+              'rather than judging a joined path. Temporary environment assignments '
+              'do not supply values for their own argv expansion.\n\n'
+              'Verified the native before/after reproduction, isolated CLI and hook '
+              'regressions without custom packs, Bash argv comparisons, existing '
+              'evaluator/core tests, all-target check and Clippy, formatting, and '
+              'the real hook harness.\n\n'
+              f'Validation: https://github.com/{repository}/actions/runs/{os.environ["GITHUB_RUN_ID"]}'
+          )
+          commit = api('git/commits', {'message': message, 'tree': tree['sha'], 'parents': [parent]})
+          api('git/refs/heads/main', {'sha': commit['sha'], 'force': False}, method='PATCH')
+          manifest['source_commit'] = commit['sha']
+          encoded = json.dumps(manifest, sort_keys=True)
+          pathlib.Path('target/ifs-558/verified-source.json').write_text(encoded + '\n')
+          print('IFS558_VERIFIED_SOURCE=' + encoded)
+          PY
+
+      - name: Retain exact candidate source and diagnostics
+        if: always()
+        run: |
+          mkdir -p target/ifs-558
+          git diff --binary > target/ifs-558/tested.patch
+          if test -f src/evaluator/word_splitting.rs; then
+            tar -czf target/ifs-558/source.tar.gz \
+              src/evaluator.rs src/evaluator/word_splitting.rs tests/repro_538_flowctl_command_data.rs
+          fi
+
+      - uses: actions/cache/save@v6
+        if: always() && steps.baseline.outcome == 'success'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: ifs-558-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ifs-558-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ifs-558/
+          if-no-files-found: error

@@ -33,14 +33,15 @@
 //! - Hard timeout: 20ms
 
 use crate::heredoc::ScriptLanguage;
+use ast_grep_core::matcher::{Matcher, MatcherExt};
 use ast_grep_core::{AstGrep, Pattern};
 use ast_grep_language::SupportLang;
 use memchr::memchr_iter;
 use regex::Regex;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, mpsc};
+use std::sync::{Arc, LazyLock, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -138,7 +139,7 @@ impl Severity {
 }
 
 /// Result of a pattern match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternMatch {
     /// Stable rule ID for allowlisting (e.g., `heredoc.python.subprocess_rm`).
     pub rule_id: String,
@@ -306,12 +307,35 @@ struct PrecompiledPattern {
     meta: CompiledPattern,
 }
 
+/// Immutable matching plan shared by calls and their bounded worker threads.
+/// The index uses ast-grep's own necessary node-kind conditions, exactly as
+/// `Node::find_all` does. A pattern without that condition visits every node.
+struct PatternIndex {
+    patterns: Vec<PrecompiledPattern>,
+    by_kind: Vec<Vec<usize>>,
+    any_kind: Vec<usize>,
+}
+
+/// A hook normally reads one interpreter language. Keep the other grammars
+/// cold, while retaining every rule when a nested interpreter needs them.
+struct LanguagePatterns {
+    source: Vec<CompiledPattern>,
+    compiled: OnceLock<Arc<PatternIndex>>,
+}
+
+impl LanguagePatterns {
+    fn compiled(&self, language: SupportLang) -> &Arc<PatternIndex> {
+        self.compiled
+            .get_or_init(|| Arc::new(compile_patterns(&self.source, language)))
+    }
+}
+
 /// AST pattern matcher using ast-grep-core.
 ///
-/// Holds pre-compiled patterns for each supported language.
+/// Compiles each supported language's patterns once, on first use.
 pub struct AstMatcher {
     /// Patterns organized by language.
-    patterns: HashMap<ScriptLanguage, Vec<PrecompiledPattern>>,
+    patterns: HashMap<ScriptLanguage, LanguagePatterns>,
     /// Timeout for matching operations.
     timeout: Duration,
 }
@@ -326,9 +350,8 @@ impl AstMatcher {
     /// Create a new matcher with default destructive patterns.
     #[must_use]
     pub fn new() -> Self {
-        precompile_perl_patterns();
         Self {
-            patterns: precompile_patterns(default_patterns()),
+            patterns: prepare_patterns(default_patterns()),
             timeout: ast_timeout(),
         }
     }
@@ -337,9 +360,8 @@ impl AstMatcher {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // HashMap is not const-constructible
     pub fn with_patterns(patterns: HashMap<ScriptLanguage, Vec<CompiledPattern>>) -> Self {
-        precompile_perl_patterns();
         Self {
-            patterns: precompile_patterns(patterns),
+            patterns: prepare_patterns(patterns),
             timeout: ast_timeout(),
         }
     }
@@ -386,13 +408,15 @@ impl AstMatcher {
         language: ScriptLanguage,
         timeout: Duration,
     ) -> Result<Vec<PatternMatch>, MatchError> {
-        let start_time = Instant::now();
         let budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
 
         // Perl is not supported by ast-grep-language; use a conservative regex fallback.
         if language == ScriptLanguage::Perl {
-            return find_matches_perl(code, start_time, timeout, budget_ms);
+            precompile_perl_patterns();
+            return find_matches_perl(code, Instant::now(), timeout, budget_ms);
         }
+
+        let start_time = Instant::now();
 
         // Check language support FIRST (before patterns, so we report unsupported properly)
         let Some(ast_lang) = script_language_to_ast_lang(language) else {
@@ -401,9 +425,17 @@ impl AstMatcher {
 
         // Get patterns for this language (after language support check)
         let patterns = match self.patterns.get(&language) {
-            Some(p) if !p.is_empty() => p,
+            Some(p) => p,
             _ => return Ok(Vec::new()), // No patterns = no matches
         };
+
+        // Compilation, like the previous eager constructor, is outside the
+        // tier-local matching deadline and inside the caller's hook deadline.
+        // Only the requested language pays this once-per-matcher cost.
+        let patterns = patterns.compiled(ast_lang);
+        if patterns.patterns.is_empty() {
+            return Ok(Vec::new());
+        }
 
         if timeout.is_zero() || code.len() > MAX_AST_INPUT_BYTES {
             return Err(timeout_error(start_time, budget_ms));
@@ -413,7 +445,7 @@ impl AstMatcher {
             code.to_string(),
             language,
             ast_lang,
-            patterns.clone(),
+            Arc::clone(patterns),
             timeout,
             budget_ms,
         )
@@ -535,6 +567,9 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
 
     for caps in sink_regex.captures_iter(code) {
         let Some(m) = caps.get(0) else { continue };
+        let Some((call_start, sink)) = exec_sink_call(&caps) else {
+            continue;
+        };
 
         // Scan the sink call's full argument region — not just its first string
         // literal — so a destructive payload nested inside a list/tuple literal
@@ -542,7 +577,7 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         // first literal (`"sh"`) is inert (#136). The region spans from the
         // opening paren of this match to the balanced close paren (bounded to the
         // remainder of the source), descending into bracketed list elements.
-        let arg_region = exec_sink_arg_region(code, m.start());
+        let arg_region = exec_sink_arg_region(code, call_start);
         let Some(hit) = detect_destructive_in_args(arg_region, language) else {
             continue;
         };
@@ -573,7 +608,7 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         }
         let severity = hit.severity;
 
-        let sink = caps.name("sink").map_or("exec", |s| s.as_str());
+        let sink = if sink.is_empty() { "exec" } else { sink };
         let lang_id = match language {
             ScriptLanguage::JavaScript => "javascript",
             ScriptLanguage::TypeScript => "typescript",
@@ -583,13 +618,13 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
             ScriptLanguage::Php => "php",
             _ => "unknown",
         };
-        let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+        let line_number = newline_positions.partition_point(|&idx| idx < call_start) + 1;
 
         out.push(PatternMatch {
             rule_id: format!("heredoc.{lang_id}.exec_sink.{}", hit.rule_suffix),
             reason: format!("{} via {sink}() exec sink", hit.reason),
-            matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
-            start: m.start(),
+            matched_text_preview: truncate_preview(code.get(call_start..m.end()).unwrap_or(""), 60),
+            start: call_start,
             end: m.end(),
             line_number,
             severity,
@@ -609,6 +644,57 @@ pub struct ReconstructedCommand {
     pub start: usize,
     /// End of that span.
     pub end: usize,
+}
+
+/// Starts of named calls whose command operands the existing scanner parsed
+/// completely, including single-string APIs that do not invoke a shell.
+///
+/// These offsets are metadata for the interpreter literal recovery pass. They
+/// do not approve source: that pass must establish a real AST callee at each
+/// offset before excluding the call's arguments, because regex-looking text
+/// inside a string or comment is not an executing sink. `None` reports a
+/// bounded scan that did not finish enumerating its candidates.
+///
+/// A `$` tagged template (#570) is never claimed. The literal pass already
+/// reads a tag's unescaped template as the command it may run (#544), and
+/// claiming the call would only take that reading away from it; the
+/// reconstruction judges the same text beside it.
+pub(crate) fn literal_exec_sink_starts(
+    code: &str,
+    language: ScriptLanguage,
+    max_calls: usize,
+) -> Option<Vec<usize>> {
+    let sink_regex = match language {
+        ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
+        ScriptLanguage::JavaScript => &JS_EXEC_SINK_LITERAL,
+        _ => return Some(Vec::new()),
+    };
+    let mut starts = Vec::new();
+    let mut calls = 0_usize;
+    for caps in sink_regex.captures_iter(code) {
+        if caps.name("tag").is_some() {
+            continue;
+        }
+        if calls >= max_calls {
+            return None;
+        }
+        calls += 1;
+        let Some((call_start, _)) = exec_sink_call(&caps) else {
+            continue;
+        };
+        let region = exec_sink_arg_region(code, call_start);
+        let argv = exec_argv_operands(region, language);
+        if !argv.unverified
+            && !argv.values.is_empty()
+            && argv
+                .values
+                .iter()
+                .all(|value| !value.contains(RUNTIME_VALUE))
+        {
+            starts.push(call_start);
+        }
+    }
+    Some(starts)
 }
 
 /// Each exec-sink argv-split call in `code`, reconstructed as the shell command
@@ -668,10 +754,24 @@ pub fn exec_sink_reconstructed_commands(
     };
     let haystack = masked.as_ref();
 
+    // Resolve proven module-scope Python constants in archive-tool argv
+    // operands (#562). Built only when a sink and a tar reference are both
+    // present, so a sink-free or tar-free Python body pays no extra parse.
+    // `tar`/`gtar`/`bsdtar` all contain "tar". The guard is held for the
+    // operand reads below; resolution itself is enabled per call.
+    let const_env = (language == ScriptLanguage::Python
+        && code.contains("tar")
+        && sink_regex.is_match(haystack))
+    .then(|| install_python_const_env(build_python_const_env(code)))
+    .flatten();
+
     let mut out = Vec::new();
     for caps in sink_regex.captures_iter(haystack) {
         let Some(m) = caps.get(0) else { continue };
-        let region = exec_sink_arg_region(haystack, m.start());
+        let Some((call_start, sink)) = exec_sink_call(&caps) else {
+            continue;
+        };
+        let region = exec_sink_arg_region(haystack, call_start);
         // A call the rm/git backstop owns (any `detect_destructive_in_args`
         // hit) is left to it, so an allowlisted `rm`/`git` is not re-denied
         // here under a pack rule id.
@@ -681,7 +781,27 @@ pub fn exec_sink_reconstructed_commands(
         // Operands, for the same reason `detect_destructive_in_args` uses them:
         // reconstructing `dd` from `"d"+"d"` as two argv words would not be the
         // command the call actually runs (#474).
-        let argv = exec_argv_operands(region, language);
+        //
+        // #562 resolution is enabled only once this call's program word
+        // (read with resolution off) is an archive tool, never a launcher.
+        let argv = if const_env.is_some() {
+            RESOLVE_ENABLED.with(|cell| cell.set(false));
+            let unresolved = exec_argv_operands(region, language);
+            let archive = unresolved
+                .values
+                .first()
+                .is_some_and(|program| is_archive_program(program));
+            if archive {
+                RESOLVE_ENABLED.with(|cell| cell.set(true));
+                let resolved = exec_argv_operands(region, language);
+                RESOLVE_ENABLED.with(|cell| cell.set(false));
+                resolved
+            } else {
+                unresolved
+            }
+        } else {
+            exec_argv_operands(region, language)
+        };
         if argv.unverified {
             continue;
         }
@@ -690,15 +810,7 @@ pub fn exec_sink_reconstructed_commands(
             [] => continue,
             // One string handed to a shell (#512): see below.
             [script] => {
-                if !single_string_sink_runs_shell(
-                    language,
-                    caps.name("sink")
-                        .or_else(|| caps.name("call"))
-                        .map_or("", |s| s.as_str()),
-                    haystack,
-                    m.start(),
-                    region,
-                ) {
+                if !single_string_sink_runs_shell(language, sink, haystack, call_start, region) {
                     continue;
                 }
                 script.to_string()
@@ -719,7 +831,7 @@ pub fn exec_sink_reconstructed_commands(
         };
         out.push(ReconstructedCommand {
             command,
-            start: m.start(),
+            start: call_start,
             end: m.end(),
         });
     }
@@ -770,10 +882,11 @@ pub fn exec_sink_reconstructed_commands(
 /// - PHP `shell_exec`/`passthru`/`system`/`exec`/`popen`/`proc_open` as plain
 ///   functions (`$pdo->exec("…")` runs SQL, not a shell);
 /// - JavaScript `execSync`, `exec` on `child_process` (not `RegExp.exec` or a
-///   database handle's `exec`), and `spawn`/`execFile` family with
-///   `shell: true`.
+///   database handle's `exec`), `spawn`/`execFile` family with
+///   `shell: true`, and a `$` tagged template (Bun Shell, zx, execa).
 ///
-/// Go's `exec.Command` never uses a shell, so it answers false.
+/// Go's `exec.Command`, Deno's `Command`/`run` and Bun's `spawn` never use a
+/// shell, so they answer false.
 fn single_string_sink_runs_shell(
     language: ScriptLanguage,
     sink: &str,
@@ -822,6 +935,9 @@ fn single_string_sink_runs_shell(
                 "spawn" | "spawnSync" | "execFile" | "execFileSync" => {
                     child_process_receiver && JS_SHELL_TRUE.is_match(region)
                 }
+                // A `$` tagged template (Bun Shell, zx, execa) is a command
+                // line whatever its receiver.
+                "$" => true,
                 _ => false,
             }
         }
@@ -1376,29 +1492,78 @@ static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     // first literal (`"sh"`) is inert (#136). Longer names precede their prefixes
     // (`execFileSync` before `execFile` before `exec`; `spawnSync` before `spawn`)
     // so the alternation picks the full sink.
-    Regex::new(
-        r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
+    //
+    // Deno and Bun start processes through their own APIs, which were in no
+    // alternative here, so `deno eval 'new Deno.Command("git", {args: ["reset",
+    // "--hard"]}).outputSync()'` and `bun -e 'Bun.spawnSync(["git", "reset",
+    // "--hard"])'` were ALLOWED while the `child_process` twin of each denied
+    // (#570). They are sinks of the same two kinds, so they feed the same argv
+    // reconstruction (`exec_argv_operands`) and shell-string evaluation:
+    //
+    // - `Deno.Command(program, {args: [...]})` and `Deno.run({cmd: [...]})`;
+    // - `spawn`/`spawnSync` whose first argument is an argv array or a
+    //   `{cmd: [...]}` object. That is Bun's signature (`Bun.spawnSync([...])`,
+    //   or destructured from "bun"); Node's takes a string, the first
+    //   alternative;
+    // - a `$` tagged template, which hands its text to a shell: Bun's `Bun.$`
+    //   and imported `$`, zx's `$` and `$.sync`, execa's `$`, with or without an
+    //   options object first (`` $({cwd})`…` ``). The options form must open
+    //   with `({`, so a shell substitution inside a template (`` $`echo
+    //   $(date)` ``) is not mistaken for one.
+    //
+    // These name their call through `deno`/`bun`/`tag` instead of `sink`, whose
+    // match starts at a receiver or a preceding character; `exec_sink_call`
+    // gives every consumer the sink name's own offset.
+    //
+    // A template literal is as much a string literal as a quoted one, so a
+    // `child_process` call whose first argument is one (``execSync(`git
+    // reset --hard`)``) is a candidate too; `exec_literal_operand` reads it.
+    // Only a template without quotes or escapes: the region scanners pair
+    // `'` and `"` but not backticks, so an apostrophe inside one
+    // (``execSync(`echo it's`)``) would leave its argument list unreadable,
+    // and that reads as an unverified argv.
+    Regex::new(concat!(
+        r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)"#,
+        r#"\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)'|`[^`'"\\]*`)"#,
+        r"|\bDeno\s*\.\s*(?P<deno>Command|run)\s*\(",
+        r"|\b(?P<bun>spawnSync|spawn)\s*\(\s*[\[{]",
+        r"|(?:^|[^A-Za-z0-9_$\\])(?P<tag>\$)(?:\.sync)?\s*(?:`|\(\s*\{)",
+    ))
     .expect("js exec sink literal regex compiles")
 });
 
-/// The first string literal handed to a Python call, used to read the target
-/// of `shutil.rmtree('…')` (#455).
-static PY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("python first string arg regex compiles")
-});
-
-/// A `tempfile` call whose result is a directory `tempfile` itself created.
+/// The offset and sink name of one exec-sink regex match.
 ///
-/// `shutil.rmtree(tempfile.mkdtemp())` is the documented way to clean up after
-/// `mkdtemp`, and blocking it is a false positive on the single most common
-/// correct use of `rmtree` — the target is a fresh scratch directory by
-/// construction, so it is exactly what `is_temp_scratch_path` means, reached
-/// through a call rather than a literal (#455).
-static PY_TEMPFILE_PRODUCED_DIR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:tempfile\s*\.\s*)?(?:mkdtemp|TemporaryDirectory)\s*\(")
-        .expect("python tempfile-produced dir regex compiles")
+/// Every sink regex but JavaScript's runtime-native alternatives starts at the
+/// call it found, so the match's own start is the call's (and Go's includes
+/// its receiver). `Deno.Command(`, `Bun.spawnSync([` and `` $`…` `` are
+/// anchored on a receiver or a preceding character instead, so their call
+/// starts at the named group: the region and receiver logic then see the
+/// same `name(…)` text as for any other sink, and the offset is the callee
+/// name the AST layer reports for that call.
+fn exec_sink_call<'h>(caps: &regex::Captures<'h>) -> Option<(usize, &'h str)> {
+    let whole = caps.get(0)?;
+    if let Some(native) = caps
+        .name("deno")
+        .or_else(|| caps.name("bun"))
+        .or_else(|| caps.name("tag"))
+    {
+        return Some((native.start(), native.as_str()));
+    }
+    let name = caps
+        .name("sink")
+        .or_else(|| caps.name("call"))
+        .map_or("", |name| name.as_str());
+    Some((whole.start(), name))
+}
+
+/// Only a veto for a structurally verified Python directory producer.
+/// The established name-based producer exception withheld its allowance when
+/// the first parenthesized plain literal was outside scratch. Keep that
+/// conservative restriction; this capture must never establish target safety.
+static PY_PRODUCER_LITERAL_VETO: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
+        .expect("python producer literal veto regex compiles")
 });
 
 /// The first string literal handed to a Go call, used to read the target of
@@ -1481,21 +1646,23 @@ fn run_ast_match_with_timeout(
     code: String,
     language: ScriptLanguage,
     ast_lang: SupportLang,
-    patterns: Vec<PrecompiledPattern>,
+    patterns: Arc<PatternIndex>,
     timeout: Duration,
     budget_ms: u64,
 ) -> Result<Vec<PatternMatch>, MatchError> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let start_time = Instant::now();
     let (tx, rx) = mpsc::sync_channel(1);
     // Shared cancellation flag: when the parent times out it flips this and
     // returns immediately. The worker checks it inside `check_ast_timeout`
-    // (which fires between each pattern and between `find_all` iterations) so
+    // (which fires during the traversal and after structural matches) so
     // it stops promptly instead of running for another full `timeout` window
     // after the parent has already returned. Without this, every parent
     // timeout leaks a live worker thread for the duration of the worker's
     // own deadline — under burst hook traffic that piles up.
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
+    let profile = crate::perf::capture_profile();
 
     // We don't `join` the handle on timeout — the worker may still hold a
     // tree-sitter parser mid-iteration and joining would block the hook past
@@ -1507,16 +1674,19 @@ fn run_ast_match_with_timeout(
         .spawn(move || {
             // Share the parent's `start_time` semantics by also starting the
             // worker's deadline now; cancellation is the primary stop signal.
-            let result = find_matches_ast(
-                &code,
-                language,
-                ast_lang,
-                &patterns,
-                Instant::now(),
-                timeout,
-                budget_ms,
-                &worker_cancel,
-            );
+            let result = {
+                let _profile = profile.enter();
+                find_matches_ast(
+                    &code,
+                    language,
+                    ast_lang,
+                    &patterns,
+                    Instant::now(),
+                    timeout,
+                    budget_ms,
+                    &worker_cancel,
+                )
+            };
             let _ = tx.send(result);
         })
         .map_err(|err| MatchError::Unavailable {
@@ -1544,16 +1714,25 @@ fn find_matches_ast(
     code: &str,
     language: ScriptLanguage,
     ast_lang: SupportLang,
-    patterns: &[PrecompiledPattern],
+    patterns: &PatternIndex,
     start_time: Instant,
     timeout: Duration,
     budget_ms: u64,
     cancel: &AtomicBool,
 ) -> Result<Vec<PatternMatch>, MatchError> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
     let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
 
-    // Parse the code
-    let ast = AstGrep::new(code, ast_lang);
+    // Parse the code; a shell script's heredoc terminators joined across line
+    // continuations are read as the shell reads them.
+    let ast = {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+        if language == ScriptLanguage::Bash {
+            AstGrep::new(crate::context::shell_parse_source(code).as_ref(), ast_lang)
+        } else {
+            AstGrep::new(code, ast_lang)
+        }
+    };
     let root = ast.root();
 
     // Check timeout after parsing
@@ -1561,51 +1740,731 @@ fn find_matches_ast(
 
     let mut matches = Vec::new();
 
-    // Match each pattern
-    for compiled in patterns {
-        // Check timeout before each pattern
-        check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
+    // Walk the tree once, instead of rebuilding a DFS cursor for every rule.
+    // Only ast-grep's necessary kind condition selects candidates: strings,
+    // comments, malformed syntax and nested calls receive exactly the same
+    // structural matching as `root.find_all` for every registered pattern.
+    for (visited, candidate) in root.dfs().enumerate() {
+        // Poll even when there are no matches. The previous per-pattern
+        // traversal could walk a large clean body without observing cancel.
+        if visited.is_multiple_of(64) {
+            check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
+        }
 
-        // Find all matches for this pattern
-        for node in root.find_all(&compiled.pattern) {
-            // Check timeout during matching (a single pattern can match many nodes)
+        let specific = patterns
+            .by_kind
+            .get(usize::from(candidate.kind_id()))
+            .map_or(&[][..], Vec::as_slice);
+        for &pattern_index in specific.iter().chain(&patterns.any_kind) {
+            let compiled = &patterns.patterns[pattern_index];
+            let Some(node) = compiled.pattern.match_node(candidate.clone()) else {
+                continue;
+            };
             check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
 
             let matched_text = node.text();
             let range = node.range();
 
-            // Calculate line number (1-based)
-            let line_number = newline_positions.partition_point(|&idx| idx < range.start) + 1;
-
-            // Create preview (truncate if too long, UTF-8 safe)
-            let preview = truncate_preview(&matched_text, 60);
-
-            let Some(refined) = refine_match_meta(language, &compiled.meta, &matched_text) else {
+            let Some(refined) = refine_match_meta(language, &compiled.meta, &matched_text, &node)
+            else {
                 continue;
             };
 
-            matches.push(PatternMatch {
-                rule_id: refined.rule_id,
-                reason: refined.reason,
-                matched_text_preview: preview,
-                start: range.start,
-                end: range.end,
-                line_number,
-                severity: refined.severity,
-                suggestion: refined.suggestion,
-            });
+            matches.push((
+                pattern_index,
+                PatternMatch {
+                    rule_id: refined.rule_id,
+                    reason: refined.reason,
+                    matched_text_preview: truncate_preview(&matched_text, 60),
+                    start: range.start,
+                    end: range.end,
+                    line_number: newline_positions.partition_point(|&idx| idx < range.start) + 1,
+                    severity: refined.severity,
+                    suggestion: refined.suggestion,
+                },
+            ));
         }
     }
 
+    check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
+    // Preserve the public API's pattern-major order, including DFS ordering
+    // within one pattern. The policy layer uses a stable source-order sort,
+    // so ties must retain the original rule precedence as well.
+    matches.sort_by_key(|(pattern_index, _)| *pattern_index);
+    let mut matches: Vec<_> = matches.into_iter().map(|(_, matched)| matched).collect();
+
+    // A receiver pattern cannot match `from shutil import rmtree as wipe;
+    // wipe(...)`. Resolve those bindings on the same parsed tree, using the
+    // configured rule's metadata and the same target refinement. A custom
+    // matcher that omitted this rule must not gain a built-in deletion rule.
+    if language == ScriptLanguage::Python
+        && code.contains("shutil")
+        && code.contains("rmtree")
+        && let Some(compiled) = patterns
+            .patterns
+            .iter()
+            .find(|pattern| pattern.meta.rule_id == "heredoc.python.shutil_rmtree")
+    {
+        let seen_calls = matches
+            .iter()
+            .filter(|matched| {
+                matched.rule_id == compiled.meta.rule_id
+                    || matched.rule_id.strip_prefix(compiled.meta.rule_id.as_str()) == Some(".temp")
+            })
+            .map(|matched| (matched.start, matched.end))
+            .collect();
+        PythonDeleteScan {
+            meta: &compiled.meta,
+            newline_positions: &newline_positions,
+            matches: &mut matches,
+            seen_calls,
+            start_time,
+            timeout,
+            budget_ms,
+            cancel,
+            remaining_nodes: MAX_PYTHON_DELETE_NODES,
+        }
+        .visit(root, &mut HashMap::new(), None, 0)?;
+    }
+
+    check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
     Ok(matches)
+}
+
+// This is binding provenance for one destructive API, not evaluation of Python
+// values. An unresolved name grants no new finding; a proven or possible
+// rmtree binding gets exactly the existing rule and #549 target policy.
+// Function bodies inherit bindings visible at their definition. This is
+// source-order provenance, not interprocedural execution: globals introduced
+// only after a definition are not resolved when a later call executes.
+const MAX_PYTHON_DELETE_NODES: usize = 40_000;
+const MAX_PYTHON_DELETE_DEPTH: usize = 128;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PythonDeleteBinding {
+    shutil: bool,
+    rmtree: bool,
+}
+
+type PythonDeleteBindings = HashMap<String, PythonDeleteBinding>;
+
+fn merge_python_delete_bindings(into: &mut PythonDeleteBindings, other: &PythonDeleteBindings) {
+    for (name, binding) in other {
+        let entry = into.entry(name.clone()).or_default();
+        entry.shutil |= binding.shutil;
+        entry.rmtree |= binding.rmtree;
+    }
+}
+
+fn set_python_delete_binding(
+    bindings: &mut PythonDeleteBindings,
+    name: String,
+    binding: PythonDeleteBinding,
+) {
+    if binding == PythonDeleteBinding::default() {
+        bindings.remove(&name);
+    } else {
+        bindings.insert(name, binding);
+    }
+}
+
+struct PythonDeleteScan<'a> {
+    meta: &'a CompiledPattern,
+    newline_positions: &'a [usize],
+    matches: &'a mut Vec<PatternMatch>,
+    seen_calls: HashSet<(usize, usize)>,
+    start_time: Instant,
+    timeout: Duration,
+    budget_ms: u64,
+    cancel: &'a AtomicBool,
+    remaining_nodes: usize,
+}
+
+impl PythonDeleteScan<'_> {
+    fn check(&mut self, depth: usize) -> Result<(), MatchError> {
+        check_ast_timeout(self.start_time, self.timeout, self.budget_ms, self.cancel)?;
+        if depth > MAX_PYTHON_DELETE_DEPTH || self.remaining_nodes == 0 {
+            return Err(MatchError::ParseError {
+                language: ScriptLanguage::Python,
+                detail: "Python deletion binding analysis exceeds its traversal limit".to_string(),
+            });
+        }
+        self.remaining_nodes -= 1;
+        Ok(())
+    }
+
+    fn binding<D: ast_grep_core::Doc>(
+        &mut self,
+        node: &ast_grep_core::Node<'_, D>,
+        bindings: &PythonDeleteBindings,
+        depth: usize,
+    ) -> Result<PythonDeleteBinding, MatchError> {
+        self.check(depth)?;
+        let binding = match node.kind().as_ref() {
+            "identifier" => bindings
+                .get(node.text().as_ref())
+                .copied()
+                .unwrap_or_default(),
+            "attribute" => {
+                let module = match node.field("object") {
+                    Some(object) => self.binding(&object, bindings, depth + 1)?,
+                    None => PythonDeleteBinding::default(),
+                };
+                PythonDeleteBinding {
+                    shutil: false,
+                    rmtree: module.shutil
+                        && node
+                            .field("attribute")
+                            .is_some_and(|name| name.text() == "rmtree"),
+                }
+            }
+            "parenthesized_expression" => {
+                let mut children = node
+                    .children()
+                    .filter(|child| child.is_named() && child.kind() != "comment");
+                match (children.next(), children.next()) {
+                    (Some(inner), None) => self.binding(&inner, bindings, depth + 1)?,
+                    _ => PythonDeleteBinding::default(),
+                }
+            }
+            "assignment" | "named_expression" => {
+                match node.field("right").or_else(|| node.field("value")) {
+                    Some(value) => self.binding(&value, bindings, depth + 1)?,
+                    None => PythonDeleteBinding::default(),
+                }
+            }
+            "conditional_expression" | "boolean_operator" => {
+                let mut value = PythonDeleteBinding::default();
+                let children: Vec<_> = node
+                    .children()
+                    .filter(|child| child.is_named() && child.kind() != "comment")
+                    .collect();
+                for child in children.first().into_iter().chain(children.last()) {
+                    let candidate = self.binding(child, bindings, depth + 1)?;
+                    value.shutil |= candidate.shutil;
+                    value.rmtree |= candidate.rmtree;
+                }
+                value
+            }
+            _ => PythonDeleteBinding::default(),
+        };
+        Ok(binding)
+    }
+
+    fn import_bindings<D: ast_grep_core::Doc>(
+        &mut self,
+        node: &ast_grep_core::Node<'_, D>,
+        depth: usize,
+    ) -> Result<Vec<(String, PythonDeleteBinding)>, MatchError> {
+        let module = node
+            .field("module_name")
+            .map(|name| name.text().into_owned());
+        let mut imported = Vec::new();
+        for name in node.field_children("name") {
+            self.check(depth)?;
+            let source = name
+                .field("name")
+                .unwrap_or_else(|| name.clone())
+                .text()
+                .into_owned();
+            let alias = name.field("alias").map_or_else(
+                || {
+                    if module.is_none() {
+                        source.split('.').next().unwrap_or(&source).to_string()
+                    } else {
+                        source.clone()
+                    }
+                },
+                |alias| alias.text().into_owned(),
+            );
+            imported.push((
+                alias,
+                PythonDeleteBinding {
+                    shutil: module.is_none() && source == "shutil",
+                    rmtree: module.as_deref() == Some("shutil") && source == "rmtree",
+                },
+            ));
+        }
+        if module.as_deref() == Some("shutil")
+            && node
+                .children()
+                .any(|child| child.kind() == "wildcard_import")
+        {
+            imported.push((
+                "rmtree".to_string(),
+                PythonDeleteBinding {
+                    shutil: false,
+                    rmtree: true,
+                },
+            ));
+        }
+        Ok(imported)
+    }
+
+    // Collect only binding positions. Identifiers in an annotation, default
+    // expression, attribute receiver or subscript are reads, not local names.
+    fn target_names<D: ast_grep_core::Doc>(
+        &mut self,
+        node: &ast_grep_core::Node<'_, D>,
+        names: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(depth)?;
+        match node.kind().as_ref() {
+            "identifier" => {
+                names.insert(node.text().into_owned());
+            }
+            "default_parameter" | "typed_default_parameter" => {
+                if let Some(name) = node.field("name") {
+                    self.target_names(&name, names, depth + 1)?;
+                }
+            }
+            "parameters"
+            | "lambda_parameters"
+            | "typed_parameter"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "pattern_list"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern"
+            | "parenthesized_expression"
+            | "as_pattern_target"
+            | "tuple"
+            | "list"
+            | "expression_list" => {
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    if child.kind() != "type" {
+                        self.target_names(&child, names, depth + 1)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn assign<D: ast_grep_core::Doc>(
+        &mut self,
+        target: &ast_grep_core::Node<'_, D>,
+        binding: PythonDeleteBinding,
+        bindings: &mut PythonDeleteBindings,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        let mut target = target.clone();
+        let mut grouping_depth = depth;
+        while matches!(
+            target.kind().as_ref(),
+            "parenthesized_expression" | "tuple_pattern"
+        ) && !target.children().any(|child| child.kind() == ",")
+        {
+            self.check(grouping_depth)?;
+            let inner = {
+                let mut children = target
+                    .children()
+                    .filter(|child| child.is_named() && child.kind() != "comment");
+                match (children.next(), children.next()) {
+                    (Some(inner), None) => inner,
+                    _ => break,
+                }
+            };
+            target = inner;
+            grouping_depth += 1;
+        }
+        let mut names = HashSet::new();
+        self.target_names(&target, &mut names, grouping_depth)?;
+        let scalar = target.kind() == "identifier";
+        for name in names {
+            set_python_delete_binding(
+                bindings,
+                name,
+                if scalar {
+                    binding
+                } else {
+                    PythonDeleteBinding::default()
+                },
+            );
+        }
+        // Function attributes do not replace the callable: `wipe.label = x`
+        // must preserve a captured rmtree. The same holds for unrelated module
+        // members. Only replacing the module's actual rmtree member invalidates
+        // subsequent member-to-function aliases; already captured functions
+        // retain their identity, including when the module had another alias.
+        if target.kind() == "attribute"
+            && target
+                .field("attribute")
+                .is_some_and(|name| name.text() == "rmtree")
+            && let Some(object) = target.field("object")
+            && self.binding(&object, bindings, depth + 1)?.shutil
+            && !binding.rmtree
+        {
+            bindings.retain(|_, value| {
+                value.shutil = false;
+                value.rmtree
+            });
+        }
+        Ok(())
+    }
+
+    fn locals<D: ast_grep_core::Doc>(
+        &mut self,
+        node: &ast_grep_core::Node<'_, D>,
+        names: &mut HashSet<String>,
+        nonlocals: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(depth)?;
+        match node.kind().as_ref() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = node.field("name") {
+                    names.insert(name.text().into_owned());
+                }
+                return Ok(());
+            }
+            "lambda"
+            | "list_comprehension"
+            | "set_comprehension"
+            | "dictionary_comprehension"
+            | "generator_expression" => return Ok(()),
+            "global_statement" | "nonlocal_statement" => {
+                for child in node.children().filter(|child| child.kind() == "identifier") {
+                    nonlocals.insert(child.text().into_owned());
+                }
+                return Ok(());
+            }
+            "import_statement" | "import_from_statement" => {
+                names.extend(
+                    self.import_bindings(node, depth + 1)?
+                        .into_iter()
+                        .map(|(name, _)| name),
+                );
+            }
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                if let Some(target) = node.field("left") {
+                    self.target_names(&target, names, depth + 1)?;
+                }
+            }
+            "named_expression" => {
+                if let Some(target) = node.field("name") {
+                    self.target_names(&target, names, depth + 1)?;
+                }
+            }
+            "as_pattern" | "except_clause" => {
+                if let Some(target) = node.field("alias") {
+                    self.target_names(&target, names, depth + 1)?;
+                }
+            }
+            "delete_statement" => {
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    self.target_names(&child, names, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        for child in node.children().filter(ast_grep_core::Node::is_named) {
+            self.locals(&child, names, nonlocals, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    /// Visit definition-time parameter expressions once, capturing each default
+    /// before a later default can change its enclosing binding. Parameter names
+    /// are not installed in that scope: in `def f(a=wipe, b=a)`, the second
+    /// default reads the enclosing `a`, not the first parameter's default.
+    fn parameter_defaults<D: ast_grep_core::Doc>(
+        &mut self,
+        parameters: &ast_grep_core::Node<'_, D>,
+        bindings: &mut PythonDeleteBindings,
+        class_enclosing: Option<&PythonDeleteBindings>,
+        depth: usize,
+    ) -> Result<PythonDeleteBindings, MatchError> {
+        self.check(depth)?;
+        if parameters.is_error() || parameters.is_missing() {
+            return Err(MatchError::ParseError {
+                language: ScriptLanguage::Python,
+                detail: "Python deletion binding analysis encountered invalid syntax".to_string(),
+            });
+        }
+        let mut defaults = HashMap::new();
+        for parameter in parameters.children().filter(ast_grep_core::Node::is_named) {
+            self.visit(parameter.clone(), bindings, class_enclosing, depth + 1)?;
+            if matches!(
+                parameter.kind().as_ref(),
+                "default_parameter" | "typed_default_parameter"
+            ) && let Some(name) = parameter.field("name")
+                && let Some(value) = parameter.field("value")
+            {
+                let binding = self.binding(&value, bindings, depth + 1)?;
+                set_python_delete_binding(&mut defaults, name.text().into_owned(), binding);
+            }
+        }
+        Ok(defaults)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn visit<D: ast_grep_core::Doc>(
+        &mut self,
+        node: ast_grep_core::Node<'_, D>,
+        bindings: &mut PythonDeleteBindings,
+        class_enclosing: Option<&PythonDeleteBindings>,
+        depth: usize,
+    ) -> Result<(), MatchError> {
+        self.check(depth)?;
+        if node.is_error() || node.is_missing() {
+            return Err(MatchError::ParseError {
+                language: ScriptLanguage::Python,
+                detail: "Python deletion binding analysis encountered invalid syntax".to_string(),
+            });
+        }
+        match node.kind().as_ref() {
+            "import_statement" | "import_from_statement" => {
+                for (name, binding) in self.import_bindings(&node, depth + 1)? {
+                    set_python_delete_binding(bindings, name, binding);
+                }
+                return Ok(());
+            }
+            "function_definition" | "lambda" | "class_definition" => {
+                let body = node.field("body");
+                let parameters = node.field("parameters");
+                let mut defaults = HashMap::new();
+                // Defaults, annotations, and class bases execute in the outer
+                // scope, before the definition replaces its own name.
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    if body
+                        .as_ref()
+                        .is_none_or(|body| child.range() != body.range())
+                    {
+                        if parameters
+                            .as_ref()
+                            .is_some_and(|parameters| child.range() == parameters.range())
+                        {
+                            defaults = self.parameter_defaults(
+                                &child,
+                                bindings,
+                                class_enclosing,
+                                depth + 1,
+                            )?;
+                        } else {
+                            self.visit(child, bindings, class_enclosing, depth + 1)?;
+                        }
+                    }
+                }
+                if let Some(name) = node.field("name") {
+                    bindings.remove(name.text().as_ref());
+                }
+                let enclosing = class_enclosing.unwrap_or(bindings).clone();
+                let mut local = enclosing.clone();
+                if node.kind() != "class_definition" {
+                    let mut names = HashSet::new();
+                    let mut nonlocals = HashSet::new();
+                    if let Some(parameters) = node.field("parameters") {
+                        self.target_names(&parameters, &mut names, depth + 1)?;
+                    }
+                    if let Some(body) = &body {
+                        self.locals(body, &mut names, &mut nonlocals, depth + 1)?;
+                    }
+                    for name in names.difference(&nonlocals) {
+                        local.remove(name);
+                    }
+                    // Defaults are captured at definition time. Required parameters
+                    // remain shadowing because they do not appear in this map.
+                    merge_python_delete_bindings(&mut local, &defaults);
+                }
+                if let Some(body) = body {
+                    self.visit(
+                        body,
+                        &mut local,
+                        (node.kind() == "class_definition").then_some(&enclosing),
+                        depth + 1,
+                    )?;
+                }
+                return Ok(());
+            }
+            "if_statement" => {
+                if let Some(condition) = node.field("condition") {
+                    self.visit(condition, bindings, class_enclosing, depth + 1)?;
+                }
+                let base = bindings.clone();
+                let mut merged = HashMap::new();
+                if let Some(consequence) = node.field("consequence") {
+                    let mut branch = base.clone();
+                    self.visit(consequence, &mut branch, class_enclosing, depth + 1)?;
+                    merge_python_delete_bindings(&mut merged, &branch);
+                }
+                let mut exhaustive = false;
+                for alternative in node.field_children("alternative") {
+                    exhaustive |= alternative.kind() == "else_clause";
+                    let mut branch = base.clone();
+                    self.visit(alternative, &mut branch, class_enclosing, depth + 1)?;
+                    merge_python_delete_bindings(&mut merged, &branch);
+                }
+                if !exhaustive {
+                    merge_python_delete_bindings(&mut merged, &base);
+                }
+                *bindings = merged;
+                return Ok(());
+            }
+            "for_statement" | "while_statement" => {
+                if let Some(iterable) = node.field("right") {
+                    self.visit(iterable, bindings, class_enclosing, depth + 1)?;
+                }
+                let mut entry = bindings.clone();
+                // A later iteration may call an alias established at the end
+                // of an earlier one. Iterate possible bindings to a fixed
+                // point, charging every visit to the same finite node budget.
+                loop {
+                    let mut branch = entry.clone();
+                    if let Some(condition) = node.field("condition") {
+                        self.visit(condition, &mut branch, class_enclosing, depth + 1)?;
+                    }
+                    if let Some(target) = node.field("left") {
+                        self.assign(
+                            &target,
+                            PythonDeleteBinding::default(),
+                            &mut branch,
+                            depth + 1,
+                        )?;
+                    }
+                    if let Some(body) = node.field("body") {
+                        self.visit(body, &mut branch, class_enclosing, depth + 1)?;
+                    }
+                    let previous = entry.clone();
+                    merge_python_delete_bindings(&mut entry, &branch);
+                    if entry == previous {
+                        break;
+                    }
+                }
+                if let Some(alternative) = node.field("alternative") {
+                    let mut branch = entry.clone();
+                    self.visit(alternative, &mut branch, class_enclosing, depth + 1)?;
+                    merge_python_delete_bindings(&mut entry, &branch);
+                }
+                *bindings = entry;
+                return Ok(());
+            }
+            "list_comprehension"
+            | "set_comprehension"
+            | "dictionary_comprehension"
+            | "generator_expression" => {
+                // Comprehension targets have their own scope and bind before
+                // the textually earlier element expression is evaluated.
+                let mut local = bindings.clone();
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    if child.kind() == "for_in_clause" {
+                        for right in child.field_children("right") {
+                            self.visit(right, &mut local, None, depth + 1)?;
+                        }
+                        if let Some(left) = child.field("left") {
+                            self.assign(
+                                &left,
+                                PythonDeleteBinding::default(),
+                                &mut local,
+                                depth + 1,
+                            )?;
+                        }
+                    } else if child.kind() == "if_clause" {
+                        self.visit(child, &mut local, None, depth + 1)?;
+                    }
+                }
+                if let Some(body) = node.field("body") {
+                    self.visit(body, &mut local, None, depth + 1)?;
+                }
+                return Ok(());
+            }
+            "except_clause" => {
+                for value in node.field_children("value") {
+                    self.visit(value, bindings, class_enclosing, depth + 1)?;
+                }
+                if let Some(alias) = node.field("alias") {
+                    self.assign(&alias, PythonDeleteBinding::default(), bindings, depth + 1)?;
+                }
+                for child in node.children().filter(|child| child.kind() == "block") {
+                    self.visit(child, bindings, class_enclosing, depth + 1)?;
+                }
+                return Ok(());
+            }
+            "boolean_operator" | "conditional_expression" | "try_statement" | "match_statement" => {
+                // These forms have optional execution paths. Never let a
+                // harmless arm erase a known destructive binding on another.
+                let mut merged = bindings.clone();
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    let mut branch = merged.clone();
+                    self.visit(child, &mut branch, class_enclosing, depth + 1)?;
+                    merge_python_delete_bindings(&mut merged, &branch);
+                }
+                *bindings = merged;
+                return Ok(());
+            }
+            "call" => {
+                if let Some(function) = node.field("function")
+                    && self.binding(&function, bindings, depth + 1)?.rmtree
+                {
+                    let range = node.range();
+                    if self.seen_calls.insert((range.start, range.end)) {
+                        let text = node.text();
+                        let meta = refine_python_match(self.meta, &text, &node);
+                        self.matches.push(PatternMatch {
+                            rule_id: meta.rule_id,
+                            reason: meta.reason,
+                            matched_text_preview: truncate_preview(&text, 60),
+                            start: range.start,
+                            end: range.end,
+                            line_number: self
+                                .newline_positions
+                                .partition_point(|&pos| pos < range.start)
+                                + 1,
+                            severity: meta.severity,
+                            suggestion: meta.suggestion,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        for child in node.children().filter(ast_grep_core::Node::is_named) {
+            self.visit(child, bindings, class_enclosing, depth + 1)?;
+        }
+        match node.kind().as_ref() {
+            "assignment" | "named_expression" | "augmented_assignment" => {
+                // An annotation without a value makes a name local within a
+                // function, but does not overwrite an existing runtime value.
+                if node
+                    .field("right")
+                    .or_else(|| node.field("value"))
+                    .is_some()
+                    && let Some(target) = node.field("left").or_else(|| node.field("name"))
+                {
+                    let binding = if node.kind() == "augmented_assignment" {
+                        PythonDeleteBinding::default()
+                    } else {
+                        self.binding(&node, bindings, depth + 1)?
+                    };
+                    self.assign(&target, binding, bindings, depth + 1)?;
+                }
+            }
+            "as_pattern" => {
+                if let Some(target) = node.field("alias") {
+                    self.assign(&target, PythonDeleteBinding::default(), bindings, depth + 1)?;
+                }
+            }
+            "delete_statement" => {
+                for target in node.children().filter(ast_grep_core::Node::is_named) {
+                    self.assign(&target, PythonDeleteBinding::default(), bindings, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// Truncate a string to at most `max_chars` characters, UTF-8 safe.
 ///
 /// If truncation occurs, appends "..." to indicate more content exists.
 fn truncate_preview(text: &str, max_chars: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
+    // Inspect only the preview window. A match may cover an entire multiline
+    // function or large literal; counting all its characters just to retain
+    // the first 60 repeats work for every overlapping structural match.
+    if text.chars().nth(max_chars).is_none() {
         text.to_string()
     } else {
         // Leave room for "..."
@@ -1774,16 +2633,17 @@ static RUBY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
         .expect("ruby first string arg regex compiles")
 });
 
-fn refine_match_meta(
+fn refine_match_meta<D: ast_grep_core::Doc>(
     language: ScriptLanguage,
     meta: &CompiledPattern,
     matched_text: &str,
+    node: &ast_grep_core::Node<'_, D>,
 ) -> Option<RefinedMatchMeta> {
     match language {
         ScriptLanguage::JavaScript => refine_javascript_match(meta, matched_text),
         ScriptLanguage::TypeScript => refine_typescript_match(meta, matched_text),
         ScriptLanguage::Ruby => refine_ruby_match(meta, matched_text),
-        ScriptLanguage::Python => Some(refine_python_match(meta, matched_text)),
+        ScriptLanguage::Python => Some(refine_python_match(meta, matched_text, node)),
         ScriptLanguage::Go => Some(refine_go_match(meta, matched_text)),
         ScriptLanguage::Php => Some(refine_php_match(meta, matched_text)),
         _ => Some(RefinedMatchMeta {
@@ -1810,7 +2670,11 @@ fn refine_match_meta(
 /// Fail-safe: if the payload cannot be extracted as a literal (dynamic argument),
 /// we keep the original `Medium` warn-only meta rather than dropping the match, so
 /// the raw-shell rescan (when not masked) still has a chance to act.
-fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMeta {
+fn refine_python_match<D: ast_grep_core::Doc>(
+    meta: &CompiledPattern,
+    matched_text: &str,
+    node: &ast_grep_core::Node<'_, D>,
+) -> RefinedMatchMeta {
     let rule_id = meta.rule_id.as_str();
 
     // Exact ids, not a prefix test. A new exec-sink pattern that is not added
@@ -1869,23 +2733,167 @@ fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMat
     // correct use of the function. Both are the temp carve-out the other
     // languages get; nothing else about the rule changes, so a literal outside
     // /tmp and a target this cannot read both stay Critical.
-    if is_recursive_delete_rule(rule_id) {
-        let path = PY_FIRST_STRING_ARG
-            .captures(matched_text)
-            .and_then(|caps| string_literal_from_caps(&caps));
-        let targets_scratch = path.is_some_and(is_temp_scratch_path)
-            || (path.is_none() && PY_TEMPFILE_PRODUCED_DIR.is_match(matched_text));
-        if targets_scratch {
-            return RefinedMatchMeta {
-                rule_id: format!("{rule_id}.temp"),
-                reason: format!("{} (target is a temp directory)", meta.reason),
-                severity: Severity::Medium,
-                suggestion: meta.suggestion.clone(),
-            };
-        }
+    if is_recursive_delete_rule(rule_id) && python_delete_targets_scratch(node) {
+        return RefinedMatchMeta {
+            rule_id: format!("{rule_id}.temp"),
+            reason: format!("{} (target is a temp directory)", meta.reason),
+            severity: Severity::Medium,
+            suggestion: meta.suggestion.clone(),
+        };
     }
 
     unchanged()
+}
+
+/// Grant #455's exception only from the actual deletion target (#549).
+/// A literal nested in an arbitrary call, a sliced/concatenated path prefix,
+/// or a `mkdtemp()` in another argument does not establish that target.
+fn python_delete_targets_scratch<D: ast_grep_core::Doc>(call: &ast_grep_core::Node<'_, D>) -> bool {
+    let Some(arguments) = call.field("arguments") else {
+        return false;
+    };
+    let mut target = None;
+    let mut seen_positional = false;
+    for (index, argument) in arguments
+        .children()
+        .filter(|child| child.is_named() && child.kind() != "comment")
+        .enumerate()
+    {
+        if index >= MAX_EXEC_ARGV_OPERANDS || argument.is_error() || argument.is_missing() {
+            return false;
+        }
+        match argument.kind().as_ref() {
+            "list_splat" | "dictionary_splat" => return false,
+            "keyword_argument" => {
+                if argument
+                    .field("name")
+                    .is_some_and(|name| name.text() == "path")
+                {
+                    if target.is_some() {
+                        return false;
+                    }
+                    target = argument.field("value");
+                }
+            }
+            _ if !seen_positional => {
+                if target.is_some() {
+                    return false;
+                }
+                seen_positional = true;
+                target = Some(argument);
+            }
+            _ => {}
+        }
+    }
+    let Some(mut target) = target else {
+        return false;
+    };
+    // A transparent grouping is still the same target; tuples are not.
+    for _ in 0..MAX_EXEC_ARGV_DEPTH {
+        if target.kind() != "parenthesized_expression" {
+            let text = target.text();
+            let value = if target.kind() == "concatenated_string" {
+                Cow::Owned(python_adjacent_literal_value(&target))
+            } else {
+                concatenated_operand(&text, ScriptLanguage::Python, 0)
+            };
+            return is_temp_scratch_path(&value) || python_tempfile_directory(&target);
+        }
+        target = {
+            let mut children = target
+                .children()
+                .filter(|child| child.is_named() && child.kind() != "comment");
+            let Some(inner) = children.next() else {
+                return false;
+            };
+            if children.next().is_some() {
+                return false;
+            }
+            inner
+        };
+    }
+    false
+}
+
+/// Python joins adjacent string literals at compile time, so `'/tmp/' 'build'`
+/// is the constant `'/tmp/build'`, exactly like `'/tmp/' + 'build'` (#549).
+/// The shared, language-generic text folder deliberately refuses bare
+/// adjacency (#474). Fold it here, from Python's parsed pieces, and only for
+/// plain literals: each piece is decoded by the same operand reader, so an
+/// f-string, a bytes or other prefixed piece, or an unknown escape keeps the
+/// runtime marker, and the joined value still has to pass the descendant and
+/// traversal check (`'/tmp' '/..'` is `/tmp/..`).
+fn python_adjacent_literal_value<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+) -> String {
+    let mut value = String::new();
+    for (index, piece) in node
+        .children()
+        .filter(|child| child.is_named() && child.kind() != "comment")
+        .enumerate()
+    {
+        if index >= MAX_EXEC_ARGV_OPERANDS
+            || piece.kind() != "string"
+            || piece.is_error()
+            || piece.is_missing()
+        {
+            return RUNTIME_VALUE.to_string();
+        }
+        value.push_str(&concatenated_operand(
+            &piece.text(),
+            ScriptLanguage::Python,
+            0,
+        ));
+    }
+    value
+}
+
+/// Preserve cleanup of a freshly produced directory without treating any
+/// expression containing a producer as that directory. In particular,
+/// `Path(tempfile.mkdtemp()).parent` targets its parent, not the created child.
+fn python_tempfile_directory<D: ast_grep_core::Doc>(target: &ast_grep_core::Node<'_, D>) -> bool {
+    let (call, takes_name) = if target.kind() == "attribute"
+        && target
+            .field("attribute")
+            .is_some_and(|name| name.text() == "name")
+    {
+        let Some(object) = target.field("object") else {
+            return false;
+        };
+        (object, true)
+    } else {
+        (target.clone(), false)
+    };
+    if call.kind() != "call" {
+        return false;
+    }
+    let Some(function) = call.field("function") else {
+        return false;
+    };
+    let name = if function.kind() == "identifier" {
+        function.text()
+    } else if function.kind() == "attribute"
+        && function
+            .field("object")
+            .is_some_and(|object| object.kind() == "identifier")
+    {
+        // Preserve ordinary module aliases under the existing name-based
+        // producer policy, while the complete target shape stays mandatory.
+        let Some(attribute) = function.field("attribute") else {
+            return false;
+        };
+        attribute.text()
+    } else {
+        return false;
+    };
+    if name != "TemporaryDirectory" && (takes_name || name != "mkdtemp") {
+        return false;
+    }
+    let text = target.text();
+    PY_PRODUCER_LITERAL_VETO
+        .captures(&text)
+        .and_then(|caps| string_literal_from_caps(&caps))
+        .is_none_or(is_temp_scratch_path)
 }
 
 /// Give Go's recursive delete the same temp carve-out every other language has.
@@ -2500,10 +3508,11 @@ static PERL_RMDIR_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn precompile_perl_patterns() {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstPatternCompile);
     // Perl uses the bounded regex fallback rather than ast-grep. Compile its
-    // fixed patterns while constructing the matcher so first-use compilation
+    // fixed patterns when Perl is first requested so first-use compilation
     // cannot consume the per-match timeout and turn a valid first Perl scan
-    // into a tier-local timeout. Construction remains covered by the caller's
+    // into a tier-local timeout. Compilation remains covered by the caller's
     // absolute hook deadline.
     LazyLock::force(&PERL_SYSTEM_EXEC_LITERAL);
     LazyLock::force(&PERL_BACKTICKS_LITERAL);
@@ -3005,7 +4014,16 @@ static ANY_STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 /// an argument — `lc('/tmp/x')` in `system 'rm', '-rf', lc('/tmp/x'),
 /// './build'` — and drop every operand after it. [`exec_argv_region`] then
 /// finds where such a list really ends (`;`, `or die …`, `if …`).
+///
+/// A JavaScript `$` tagged template (#570) has no argument list: its region
+/// runs through the template's closing backtick, however many lines and
+/// `${…}` interpolations it spans. Without a template the tag runs nothing,
+/// and its region is the `$` alone rather than the rest of the line.
 fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
+    if code[match_start..].starts_with('$') {
+        let end = js_shell_template(&code[match_start..]).map_or(1, |(end, _)| end);
+        return &code[match_start..match_start + end];
+    }
     let after_name = code[match_start..]
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.' | ':')))
         .map_or(code.len(), |offset| match_start + offset);
@@ -3094,7 +4112,16 @@ fn detect_destructive_in_args(
     // not a scalar literal, such as a conditional choosing between "rm" and
     // "echo". This fragment view can only add a blocking result. It cannot
     // reconstruct a command, justify a temp exemption, or shift Git's options.
-    let fragments = literal_fragment_operands(exec_argv_region(call_text));
+    //
+    // Deno's and Bun's object-argv calls and `$` templates (#570) have no such
+    // prior evidence, and their argv is read structurally. A template's quoted
+    // fragments are not argv words either: `` $`echo 'rm -rf /'` `` only
+    // prints its `'rm -rf /'`.
+    let fragments = if js_native_sink(call_text, language).is_some() {
+        Vec::new()
+    } else {
+        literal_fragment_operands(exec_argv_region(call_text))
+    };
     let fragment_words: Vec<&str> = fragments.iter().map(Cow::as_ref).collect();
     let mut fragment_hit = None;
     for fragment in &fragment_words {
@@ -3154,6 +4181,9 @@ const MAX_EXEC_ARGV_OPERANDS: usize = 1_024;
 /// contributes one unknown value; neither its nested literal nor its comma
 /// is an argv element. Only the list that actually supplies argv is flattened.
 fn exec_argv_operands(call_text: &str, language: ScriptLanguage) -> ExecArgv<'_> {
+    if let Some(kind) = js_native_sink(call_text, language) {
+        return js_native_exec_argv(call_text, kind, language);
+    }
     let region = exec_argv_region(call_text);
     let Some(arguments) = split_exec_operands(region, b",", language) else {
         return unverified_exec_argv(region, language);
@@ -3288,6 +4318,390 @@ fn unverified_exec_argv(region: &str, language: ScriptLanguage) -> ExecArgv<'_> 
     }
 }
 
+/// A Deno or Bun process API whose argv [`exec_argv_region`] cannot see (#570).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsNativeSink {
+    /// `` $`…` ``: Bun Shell, zx and execa run the template as a command line.
+    ShellTemplate,
+    /// `Deno.Command(program, {args: […]})`.
+    DenoCommand,
+    /// `Deno.run({cmd: […]})`, or Bun's `spawn`/`spawnSync({cmd: […]})`.
+    CmdOption,
+}
+
+/// Which [`JsNativeSink`] a JavaScript exec-sink call is, if any.
+///
+/// Only `JS_EXEC_SINK_LITERAL` hands these call texts over: `Command` and
+/// `run` come from its `Deno.` alternative alone, and a `spawn` whose first
+/// argument is an object is Bun's signature. Bun's argv-array form
+/// (`Bun.spawnSync(["git", …])`) is not one, because a leading list argument
+/// already IS the argv for [`exec_argv_operands`].
+fn js_native_sink(call_text: &str, language: ScriptLanguage) -> Option<JsNativeSink> {
+    if !matches!(
+        language,
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+    ) {
+        return None;
+    }
+    if call_text.starts_with('$') {
+        return Some(JsNativeSink::ShellTemplate);
+    }
+    let (name, arguments) = call_text.split_once('(')?;
+    match name.trim_end() {
+        "Command" => Some(JsNativeSink::DenoCommand),
+        "run" => Some(JsNativeSink::CmdOption),
+        "spawn" | "spawnSync" if skip_exec_trivia(arguments, language).starts_with('{') => {
+            Some(JsNativeSink::CmdOption)
+        }
+        _ => None,
+    }
+}
+
+/// The argv a Deno or Bun process API runs (#570).
+///
+/// [`exec_argv_region`] ends a call's argv at its first `{…}` argument,
+/// because for `child_process` that is an options object. For these APIs the
+/// object is where the argv is: `new Deno.Command("git", {args: ["reset",
+/// "--hard"]})`, `Deno.run({cmd: ["git", "reset", "--hard"]})`,
+/// `Bun.spawn({cmd: […]})`. So the one property that supplies argv is read
+/// out of it, and every other property (`cwd`, `env`, `stdout`) stays out, as
+/// options do for every other sink. A `$` template is one command line.
+///
+/// What cannot be read fails closed the way an unreadable `child_process`
+/// argv does: a spread, a computed key, an options value that is not an
+/// object literal, or an `args`/`cmd` that is not an array literal marks the
+/// vector unverified. With the program visible that is the `argv_unverified`
+/// finding, exactly as for `spawnSync("git", flags)`; with it hidden, the
+/// existing posture for an opaque executable.
+fn js_native_exec_argv(
+    call_text: &str,
+    kind: JsNativeSink,
+    language: ScriptLanguage,
+) -> ExecArgv<'_> {
+    let mut argv = ExecArgv {
+        values: Vec::new(),
+        unverified: false,
+    };
+    if kind == JsNativeSink::ShellTemplate {
+        // A `$({…})` call with no template after it runs nothing.
+        if let Some((_, script)) = js_shell_template(call_text) {
+            argv.values.push(Cow::Owned(script));
+        }
+        return argv;
+    }
+    let Some(open) = call_text.find('(') else {
+        return argv;
+    };
+    let after_open = &call_text[open + 1..];
+    let Some(arguments) = after_open
+        .strip_suffix(')')
+        .and_then(|inner| split_exec_operands(inner, b",", language))
+    else {
+        // An argument list this reader cannot delimit. Keep a literal
+        // program for the conservative finding, as for any other sink.
+        if kind == JsNativeSink::DenoCommand {
+            return unverified_exec_argv(after_open, language);
+        }
+        argv.unverified = true;
+        return argv;
+    };
+    let mut arguments = arguments
+        .into_iter()
+        .filter(|argument| !skip_exec_trivia(argument, language).trim_end().is_empty());
+    let key = if kind == JsNativeSink::DenoCommand {
+        let Some(program) = arguments.next() else {
+            return argv;
+        };
+        push_exec_operand(&mut argv, program, language);
+        "args"
+    } else {
+        "cmd"
+    };
+    let Some(options) = arguments.next() else {
+        return argv;
+    };
+    let (value, uncertain) = js_object_property(options, key, language);
+    if let Some(value) = value {
+        push_js_argv_list(&mut argv, value, language);
+    }
+    argv.unverified |= uncertain;
+    argv
+}
+
+/// Push an `args`/`cmd` value's elements. Only an array literal is a fixed
+/// argv; any other expression (`flags`, `base.concat(extra)`, a list behind a
+/// TypeScript assertion) supplies an unknown number of words.
+fn push_js_argv_list<'a>(argv: &mut ExecArgv<'a>, value: &'a str, language: ScriptLanguage) {
+    let elements = ungroup_exec_operand(value, language)
+        .and_then(|list| list.strip_prefix('['))
+        .and_then(|list| list.strip_suffix(']'))
+        .and_then(|inner| split_exec_operands(inner, b",", language));
+    let Some(elements) = elements else {
+        argv.unverified = true;
+        return;
+    };
+    for element in elements {
+        if !skip_exec_trivia(element, language).trim_end().is_empty() {
+            push_exec_operand(argv, element, language);
+        }
+    }
+}
+
+/// The value of `key` in a JavaScript object literal, and whether something
+/// else in the object may define it instead.
+///
+/// Read the way JavaScript evaluates the literal: a later property overrides
+/// an earlier one. So a spread, a computed key, a shorthand `{ args }` or an
+/// accessor makes the answer uncertain until a plain `key: value` follows it,
+/// and a plain value before one of those is kept but no longer certain. A
+/// value that is not an object literal at all is wholly uncertain.
+fn js_object_property<'a>(
+    object: &'a str,
+    key: &str,
+    language: ScriptLanguage,
+) -> (Option<&'a str>, bool) {
+    let properties = ungroup_exec_operand(object, language)
+        .and_then(|object| object.strip_prefix('{'))
+        .and_then(|object| object.strip_suffix('}'))
+        .and_then(|inner| split_exec_operands(inner, b",", language));
+    let Some(properties) = properties else {
+        return (None, true);
+    };
+    let mut value = None;
+    let mut uncertain = false;
+    for property in properties {
+        let property = skip_exec_trivia(property, language).trim_end();
+        if property.is_empty() {
+            continue;
+        }
+        let Some((name, rest)) = js_property_name(property, language) else {
+            // A spread or computed key may define any property.
+            uncertain = true;
+            continue;
+        };
+        let rest = skip_exec_trivia(rest, language);
+        if let Some(found) = rest.strip_prefix(':') {
+            if name == key {
+                value = Some(found);
+                uncertain = false;
+            }
+        } else if name == key {
+            // `{ args }` names a variable; `args() {…}` and `get args()`
+            // compute the value.
+            value = None;
+            uncertain = true;
+        } else if !(rest.is_empty() || rest.starts_with('(')) {
+            // Neither shorthand nor a method of another name.
+            uncertain = true;
+        }
+    }
+    (value, uncertain)
+}
+
+/// An object literal property's key and the text after it, or `None` for a
+/// spread or computed key. A `get`/`set`/`async` modifier is skipped, so
+/// `get args() {…}` names `args`.
+fn js_property_name(property: &str, language: ScriptLanguage) -> Option<(Cow<'_, str>, &str)> {
+    if let Some(end) = exec_literal_end(property) {
+        return Some((
+            exec_literal_operand(&property[..end], language)?,
+            &property[end..],
+        ));
+    }
+    let identifier_len = |text: &str| {
+        text.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$')))
+            .unwrap_or(text.len())
+    };
+    let len = identifier_len(property);
+    if len == 0 {
+        return None;
+    }
+    let (name, rest) = property.split_at(len);
+    if matches!(name, "get" | "set" | "async") && rest.starts_with(char::is_whitespace) {
+        let rest = rest.trim_start().trim_start_matches('*').trim_start();
+        let len = identifier_len(rest);
+        return (len > 0).then(|| (Cow::Borrowed(&rest[..len]), &rest[len..]));
+    }
+    Some((Cow::Borrowed(name), rest))
+}
+
+/// A `$` tag's template literal (#570): where it ends in `text`, which starts
+/// at the `$`, and the command line it spells.
+///
+/// The tag may be zx's `$.sync`, or be called with options first
+/// (`` $({cwd: dir})`…` ``, zx and execa). Each `${…}` interpolation is one
+/// runtime value, which is how these libraries pass it (one escaped
+/// argument), so `` $`rm -rf ${dir}` `` reads like `rm -rf "$dir"`. `None`
+/// when no template follows the tag, or it never closes.
+fn js_shell_template(text: &str) -> Option<(usize, String)> {
+    let bytes = text.as_bytes();
+    let skip_space = |mut i: usize| {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = 1;
+    if text[i..].starts_with(".sync") {
+        i += ".sync".len();
+    }
+    i = skip_space(i);
+    if bytes.get(i) == Some(&b'(') {
+        i = skip_space(js_balanced_end(text, i, 0)?);
+    }
+    js_template_literal(text, i)
+}
+
+/// The JavaScript template literal whose opening backtick is at `open`:
+/// where it ends, and its cooked value with each `${…}` interpolation as one
+/// runtime value. `None` when `open` is no backtick or the literal never
+/// closes.
+fn js_template_literal(text: &str, open: usize) -> Option<(usize, String)> {
+    let bytes = text.as_bytes();
+    if bytes.get(open) != Some(&b'`') {
+        return None;
+    }
+    let mut i = open + 1;
+    let mut value = String::new();
+    let mut literal = i;
+    loop {
+        match *bytes.get(i)? {
+            b'`' => {
+                push_js_template_text(&mut value, &text[literal..i]);
+                return Some((i + 1, value));
+            }
+            b'\\' => i += 2,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                push_js_template_text(&mut value, &text[literal..i]);
+                if !value.ends_with(RUNTIME_VALUE) {
+                    value.push_str(RUNTIME_VALUE);
+                }
+                i = js_balanced_end(text, i + 1, 0)?;
+                literal = i;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// Template text as the tag receives it, cooked: zx hands the cooked string
+/// to bash, so `` $`\x72m -rf /` `` runs `rm`. An escape this reader does not
+/// model is kept as a runtime value rather than guessed.
+fn push_js_template_text(command: &mut String, raw: &str) {
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            command.push(ch);
+            continue;
+        }
+        let decoded = match chars.next() {
+            Some(escaped @ ('\\' | '`' | '$' | '\'' | '"')) => Some(escaped),
+            Some('n') => Some('\n'),
+            Some('r') => Some('\r'),
+            Some('t') => Some('\t'),
+            Some('\n') => continue,
+            Some('x') => {
+                let digits: String = chars.by_ref().take(2).collect();
+                u32::from_str_radix(&digits, 16)
+                    .ok()
+                    .filter(|_| digits.len() == 2)
+                    .and_then(char::from_u32)
+            }
+            Some('u') => {
+                let rest = chars.as_str();
+                let (digits, consumed) = match rest.strip_prefix('{') {
+                    Some(braced) => braced
+                        .find('}')
+                        .map_or(("", 0), |end| (&braced[..end], end + 2)),
+                    None => (rest.get(..4).unwrap_or(""), 4),
+                };
+                let value = u32::from_str_radix(digits, 16)
+                    .ok()
+                    .filter(|_| digits.len() <= 6)
+                    .and_then(char::from_u32);
+                if value.is_some() {
+                    chars = rest[consumed..].chars();
+                }
+                value
+            }
+            _ => None,
+        };
+        match decoded {
+            Some(decoded) => command.push(decoded),
+            None => command.push_str(RUNTIME_VALUE),
+        }
+    }
+}
+
+/// Index just past the bracket closing the one at `open` in JavaScript
+/// source, skipping strings, comments and templates with their own `${…}`.
+/// `None` when it never closes or nests past [`MAX_EXEC_ARGV_DEPTH`].
+fn js_balanced_end(text: &str, open: usize, depth: usize) -> Option<usize> {
+    if depth >= MAX_EXEC_ARGV_DEPTH {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut stack = vec![*bytes.get(open)?];
+    let mut i = open + 1;
+    while let Some(&byte) = bytes.get(i) {
+        match byte {
+            b'\'' | b'"' => {
+                i += exec_literal_end(&text[i..])?;
+                continue;
+            }
+            b'`' => {
+                i = js_template_end(text, i, depth + 1)?;
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |n| i + n);
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += memchr::memmem::find(&bytes[i + 2..], b"*/")? + 4;
+                continue;
+            }
+            b'(' | b'[' | b'{' => {
+                if stack.len() == MAX_EXEC_ARGV_DEPTH {
+                    return None;
+                }
+                stack.push(byte);
+            }
+            b')' | b']' | b'}' => {
+                let opener = stack.pop()?;
+                if !matches!((opener, byte), (b'(', b')') | (b'[', b']') | (b'{', b'}')) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index just past the backtick closing the template literal at `open`.
+fn js_template_end(text: &str, open: usize, depth: usize) -> Option<usize> {
+    if depth >= MAX_EXEC_ARGV_DEPTH {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut i = open + 1;
+    loop {
+        match *bytes.get(i)? {
+            b'`' => return Some(i + 1),
+            b'\\' => i += 2,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                i = js_balanced_end(text, i + 1, depth + 1)?;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
 fn push_exec_operand<'a>(argv: &mut ExecArgv<'a>, expression: &'a str, language: ScriptLanguage) {
     let expression = skip_exec_trivia(expression, language).trim_end();
     if argv.values.len() >= MAX_EXEC_ARGV_OPERANDS {
@@ -3414,6 +4828,11 @@ fn concatenated_operand(expression: &str, language: ScriptLanguage, depth: usize
     if let Some(value) = exec_literal_operand(expression, language) {
         return value;
     }
+    // A proven module-scope Python constant resolves to its exact literal
+    // value, judged downstream exactly as that literal spelled inline (#562).
+    if let Some(value) = resolve_active_python_const(expression, language) {
+        return Cow::Owned(value);
+    }
     let Some(terms) = split_exec_operands(expression, b"+.", language) else {
         return Cow::Borrowed(RUNTIME_VALUE);
     };
@@ -3440,6 +4859,421 @@ fn concatenated_operand(expression: &str, language: ScriptLanguage, depth: usize
     Cow::Borrowed(RUNTIME_VALUE)
 }
 
+// =============================================================================
+// Python module-constant argv resolution (#562)
+// =============================================================================
+//
+// An archive-only `subprocess.Popen(['tar', '-cf', '-', '-C', src, name])`
+// whose `name`/`src` are module-scope string or `pathlib.Path` constants
+// denied as `tar-exec-unverified`, because the reconstruction turned each
+// non-literal operand into `${dcg_runtime_value}` and the tar helper check
+// read an unresolved positional as a possible option. These constants have one
+// provable value, so resolve exactly that value and let the ordinary pack
+// pipeline judge it — the identical reconstruction as spelling the literal
+// inline, which already allows an archive and still denies an option such as
+// `--to-command=sh`.
+//
+// Soundness is fail-closed: a resolved operand is always the operand's true
+// literal value (the downstream tar check still decides it), so resolution can
+// only be wrong by resolving to a value the program does not have. The env is
+// therefore built only for straight-line programs (see
+// `build_python_const_env`), where a name assigned exactly once at module level
+// has one provable value, and resolution runs only for archive programs, never
+// for a launcher's code argument. Any doubt leaves the operand unresolved, i.e.
+// denied as before.
+
+#[derive(Clone)]
+enum PythonConst {
+    /// Bound to a plain string literal: its decoded value.
+    Str(String),
+    /// Bound to `Path('<literal>')` / `pathlib.Path('<literal>')`: the literal
+    /// path, recorded only when `Path`/`pathlib` were not rebound and the path
+    /// is "clean" (every `/`-separated component non-empty and not `.`/`..`),
+    /// so `str()`, `.name` and `.parent` match pathlib without normalization.
+    Path(String),
+}
+
+#[derive(Default, Clone)]
+struct PythonConstEnv {
+    values: HashMap<String, PythonConst>,
+    /// The `str` builtin was rebound, so a `str(...)` operand is not stringify.
+    str_rebound: bool,
+}
+
+impl PythonConstEnv {
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+thread_local! {
+    // Set only for the duration of one Python exec-sink reconstruction, whose
+    // operands all belong to that one program. Absent for every other caller
+    // and language, so resolution changes nothing there.
+    static PYTHON_CONST_ENV: std::cell::RefCell<Option<PythonConstEnv>> =
+        const { std::cell::RefCell::new(None) };
+    // Resolution is enabled per call only while reading the argv of an archive
+    // program (`tar`/`gtar`/`bsdtar`), the case #562 is about. It stays off for
+    // a shell/interpreter launcher (`pwsh -c <code>`, `sh -c <code>`, …), where
+    // resolving the code-string argument would defeat the launcher-unverified
+    // conservatism and let a payload no enabled pack matches through.
+    static RESOLVE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a reconstructed program word is an archive tool whose positional
+/// operands #562 may resolve. Never a shell or interpreter launcher.
+fn is_archive_program(program: &str) -> bool {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    matches!(name, "tar" | "gtar" | "bsdtar")
+}
+
+struct PythonConstEnvGuard;
+
+impl Drop for PythonConstEnvGuard {
+    fn drop(&mut self) {
+        PYTHON_CONST_ENV.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Install `env` as the active Python constant environment until the returned
+/// guard drops. Nesting is not expected; a prior env is restored on drop only
+/// through the single top-level install in the reconstruction entry.
+fn install_python_const_env(env: PythonConstEnv) -> Option<PythonConstEnvGuard> {
+    if env.is_empty() {
+        return None;
+    }
+    PYTHON_CONST_ENV.with(|slot| *slot.borrow_mut() = Some(env));
+    Some(PythonConstEnvGuard)
+}
+
+/// A "clean" path's basename: every component non-empty and not `.`/`..`.
+fn clean_path_components(path: &str) -> Option<Vec<&str>> {
+    let body = path.strip_prefix('/').unwrap_or(path);
+    let mut components = Vec::new();
+    for component in body.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return None;
+        }
+        components.push(component);
+    }
+    (!components.is_empty()).then_some(components)
+}
+
+/// Resolve one argv-operand expression to a `PythonConst`, given the active
+/// environment. Only bare names, `str(...)`, `.name` and `.parent` resolve.
+fn resolve_python_const_value(
+    env: &PythonConstEnv,
+    expression: &str,
+    depth: usize,
+) -> Option<PythonConst> {
+    if depth >= MAX_EXEC_ARGV_DEPTH {
+        return None;
+    }
+    let expression = expression.trim();
+    // Unwrap one transparent parenthesized expression (no top-level comma).
+    if let Some(inner) = expression
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        && split_exec_operands(inner, b",", ScriptLanguage::Python).is_some_and(|p| p.len() == 1)
+    {
+        return resolve_python_const_value(env, inner, depth + 1);
+    }
+    // str(<expr>): the builtin stringify, only if `str` was not rebound.
+    if !env.str_rebound
+        && let Some(argument) = expression
+            .strip_prefix("str")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+        && split_exec_operands(argument, b",", ScriptLanguage::Python).is_some_and(|p| p.len() == 1)
+    {
+        return match resolve_python_const_value(env, argument, depth + 1)? {
+            PythonConst::Str(value) | PythonConst::Path(value) => Some(PythonConst::Str(value)),
+        };
+    }
+    // <expr>.name / <expr>.parent on a Path value.
+    if let Some(base) = expression.strip_suffix(".name") {
+        let PythonConst::Path(path) = resolve_python_const_value(env, base, depth + 1)? else {
+            return None;
+        };
+        let components = clean_path_components(&path)?;
+        return Some(PythonConst::Str((*components.last()?).to_string()));
+    }
+    if let Some(base) = expression.strip_suffix(".parent") {
+        let PythonConst::Path(path) = resolve_python_const_value(env, base, depth + 1)? else {
+            return None;
+        };
+        let components = clean_path_components(&path)?;
+        if components.len() < 2 {
+            return None;
+        }
+        let absolute = path.starts_with('/');
+        let parent = components[..components.len() - 1].join("/");
+        return Some(PythonConst::Path(if absolute {
+            format!("/{parent}")
+        } else {
+            parent
+        }));
+    }
+    // A bare identifier.
+    if is_python_identifier(expression) {
+        return env.values.get(expression).cloned();
+    }
+    None
+}
+
+fn is_python_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Resolve an argv-operand to its proven literal string, using the active
+/// Python constant environment, if any. A bare `Path` operand stringifies to
+/// its path (subprocess uses `os.fspath`).
+fn resolve_active_python_const(expression: &str, language: ScriptLanguage) -> Option<String> {
+    if language != ScriptLanguage::Python || !RESOLVE_ENABLED.with(std::cell::Cell::get) {
+        return None;
+    }
+    PYTHON_CONST_ENV.with(|slot| {
+        let slot = slot.borrow();
+        let env = slot.as_ref()?;
+        match resolve_python_const_value(env, expression, 0)? {
+            PythonConst::Str(value) | PythonConst::Path(value) => Some(value),
+        }
+    })
+}
+
+/// Build the Python module-constant environment for `code` (#562).
+///
+/// Sound by a straight-line requirement: the program may contain only imports,
+/// plain simple-identifier assignments, and expression statements. Any
+/// construct that could rebind a name without a counted top-level assignment —
+/// `def`/`class`/`lambda`, `for`/`while`/`with`/`try`/`match`, a comprehension
+/// or generator, a walrus, `global`/`nonlocal`/`del`, an augmented assignment,
+/// an attribute/subscript/tuple/starred target, a wildcard import, or any
+/// reflective name (`exec`/`eval`/`globals`/`getattr`/…) — makes the whole env
+/// empty, so nothing is resolved and the operand keeps its denial. With that
+/// shape the only binder is a top-level assignment, so a name assigned exactly
+/// once has a provably fixed value. Returns an empty env on any disqualifier.
+fn build_python_const_env(code: &str) -> PythonConstEnv {
+    let empty = PythonConstEnv::default();
+    if code.len() > super::MAX_INTERPRETER_LITERAL_SOURCE_BYTES || !code.contains('=') {
+        return empty;
+    }
+    let Ok(ast) = AstGrep::try_new(code, SupportLang::Python) else {
+        return empty;
+    };
+    let root = ast.root();
+
+    let mut candidates: HashMap<String, PythonConst> = HashMap::new();
+    let mut assign_count: HashMap<String, usize> = HashMap::new();
+    let mut str_rebound = false;
+
+    for (index, node) in root.dfs().enumerate() {
+        if index >= super::MAX_INTERPRETER_LITERAL_NODES {
+            return empty;
+        }
+        if node.is_error() || node.is_missing() {
+            return empty;
+        }
+        let kind = node.kind();
+        match kind.as_ref() {
+            // Any construct that can introduce or rebind a name outside a
+            // counted top-level assignment. Bailing keeps the proof trivial.
+            "wildcard_import"
+            | "function_definition"
+            | "class_definition"
+            | "decorated_definition"
+            | "lambda"
+            | "for_statement"
+            | "while_statement"
+            | "with_statement"
+            | "try_statement"
+            | "match_statement"
+            | "named_expression"
+            | "global_statement"
+            | "nonlocal_statement"
+            | "delete_statement"
+            | "augmented_assignment"
+            | "list_comprehension"
+            | "dictionary_comprehension"
+            | "set_comprehension"
+            | "generator_expression"
+            | "for_in_clause" => return empty,
+            "identifier" if python_reflective_name(node.text().as_ref()) => return empty,
+            "identifier" if !node.text().is_ascii() => return empty,
+            "assignment" => {
+                let Some(left) = node.field("left") else {
+                    continue;
+                };
+                // Only a single bare-identifier target. A tuple/list/attribute/
+                // subscript/starred target cannot be tracked, so bail.
+                let targets = binding_target_names(&left);
+                let [Some(name)] = targets.as_slice() else {
+                    return empty;
+                };
+                *assign_count.entry(name.clone()).or_insert(0) += 1;
+                if name == "str" {
+                    str_rebound = true;
+                }
+                // tree-sitter wraps a top-level `name = …` in an
+                // `expression_statement`, so the statement is the parent whose
+                // own parent must be the module.
+                let statement = node
+                    .parent()
+                    .filter(|parent| matches!(parent.kind().as_ref(), "expression_statement"));
+                let module_level = statement
+                    .as_ref()
+                    .unwrap_or(&node)
+                    .parent()
+                    .is_some_and(|parent| matches!(parent.kind().as_ref(), "module" | "program"));
+                if module_level
+                    && let Some(value) = node
+                        .field("right")
+                        .and_then(|right| python_const_rhs(&right))
+                {
+                    candidates.insert(name.clone(), value);
+                }
+            }
+            "import_statement" | "import_from_statement" => {
+                // An import binds a name too; count it so a const shadowed by
+                // `import evil as name` is not resolved.
+                for name in import_bound_names(&node) {
+                    *assign_count.entry(name.clone()).or_insert(0) += 1;
+                    if name == "str" {
+                        str_rebound = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut env = PythonConstEnv {
+        values: HashMap::new(),
+        str_rebound,
+    };
+    for (name, value) in candidates {
+        // Exactly one top-level binding of the name: its candidate assignment.
+        if assign_count.get(&name) == Some(&1) {
+            env.values.insert(name, value);
+        }
+    }
+    env
+}
+
+/// The names a `left` assignment target binds. `None` for a target that is not
+/// a bare identifier (attribute, subscript, starred), so the caller fails
+/// closed rather than resolve a name whose value it cannot track.
+fn binding_target_names<D: ast_grep_core::Doc>(
+    left: &ast_grep_core::Node<'_, D>,
+) -> Vec<Option<String>> {
+    match left.kind().as_ref() {
+        "identifier" => vec![Some(left.text().into_owned())],
+        "pattern_list" | "tuple_pattern" | "list_pattern" | "tuple" | "list" => left
+            .children()
+            .filter(|child| child.is_named() && child.kind().as_ref() != "comment")
+            .flat_map(|child| binding_target_names(&child))
+            .collect(),
+        // An attribute/subscript/starred target is not a tracked name.
+        "attribute"
+        | "subscript"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern"
+        | "list_splat" => vec![None],
+        _ => vec![None],
+    }
+}
+
+/// Names a Python import statement binds into the module namespace.
+fn import_bound_names<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -> Vec<String> {
+    let mut names = Vec::new();
+    for child in node.children() {
+        match child.kind().as_ref() {
+            "dotted_name" => {
+                if let Some(first) = child.children().find(|n| n.kind().as_ref() == "identifier") {
+                    names.push(first.text().into_owned());
+                }
+            }
+            "aliased_import" => {
+                if let Some(alias) = child.field("alias") {
+                    names.push(alias.text().into_owned());
+                } else if let Some(name) = child.field("name") {
+                    if let Some(first) = name.children().find(|n| n.kind().as_ref() == "identifier")
+                    {
+                        names.push(first.text().into_owned());
+                    } else {
+                        names.push(name.text().into_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// A qualifying constant right-hand side: a plain string literal, or a
+/// `Path('<literal>')` / `pathlib.Path('<literal>')` whose path is clean.
+fn python_const_rhs<D: ast_grep_core::Doc>(
+    right: &ast_grep_core::Node<'_, D>,
+) -> Option<PythonConst> {
+    if let Some(value) = super::static_interpreter_literal(right, ScriptLanguage::Python, 0) {
+        return Some(PythonConst::Str(value));
+    }
+    if right.kind().as_ref() != "call" {
+        return None;
+    }
+    let function = right.field("function")?;
+    let is_path = match function.kind().as_ref() {
+        "identifier" => function.text() == "Path",
+        "attribute" => {
+            function
+                .field("object")
+                .is_some_and(|object| object.text() == "pathlib")
+                && function
+                    .field("attribute")
+                    .is_some_and(|attr| attr.text() == "Path")
+        }
+        _ => false,
+    };
+    if !is_path {
+        return None;
+    }
+    let arguments = right.field("arguments")?;
+    let mut args = arguments
+        .children()
+        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
+    let argument = args.next()?;
+    if args.next().is_some() {
+        return None; // Path(a, b, …) joins; keep to the single-literal case.
+    }
+    let literal = super::static_interpreter_literal(&argument, ScriptLanguage::Python, 0)?;
+    clean_path_components(&literal)?;
+    Some(PythonConst::Path(literal))
+}
+
+fn python_reflective_name(name: &str) -> bool {
+    matches!(
+        name,
+        "exec"
+            | "eval"
+            | "compile"
+            | "getattr"
+            | "setattr"
+            | "delattr"
+            | "vars"
+            | "globals"
+            | "locals"
+            | "__import__"
+            | "__builtins__"
+            | "__dict__"
+    )
+}
+
 /// End of one complete quoted literal, including escaped delimiters.
 fn exec_literal_end(expression: &str) -> Option<usize> {
     let bytes = expression.as_bytes();
@@ -3462,6 +5296,22 @@ fn exec_literal_end(expression: &str) -> Option<usize> {
 
 fn exec_literal_operand(expression: &str, language: ScriptLanguage) -> Option<Cow<'_, str>> {
     let expression = skip_exec_trivia(expression, language);
+    if expression.starts_with('`')
+        && matches!(
+            language,
+            ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+        )
+    {
+        // A JavaScript template literal is a string like any other, cooked,
+        // with each `${…}` as one runtime value. Reading it as wholly dynamic
+        // hid ``execSync(`git reset --hard`)`` and ``Bun.spawnSync(["sh",
+        // "-c", `git reset --hard`])`` from every exec-sink view (#570).
+        // Ruby's and Perl's backticks run a command, so they stay no value.
+        let (end, value) = js_template_literal(expression, 0)?;
+        return skip_exec_trivia(&expression[end..], language)
+            .is_empty()
+            .then_some(Cow::Owned(value));
+    }
     let end = exec_literal_end(expression)?;
     if !skip_exec_trivia(&expression[end..], language).is_empty() {
         return None;
@@ -4152,17 +6002,33 @@ fn is_catastrophic_path(path: &str) -> bool {
 /// allowed too, or the policy depends on which language the agent picked
 /// (#455).
 ///
-/// Traversal disqualifies a path here for the same reason it does there:
-/// `/tmp/../etc` names `/etc`, not a scratch directory.
+/// A temp root itself is never scratch owned by the caller (#549). Ignore
+/// redundant separators and `.` components before requiring a real descendant.
+/// Reject `..` before that normalization: resolving it could escape the root,
+/// including through a symlink, and shell's exemption refuses it too.
 fn is_temp_scratch_path(path: &str) -> bool {
-    let candidate = path.strip_prefix("/private").unwrap_or(path);
     // Only a literal path is a temp target. An expansion anywhere can climb
     // out (`/tmp/$name` with `name=../home/user`), which is why the shell
     // rules deny `rm -rf /tmp/$x`; `concatenated_operand` marks a literal
     // joined to a runtime value the same way (#485).
-    (has_path_prefix(candidate, "/tmp") || has_path_prefix(candidate, "/var/tmp"))
-        && !contains_path_traversal(candidate)
-        && !candidate.contains(['$', '`'])
+    if !path.starts_with('/') || contains_path_traversal(path) || path.contains(['$', '`']) {
+        return false;
+    }
+
+    // Parse Unix command-path data explicitly, independent of the host OS.
+    let mut components = path
+        .split('/')
+        .filter(|component| !matches!(*component, "" | "."));
+    let root = match components.next() {
+        Some("private") => components.next(),
+        component => component,
+    };
+    match root {
+        Some("tmp") => {}
+        Some("var") if components.next() == Some("tmp") => {}
+        _ => return false,
+    }
+    components.next().is_some()
 }
 
 /// Go's exec-sink rule ids, the set `refine_go_match` escalates (#472).
@@ -5028,36 +6894,63 @@ pub(crate) fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>
 /// Global default matcher instance (lazy-initialized).
 pub static DEFAULT_MATCHER: LazyLock<AstMatcher> = LazyLock::new(AstMatcher::new);
 
-fn precompile_patterns(
+fn prepare_patterns(
     patterns: HashMap<ScriptLanguage, Vec<CompiledPattern>>,
-) -> HashMap<ScriptLanguage, Vec<PrecompiledPattern>> {
-    let mut out: HashMap<ScriptLanguage, Vec<PrecompiledPattern>> = HashMap::new();
+) -> HashMap<ScriptLanguage, LanguagePatterns> {
+    patterns
+        .into_iter()
+        .filter(|(language, source)| {
+            script_language_to_ast_lang(*language).is_some() && !source.is_empty()
+        })
+        .map(|(language, source)| {
+            (
+                language,
+                LanguagePatterns {
+                    source,
+                    compiled: OnceLock::new(),
+                },
+            )
+        })
+        .collect()
+}
 
-    for (language, patterns) in patterns {
-        let Some(ast_lang) = script_language_to_ast_lang(language) else {
+fn compile_patterns(patterns: &[CompiledPattern], ast_lang: SupportLang) -> PatternIndex {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstPatternCompile);
+    let mut index = PatternIndex {
+        patterns: Vec::with_capacity(patterns.len()),
+        by_kind: Vec::new(),
+        any_kind: Vec::new(),
+    };
+
+    for meta in patterns {
+        let built = match meta.selector.as_deref() {
+            Some(selector) => Pattern::contextual(&meta.pattern_str, selector, ast_lang),
+            None => Pattern::try_new(&meta.pattern_str, ast_lang),
+        };
+        let Ok(pattern) = built else {
+            // Preserve custom-corpus behavior: invalid patterns are skipped.
+            // The complete built-in corpus is compilation-tested below.
             continue;
         };
 
-        let mut compiled = Vec::with_capacity(patterns.len());
-        for meta in patterns {
-            let built = match meta.selector.as_deref() {
-                Some(selector) => Pattern::contextual(&meta.pattern_str, selector, ast_lang),
-                None => Pattern::try_new(&meta.pattern_str, ast_lang),
-            };
-            let Ok(pattern) = built else {
-                // Fail-open: skip invalid patterns silently (default patterns should be validated by tests).
-                continue;
-            };
-
-            compiled.push(PrecompiledPattern { pattern, meta });
+        let pattern_index = index.patterns.len();
+        if let Some(kinds) = pattern.potential_kinds() {
+            for kind in &kinds {
+                if index.by_kind.len() <= kind {
+                    index.by_kind.resize_with(kind + 1, Vec::new);
+                }
+                index.by_kind[kind].push(pattern_index);
+            }
+        } else {
+            index.any_kind.push(pattern_index);
         }
-
-        if !compiled.is_empty() {
-            out.insert(language, compiled);
-        }
+        index.patterns.push(PrecompiledPattern {
+            pattern,
+            meta: meta.clone(),
+        });
     }
 
-    out
+    index
 }
 
 // ============================================================================
@@ -5069,6 +6962,62 @@ fn precompile_patterns(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn python_default_parameter_captures_preserve_rmtree_binding() {
+        let matcher = AstMatcher::new().with_timeout(Duration::from_secs(5));
+        for (source, denied) in [
+            (
+                "import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove('/tmp')\ncleanup()",
+                true,
+            ),
+            (
+                "import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove('/tmp/build')\ncleanup()",
+                false,
+            ),
+            (
+                "from shutil import rmtree as remove\ndef cleanup(remove):\n    remove('/tmp')\ncleanup(print)",
+                false,
+            ),
+            (
+                "import shutil\ndef cleanup(remove=shutil.rmtree):\n    remove = print\n    remove('/tmp')\ncleanup()",
+                false,
+            ),
+        ] {
+            let matches = matcher
+                .find_matches(source, ScriptLanguage::Python)
+                .expect("complete default-argument binding analysis");
+            assert_eq!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                denied,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn python_default_parameter_capture_respects_definition_order() {
+        let matcher = AstMatcher::new().with_timeout(Duration::from_secs(5));
+        for (source, denied) in [
+            (
+                "from shutil import rmtree as erase\ndef cleanup(remove=erase, marker=(erase := print)):\n    remove('/tmp')\ncleanup()",
+                true,
+            ),
+            (
+                "from shutil import rmtree as erase\ndef cleanup(marker=(erase := print), remove=erase):\n    remove('/tmp')\ncleanup()",
+                false,
+            ),
+        ] {
+            let matches = matcher
+                .find_matches(source, ScriptLanguage::Python)
+                .expect("definition-order defaults must remain analyzable");
+            assert_eq!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                denied,
+                "{source}",
+            );
+        }
+    }
 
     /// A per-call budget overrides the matcher's own, in both directions: an
     /// exhausted one reports a transient failure (never an empty match list),
@@ -5281,6 +7230,351 @@ mod tests {
                 matches.iter().any(|m| m.severity.blocks_by_default()),
                 "must still block: {code:?}"
             );
+        }
+    }
+
+    /// #549: only a real child of an approved temp root gets the exemption.
+    /// These are verdict checks on source text; none of the paths is accessed.
+    #[test]
+    fn python_temp_cleanup_requires_a_descendant_issue_549() {
+        let ast_matcher = AstMatcher::new();
+        for root in ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"] {
+            for (suffix, blocks) in [
+                ("", true),
+                ("/", true),
+                ("//", true),
+                ("/.", true),
+                ("/./", true),
+                ("//.//./", true),
+                ("/build/..", true),
+                ("/build/../.", true),
+                ("/build/../cache", true),
+                ("/x/../../home/user/Documents", true),
+                ("/../../etc", true),
+                ("/build", false),
+                ("/build/", false),
+                ("/./build", false),
+                ("//build//./cache/", false),
+                ("/.cache", false),
+                ("/build..old", false),
+                ("/...", false),
+            ] {
+                for receiver in ["shutil", "sh"] {
+                    let code =
+                        format!("import shutil as {receiver}\n{receiver}.rmtree('{root}{suffix}')");
+                    let matches = ast_matcher
+                        .find_matches(&code, ScriptLanguage::Python)
+                        .unwrap();
+                    assert_eq!(
+                        matches.iter().any(|m| m.severity.blocks_by_default()),
+                        blocks,
+                        "wrong deletion verdict: {code:?}"
+                    );
+                }
+            }
+        }
+
+        for (path, blocks) in [
+            ("//tmp//.", true),
+            ("/./private//var/./tmp/", true),
+            ("/tmp-other/build", true),
+            ("/private/tmp-other/build", true),
+            ("/privatevar/tmp/build", true),
+            ("tmp/build", true),
+            ("/home/user/Documents", true),
+            ("//tmp//build", false),
+            ("/./private//var/./tmp/build", false),
+        ] {
+            let code = format!("import shutil\nshutil.rmtree('{path}')");
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Python)
+                .unwrap();
+            assert_eq!(
+                matches.iter().any(|m| m.severity.blocks_by_default()),
+                blocks,
+                "wrong deletion verdict: {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_temp_exemption_uses_the_complete_target_issue_549() {
+        let ast_matcher = AstMatcher::new();
+        for call in [
+            "shutil.rmtree(path='/tmp')",
+            "shutil.rmtree(('/tmp/.'))",
+            "shutil.rmtree('/tmp/build' + '/..')",
+            "shutil.rmtree('/tmp/build' + '/../../home/user/Documents')",
+            "shutil.rmtree('/tmp/build' + suffix)",
+            "shutil.rmtree('/tmp/build'[:-5])",
+            "shutil.rmtree(Path('/tmp/build').parent)",
+            "shutil.rmtree(os.path.join('/tmp/build', '../../etc'))",
+            "shutil.rmtree('/tmp/\\x2e')",
+            "shutil.rmtree(tempfile.gettempdir())",
+            "shutil.rmtree(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+            "shutil.rmtree(tempfile.gettempdir(), onerror=lambda *args: Path('/tmp/build'))",
+            "shutil.rmtree(Path(tempfile.mkdtemp()).parent)",
+            "shutil.rmtree(tempfile.mkdtemp() + '/..')",
+            "shutil.rmtree(tempfile.TemporaryDirectory().name + '/..')",
+            "shutil.rmtree(*targets, path='/tmp/build')",
+            "shutil.rmtree('/tmp/build', **options)",
+            "shutil.rmtree(other.mkdtemp('/srv'))",
+            "shutil.rmtree(Path(tf.mkdtemp()).parent)",
+            // Adjacent literals fold to one constant, which must still be a
+            // real descendant; an interpolated, prefixed or unknown piece
+            // keeps the whole value unproven.
+            "shutil.rmtree('/tmp' '/..')",
+            "shutil.rmtree('/tmp/' 'build' '/..')",
+            "shutil.rmtree('/tmp/build' '/../../etc')",
+            "shutil.rmtree('/tmp/' '')",
+            "shutil.rmtree('/tmp' '')",
+            "shutil.rmtree('/home/' 'user')",
+            "shutil.rmtree('/tmp/' f'{name}')",
+            "shutil.rmtree('/tmp/' f'build')",
+            "shutil.rmtree('/tmp/' b'build')",
+            "shutil.rmtree('/tmp/' '\\x2e\\x2e')",
+            "shutil.rmtree('/tmp/' 'build'[:-5])",
+            "shutil.rmtree(('/tmp/' 'build', '/'))",
+        ] {
+            let code = format!("import os, shutil, tempfile\nfrom pathlib import Path\n{call}");
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                matches.iter().any(|m| m.severity.blocks_by_default()),
+                "an unproven or root-equivalent target must block: {call:?}"
+            );
+        }
+
+        for call in [
+            "shutil.rmtree(path='/tmp/build')",
+            "shutil.rmtree(('/tmp/build'))",
+            "shutil.rmtree('/tmp/' + 'build')",
+            "shutil.rmtree('/tmp/' 'build')",
+            "shutil.rmtree(('/tmp/' 'build'))",
+            "shutil.rmtree(path='/var/tmp/' 'build')",
+            "shutil.rmtree('/private' '/tmp/' 'build', ignore_errors=True)",
+            "shutil.rmtree('/tmp/'  # scratch root\n    'build')",
+            "shutil.rmtree('/tmp/build', ignore_errors=True)",
+            "shutil.rmtree(ignore_errors=True, path='/tmp/build')",
+            "shutil.rmtree(tempfile.mkdtemp())",
+            "shutil.rmtree(mkdtemp())",
+            "shutil.rmtree(tempfile.TemporaryDirectory().name)",
+            "shutil.rmtree(tf.mkdtemp())",
+            "shutil.rmtree(tf.mkdtemp(prefix='build-'))",
+            "shutil.rmtree(tf.TemporaryDirectory().name)",
+        ] {
+            let code = format!(
+                "import shutil, tempfile\nimport tempfile as tf\nfrom tempfile import mkdtemp\n{call}"
+            );
+            let matches = ast_matcher
+                .find_matches(&code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                !matches.iter().any(|m| m.severity.blocks_by_default()),
+                "ordinary temporary cleanup must remain allowed: {call:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_has_the_same_temporary_path_policy() {
+        let matcher = AstMatcher::new();
+        for (imports, function) in [
+            ("from shutil import rmtree", "rmtree"),
+            ("from shutil import rmtree as wipe", "wipe"),
+            ("from shutil import copy, rmtree as erase, move", "erase"),
+            (
+                "from shutil import (\n    copy,\n    rmtree as clean,\n)",
+                "clean",
+            ),
+            ("from shutil import *", "rmtree"),
+            ("import shutil as sh\nwipe = sh.rmtree", "wipe"),
+            (
+                "from shutil import rmtree\nwipe = rmtree\nerase = wipe",
+                "erase",
+            ),
+        ] {
+            for (target, expected) in [
+                ("'/tmp'", true),
+                ("'/tmp/.'", true),
+                ("'/private/tmp/'", true),
+                ("'/var/tmp'", true),
+                ("'/./private//var/./tmp/'", true),
+                ("'/tmp/build/..'", true),
+                ("'/tmp/build/../../etc'", true),
+                ("'/tmp/' + 'build/..'", true),
+                ("'/tmp-other/build'", true),
+                ("target", true),
+                ("'/tmp/build'", false),
+                ("'/tmp/./build'", false),
+                ("'/private/var/tmp/build'", false),
+                ("'/tmp/' + 'build'", false),
+                ("tempfile.mkdtemp()", false),
+                ("tempfile.TemporaryDirectory().name", false),
+            ] {
+                let source = format!("{imports}\n{function}({target})");
+                let matches = matcher
+                    .find_matches(&source, ScriptLanguage::Python)
+                    .unwrap();
+                assert_eq!(
+                    matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                    expected,
+                    "{source}"
+                );
+            }
+        }
+        for (call, expected) in [
+            ("(wipe)('/tmp')", true),
+            ("((wipe))(path='/tmp/.')", true),
+            ("wipe(ignore_errors=True, path='/tmp/build')", false),
+            ("wipe('/tmp/build'); wipe('/tmp')", true),
+            ("wipe(Path(tempfile.mkdtemp()).parent)", true),
+            ("wipe(tempfile.mkdtemp() + '/..')", true),
+            (
+                "wipe(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+                true,
+            ),
+        ] {
+            let source = format!("from shutil import rmtree as wipe\n{call}");
+            let matches = matcher
+                .find_matches(&source, ScriptLanguage::Python)
+                .unwrap();
+            assert_eq!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_requires_a_visible_unshadowed_binding() {
+        let matcher = AstMatcher::new();
+        for source in [
+            "from shutil import rmtree as wipe",
+            "from project_helpers import rmtree\nrmtree('/tmp')",
+            "from .shutil import rmtree\nrmtree('/tmp')",
+            "from shutil import rmtree\nfrom project_helpers import rmtree\nrmtree('/tmp')",
+            "from shutil import rmtree as wipe\nwipe = print\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef wipe(path):\n    print(path)\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef render(wipe):\n    wipe('/tmp')\nrender(print)",
+            "from shutil import rmtree as wipe\nrender = lambda wipe: wipe('/tmp')\nrender(print)",
+            "from shutil import rmtree as wipe\ndef render():\n    wipe('/tmp')\n    wipe = print",
+            "wipe = print\ndef unrelated():\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\nclass Unrelated:\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\nclass Unrelated:\n    def render(self, wipe):\n        wipe('/tmp')",
+            "from shutil import rmtree as wipe\n[wipe('/tmp') for wipe in callbacks]",
+            "from shutil import rmtree as wipe\nwith context as wipe:\n    wipe('/tmp')",
+            "from shutil import rmtree as wipe\ntry:\n    pass\nexcept Exception as wipe:\n    wipe('/tmp')",
+            "from shutil import rmtree as wipe\nif flag:\n    wipe = print\nelse:\n    wipe = print\nwipe('/tmp')",
+            "import shutil as sh\nsh.rmtree = print\nwipe = sh.rmtree\nwipe('/tmp')",
+            "wipe = print\n# from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\ntext = 'from shutil import rmtree as wipe'\nwipe('/tmp')",
+        ] {
+            let matches = matcher
+                .find_matches(source, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                !matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                "unrelated or inert source: {source}"
+            );
+        }
+        for source in [
+            "from shutil import rmtree as wipe\ndef cleanup():\n    wipe('/tmp')\ncleanup()",
+            "def cleanup():\n    from shutil import rmtree as wipe\n    wipe('/tmp')\ncleanup()",
+            "from shutil import rmtree as wipe\ndef cleanup():\n    global wipe\n    wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef render(path: wipe):\n    wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef render(wipe=wipe('/tmp')):\n    pass",
+            "from shutil import rmtree as wipe\nclass Example:\n    wipe = print\n    def cleanup(self):\n        wipe('/tmp')",
+            "from shutil import rmtree as wipe\nif flag:\n    wipe = print\nwipe('/tmp')",
+            "wipe = print\nif flag:\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\nif flag:\n    from shutil import rmtree as wipe\nelse:\n    wipe = print\nwipe('/tmp')",
+            "from shutil import rmtree\nwipe = rmtree if flag else print\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\nflag and (wipe := print)\nwipe('/tmp')",
+            "from shutil import rmtree\nwipe = print\nfor item in items:\n    wipe('/tmp')\n    wipe = rmtree",
+            "from shutil import rmtree as wipe\nfor item in items:\n    wipe = print\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\n[wipe('/tmp/build') for wipe in callbacks]\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\nwipe.label = 'cleanup'\nwipe('/tmp')",
+            "import shutil as sh\nsh.label = 'cleanup'\nwipe = sh.rmtree\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\nwipe: object\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\n(wipe) = wipe\nwipe('/tmp')",
+            "from shutil import rmtree as wipe\n((wipe)) = wipe\nwipe('/tmp')",
+            "import shutil as sh\nwipe = sh.rmtree\nsh.rmtree = print\nwipe('/tmp')",
+        ] {
+            let matches = matcher
+                .find_matches(source, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                "possible destructive binding: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_respects_the_active_rule_configuration() {
+        let source = "from shutil import rmtree as wipe\nwipe('/tmp')";
+        let mut patterns = default_patterns();
+        patterns
+            .get_mut(&ScriptLanguage::Python)
+            .unwrap()
+            .retain(|pattern| pattern.rule_id != "heredoc.python.shutil_rmtree");
+        let matches = AstMatcher::with_patterns(patterns)
+            .find_matches(source, ScriptLanguage::Python)
+            .unwrap();
+        assert!(!matches.iter().any(|hit| hit.severity.blocks_by_default()));
+
+        let mut patterns = default_patterns();
+        let rule = patterns
+            .get_mut(&ScriptLanguage::Python)
+            .unwrap()
+            .iter_mut()
+            .find(|pattern| pattern.rule_id == "heredoc.python.shutil_rmtree")
+            .unwrap();
+        rule.severity = Severity::Medium;
+        let matches = AstMatcher::with_patterns(patterns)
+            .find_matches(source, ScriptLanguage::Python)
+            .unwrap();
+        assert!(!matches.iter().any(|hit| hit.severity.blocks_by_default()));
+    }
+
+    #[test]
+    fn recursive_deletes_share_the_temp_root_boundary_issue_549() {
+        let ast_matcher = AstMatcher::new();
+        for root in ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"] {
+            for (suffix, blocks) in [("", true), ("/.", true), ("/build", false)] {
+                let path = format!("{root}{suffix}");
+                for (language, code) in [
+                    (
+                        ScriptLanguage::Go,
+                        format!(
+                            "package main\nimport \"os\"\nfunc main() {{ os.RemoveAll(\"{path}\") }}"
+                        ),
+                    ),
+                    (
+                        ScriptLanguage::Ruby,
+                        format!("require 'fileutils'\nFileUtils.rm_rf('{path}')"),
+                    ),
+                    (
+                        ScriptLanguage::JavaScript,
+                        format!(
+                            "const fs = require('fs'); fs.rmSync('{path}', {{recursive: true}})"
+                        ),
+                    ),
+                    (
+                        ScriptLanguage::Perl,
+                        format!("use File::Path qw(remove_tree); remove_tree('{path}');"),
+                    ),
+                ] {
+                    let matches = ast_matcher.find_matches(&code, language).unwrap();
+                    assert_eq!(
+                        matches.iter().any(|m| m.severity.blocks_by_default()),
+                        blocks,
+                        "wrong {language:?} temporary cleanup verdict: {code:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -6249,14 +8543,399 @@ mod tests {
         let expected: HashMap<ScriptLanguage, usize> =
             raw.iter().map(|(lang, pats)| (*lang, pats.len())).collect();
 
-        let compiled = precompile_patterns(raw);
+        let prepared = prepare_patterns(raw);
 
         for (lang, expected_len) in expected {
-            let got = compiled.get(&lang).map_or(0, std::vec::Vec::len);
+            let ast_lang = script_language_to_ast_lang(lang).expect("registered language");
+            let got = prepared
+                .get(&lang)
+                .map_or(0, |corpus| corpus.compiled(ast_lang).patterns.len());
             assert_eq!(
                 got, expected_len,
                 "all default patterns should compile for {lang:?}"
             );
+        }
+    }
+
+    /// The independent traversal used before #555, retained as a differential
+    /// oracle. It asks ast-grep to walk the whole tree separately for each
+    /// rule, so mistakes in our kind index or traversal cannot validate
+    /// themselves. The later imported-function safety pass is identical in
+    /// both paths. Compare the complete findings, including tie order.
+    fn reference_find_all_matches(
+        code: &str,
+        language: ScriptLanguage,
+        patterns: &PatternIndex,
+    ) -> Vec<PatternMatch> {
+        let ast_lang = script_language_to_ast_lang(language).expect("supported language");
+        let ast = AstGrep::new(code, ast_lang);
+        let root = ast.root();
+        let newline_positions: Vec<_> = memchr_iter(b'\n', code.as_bytes()).collect();
+        let mut matches = Vec::new();
+        for compiled in &patterns.patterns {
+            for node in root.find_all(&compiled.pattern) {
+                let text = node.text();
+                let Some(refined) = refine_match_meta(language, &compiled.meta, &text, &node)
+                else {
+                    continue;
+                };
+                let range = node.range();
+                matches.push(PatternMatch {
+                    rule_id: refined.rule_id,
+                    reason: refined.reason,
+                    matched_text_preview: truncate_preview(&text, 60),
+                    start: range.start,
+                    end: range.end,
+                    line_number: newline_positions.partition_point(|&idx| idx < range.start) + 1,
+                    severity: refined.severity,
+                    suggestion: refined.suggestion,
+                });
+            }
+        }
+        if language == ScriptLanguage::Python
+            && code.contains("shutil")
+            && code.contains("rmtree")
+            && let Some(compiled) = patterns
+                .patterns
+                .iter()
+                .find(|pattern| pattern.meta.rule_id == "heredoc.python.shutil_rmtree")
+        {
+            let seen_calls = matches
+                .iter()
+                .filter(|matched| {
+                    matched.rule_id == compiled.meta.rule_id
+                        || matched.rule_id.strip_prefix(compiled.meta.rule_id.as_str())
+                            == Some(".temp")
+                })
+                .map(|matched| (matched.start, matched.end))
+                .collect();
+            PythonDeleteScan {
+                meta: &compiled.meta,
+                newline_positions: &newline_positions,
+                matches: &mut matches,
+                seen_calls,
+                start_time: Instant::now(),
+                timeout: Duration::from_millis(AST_TIMEOUT_MS),
+                budget_ms: AST_TIMEOUT_MS,
+                cancel: &AtomicBool::new(false),
+                remaining_nodes: MAX_PYTHON_DELETE_NODES,
+            }
+            .visit(root, &mut HashMap::new(), None, 0)
+            .expect("reference imported-function safety analysis must complete");
+        }
+        matches
+    }
+
+    #[test]
+    fn indexed_matching_preserves_every_language_and_nested_finding_issue_555() {
+        let matcher = AstMatcher::new();
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                concat!(
+                    "# shutil.rmtree('/etc') stays a comment\n",
+                    "print(\"os.system('rm -rf /etc')\")\n",
+                    "def nested():\n",
+                    "    return subprocess.run(['sh', '-c', 'rm -rf /etc'])\n",
+                    "shutil.rmtree('/tmp')\n",
+                    "shutil.rmtree('/tmp/build')\n",
+                    "os.remove('/home/example/file')\n",
+                ),
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                concat!(
+                    "// fs.rmSync('/etc', {recursive: true})\n",
+                    "const text = `fs.rmSync('/etc')`;\n",
+                    "function nested() {\n",
+                    "  return require('child_process').execSync('rm -rf /etc');\n",
+                    "}\n",
+                    "fs.rmSync('/tmp', {recursive: true});\n",
+                    "fs.rmSync('/tmp/build', {recursive: true});\n",
+                ),
+            ),
+            (
+                ScriptLanguage::TypeScript,
+                concat!(
+                    "const text: string = 'rm -rf /etc';\n",
+                    "function nested(): void {\n",
+                    "  child_process.spawnSync('rm', ['-rf', '/home/example']);\n",
+                    "}\n",
+                    "fs.rmSync('/tmp', {recursive: true});\n",
+                ),
+            ),
+            (
+                ScriptLanguage::Ruby,
+                concat!(
+                    "# FileUtils.rm_rf('/etc')\n",
+                    "puts 'rm -rf /etc'\n",
+                    "def nested\n",
+                    "  system('rm -rf /etc')\n",
+                    "end\n",
+                    "FileUtils.rm_rf('/tmp')\n",
+                ),
+            ),
+            (
+                ScriptLanguage::Bash,
+                concat!(
+                    "# rm -rf /etc\n",
+                    "printf '%s' 'git reset --hard'\n",
+                    "nested() { git reset --hard HEAD; }\n",
+                    "printf '%s' \"$(rm -rf /etc)\"\n",
+                ),
+            ),
+            (
+                ScriptLanguage::Go,
+                concat!(
+                    "package main\nimport (\"os\"; \"os/exec\")\n",
+                    "func main() {\n",
+                    "  // os.RemoveAll(\"/etc\")\n",
+                    "  exec.Command(\"sh\", \"-c\", \"rm -rf /etc\").Run()\n",
+                    "  os.RemoveAll(\"/tmp\")\n",
+                    "  os.RemoveAll(\"/tmp/build\")\n",
+                    "}\n",
+                ),
+            ),
+            (
+                ScriptLanguage::Php,
+                concat!(
+                    "<?php\n// unlink('/etc/passwd');\n",
+                    "function nested() { system('rm -rf /etc'); }\n",
+                    "unlink('/home/example/file');\n",
+                    "echo `git reset --hard`;\n",
+                ),
+            ),
+        ] {
+            let ast_lang = script_language_to_ast_lang(language).unwrap();
+            let patterns = matcher.patterns[&language].compiled(ast_lang);
+            let reference = reference_find_all_matches(source, language, patterns);
+            assert!(
+                reference.iter().any(|hit| hit.severity.blocks_by_default()),
+                "{language:?} fixture must exercise a denial"
+            );
+            assert_eq!(
+                matcher.find_matches(source, language).unwrap(),
+                reference,
+                "all rule identities, ranges, severities and ordering for {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_matching_keeps_wildcards_and_ambiguous_syntax_issue_555() {
+        let language = ScriptLanguage::Python;
+        let source = "danger(danger('λ雪'))\npayload = [danger('nested'), 2]\nif (\n";
+        let custom = ["danger($$$)", "$VALUE", "payload = $VALUE"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                CompiledPattern::new(
+                    pattern.into(),
+                    format!("custom.python.pattern_{index}"),
+                    format!("Custom structural pattern {index}"),
+                    Severity::High,
+                    None,
+                )
+            })
+            .collect();
+        let matcher = AstMatcher::with_patterns(HashMap::from([(language, custom)]));
+        let patterns = matcher.patterns[&language].compiled(SupportLang::Python);
+        assert!(
+            !patterns.any_kind.is_empty(),
+            "root metavariables must exercise unrestricted node dispatch"
+        );
+        let reference = reference_find_all_matches(source, language, patterns);
+        assert!(
+            reference.len() > 3,
+            "nested and wildcard findings are present"
+        );
+        assert_eq!(matcher.find_matches(source, language).unwrap(), reference);
+    }
+
+    #[test]
+    fn indexed_matching_preserves_python_delete_binding_findings_issue_555() {
+        let matcher = AstMatcher::new();
+        let language = ScriptLanguage::Python;
+        let patterns = matcher.patterns[&language].compiled(SupportLang::Python);
+        for (source, findings, blocking) in [
+            (
+                concat!(
+                    "import shutil\nfrom shutil import rmtree as wipe\n",
+                    "shutil.rmtree('/tmp/build')\nwipe('/tmp')\n",
+                    "shutil.rmtree('/tmp')\nwipe('/tmp/build')\n",
+                ),
+                4,
+                2,
+            ),
+            (
+                concat!(
+                    "from shutil import rmtree as wipe\n",
+                    "def render(wipe):\n    wipe('/tmp')\n",
+                    "wipe('/tmp')\n",
+                ),
+                1,
+                1,
+            ),
+            (
+                "from shutil import rmtree as wipe\nwipe = print\nwipe('/tmp')\n",
+                0,
+                0,
+            ),
+            (
+                "from shutil import rmtree as wipe\nwipe('/tmp/build')\n",
+                1,
+                0,
+            ),
+        ] {
+            let reference = reference_find_all_matches(source, language, patterns);
+            assert_eq!(reference.len(), findings, "{source}");
+            assert_eq!(
+                reference
+                    .iter()
+                    .filter(|hit| hit.severity.blocks_by_default())
+                    .count(),
+                blocking,
+                "{source}",
+            );
+            assert_eq!(
+                matcher.find_matches(source, language).unwrap(),
+                reference,
+                "all direct and imported findings, metadata, and order: {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_matching_preserves_large_multiline_source_issue_555() {
+        let matcher = AstMatcher::new();
+        let language = ScriptLanguage::Python;
+        let patterns = matcher.patterns[&language].compiled(SupportLang::Python);
+        for lines in [1, 40, 300, 3_000] {
+            let mut source = "print('shutil.rmtree(\"/etc\") λ雪')\n".repeat(lines);
+            assert!(matcher.find_matches(&source, language).unwrap().is_empty());
+            source.push_str("def nested():\n    return subprocess.run(['rm', '-rf', '/etc'])\n");
+            let reference = reference_find_all_matches(&source, language, patterns);
+            assert_eq!(reference.len(), 1, "one late executable call");
+            assert!(reference[0].severity.blocks_by_default());
+            assert_eq!(reference[0].line_number, lines + 2);
+            assert_eq!(matcher.find_matches(&source, language).unwrap(), reference);
+        }
+    }
+
+    #[test]
+    fn language_compilation_is_lazy_shared_and_never_skips_nested_languages_issue_555() {
+        let matcher = AstMatcher::new();
+        assert!(
+            matcher
+                .patterns
+                .values()
+                .all(|corpus| corpus.compiled.get().is_none())
+        );
+        let python = "shutil.rmtree('/etc')";
+        assert!(
+            matcher
+                .find_matches(python, ScriptLanguage::Python)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.severity.blocks_by_default())
+        );
+        for (language, corpus) in &matcher.patterns {
+            assert_eq!(
+                corpus.compiled.get().is_some(),
+                *language == ScriptLanguage::Python,
+                "a Python body does not initialize the {language:?} grammar"
+            );
+        }
+        let corpus = &matcher.patterns[&ScriptLanguage::Python];
+        let first = Arc::clone(corpus.compiled(SupportLang::Python));
+        matcher
+            .find_matches(python, ScriptLanguage::Python)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, corpus.compiled(SupportLang::Python)));
+
+        let nested = "require('child_process').execSync('rm -rf /etc')";
+        assert!(
+            matcher
+                .find_matches(nested, ScriptLanguage::JavaScript)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.severity.blocks_by_default()),
+            "a later nested interpreter still initializes its full corpus"
+        );
+        assert!(
+            matcher.patterns[&ScriptLanguage::JavaScript]
+                .compiled
+                .get()
+                .is_some()
+        );
+    }
+
+    /// A paired measurement of the incumbent traversal and candidate in the
+    /// same invocation. It includes parsing, matching and match refinement;
+    /// constructor/worker/process costs are covered by the hook benchmarks.
+    #[test]
+    #[ignore = "paired CPU-path benchmark: run with --release --ignored --nocapture"]
+    fn paired_ast_traversal_benchmark_issue_555() {
+        let matcher = AstMatcher::new();
+        let language = ScriptLanguage::Python;
+        let patterns = matcher.patterns[&language].compiled(SupportLang::Python);
+        let cancel = AtomicBool::new(false);
+        let budget = Duration::from_secs(60);
+        for lines in [40, 300] {
+            for (shape, statement) in [
+                ("no_calls", "value = 'quoted rm -rf /etc'\n"),
+                ("calls", "print('quoted shutil.rmtree(\"/etc\")')\n"),
+                ("findings", "os.system('rm -rf /etc')\n"),
+            ] {
+                let source = statement.repeat(lines);
+                let run_reference = || {
+                    let started = Instant::now();
+                    let result = reference_find_all_matches(
+                        std::hint::black_box(&source),
+                        language,
+                        patterns,
+                    );
+                    (started.elapsed(), result)
+                };
+                let run_indexed = || {
+                    let started = Instant::now();
+                    let result = find_matches_ast(
+                        std::hint::black_box(&source),
+                        language,
+                        SupportLang::Python,
+                        patterns,
+                        started,
+                        budget,
+                        60_000,
+                        &cancel,
+                    )
+                    .unwrap();
+                    (started.elapsed(), result)
+                };
+                // Warm both implementations and lazily compiled refinements.
+                assert_eq!(run_reference().1, run_indexed().1);
+                let mut reference_times = Vec::new();
+                let mut indexed_times = Vec::new();
+                for sample in 0..100 {
+                    let (reference, indexed) = if sample % 2 == 0 {
+                        (run_reference(), run_indexed())
+                    } else {
+                        let indexed = run_indexed();
+                        (run_reference(), indexed)
+                    };
+                    assert_eq!(reference.1, indexed.1, "{shape}/{lines}/{sample}");
+                    reference_times.push(reference.0);
+                    indexed_times.push(indexed.0);
+                }
+                reference_times.sort_unstable();
+                indexed_times.sort_unstable();
+                eprintln!(
+                    "ast_traversal/{shape}/{lines}: reference_p50_us={:.1} indexed_p50_us={:.1} ratio={:.3}",
+                    reference_times[50].as_secs_f64() * 1_000_000.0,
+                    indexed_times[50].as_secs_f64() * 1_000_000.0,
+                    indexed_times[50].as_secs_f64() / reference_times[50].as_secs_f64(),
+                );
+            }
         }
     }
 
@@ -6406,7 +9085,7 @@ mod tests {
                 DEFAULT_MATCHER
                     .patterns
                     .get(language)
-                    .map_or(0, std::vec::Vec::len)
+                    .map_or(0, |corpus| corpus.source.len())
             );
         }
     }
@@ -8949,6 +11628,37 @@ def cleanup():
         /// command line, for verbs the rm/git backstop does not own, and skips
         /// the calls it does own.
         #[test]
+        fn reconstructs_module_constant_python_argv_562() {
+            let lines = |code| {
+                exec_sink_reconstructed_commands(code, ScriptLanguage::Python)
+                    .into_iter()
+                    .map(|c| c.command)
+                    .collect::<Vec<_>>()
+            };
+            // A module-scope string/Path constant resolves to its literal, so
+            // the reconstruction has no `${dcg_runtime_value}` placeholder.
+            assert_eq!(
+                lines(
+                    "import subprocess\nname = 'checkout'\nsubprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', name])"
+                ),
+                vec!["tar -cf - -C /tmp/dcg-synthetic checkout".to_string()]
+            );
+            assert_eq!(
+                lines(
+                    "from pathlib import Path\nimport subprocess\nsource = Path('/tmp/dcg-synthetic/checkout')\nsubprocess.Popen(['tar', '-cf', '-', '-C', str(source.parent), source.name])"
+                ),
+                vec!["tar -cf - -C /tmp/dcg-synthetic checkout".to_string()]
+            );
+            // A reassigned name is not resolved: the placeholder remains.
+            assert!(
+                lines(
+                    "import subprocess\nname = 'checkout'\nname = sys.argv[1]\nsubprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/x', name])"
+                )[0]
+                .contains(RUNTIME_VALUE)
+            );
+        }
+
+        #[test]
         fn reconstructs_non_rm_argv_commands() {
             let lines = |code, lang| {
                 exec_sink_reconstructed_commands(code, lang)
@@ -8961,7 +11671,8 @@ def cleanup():
                     "cp.spawnSync('dd', ['if=/dev/zero', 'of=/dev/sda'])",
                     ScriptLanguage::JavaScript
                 ),
-                vec!["dd if=/dev/zero of=/dev/sda".to_string()]
+                // Each argv literal is shell-quoted so it stays one word (#527).
+                vec!["dd 'if=/dev/zero' 'of=/dev/sda'".to_string()]
             );
             assert_eq!(
                 lines(
@@ -8975,7 +11686,8 @@ def cleanup():
                     "system('dd', 'if=/dev/zero', 'of=/dev/sda')",
                     ScriptLanguage::Perl
                 ),
-                vec!["dd if=/dev/zero of=/dev/sda".to_string()]
+                // Each argv literal is shell-quoted so it stays one word (#527).
+                vec!["dd 'if=/dev/zero' 'of=/dev/sda'".to_string()]
             );
             // rm and git are the backstop's; they are not reconstructed here.
             assert!(
@@ -9560,6 +12272,426 @@ def cleanup():
             ] {
                 assert!(commands(code, language).is_empty(), "{code:?}");
             }
+        }
+    }
+
+    /// #570: Deno's and Bun's own process APIs, and the `$` template tag of
+    /// Bun Shell, zx and execa, are exec sinks of the two kinds
+    /// `child_process` has, judged by the same argv and shell-string reading.
+    mod deno_and_bun_process_apis {
+        use super::*;
+
+        const JS_LANGUAGES: [(ScriptLanguage, &str); 2] = [
+            (ScriptLanguage::TypeScript, "typescript"),
+            (ScriptLanguage::JavaScript, "javascript"),
+        ];
+
+        fn blocking_rules(code: &str, language: ScriptLanguage) -> Vec<String> {
+            scan_executing_sink_matches(code, language)
+                .into_iter()
+                .filter(|m| m.severity.blocks_by_default())
+                .map(|m| m.rule_id)
+                .collect()
+        }
+
+        fn commands(code: &str, language: ScriptLanguage) -> Vec<String> {
+            exec_sink_reconstructed_commands(code, language)
+                .into_iter()
+                .map(|c| c.command)
+                .collect()
+        }
+
+        #[test]
+        fn issue_570_repros_block_under_the_exec_sink_rules() {
+            for (code, suffix) in [
+                // The issue's rows, verbatim.
+                (
+                    r#"new Deno.Command("git", {args: ["reset", "--hard"]}).outputSync()"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"await new Deno.Command("rm", {args: ["-rf", "/etc"]}).output()"#,
+                    "rm_rf_catastrophic",
+                ),
+                (
+                    r#"new Deno.Command("sh", {args: ["-c", "git reset --hard"]}).spawn()"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Deno.run({cmd: ["git", "reset", "--hard"]})"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawnSync(["git", "reset", "--hard"])"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawn({cmd: ["git", "reset", "--hard"]})"#,
+                    "git_reset_hard",
+                ),
+                ("await Bun.$`git reset --hard`", "git_reset_hard"),
+                (
+                    "import { $ } from \"bun\"; await $`git reset --hard`",
+                    "git_reset_hard",
+                ),
+                (
+                    "const {$} = require(\"zx\"); $`git reset --hard`",
+                    "git_reset_hard",
+                ),
+                // Spacing, line breaks, property order, quoted keys and other
+                // options do not hide the argv.
+                (
+                    "new Deno . Command(\n  \"git\",\n  { cwd: \"/repo\", \"args\": [\"reset\", \"--hard\"], },\n).outputSync()",
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawnSync({ stdout: "pipe", cmd: ["git", "reset", "--hard"] })"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawn({ cmd: ["rm", "-rf", "/etc"], onExit(proc) { console.log(proc) } })"#,
+                    "rm_rf_catastrophic",
+                ),
+                (
+                    r#"Bun.spawnSync(["git", "reset", "--hard"], { cwd: "/repo" })"#,
+                    "git_reset_hard",
+                ),
+                // A spread before the argv is overridden by it.
+                (
+                    r#"new Deno.Command("git", {...base, args: ["reset", "--hard"]})"#,
+                    "git_reset_hard",
+                ),
+                // Destructured from Bun, as with `child_process`.
+                (
+                    r#"const { spawnSync } = Bun; spawnSync(["rm", "-rf", "/etc"])"#,
+                    "rm_rf_catastrophic",
+                ),
+                // zx's `$.sync`, an options call first, a multi-line template.
+                ("$.sync`git reset --hard`", "git_reset_hard"),
+                (
+                    "await $({ cwd: \"/repo\" })`git reset --hard`",
+                    "git_reset_hard",
+                ),
+                ("await $`git status\ngit reset --hard`", "git_reset_hard"),
+                // An interpolation is one runtime value, never a temp target.
+                ("await $`rm -rf ${dir}`", "rm_rf"),
+                ("await Bun.$`rm -rf /tmp/${name}`", "rm_rf"),
+                // zx runs the cooked template, so escapes spell the command.
+                ("await $`\\x72m -rf /etc`", "rm_rf_catastrophic"),
+                ("await $`\\u0072m -rf /etc`", "rm_rf_catastrophic"),
+                ("await $`\\u{72}m -rf /etc`", "rm_rf_catastrophic"),
+            ] {
+                for (language, lang_id) in JS_LANGUAGES {
+                    let expected = format!("heredoc.{lang_id}.exec_sink.{suffix}");
+                    let rules = blocking_rules(code, language);
+                    assert!(
+                        rules.contains(&expected),
+                        "{language:?}: {code:?} must block as {expected}; got {rules:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn benign_calls_and_non_tags_stay_allowed() {
+            for code in [
+                r#"new Deno.Command("ls").outputSync()"#,
+                r#"new Deno.Command("git", {args: ["status"]}).outputSync()"#,
+                r#"Deno.run({cmd: ["git", "log", "-1"]})"#,
+                r#"Bun.spawnSync(["echo", "hi"])"#,
+                r#"Bun.spawn({cmd: ["ls", "-la"], cwd: "/"})"#,
+                "await Bun.$`ls -la`",
+                "await $`git status`",
+                // The temp carve-out holds as for `spawnSync`, and an options
+                // object's `cwd: "/"` is not an operand.
+                r#"new Deno.Command("rm", {args: ["-rf", "/tmp/build"], cwd: "/"}).outputSync()"#,
+                r#"Bun.spawnSync(["rm", "-rf", "/tmp/build"], {cwd: "/"})"#,
+                // A shell-quoted string the template only prints.
+                "await $`echo 'rm -rf /'`",
+                // `$` that tags no template.
+                r##"$("#id").hide()"##,
+                "const price = `$${amount}`;",
+                "console.log(`cost: $` + total)",
+                // A `spawn` whose object has no `cmd` runs no command.
+                r#"spawn({ name: "worker" })"#,
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert_eq!(
+                        blocking_rules(code, language),
+                        Vec::<String>::new(),
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+        }
+
+        /// An argv that cannot be read fails closed exactly as the
+        /// `child_process` twin does: a visible program with an unknown
+        /// argument list is `argv_unverified`, and a wholly opaque program
+        /// keeps the existing posture.
+        #[test]
+        fn unreadable_argv_fails_closed_like_child_process() {
+            for (language, lang_id) in JS_LANGUAGES {
+                let expected = format!("heredoc.{lang_id}.exec_sink.argv_unverified");
+                assert!(
+                    blocking_rules(r#"cp.spawnSync("git", flags)"#, language).contains(&expected),
+                    "the child_process baseline this mirrors"
+                );
+                for code in [
+                    r#"new Deno.Command("git", {args: flags}).outputSync()"#,
+                    r#"new Deno.Command("git", {args}).outputSync()"#,
+                    r#"new Deno.Command("git", opts).outputSync()"#,
+                    r#"new Deno.Command("git", {args: ["status"], ...opts})"#,
+                    r#"new Deno.Command("git", {[key]: ["reset", "--hard"]})"#,
+                    r#"new Deno.Command("git", {args: ["-C", ...dirs, "status"]})"#,
+                    r#"new Deno.Command("git", {args: base.concat(["status"])})"#,
+                    r#"new Deno.Command("git", {args: ["status"] as string[]})"#,
+                    r#"Deno.run({cmd: ["git", ...flags]})"#,
+                    r#"Bun.spawnSync(["git", ...flags])"#,
+                    r#"Bun.spawn({cmd: ["git", "status"], ...opts})"#,
+                ] {
+                    let rules = blocking_rules(code, language);
+                    assert!(
+                        rules.contains(&expected),
+                        "{language:?}: {code:?} must block as {expected}; got {rules:?}"
+                    );
+                    assert!(
+                        commands(code, language).is_empty(),
+                        "unknown cardinality is never a fixed command line: {code:?}"
+                    );
+                }
+                for code in [
+                    "Deno.run({cmd})",
+                    "Deno.run(options)",
+                    "Bun.spawnSync({cmd: argv})",
+                    r#"Bun.spawn({cmd: ["git", "status"], get cmd() { return argv; }})"#,
+                    "new Deno.Command(program, {args: flags})",
+                    "await $`${command}`",
+                ] {
+                    assert_eq!(
+                        blocking_rules(code, language),
+                        Vec::<String>::new(),
+                        "{language:?}: a wholly opaque program keeps the existing posture: {code:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn argv_is_read_structurally() {
+            for (call, expected) in [
+                (
+                    r#"Command("git", {cwd: "/", args: ["reset", "--hard"], env: {A: "b"}})"#,
+                    vec!["git", "reset", "--hard"],
+                ),
+                (
+                    r#"Command("git", {args: ["status"], args: ["reset", "--hard"]})"#,
+                    vec!["git", "reset", "--hard"],
+                ),
+                (r#"Command("ls")"#, vec!["ls"]),
+                (
+                    r#"run({cmd: ["git", "status"], cwd: "/"})"#,
+                    vec!["git", "status"],
+                ),
+                (r#"spawnSync({cmd: ["ls"]})"#, vec!["ls"]),
+                ("$`git reset --hard`", vec!["git reset --hard"]),
+                ("$.sync`git status`", vec!["git status"]),
+                (
+                    "$({ cwd: \"/x\" })`ls ${dir}`",
+                    vec!["ls ${dcg_runtime_value}"],
+                ),
+                (
+                    "$`echo ${`nested ${x}`} \\` \\$HOME`",
+                    vec!["echo ${dcg_runtime_value} ` $HOME"],
+                ),
+            ] {
+                let argv = exec_argv_operands(call, ScriptLanguage::TypeScript);
+                assert!(!argv.unverified, "{call}");
+                assert_eq!(
+                    argv.values.iter().map(Cow::as_ref).collect::<Vec<_>>(),
+                    expected,
+                    "{call}"
+                );
+            }
+            // A template that never closes, or `$(…)` with none after it,
+            // runs nothing.
+            for call in ["$`git reset --hard", "$({ cwd: \"/\" }).x"] {
+                let argv = exec_argv_operands(call, ScriptLanguage::TypeScript);
+                assert!(argv.values.is_empty() && !argv.unverified, "{call}");
+            }
+        }
+
+        /// Destructive verbs only the packs know reach them through the same
+        /// reconstruction as `spawnSync`, and argv[0] stays the program.
+        #[test]
+        fn pack_only_verbs_are_reconstructed_for_the_packs() {
+            for (code, expected) in [
+                (
+                    r#"new Deno.Command("dd", {args: ["if=/dev/zero", "of=/dev/sda"]}).outputSync()"#,
+                    "dd 'if=/dev/zero' 'of=/dev/sda'",
+                ),
+                (
+                    r#"Deno.run({cmd: ["wipefs", "-a", "/dev/sda"]})"#,
+                    "wipefs -a /dev/sda",
+                ),
+                (
+                    r#"Bun.spawnSync(["wipefs", "-a", "/dev/sda"])"#,
+                    "wipefs -a /dev/sda",
+                ),
+                (
+                    r#"Bun.spawn({cmd: ["wipefs", "-a", "/dev/sda"]})"#,
+                    "wipefs -a /dev/sda",
+                ),
+                (
+                    "await Bun.$`dd if=/dev/zero of=/dev/sda`",
+                    "dd if=/dev/zero of=/dev/sda",
+                ),
+                (
+                    "await $`git push --force origin main`",
+                    "git push --force origin main",
+                ),
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert_eq!(
+                        commands(code, language),
+                        vec![expected.to_string()],
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+            for code in [
+                // A program name with no shell, as for `spawnSync('dd if=…')`.
+                r#"new Deno.Command("dd if=/dev/zero of=/dev/sda").outputSync()"#,
+                // The rm/git backstop owns these, so its rule id stays the one
+                // to allowlist.
+                r#"new Deno.Command("git", {args: ["reset", "--hard"]}).outputSync()"#,
+                "await Bun.$`git reset --hard`",
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert!(
+                        commands(code, language).is_empty(),
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+        }
+
+        /// The offsets handed to the interpreter literal pass are the callee
+        /// names the AST reports, as for every other sink, and a `$` template
+        /// stays with that pass (#544), which reads it as a command already.
+        #[test]
+        fn owned_call_starts_are_the_callee_names() {
+            for (code, start) in [
+                (r#"Bun.spawnSync(["echo", "hi"])"#, 4),
+                (r#"Deno.run({cmd: ["ls"]})"#, 5),
+            ] {
+                assert_eq!(
+                    literal_exec_sink_starts(code, ScriptLanguage::JavaScript, 8),
+                    Some(vec![start]),
+                    "{code:?}"
+                );
+            }
+            for code in ["await Bun.$`ls -la`", "await $`ls ${dir}`"] {
+                assert_eq!(
+                    literal_exec_sink_starts(code, ScriptLanguage::JavaScript, 8),
+                    Some(Vec::new()),
+                    "{code:?}"
+                );
+            }
+            // Templates do not use up the bounded candidate count either.
+            let many = "await $`ls`;\n".repeat(16);
+            assert_eq!(
+                literal_exec_sink_starts(&many, ScriptLanguage::JavaScript, 8),
+                Some(Vec::new())
+            );
+        }
+
+        /// A template literal operand is a string, not an unknown value, for
+        /// `child_process` and the native APIs alike; only its `${…}` are
+        /// runtime values.
+        #[test]
+        fn template_literal_operands_are_strings() {
+            for (code, suffix) in [
+                (
+                    "require(\"child_process\").execSync(`git reset --hard`)",
+                    "git_reset_hard",
+                ),
+                ("cp.spawnSync(`rm`, [`-rf`, `/etc`])", "rm_rf_catastrophic"),
+                ("cp.execSync(`rm -rf ${dir}`)", "rm_rf"),
+                (
+                    "cp.execSync(`git status\n  git reset --hard`)",
+                    "git_reset_hard",
+                ),
+                (
+                    r#"cp.spawnSync("sh", ["-c", `git reset --hard`])"#,
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawnSync(["sh", "-c", `git reset --hard`])"#,
+                    "git_reset_hard",
+                ),
+                (
+                    "new Deno.Command(`git`, {args: [`reset`, `--hard`]}).outputSync()",
+                    "git_reset_hard",
+                ),
+                (
+                    r#"Bun.spawn({cmd: ["rm", "-rf", `/tmp/${name}`]})"#,
+                    "rm_rf",
+                ),
+            ] {
+                for (language, lang_id) in JS_LANGUAGES {
+                    let expected = format!("heredoc.{lang_id}.exec_sink.{suffix}");
+                    let rules = blocking_rules(code, language);
+                    assert!(
+                        rules.contains(&expected),
+                        "{language:?}: {code:?} must block as {expected}; got {rules:?}"
+                    );
+                }
+            }
+            for code in [
+                "cp.execSync(`git status`)",
+                "cp.execSync(`echo ${message}`)",
+                "cp.spawnSync(`ls`, [`-la`])",
+                r#"Bun.spawnSync(["echo", `hi`])"#,
+                "cp.spawnSync(`rm`, [`-rf`, `/tmp/build`])",
+                // Quotes or escapes inside a first-argument template leave it
+                // to the existing posture rather than to an unreadable argv.
+                "cp.execSync(`echo it's done`)",
+                "cp.execSync(`echo \\`date\\``)",
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert_eq!(
+                        blocking_rules(code, language),
+                        Vec::<String>::new(),
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+            for (code, expected) in [
+                ("cp.execSync(`wipefs -a /dev/sda`)", "wipefs -a /dev/sda"),
+                (
+                    "cp.spawnSync(`dd`, [`if=/dev/zero`, `of=/dev/sda`])",
+                    "dd 'if=/dev/zero' 'of=/dev/sda'",
+                ),
+            ] {
+                for (language, _) in JS_LANGUAGES {
+                    assert_eq!(
+                        commands(code, language),
+                        vec![expected.to_string()],
+                        "{language:?}: {code:?}"
+                    );
+                }
+            }
+            // Ruby's and Perl's backticks run a command: still no value.
+            for language in [ScriptLanguage::Ruby, ScriptLanguage::Perl] {
+                assert!(exec_literal_operand("`ls`", language).is_none());
+            }
+            assert_eq!(
+                exec_literal_operand("`a ${b} \\x63`", ScriptLanguage::JavaScript).as_deref(),
+                Some("a ${dcg_runtime_value} c")
+            );
+            // A template that does not end the operand is no literal value.
+            assert!(exec_literal_operand("`a` + b", ScriptLanguage::JavaScript).is_none());
         }
     }
 }

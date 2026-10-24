@@ -706,6 +706,22 @@ impl Pack {
         if self.destructive_match_vetoes_safe(cmd) {
             return false;
         }
+        if self.id == "core.filesystem"
+            && let Some(command) =
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+        {
+            // This proof owns unlink's exemptions. A permissive legacy temp
+            // regex must not override a rejected literal-path boundary.
+            return command.safe;
+        }
+        if self.id == "system.permissions"
+            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
+        {
+            return true;
+        }
         if self.id == "kubernetes.kubectl"
             && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
         {
@@ -763,6 +779,20 @@ impl Pack {
         if self.destructive_match_vetoes_safe_with_deadline(cmd, deadline) {
             return false;
         }
+        if self.id == "core.filesystem"
+            && let Some(command) =
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+        {
+            return command.safe;
+        }
+        if self.id == "system.permissions"
+            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
+        {
+            return true;
+        }
         if self.id == "kubernetes.kubectl"
             && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
         {
@@ -804,6 +834,22 @@ impl Pack {
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
+        if self.id == "system.permissions" {
+            match crate::packs::system::permissions::posix_permission_decision(
+                cmd,
+                crate::normalize::ShellDialect::Unknown,
+            ) {
+                crate::packs::system::permissions::PosixPermissionDecision::NonDestructive => {
+                    return None;
+                }
+                crate::packs::system::permissions::PosixPermissionDecision::Destructive(names) => {
+                    return names
+                        .iter()
+                        .find_map(|name| self.destructive_match_by_name(name, cmd));
+                }
+                crate::packs::system::permissions::PosixPermissionDecision::NoMatch => {}
+            }
+        }
         if self.id == "careful_company_running_windows.transfer" {
             match crate::packs::careful_company_running_windows::transfer::direct_scp_decision(cmd) {
                 crate::packs::careful_company_running_windows::transfer::DirectScpDecision::Safe
@@ -860,10 +906,32 @@ impl Pack {
                     .matches_destructive_named_by(cmd, |name| name != Some("branch-force-delete"));
             }
         }
-        let found = self
-            .destructive_patterns
-            .iter()
-            .find(|p| p.matches_command(cmd));
+        let unlink_command = (self.id == "core.filesystem")
+            .then(|| {
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+            })
+            .flatten();
+        let found = self.destructive_patterns.iter().find(|pattern| {
+            if crate::packs::core::filesystem::is_unlink_rule(pattern.name)
+                && let Some(command) = &unlink_command
+            {
+                return !command.safe && pattern.regex.is_match(&command.matching_view);
+            }
+            pattern.matches_command(cmd)
+        });
+        // The same add-only masked pass the evaluator gives core.filesystem
+        // (#552 follow-up); the unlink proof above already read the operands.
+        let found = found.or_else(|| {
+            let masked = self.core_filesystem_separator_masked_view(cmd)?;
+            self.destructive_patterns.iter().find(|pattern| {
+                !(crate::packs::core::filesystem::is_unlink_rule(pattern.name)
+                    && unlink_command.is_some())
+                    && pattern.matches_command(&masked)
+            })
+        });
         // #509: the `branch-force-delete` regex is the fallback for a branch
         // command the parser could not read; a readable merge-checked
         // deletion is reported as `branch-delete`, as the parser would.
@@ -893,16 +961,38 @@ impl Pack {
         cmd: &str,
         predicate: impl Fn(Option<&'static str>) -> bool,
     ) -> Option<DestructiveMatch> {
-        self.destructive_patterns
-            .iter()
-            .filter(|p| predicate(p.name))
-            .find(|p| p.matches_command(cmd))
+        let find = |text: &str| {
+            self.destructive_patterns
+                .iter()
+                .filter(|p| predicate(p.name))
+                .find(|p| p.matches_command(text))
+        };
+        find(cmd)
+            .or_else(|| {
+                self.core_filesystem_separator_masked_view(cmd)
+                    .and_then(|masked| find(&masked))
+            })
             .map(|p| DestructiveMatch {
                 reason: p.reason,
                 name: p.name,
                 severity: p.severity,
                 explanation: p.explanation,
             })
+    }
+
+    /// For `core.filesystem`, `cmd` with its quoted and escaped `;`, `|` and
+    /// `&` masked, when it has any: the view the evaluator's add-only second
+    /// destructive pass matches (see
+    /// [`crate::packs::mask_quoted_shell_separators`]). Destructive matching
+    /// only; safe patterns never see it.
+    fn core_filesystem_separator_masked_view(&self, cmd: &str) -> Option<String> {
+        if self.id != "core.filesystem" {
+            return None;
+        }
+        match crate::packs::mask_quoted_shell_separators(cmd) {
+            std::borrow::Cow::Owned(masked) => Some(masked),
+            std::borrow::Cow::Borrowed(_) => None,
+        }
     }
 
     fn destructive_match_by_name(&self, name: &str, cmd: &str) -> Option<DestructiveMatch> {
@@ -995,7 +1085,10 @@ impl Pack {
                     return Some(m);
                 }
             }
-            if matches!(self.id.as_str(), "core.git" | "remote.scp") {
+            if matches!(
+                self.id.as_str(),
+                "core.git" | "remote.scp" | "system.permissions"
+            ) {
                 return None;
             }
             // Also check the whole command so patterns that legitimately
@@ -1007,7 +1100,13 @@ impl Pack {
 
     fn check_single(&self, cmd: &str) -> Option<DestructiveMatch> {
         // Quick reject if no keywords match
-        if !self.might_match(cmd) {
+        if !(self.might_match(cmd)
+            || (self.id == "core.filesystem"
+                && crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )))
+        {
             return None;
         }
 
@@ -1232,6 +1331,7 @@ impl PackEntry {
 
                 // Only build RegexSet if we have linear patterns
                 if !patterns.is_empty() {
+                    let _phase = crate::perf::phase(crate::perf::ProfilePhase::RegexCompile);
                     pack.safe_regex_set = regex::RegexSet::new(patterns).ok();
                 }
             }
@@ -2469,6 +2569,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         // `upstart` is here only so the row covers the pack's own list. It matches
         // no real command — upstart's CLI is `initctl` — and no rule covers
         // `initctl` at all, so that is a coverage gap rather than a gate problem.
+        //
+        // `modprobe` and `rmmod` are the command words of the kernel-module
+        // unload rules, which no other word here would let through.
         &[
             "systemctl",
             "service",
@@ -2476,6 +2579,8 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "upstart",
             "shutdown",
             "reboot",
+            "modprobe",
+            "rmmod",
         ],
         system::services::create_pack,
     ),
@@ -3456,10 +3561,31 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8], offset: usize) ->
     if needle.is_empty() || offset > haystack.len() || needle.len() > haystack.len() - offset {
         return None;
     }
-    haystack[offset..]
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle))
-        .map(|position| offset + position)
+
+    // Every complete match must start with the needle's first byte, allowing
+    // only the same ASCII case fold as the full comparison below. Search those
+    // candidate positions with memchr instead of comparing a window at every
+    // byte for every keyword. This matters especially after a large data
+    // heredoc has been masked to spaces: the unchanged keyword rules still
+    // inspect its complete source view, but almost no position is a candidate.
+    let first = needle[0];
+    let last_start = haystack.len() - needle.len();
+    let starts = &haystack[offset..=last_start];
+    let matches_at = |&position: &usize| {
+        let start = offset + position;
+        haystack[start..start + needle.len()].eq_ignore_ascii_case(needle)
+    };
+    let position = if first.is_ascii_alphabetic() {
+        memchr::memchr2_iter(
+            first.to_ascii_lowercase(),
+            first.to_ascii_uppercase(),
+            starts,
+        )
+        .find(matches_at)
+    } else {
+        memchr::memchr_iter(first, starts).find(matches_at)
+    };
+    position.map(|position| offset + position)
 }
 
 fn split_keyword_parts(keyword: &str) -> SmallVec<[&str; 4]> {
@@ -3652,6 +3778,237 @@ fn contains_unquoted_shell_operator(
     false
 }
 
+/// The POSIX command text with every inert redirection replaced by spaces,
+/// for keyword gating only (#571).
+///
+/// A redirection is inert when it can neither write nor read anything but
+/// the null device, and neither names a file nor runs code: a redirection of
+/// any descriptor to or from `/dev/null` (`2>/dev/null`, `>/dev/null`,
+/// `&>/dev/null`, `>>/dev/null`, `>|/dev/null`, `</dev/null`) and a
+/// descriptor duplication or close (`2>&1`, `>&2`, `1>&-`, `<&3`). Removing
+/// one from a command never changes which files the command touches, so it
+/// cannot be what makes the command destructive. Its bytes still spelled the
+/// `2>`, `>&`, `>/` and `/dev/` keywords, so `ls 2>/dev/null` selected
+/// `core.filesystem` and `system.disk` and paid for compiling both packs,
+/// about four times the cost of `ls`, while neither pack had a rule that could
+/// match it.
+///
+/// Only the gating decision reads this view. Every selected pack still
+/// matches against the original text.
+///
+/// Blanking is applied ONLY when every unquoted redirection in the command is
+/// inert. A command that also has a real redirection keeps its full text, so
+/// the pack it selects still evaluates that redirection — critically, a
+/// destructive redirect can have NO keyword of its own (`> logs/run_$x.log`
+/// carries none of `>/`, `>$`, …; it was caught only because some other
+/// redirect such as `2>&1` selected `core.filesystem`). Removing the inert
+/// redirect's keyword would then drop the pack and hide the real redirect, so
+/// in that case nothing is blanked.
+///
+/// The recognizer is deliberately narrow and lexical: the redirection must be
+/// unquoted and unescaped, a descriptor number must begin its word, and the
+/// target must be exactly `/dev/null` (or a descriptor number, or `-`) ending
+/// at a shell metacharacter. `>/dev/null"x"`, `>/dev/null/../sda`, `>&file`,
+/// `"2>/dev/null"` and `{fd}>/dev/null` are left as they are. Spans are blanked
+/// in place, so offsets and word boundaries are unchanged: in
+/// `"git">/dev/null reset --hard` the command word stays `"git"`.
+#[must_use]
+pub(crate) fn blank_inert_redirections(command: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = command.as_bytes();
+    if !bytes.iter().any(|&byte| matches!(byte, b'>' | b'<')) {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    // Pass 1: every unquoted `>`/`<` is a redirection operator. Collect the
+    // inert ones; a single real (non-inert) one means the whole command keeps
+    // its keywords, so return it unchanged.
+    let mut inert_spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_ansi_c = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_single {
+            in_single = byte != b'\'';
+            i += 1;
+            continue;
+        }
+        if in_ansi_c {
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            in_ansi_c = byte != b'\'';
+            i += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            i += 2;
+            continue;
+        }
+        if in_double {
+            in_double = byte != b'"';
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                in_ansi_c = true;
+                i += 2;
+                continue;
+            }
+            // A comment runs to the end of its line; its quotes quote nothing.
+            b'#' if i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')'
+                ) =>
+            {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'>' | b'<' => {
+                let start = redirect_operator_start(bytes, i);
+                match inert_redirection_end(bytes, start) {
+                    Some(end) => {
+                        inert_spans.push((start, end));
+                        i = end;
+                        continue;
+                    }
+                    // A real redirection: do not blank anything on this line.
+                    None => return std::borrow::Cow::Borrowed(command),
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if inert_spans.is_empty() {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    let mut out = bytes.to_vec();
+    for (start, end) in inert_spans {
+        out[start..end].fill(b' ');
+    }
+    // Only ASCII bytes were replaced, with ASCII spaces.
+    std::borrow::Cow::Owned(String::from_utf8(out).unwrap_or_else(|_| command.to_string()))
+}
+
+/// The byte where the redirection whose operator is at `op` (`>` or `<`)
+/// begins: a leading file-descriptor number that forms a whole word, or the
+/// `&` of an `&>`; otherwise the operator itself.
+fn redirect_operator_start(bytes: &[u8], op: usize) -> usize {
+    const fn boundary(byte: u8) -> bool {
+        matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'{' | b'}'
+        )
+    }
+    let mut digits = op;
+    while digits > 0 && bytes[digits - 1].is_ascii_digit() {
+        digits -= 1;
+    }
+    if digits < op && (digits == 0 || boundary(bytes[digits - 1])) {
+        return digits;
+    }
+    if bytes[op] == b'>'
+        && op > 0
+        && bytes[op - 1] == b'&'
+        && !(op >= 2 && matches!(bytes[op - 2], b'&' | b'|'))
+    {
+        return op - 1;
+    }
+    op
+}
+
+/// End of the inert redirection that starts at `start`, if one does (see
+/// [`blank_inert_redirections`]). `start` is an unquoted, unescaped byte.
+fn inert_redirection_end(bytes: &[u8], start: usize) -> Option<usize> {
+    const fn ends_word(byte: Option<&u8>) -> bool {
+        matches!(
+            byte,
+            None | Some(
+                b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+            )
+        )
+    }
+    let previous = start.checked_sub(1).map(|index| &bytes[index]);
+    let mut i = start;
+    if bytes[i].is_ascii_digit() {
+        // A descriptor number only when it is a whole word before the
+        // operator: in `foo2>/dev/null` the `2` belongs to the word `foo2`,
+        // and the redirection starts at `>`.
+        if !matches!(
+            previous,
+            None | Some(b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')')
+        ) {
+            return None;
+        }
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if !matches!(bytes.get(i), Some(b'>' | b'<')) {
+            return None;
+        }
+    } else if bytes[i] == b'&' {
+        // `&>` and `&>>`, but not the `&&` / `|&` operators before a `>`.
+        if bytes.get(i + 1) != Some(&b'>') || matches!(previous, Some(b'&' | b'|')) {
+            return None;
+        }
+        i += 1;
+    } else if matches!(previous, Some(b'&' | b'<' | b'>' | b'}')) {
+        // The tail of a longer operator an earlier position declined (`&&>`,
+        // `<<<`, `<>`), or a bash `{name}` descriptor variable.
+        return None;
+    }
+    let input = bytes[i] == b'<';
+    i += 1;
+    let mut duplication = false;
+    match (input, bytes.get(i)) {
+        // `<<`, `<<<` and `<>` are here-documents, here-strings and
+        // read-write opens, never inert.
+        (true, Some(b'<' | b'>')) => return None,
+        (_, Some(b'&')) if bytes[start] != b'&' => {
+            duplication = true;
+            i += 1;
+        }
+        (false, Some(b'>' | b'|')) => i += 1,
+        _ => {}
+    }
+    if duplication {
+        // `N>&M`, `N>&-`, `N<&M`, `N<&-`. A word target after `>&` is a file
+        // (`>&/etc/passwd` truncates it), except the null device itself.
+        let target = i;
+        if bytes.get(i) == Some(&b'-') {
+            i += 1;
+        } else {
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+        }
+        if i > target && ends_word(bytes.get(i)) {
+            return Some(i);
+        }
+        if input {
+            return None;
+        }
+        i = target;
+    }
+    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    let target = bytes.get(i..i + b"/dev/null".len())?;
+    if target != b"/dev/null" {
+        return None;
+    }
+    i += b"/dev/null".len();
+    ends_word(bytes.get(i)).then_some(i)
+}
+
 #[inline]
 fn pipeline_text_may_be_executed(command: &str) -> bool {
     if !contains_shell_pipeline_operator(command) {
@@ -3823,6 +4180,7 @@ pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
 /// inner commands cannot be hidden behind a safe outer command.
 #[must_use]
 pub fn split_command_segments(cmd: &str) -> Vec<&str> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellSegmentation);
     let mut segments: Vec<&str> = Vec::new();
     collect_command_segments(cmd, 0, cmd.len(), 0, true, &mut segments);
 
@@ -3847,6 +4205,7 @@ pub(crate) fn split_command_segments_in_dialect(
     cmd: &str,
     dialect: crate::normalize::ShellDialect,
 ) -> Vec<&str> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellSegmentation);
     if matches!(
         dialect,
         crate::normalize::ShellDialect::Posix | crate::normalize::ShellDialect::Unknown
@@ -4061,6 +4420,146 @@ fn collect_command_segments<'a>(
 
     if emit_plain_segments {
         push_trimmed_segment(cmd, segment_start, end, segments);
+    }
+}
+
+/// The byte a data `;`, `|` or `&` becomes in [`mask_quoted_shell_separators`].
+///
+/// A word byte, so it neither ends a `[^|;&]*` scan nor reads as whitespace,
+/// a quote, a path separator, or an expansion.
+pub(crate) const MASKED_SHELL_SEPARATOR: u8 = b'_';
+
+/// Byte offsets of every `;`, `|` and `&` in `cmd` that POSIX shell reads as
+/// data: inside single or double quotes, or escaped by a backslash.
+///
+/// The scan is [`collect_command_segments`]'s, byte for byte: the same quote
+/// toggles, the same backslash skip outside single quotes, and the same
+/// command, process and arithmetic substitution bodies. A body is scanned in
+/// its own quoting context, because there its unquoted separators are real
+/// and split its own segments. So an offset returned here is never one the
+/// segmenter splits on, while every separator byte it declined to split on
+/// for quoting or escaping is returned. Redirection syntax (`2>&1`, `&>`,
+/// `>|`) is not quoting and is not returned.
+#[must_use]
+pub(crate) fn quoted_shell_separator_offsets(cmd: &str) -> Vec<usize> {
+    let bytes = cmd.as_bytes();
+    let mut offsets = Vec::new();
+    if bytes.iter().any(|byte| matches!(byte, b';' | b'|' | b'&'))
+        && bytes
+            .iter()
+            .any(|byte| matches!(byte, b'\'' | b'"' | b'\\'))
+    {
+        collect_quoted_shell_separator_offsets(cmd, 0, cmd.len(), 0, &mut offsets);
+        // The scan visits bodies in place, so this is already ordered; callers
+        // binary-search it.
+        offsets.sort_unstable();
+    }
+    offsets
+}
+
+/// `cmd` with each offset from [`quoted_shell_separator_offsets`] replaced by
+/// [`MASKED_SHELL_SEPARATOR`]; length and every other byte are unchanged.
+///
+/// Regex rules that stay inside one command with `[^|;&]*` stop at the first
+/// `;`, `|` or `&` even when it is quoted, so a quoted separator in an earlier
+/// operand hid every later operand from them: `mv "a;b" ~/Documents /tmp/x`
+/// and `find "a;b" / -delete` were allowed (GitHub #552 follow-up). Matching
+/// this view lets those scans read the whole command the shell runs.
+#[must_use]
+pub(crate) fn mask_quoted_shell_separators(cmd: &str) -> std::borrow::Cow<'_, str> {
+    let offsets = quoted_shell_separator_offsets(cmd);
+    if offsets.is_empty() {
+        return std::borrow::Cow::Borrowed(cmd);
+    }
+    let mut bytes = cmd.as_bytes().to_vec();
+    for offset in offsets {
+        bytes[offset] = MASKED_SHELL_SEPARATOR;
+    }
+    std::borrow::Cow::Owned(
+        String::from_utf8(bytes).expect("replacing ASCII bytes with ASCII keeps UTF-8 valid"),
+    )
+}
+
+fn collect_quoted_shell_separator_offsets(
+    cmd: &str,
+    start: usize,
+    end: usize,
+    recursion_depth: usize,
+    offsets: &mut Vec<usize>,
+) {
+    if recursion_depth > MAX_SEGMENT_RECURSION {
+        return;
+    }
+    let bytes = cmd.as_bytes();
+    let mut i = start;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < end {
+        let b = bytes[i];
+
+        if b == b'\\' && !in_single && i + 1 < end {
+            if matches!(bytes[i + 1], b';' | b'|' | b'&') {
+                offsets.push(i + 1);
+            }
+            i += 2;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+
+        if !in_single
+            && b == b'$'
+            && i + 2 < end
+            && bytes[i + 1] == b'('
+            && bytes[i + 2] == b'('
+            && let Some(close) = find_matching_arithmetic_expansion(cmd, i + 3, end)
+        {
+            collect_quoted_shell_separator_offsets(cmd, i + 3, close, recursion_depth + 1, offsets);
+            i = close + 2;
+            continue;
+        }
+        // `$(…)` anywhere outside single quotes; `<(…)` / `>(…)` unquoted.
+        let opens_substitution = i + 1 < end
+            && bytes[i + 1] == b'('
+            && ((!in_single && b == b'$')
+                || (!in_single && !in_double && matches!(b, b'<' | b'>')));
+        if opens_substitution {
+            // An unclosed body runs to `end`, exactly as the segmenter reads it.
+            let body = i + 2;
+            let close = find_matching_command_substitution(cmd, body, end);
+            let body_end = close.unwrap_or(end);
+            collect_quoted_shell_separator_offsets(
+                cmd,
+                body,
+                body_end,
+                recursion_depth + 1,
+                offsets,
+            );
+            i = close.map_or(end, |close| close + 1);
+            continue;
+        }
+        if !in_single
+            && b == b'`'
+            && let Some(close) = find_matching_backtick(cmd, i + 1, end)
+        {
+            collect_quoted_shell_separator_offsets(cmd, i + 1, close, recursion_depth + 1, offsets);
+            i = close + 1;
+            continue;
+        }
+
+        if (in_single || in_double) && matches!(b, b';' | b'|' | b'&') {
+            offsets.push(i);
+        }
+        i += 1;
     }
 }
 
@@ -4348,6 +4847,17 @@ pub(crate) fn pack_aware_quick_reject_pre_normalized(
         && !span_matches_any_keyword(normalized, enabled_keywords)
 }
 
+/// [`pack_aware_quick_reject`] for a view that is already normalized, such as
+/// the evaluator's normalized command after [`blank_inert_redirections`].
+#[inline]
+#[must_use]
+pub(crate) fn pack_aware_quick_reject_normalized_view(
+    normalized: &str,
+    enabled_keywords: &[&str],
+) -> bool {
+    pack_aware_quick_reject_from_normalized_spans(normalized, enabled_keywords)
+}
+
 #[inline]
 fn pack_aware_quick_reject_from_normalized_spans(
     normalized: &str,
@@ -4399,6 +4909,191 @@ fn pack_aware_quick_reject_from_normalized_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_find_ascii_case_insensitive(
+        haystack: &[u8],
+        needle: &[u8],
+        offset: usize,
+    ) -> Option<usize> {
+        if needle.is_empty() || offset > haystack.len() || needle.len() > haystack.len() - offset {
+            return None;
+        }
+        haystack[offset..]
+            .windows(needle.len())
+            .position(|window| window.eq_ignore_ascii_case(needle))
+            .map(|position| offset + position)
+    }
+
+    #[test]
+    fn keyword_candidate_search_matches_every_byte_and_offset_issue_555() {
+        for byte in 0..=u8::MAX {
+            let haystack = [
+                byte ^ 0x20,
+                byte,
+                0,
+                u8::MAX,
+                byte.to_ascii_uppercase(),
+                byte.to_ascii_lowercase(),
+                0x80,
+                byte,
+                byte,
+                0,
+            ];
+            let needles: &[&[u8]] = &[
+                &[],
+                &[byte],
+                &[byte, 0],
+                &[byte, u8::MAX],
+                &[byte, 0x80],
+                &[byte, byte],
+                &[0x80, byte],
+                &[byte; 11],
+            ];
+            for needle in needles {
+                for offset in (0..=haystack.len() + 1).chain(std::iter::once(usize::MAX)) {
+                    assert_eq!(
+                        find_ascii_case_insensitive(&haystack, needle, offset),
+                        reference_find_ascii_case_insensitive(&haystack, needle, offset),
+                        "byte={byte}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+
+        for haystack in [
+            &b""[..],
+            &b"Git gIT giT GIT gitgit gix git"[..],
+            &b"aaAaAAAaAAaAAaAaab"[..],
+            &[0xff, 0x80, b'G', b'i', b't', 0, 0xc3, 0xa9, 0xc3, 0x89][..],
+        ] {
+            for needle in [
+                &b""[..],
+                &b"gIt"[..],
+                &b"GITGIT"[..],
+                &b"aAaB"[..],
+                &b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"[..],
+                &[0xff, 0x80][..],
+                &[0xc3, 0x89][..],
+                &[0][..],
+            ] {
+                for offset in 0..=haystack.len() + 1 {
+                    assert_eq!(
+                        find_ascii_case_insensitive(haystack, needle, offset),
+                        reference_find_ascii_case_insensitive(haystack, needle, offset),
+                        "haystack={haystack:?}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyword_candidate_search_preserves_large_masked_sources_issue_555() {
+        for lines in [40, 300] {
+            let line = " ".repeat(55) + "\n";
+            let command = format!("cat <<'TEXT'\n{}TEXT\ngIT status", line.repeat(lines));
+            let offsets = std::iter::once(0)
+                .chain(command.match_indices('\n').map(|(at, _)| at + 1))
+                .chain([
+                    command.len().saturating_sub(1),
+                    command.len(),
+                    command.len() + 1,
+                ]);
+            for offset in offsets {
+                for needle in [&b"rm"[..], &b"GIT"[..], &b"TEXT"[..], &b" "[..]] {
+                    assert_eq!(
+                        find_ascii_case_insensitive(command.as_bytes(), needle, offset),
+                        reference_find_ascii_case_insensitive(command.as_bytes(), needle, offset),
+                        "lines={lines}, needle={needle:?}, offset={offset}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "paired keyword-search timing; run in release mode with --nocapture"]
+    fn paired_keyword_search_benchmark_issue_555() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const REPEATS: usize = 32;
+        let needles: &[&[u8]] = &[
+            b"git",
+            b"rm",
+            b"truncate",
+            b".git",
+            b"> /",
+            b"aaab",
+            b"aaaa",
+            b"A",
+            &[0x80],
+        ];
+        for lines in [40, 300] {
+            for (shape, line) in [
+                (
+                    "masked",
+                    "                                                       \n",
+                ),
+                (
+                    "frequent",
+                    "aaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaa\n",
+                ),
+            ] {
+                let source = format!("cat <<'TEXT'\n{}TEXT", line.repeat(lines));
+                let expected: Vec<_> = needles
+                    .iter()
+                    .map(|needle| {
+                        reference_find_ascii_case_insensitive(source.as_bytes(), needle, 0)
+                    })
+                    .collect();
+                let expected = expected.repeat(REPEATS);
+                let run = |reference: bool| {
+                    let mut found = Vec::with_capacity(REPEATS * needles.len());
+                    let start = Instant::now();
+                    for _ in 0..REPEATS {
+                        for needle in needles {
+                            found.push(if reference {
+                                reference_find_ascii_case_insensitive(
+                                    black_box(source.as_bytes()),
+                                    black_box(needle),
+                                    0,
+                                )
+                            } else {
+                                find_ascii_case_insensitive(
+                                    black_box(source.as_bytes()),
+                                    black_box(needle),
+                                    0,
+                                )
+                            });
+                        }
+                    }
+                    (start.elapsed(), found)
+                };
+                let mut reference_times = Vec::new();
+                let mut candidate_times = Vec::new();
+                for sample in 0..11 {
+                    for reference in [sample % 2 == 0, sample % 2 != 0] {
+                        let (elapsed, found) = run(reference);
+                        assert_eq!(found, expected, "{shape}/{lines}/{sample}");
+                        if reference {
+                            reference_times.push(elapsed);
+                        } else {
+                            candidate_times.push(elapsed);
+                        }
+                    }
+                }
+                reference_times.sort_unstable();
+                candidate_times.sort_unstable();
+                eprintln!(
+                    "keyword_search/{shape}/{lines}: legacy_p50_us={:.3} candidate_p50_us={:.3} speedup={:.2}x",
+                    reference_times[5].as_secs_f64() * 1_000_000.0,
+                    candidate_times[5].as_secs_f64() * 1_000_000.0,
+                    reference_times[5].as_secs_f64() / candidate_times[5].as_secs_f64(),
+                );
+            }
+        }
+    }
 
     /// Pack-authored denial text (#416): a rule's text wins, the pack's is
     /// the fallback, an unknown pack has none, and invalid text is refused at
@@ -4546,6 +5241,84 @@ destructive_patterns:
             !pack_aware_quick_reject(r#""git">/dev/null reset --hard"#, &keywords),
             "quoted command words with attached redirections must still trigger pack evaluation"
         );
+    }
+
+    #[test]
+    fn blank_inert_redirections_spans_issue_571() {
+        // (input, expected gating view)
+        let blanked = [
+            ("ls 2>/dev/null", "ls            "),
+            ("ls >/dev/null 2>&1", "ls                "),
+            ("ls &>/dev/null", "ls            "),
+            ("ls &>>/dev/null", "ls             "),
+            ("ls >> /dev/null", "ls             "),
+            ("ls >|/dev/null", "ls            "),
+            ("ls 2> /dev/null;rm x", "ls             ;rm x"),
+            ("cat x </dev/null", "cat x           "),
+            ("cat x 0< /dev/null", "cat x             "),
+            ("echo hi >&2", "echo hi    "),
+            ("echo hi 1>&2", "echo hi     "),
+            ("exec 3>&- 4<&3", "exec          "),
+            ("ls >& /dev/null", "ls             "),
+            ("ls 10>/dev/null|wc", "ls             |wc"),
+            ("(ls 2>/dev/null)", "(ls            )"),
+            ("$(ls 2>/dev/null)", "$(ls            )"),
+            ("foo2>/dev/null x", "foo2           x"),
+            (
+                "\"git\">/dev/null reset --hard",
+                "\"git\"           reset --hard",
+            ),
+            ("ls 2&>/dev/null", "ls 2           "),
+            ("ls # it's\nls 2>/dev/null", "ls # it's\nls            "),
+        ];
+        for (input, expected) in blanked {
+            assert_eq!(blank_inert_redirections(input), expected, "{input:?}");
+            assert_eq!(
+                blank_inert_redirections(input).len(),
+                input.len(),
+                "{input:?}"
+            );
+        }
+        // Not inert, or not provably a redirection at this level: unchanged.
+        for input in [
+            "ls",
+            "ls > /etc/hosts",
+            "ls 2>/dev/null2",
+            "ls 2>/dev/null/../sda",
+            r#"ls >/dev/null"x""#,
+            "ls >/dev/nul'l'",
+            "ls >\"/dev/null\"",
+            "echo x >&/etc/passwd",
+            "echo x >&2x",
+            "echo x >& file",
+            "ls {fd}>/dev/null",
+            "cat <<EOF",
+            "cat <<</dev/null",
+            "cat <>/dev/null",
+            "echo '2>/dev/null'",
+            "echo \"2>/dev/null\"",
+            "echo $'2>/dev/null'",
+            r"echo \>/dev/null",
+            "ls >/dev/zero",
+            "ls >/dev/sda",
+            "ls &&>/dev/null",
+            "ls # 2>/dev/null",
+            // A real redirection anywhere keeps the WHOLE command's keywords,
+            // so a destructive redirect without a keyword of its own (caught
+            // only because the inert redirect's keyword selected the pack) is
+            // still evaluated. Nothing is blanked when a real redirect is
+            // present, e.g. a remote script's `>logs/run_$x.log 2>&1`.
+            "ls 2>/dev/null >/etc/hosts",
+            "echo x 2>&1 >/etc/hosts",
+            "cat a.log 2>/dev/null > out_$x.log",
+            "ssh h 'run 2>&1 >logs/gate_$t.log'",
+        ] {
+            assert_eq!(blank_inert_redirections(input), input, "{input:?}");
+        }
+        assert!(matches!(
+            blank_inert_redirections("ls -la"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -4997,6 +5770,71 @@ destructive_patterns:
         assert_eq!(split_command_segments(r"echo a\; b"), vec![r"echo a\; b"]);
         assert_eq!(split_command_segments(r"echo a\| b"), vec![r"echo a\| b"]);
         assert_eq!(split_command_segments(r"echo a\& b"), vec![r"echo a\& b"]);
+    }
+
+    #[test]
+    fn quoted_shell_separators_are_masked_exactly_where_the_segmenter_declines_to_split() {
+        // Quoted and escaped separators are data; each becomes `_` in place.
+        for (command, masked) in [
+            (r#"mv "a & b" /etc /tmp/x"#, r#"mv "a _ b" /etc /tmp/x"#),
+            ("mv 'a;b|c' ~ /tmp/x", "mv 'a_b_c' ~ /tmp/x"),
+            (r"find a\;b / -delete", r"find a\_b / -delete"),
+            (r#"echo "a\;b""#, r#"echo "a\_b""#),
+            // Real separators stay, so a command never runs into the next.
+            (
+                r#"mv "a;b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+                r#"mv "a_b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+            ),
+            (r#"a "x|y" && b 'p&q' || c"#, r#"a "x_y" && b 'p_q' || c"#),
+            // A substitution body has its own quoting: its bare `;` is real
+            // even inside double quotes, while a quoted one inside it is data.
+            (
+                r#"echo "$(cd /; ls "a;b")" '$(x;y)'"#,
+                r#"echo "$(cd /; ls "a_b")" '$(x_y)'"#,
+            ),
+            ("echo `a; b \"c;d\"`", "echo `a; b \"c_d\"`"),
+            (r#"diff <(sort "a|b"; ls) y"#, r#"diff <(sort "a_b"; ls) y"#),
+            // A single quote inside double quotes is a byte, and the reverse.
+            (r#"echo "it's; ok" x"#, r#"echo "it's_ ok" x"#),
+            (r#"echo 'say "a;b"' x"#, r#"echo 'say "a_b"' x"#),
+        ] {
+            let actual = mask_quoted_shell_separators(command);
+            assert_eq!(actual, masked, "{command}");
+            assert_eq!(actual.len(), command.len(), "{command}");
+        }
+        // Nothing to mask: borrowed, and redirection syntax is not quoting.
+        for command in [
+            "cp -a /etc /tmp/x && rm -rf /tmp/x",
+            "make 2>&1 | tee log",
+            "cmd &> out; echo >| f",
+            r#"echo "no separators here""#,
+            "mv a b; rm c",
+        ] {
+            assert!(
+                matches!(
+                    mask_quoted_shell_separators(command),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{command}"
+            );
+        }
+        // An unbalanced quote keeps the segmenter's reading: the rest of the
+        // text is one quoted segment, so its separators are data to both.
+        let unbalanced = r#"echo "a; b"#;
+        assert_eq!(split_command_segments(unbalanced), vec![unbalanced]);
+        assert_eq!(mask_quoted_shell_separators(unbalanced), r#"echo "a_ b"#);
+        // The offsets agree with the segmenter on every listed command: no
+        // masked byte is ever a place it splits.
+        for command in [
+            r#"mv "a;b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+            r#"echo "$(cd /; ls "a;b")" && x 'p|q' | y"#,
+            r"a\;b; c\|d | e\&f & g",
+        ] {
+            let masked = mask_quoted_shell_separators(command);
+            let segments = split_command_segments(command);
+            let masked_segments = split_command_segments(&masked);
+            assert_eq!(segments.len(), masked_segments.len(), "{command}");
+        }
     }
 
     #[test]

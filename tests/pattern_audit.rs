@@ -256,6 +256,11 @@ fn test_audit_backtracking_requirements() {
                 "docker-pull",
                 "docker-run",
                 "docker-stats",
+                // #548: the force flag must be an option word of this docker
+                // command. Atomic groups keep each shell word whole, and a
+                // lookahead ends the flag at a word boundary.
+                "rm-force",
+                "rmi-force",
             ]),
         ),
         (
@@ -269,6 +274,9 @@ fn test_audit_backtracking_requirements() {
                 "podman-ps",
                 "podman-pull",
                 "podman-run",
+                // #548: scoped to podman's own option words, as in docker.
+                "rm-force",
+                "rmi-force",
             ]),
         ),
         (
@@ -319,6 +327,9 @@ fn test_audit_backtracking_requirements() {
                 "find-exec-rm-tmp",
                 "find-exec-rm-var-tmp",
                 "ln-symlink-sensitive-then-delete",
+                // #550: `mv` must be a whole shell word, which takes a
+                // lookbehind and a lookahead around the command word.
+                "mv-dynamic-path",
                 "mv-relative-into-home",
                 "mv-sensitive-source-root-home",
                 "mv-tmp",
@@ -1192,6 +1203,9 @@ fn test_audit_backtracking_requirements() {
                 "sfdisk-modify",
                 "sgdisk-modify",
                 "tee-device",
+                // #548: the force flag must be an option word of this umount
+                // command; atomic word groups and a word-end lookahead.
+                "umount-force",
             ]),
         ),
         (

@@ -1,0 +1,105 @@
+name: Verify trusted configuration failures (#568)
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a reviewed patch to main only after all verification passes
+        required: false
+        default: 'false'
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - src/config.rs
+      - src/main.rs
+      - src/cli.rs
+      - src/evaluator.rs
+      - src/config_load_regression_tests.rs
+      - tests/repro_568_config_load.rs
+      - scripts/apply_config_load_candidate.py
+      - scripts/test_apply_config_load_candidate.py
+      - .github/workflows/config-load-568.yml
+      - .github/patches/config-load-568.patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: config-load-568-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          # The candidate tests read its real immutable source preimages.
+          fetch-depth: 0
+      - name: Record exact source for review
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          git archive --format=tar HEAD > "$RUNNER_TEMP/dcg-source.tar"
+          for symbol in 'pub fn run_command' 'fn test_command_with_options'; do
+            grep -n -F "$symbol" src/cli.rs || true
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: config-568-source
+          path: ${{ runner.temp }}/dcg-source.tar
+          retention-days: 3
+      - name: Apply reviewed diff on explicitly requested publication
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        run: |
+          python3 scripts/apply_config_load_candidate.py
+          git diff --check
+      - name: Candidate acquisition and refusal regressions
+        run: python3 -m unittest discover -s scripts -p test_apply_config_load_candidate.py -v
+      - name: Install the repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Format publication candidate
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        # Format only the exact paths the publisher will commit. The final
+        # whole-tree check must still reject unrelated baseline formatting.
+        run: >-
+          rustfmt --edition 2024 --config skip_children=true
+          src/config.rs src/evaluator.rs src/main.rs src/cli.rs
+          src/config_load_regression_tests.rs tests/repro_568_config_load.rs
+      - name: Trusted-policy process regressions
+        run: cargo test --locked --test repro_568_config_load -- --test-threads=1
+      - name: Configuration and hook unit regressions
+        run: |
+          cargo test --locked --lib config:: -- --test-threads=1
+          cargo test --locked --bin dcg -- --test-threads=1
+      - name: Check every target
+        run: cargo check --locked --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Real-binary harness conformance
+        run: bash scripts/e2e_harness_matrix.sh --binary target/debug/dcg --json
+      - name: Publish verified source directly to main
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        shell: bash
+        run: |
+          test "${GITHUB_REF}" = refs/heads/main
+          base=$(git rev-parse HEAD)
+          remote=$(git ls-remote origin refs/heads/main | cut -f1)
+          test "$base" = "$remote" || { echo 'main advanced; refusing to publish a stale candidate'; exit 1; }
+          master=$(git ls-remote origin refs/heads/master | cut -f1)
+          test "$base" = "$master" || { echo 'master differs from main; refusing an unreviewed mirror update'; exit 1; }
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/config.rs src/evaluator.rs src/main.rs src/cli.rs tests/repro_568_config_load.rs
+          if test -f src/config_load_regression_tests.rs; then git add src/config_load_regression_tests.rs; fi
+          git diff --cached --quiet && { echo 'No source changes to publish'; exit 1; }
+          git commit -m 'fix(config): preserve trusted policy failures across evaluation and hook protocols (#568)'
+          git push --atomic origin HEAD:refs/heads/main HEAD:refs/heads/master
+          echo "Published $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"

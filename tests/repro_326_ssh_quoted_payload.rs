@@ -162,3 +162,133 @@ fn dynamic_payload_parity_with_local_treatment() {
         );
     }
 }
+
+fn rule(result: &destructive_command_guard::EvaluationResult) -> Option<String> {
+    result.pattern_info.as_ref().map(|info| {
+        format!(
+            "{}:{}",
+            info.pack_id.as_deref().unwrap_or_default(),
+            info.pattern_name.as_deref().unwrap_or_default()
+        )
+    })
+}
+
+/// #551: a payload whose only hazard is a dynamic executable before a delete
+/// flag carries no pack keyword, so the remote recursion skipped it while the
+/// same text run locally is denied as `core.git:branch-dynamic-token`, and
+/// an unrelated word (`.FullName`) in the payload flipped the verdict. The
+/// remote spelling must get the local verdict and rule whatever else the
+/// payload contains; benign dynamic payloads stay allowed like their local
+/// text.
+#[test]
+fn keyword_less_payloads_get_their_local_verdict_551() {
+    for (local, remote) in [
+        ("$G -D main", "ssh h '$G -D main'"),
+        ("$p = x -d 1", "ssh h '$p = x -d 1'"),
+        ("$p = x -d 1; $q.Name", "ssh h '$p = x -d 1; $q.Name'"),
+        (
+            "$p = x -d 1; $q.FullName",
+            "ssh h '$p = x -d 1; $q.FullName'",
+        ),
+        ("$p -d 1", "ssh -p 2222 user@host '$p -d 1'"),
+    ] {
+        for dialect in DIALECTS {
+            let local_result = evaluate(local, &[], dialect);
+            let remote_result = evaluate(remote, &[], dialect);
+            assert_eq!(
+                rule(&local_result).as_deref(),
+                Some("core.git:branch-dynamic-token"),
+                "{local:?} under {dialect:?}: {local_result:?}"
+            );
+            assert!(
+                remote_result.is_denied(),
+                "{remote:?} must be denied like {local:?} under {dialect:?}, got {remote_result:?}"
+            );
+            assert_eq!(
+                rule(&remote_result),
+                rule(&local_result),
+                "{remote:?} under {dialect:?}"
+            );
+        }
+    }
+    for (local, remote) in [
+        ("echo $X", "ssh h 'echo $X'"),
+        ("$CMD --help", "ssh h '$CMD --help'"),
+        ("cd $D && make", "ssh h 'cd $D && make'"),
+    ] {
+        for dialect in DIALECTS {
+            let local_result = evaluate(local, &[], dialect);
+            let remote_result = evaluate(remote, &[], dialect);
+            assert!(
+                local_result.is_allowed() && remote_result.is_allowed(),
+                "{remote:?} and {local:?} must stay allowed under {dialect:?}: \
+                 {remote_result:?} / {local_result:?}"
+            );
+        }
+    }
+}
+
+/// An ssh_config option can carry a command line: `ProxyCommand`,
+/// `LocalCommand` and `KnownHostsCommand` run theirs on the local host,
+/// `RemoteCommand` on the remote one. `ssh`, `scp` and `sftp` all take them
+/// as `-o` options, and every spelling OpenSSH accepts (attached, after `=`
+/// or a blank, any letter case, bundled behind flags, after the destination)
+/// must reach the same verdict as the command line itself.
+#[test]
+fn ssh_config_option_commands_are_evaluated() {
+    let denied = [
+        "ssh -o ProxyCommand='rm -rf ~' host",
+        "ssh -oProxyCommand='rm -rf ~' host true",
+        "ssh -o PermitLocalCommand=yes -o LocalCommand='rm -rf ~' host",
+        "ssh -o ProxyCommand='rm -rf ~' host 'rm -rf /tmp/probe'",
+        "ssh -o 'ProxyCommand rm -rf ~' host",
+        "ssh -o 'ProxyCommand = rm -rf ~' host",
+        "ssh -o proxycommand='rm -rf ~' host",
+        "ssh -nT -oProxyCommand='rm -rf ~' host",
+        "ssh \"-o\"ProxyCommand='rm -rf ~' host",
+        "ssh -o ProxyCommand=rm\\ -rf\\ ~ host",
+        "ssh host -o ProxyCommand='rm -rf ~'",
+        "ssh -F /dev/null -o ProxyCommand='rm -rf ~' host",
+        "ssh -oLocalCommand='rm -rf ~' host",
+        "ssh -o KnownHostsCommand='rm -rf /home/user' host",
+        "ssh -o RemoteCommand='rm -rf ~' host",
+        "ssh -o ProxyCommand='git reset --hard' host",
+        "scp -o ProxyCommand='rm -rf ~' a host:b",
+        "scp -qo ProxyCommand='rm -rf ~' a host:b",
+        "sftp -o ProxyCommand='rm -rf ~' host",
+        "/usr/bin/ssh -o ProxyCommand='rm -rf ~' host",
+        // Code chosen at run time, like `sh -c "$X"`.
+        "ssh -o \"ProxyCommand=$P\" host",
+    ];
+    for command in denied {
+        for dialect in DIALECTS {
+            let result = evaluate(command, &[], dialect);
+            assert!(
+                result.is_denied(),
+                "{command:?} must be denied under {dialect:?}, got {result:?}"
+            );
+        }
+    }
+    let allowed = [
+        "ssh -o ProxyCommand='ssh -W %h:%p bastion' host uptime",
+        "ssh -o 'ProxyCommand nc -X 5 -x proxy:1080 %h %p' host",
+        "ssh -o ProxyCommand=none host",
+        "ssh -o ProxyJump=bastion host",
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 host uptime",
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null host",
+        "ssh -o SendEnv='rm -rf ~' host",
+        "scp -o ProxyCommand='ssh -W %h:%p bastion' a host:b",
+        "sftp -o ProxyCommand='ssh -W %h:%p bastion' host",
+        "ssh -o \"ProxyCommand=ssh -W %h:%p $JUMP\" host",
+        "echo ssh -o ProxyCommand='rm -rf ~' host",
+    ];
+    for command in allowed {
+        for dialect in DIALECTS {
+            let result = evaluate(command, &[], dialect);
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed under {dialect:?}, got {result:?}"
+            );
+        }
+    }
+}

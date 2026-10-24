@@ -397,10 +397,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             r#"mount\s+.*--bind\s+.*\s+['"]?/(?:$|[^a-z])"#,
             "mount --bind to root directory can have system-wide effects."
         ),
-        // umount -f (force)
+        // umount -f (force). The flag must be an option word of this umount
+        // command (#548): one shell word per `[ \t]+`-separated token, ended by
+        // an unquoted `;`, `&`, `|` or newline, and the flag must start a word,
+        // so `-f` inside an operand (`/mnt/drill-f`) or a later command's word
+        // (`; ip netns delete drill-firewall-test`) no longer counts.
         destructive_pattern!(
             "umount-force",
-            r"umount\s+.*-[a-z]*f",
+            r#"\bumount(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "umount -f force unmounts which may cause data loss if device is in use."
         ),
         // losetup can be dangerous
@@ -1423,6 +1427,32 @@ mod tests {
                 pack.matches_safe(command) || pack.check(command).is_none(),
                 "{command:?} must not be blocked by the mount rules"
             );
+        }
+    }
+
+    #[test]
+    fn umount_force_flag_must_belong_to_the_umount_command_548() {
+        let pack = create_pack();
+        for command in [
+            "sudo umount /mnt/x",
+            "sudo umount /mnt/x; sudo ip netns delete drill-firewall-test",
+            "umount /mnt/drill-f",
+            "umount /mnt/x && grep -f patterns.txt file.txt",
+            "umount /mnt/x\ngrep -f patterns.txt file.txt",
+        ] {
+            assert_allows(&pack, command);
+        }
+        for command in [
+            "sudo umount -f /mnt/x",
+            "umount --force /mnt/x",
+            "umount -lf /mnt/x",
+            "umount /mnt/x -f",
+            "umount -Rf /mnt",
+            "ls; umount -f /mnt/x",
+            "umount $'-f' /mnt/x",
+            "umount $\"-lf\" /mnt/x",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "umount-force");
         }
     }
 

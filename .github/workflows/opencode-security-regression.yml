@@ -1,0 +1,48 @@
+name: OpenCode security regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/cli.rs
+      - tests/repro_419_opencode_plugin_executes.rs
+      - .github/workflows/opencode-security-regression.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  adapter-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Require JavaScript and syntax-check the actual embedded driver
+        run: |
+          set -euo pipefail
+          node --version
+          python3 - <<'PY'
+          import os, pathlib
+          source = pathlib.Path('tests/repro_419_opencode_plugin_executes.rs').read_text()
+          driver = source.split('const DRIVER: &str = r#"', 1)[1].split('"#;', 1)[0]
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'dcg-opencode-driver.mjs').write_text(driver)
+          PY
+          node --check "$RUNNER_TEMP/dcg-opencode-driver.mjs"
+      - name: Install the repository's pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Exercise the installed adapter with compiled DCG
+        run: cargo test --locked --test repro_419_opencode_plugin_executes -- --nocapture
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check all Rust targets
+        run: cargo check --locked --all-targets
+      - name: Check Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings

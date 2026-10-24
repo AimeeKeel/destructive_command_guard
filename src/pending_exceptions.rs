@@ -17,7 +17,9 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::resolve_config_path_value;
-use crate::logging::{RedactionConfig, RedactionMode, redact_command};
+use crate::logging::{
+    RedactionConfig, RedactionMode, redact_command, redact_metadata, redact_reason,
+};
 
 /// Environment override for pending exceptions file path.
 pub const ENV_PENDING_EXCEPTIONS_PATH: &str = "DCG_PENDING_EXCEPTIONS_PATH";
@@ -872,11 +874,18 @@ pub fn log_maintenance(
 /// Log an allow-once management action (best-effort).
 ///
 /// This uses the same log file path expansion rules as [`log_maintenance`].
+/// Full redaction keeps known action labels but removes free-form details,
+/// including the command-derived hashes and codes recorded by revocation.
 ///
 /// # Errors
 ///
 /// Returns any I/O errors encountered while opening or appending to the log file.
-pub fn log_allow_once_action(log_file: &str, action: &str, details: &str) -> io::Result<()> {
+pub fn log_allow_once_action(
+    log_file: &str,
+    action: &str,
+    details: &str,
+    redaction: &RedactionConfig,
+) -> io::Result<()> {
     let path = expand_log_path(log_file);
 
     if let Some(parent) = path.parent() {
@@ -885,6 +894,12 @@ pub fn log_allow_once_action(log_file: &str, action: &str, details: &str) -> io:
 
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let timestamp = format_timestamp(Utc::now());
+    let action = if matches!(action, "clear" | "revoke") {
+        action.to_string()
+    } else {
+        redact_metadata(action, redaction)
+    };
+    let details = redact_metadata(details, redaction);
     writeln!(file, "[{timestamp}] [allow-once] {action}: {details}")?;
     Ok(())
 }
@@ -937,7 +952,10 @@ impl AllowOnceEventKind {
 /// A structured log entry for allow-once events.
 ///
 /// This provides machine-readable, stable log entries for audit trails.
-/// All command data respects the redaction configuration.
+/// Full redaction removes free text from commands, diagnostics, and paths.
+/// Command-derived hashes and short codes are also redacted: an unkeyed digest
+/// can disclose low-entropy commands through candidate testing. Event names,
+/// timestamps, and known source/scope labels remain useful for auditing.
 #[derive(Debug, Clone, Serialize)]
 pub struct AllowOnceLogEntry {
     /// ISO 8601 timestamp of the event.
@@ -982,17 +1000,28 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::CodeIssued.label().to_string(),
-            short_code: record.short_code.clone(),
-            full_hash: record.full_hash.clone(),
-            cwd: record.cwd.clone(),
+            short_code: redact_metadata(&record.short_code, redaction),
+            full_hash: redact_metadata(&record.full_hash, redaction),
+            cwd: redact_metadata(&record.cwd, redaction),
             command: redact_for_log(&record.command_raw, redaction),
             expires_at: Some(record.expires_at.clone()),
-            reason: Some(record.reason.clone()),
+            reason: Some(redact_reason(&record.reason, redaction)),
             allowlist_layer: None,
             scope_kind: None,
             single_use: Some(record.single_use),
             force_allow_config: None,
-            source: record.source.clone(),
+            source: record.source.as_deref().map(|source| {
+                // Production sources are MatchSource enum labels. Records
+                // loaded from disk can contain arbitrary strings instead.
+                if matches!(
+                    source,
+                    "ConfigOverride" | "LegacyPattern" | "Pack" | "HeredocAst"
+                ) {
+                    source.to_string()
+                } else {
+                    redact_metadata(source, redaction)
+                }
+            }),
         }
     }
 
@@ -1002,12 +1031,12 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::CodeResolved.label().to_string(),
-            short_code: entry.source_short_code.clone(),
-            full_hash: entry.source_full_hash.clone(),
-            cwd: entry.scope_path.clone(),
+            short_code: redact_metadata(&entry.source_short_code, redaction),
+            full_hash: redact_metadata(&entry.source_full_hash, redaction),
+            cwd: redact_metadata(&entry.scope_path, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
-            reason: Some(entry.reason.clone()),
+            reason: Some(redact_reason(&entry.reason, redaction)),
             allowlist_layer: None,
             scope_kind: Some(format!("{:?}", entry.scope_kind).to_lowercase()),
             single_use: Some(entry.single_use),
@@ -1027,13 +1056,17 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::AllowGranted.label().to_string(),
-            short_code: entry.source_short_code.clone(),
-            full_hash: entry.source_full_hash.clone(),
-            cwd: cwd.to_string(),
+            short_code: redact_metadata(&entry.source_short_code, redaction),
+            full_hash: redact_metadata(&entry.source_full_hash, redaction),
+            cwd: redact_metadata(cwd, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
             reason: None,
-            allowlist_layer: Some(layer.to_string()),
+            allowlist_layer: Some(if layer == "allow_once" {
+                layer.to_string()
+            } else {
+                redact_metadata(layer, redaction)
+            }),
             scope_kind: Some(format!("{:?}", entry.scope_kind).to_lowercase()),
             single_use: Some(entry.single_use),
             force_allow_config: Some(entry.force_allow_config),
@@ -1047,9 +1080,9 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::EntryConsumed.label().to_string(),
-            short_code: entry.source_short_code.clone(),
-            full_hash: entry.source_full_hash.clone(),
-            cwd: cwd.to_string(),
+            short_code: redact_metadata(&entry.source_short_code, redaction),
+            full_hash: redact_metadata(&entry.source_full_hash, redaction),
+            cwd: redact_metadata(cwd, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
             reason: None,
@@ -1074,9 +1107,9 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::EntryExpired.label().to_string(),
-            short_code: short_code.to_string(),
-            full_hash: full_hash.to_string(),
-            cwd: cwd.to_string(),
+            short_code: redact_metadata(short_code, redaction),
+            full_hash: redact_metadata(full_hash, redaction),
+            cwd: redact_metadata(cwd, redaction),
             command: redact_for_log(command, redaction),
             expires_at: Some(expires_at.to_string()),
             reason: None,
@@ -2244,11 +2277,12 @@ mod tests {
             mode: crate::logging::RedactionMode::Full,
             max_argument_len: 8,
         };
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
         let record = PendingExceptionRecord::new(
             now,
-            "/repo",
-            "git reset --hard HEAD",
-            "blocked",
+            marker,
+            &format!("git reset --hard {marker}"),
+            &format!("producer {}", marker.to_lowercase()),
             &redaction,
             false,
             None,
@@ -2256,6 +2290,38 @@ mod tests {
 
         let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
         assert_eq!(entry.command, "[REDACTED]");
+        let grant = AllowOnceEntry::from_pending(
+            &record,
+            now,
+            AllowOnceScopeKind::Cwd,
+            marker,
+            true,
+            false,
+            &redaction,
+        );
+        for entry in [
+            entry,
+            AllowOnceLogEntry::code_resolved(&grant, &redaction),
+            AllowOnceLogEntry::allow_granted(&grant, &redaction, "allow_once", marker),
+            AllowOnceLogEntry::entry_consumed(&grant, &redaction, marker),
+            AllowOnceLogEntry::entry_expired(
+                &record.short_code,
+                &record.full_hash,
+                marker,
+                marker,
+                &record.expires_at,
+                &redaction,
+            ),
+        ] {
+            for serialized in [entry.format_json(), entry.format_text()] {
+                assert!(
+                    !serialized.to_lowercase().contains(&marker.to_lowercase()),
+                    "{serialized}"
+                );
+                assert!(!serialized.contains(&record.short_code));
+                assert!(!serialized.contains(&record.full_hash));
+            }
+        }
     }
 
     #[test]
@@ -2280,6 +2346,254 @@ mod tests {
 
         let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
         assert_eq!(entry.command, "git reset --hard HEAD");
+    }
+
+    #[test]
+    fn test_allow_once_log_redaction_covers_entire_records_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let marker_lower = MARKER.to_ascii_lowercase();
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let cwd = format!("/repo/{MARKER}");
+        let command = format!("git reset --hard {MARKER}");
+        let reason = format!("Command uses {marker_lower}");
+        let pending = PendingExceptionRecord::new(
+            now,
+            &cwd,
+            &command,
+            &reason,
+            &RedactionConfig::default(),
+            true,
+            Some(MARKER.to_string()),
+        );
+        let allow_entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Project,
+            &cwd,
+            true,
+            false,
+            &RedactionConfig::default(),
+        );
+        let original_pending = pending.clone();
+        let original_allow_entry = allow_entry.clone();
+        let dir = TempDir::new().expect("tempdir");
+
+        // A record may predate the current logging configuration. Redact its
+        // raw diagnostic and metadata at the audit boundary, regardless of
+        // the command_redacted stored beside it.
+        for (enabled, mode, full) in [
+            (true, RedactionMode::Full, true),
+            (false, RedactionMode::Full, false),
+            (true, RedactionMode::None, false),
+            (true, RedactionMode::Arguments, false),
+        ] {
+            let redaction = RedactionConfig {
+                enabled,
+                mode,
+                max_argument_len: 8,
+            };
+            let entries = [
+                (
+                    "code_issued",
+                    AllowOnceLogEntry::code_issued(&pending, &redaction),
+                ),
+                (
+                    "code_resolved",
+                    AllowOnceLogEntry::code_resolved(&allow_entry, &redaction),
+                ),
+                (
+                    "allow_granted",
+                    AllowOnceLogEntry::allow_granted(&allow_entry, &redaction, MARKER, &cwd),
+                ),
+                (
+                    "entry_consumed",
+                    AllowOnceLogEntry::entry_consumed(&allow_entry, &redaction, &cwd),
+                ),
+                (
+                    "entry_expired",
+                    AllowOnceLogEntry::entry_expired(
+                        &pending.short_code,
+                        &pending.full_hash,
+                        &cwd,
+                        &command,
+                        &pending.expires_at,
+                        &redaction,
+                    ),
+                ),
+            ];
+
+            for (event, entry) in &entries {
+                assert_eq!(entry.event, *event);
+                assert_eq!(
+                    entry.short_code,
+                    if full {
+                        "[REDACTED]"
+                    } else {
+                        &pending.short_code
+                    }
+                );
+                assert_eq!(
+                    entry.full_hash,
+                    if full {
+                        "[REDACTED]"
+                    } else {
+                        &pending.full_hash
+                    }
+                );
+                assert_eq!(
+                    entry.expires_at.as_deref(),
+                    Some(pending.expires_at.as_str())
+                );
+                assert_eq!(entry.cwd, if full { "[REDACTED]" } else { &cwd });
+                assert_eq!(entry.command, if full { "[REDACTED]" } else { &command });
+                if matches!(*event, "code_issued" | "code_resolved") {
+                    assert_eq!(
+                        entry.reason.as_deref(),
+                        Some(if full {
+                            "Diagnostic details redacted."
+                        } else {
+                            &reason
+                        })
+                    );
+                }
+                if matches!(*event, "code_resolved" | "allow_granted" | "entry_consumed") {
+                    assert_eq!(entry.scope_kind.as_deref(), Some("project"));
+                    assert_eq!(entry.single_use, Some(true));
+                }
+                for serialized in [entry.format_json(), entry.format_text()] {
+                    assert_eq!(
+                        serialized.to_ascii_lowercase().contains(&marker_lower),
+                        !full,
+                        "whole {event} record with enabled={enabled}, mode={mode:?}: {serialized}"
+                    );
+                    if full {
+                        assert!(
+                            !serialized.contains(&pending.full_hash),
+                            "command digest must not permit candidate testing: {serialized}"
+                        );
+                        assert!(
+                            !serialized.contains(&pending.short_code),
+                            "short codes also derive from the command digest: {serialized}"
+                        );
+                    }
+                }
+            }
+
+            for format in [AllowOnceLogFormat::Json, AllowOnceLogFormat::Text] {
+                let path = dir
+                    .path()
+                    .join(format!("{enabled}-{mode:?}-{format:?}.log"));
+                for (_, entry) in &entries {
+                    log_allow_once_event(path.to_str().unwrap(), entry, format).unwrap();
+                }
+                let contents = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(contents.lines().count(), entries.len());
+                assert_eq!(
+                    contents.to_ascii_lowercase().contains(&marker_lower),
+                    !full,
+                    "persisted {format:?} records with enabled={enabled}, mode={mode:?}"
+                );
+                if full {
+                    assert!(!contents.contains(&pending.full_hash));
+                    assert!(!contents.contains(&pending.short_code));
+                }
+            }
+        }
+
+        // Redaction of audit copies must not change authorization state.
+        assert_eq!(pending, original_pending);
+        assert_eq!(allow_entry, original_allow_entry);
+        assert!(allow_entry.matches_scope(Path::new(&cwd)));
+        assert_eq!(allow_entry.command_raw, command);
+    }
+
+    #[test]
+    fn test_allow_once_log_full_redaction_preserves_known_labels_issue_585() {
+        let redaction = RedactionConfig {
+            enabled: true,
+            mode: RedactionMode::Full,
+            max_argument_len: 8,
+        };
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for source in ["ConfigOverride", "LegacyPattern", "Pack", "HeredocAst"] {
+            let pending = PendingExceptionRecord::new(
+                now,
+                "/repo",
+                "git reset --hard",
+                "blocked",
+                &redaction,
+                true,
+                Some(source.to_string()),
+            );
+            let entry = AllowOnceLogEntry::code_issued(&pending, &redaction);
+            assert_eq!(entry.source.as_deref(), Some(source));
+
+            let allow_entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                "/repo",
+                true,
+                false,
+                &redaction,
+            );
+            let granted =
+                AllowOnceLogEntry::allow_granted(&allow_entry, &redaction, "allow_once", "/repo");
+            assert_eq!(granted.allowlist_layer.as_deref(), Some("allow_once"));
+            assert_eq!(granted.scope_kind.as_deref(), Some("cwd"));
+        }
+    }
+
+    #[test]
+    fn test_allow_once_management_log_redaction_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let hash = compute_full_hash_with_secret("2026-01-10T06:30:00Z", "/repo", MARKER, None);
+        let code = short_code_from_hash(&hash);
+        let details = format!("target={code}, full_hash={hash}, reason={MARKER}");
+        let dir = TempDir::new().expect("tempdir");
+
+        for (enabled, mode, full) in [
+            (true, RedactionMode::Full, true),
+            (false, RedactionMode::Full, false),
+            (true, RedactionMode::None, false),
+            (true, RedactionMode::Arguments, false),
+        ] {
+            let redaction = RedactionConfig {
+                enabled,
+                mode,
+                max_argument_len: 8,
+            };
+            let path = dir
+                .path()
+                .join(format!("management-{enabled}-{mode:?}.log"));
+            for action in ["clear", "revoke", MARKER] {
+                log_allow_once_action(path.to_str().unwrap(), action, &details, &redaction)
+                    .unwrap();
+            }
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(contents.lines().count(), 3);
+            assert!(contents.contains("[allow-once] clear:"));
+            assert!(contents.contains("[allow-once] revoke:"));
+            assert_eq!(
+                contents
+                    .to_ascii_lowercase()
+                    .contains(&MARKER.to_ascii_lowercase()),
+                !full,
+                "management log with enabled={enabled}, mode={mode:?}: {contents}"
+            );
+            assert_eq!(contents.contains(&hash), !full);
+            assert_eq!(contents.contains(&code), !full);
+            if full {
+                assert!(contents.contains("[allow-once] [REDACTED]: [REDACTED]"));
+                assert!(contents.lines().all(|line| line.ends_with(": [REDACTED]")));
+            } else {
+                assert!(contents.lines().all(|line| line.ends_with(&details)));
+            }
+        }
     }
 
     #[test]

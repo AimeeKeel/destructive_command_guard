@@ -39,6 +39,13 @@ pub struct HookInput {
     )]
     pub hook_event_name: Option<String>,
 
+    /// Cursor's native Claude-compatible envelope identifies its host with
+    /// this marker. Populated best-effort by [`parse_hook_input`], outside the
+    /// primary parser, so duplicate or malformed metadata cannot reject a
+    /// command that was previously readable.
+    #[serde(skip)]
+    pub cursor_version: Option<String>,
+
     /// Session id (Gemini snake_case; VS Code Agent Host camelCase).
     #[serde(
         alias = "sessionId",
@@ -176,6 +183,13 @@ pub struct HookInput {
 pub struct ToolInput {
     /// The command string (for Bash tools).
     pub command: Option<serde_json::Value>,
+
+    /// The command string under the `cmd` key: the argument name of the
+    /// unified-exec `exec_command` tool (Codex, and Muse Code, whose own
+    /// bundled tooling reads a shell call as `cmd`, falling back to `command`
+    /// (#572)). Both keys are evaluated when both are present, so a benign
+    /// `command` cannot hide a destructive `cmd`.
+    pub cmd: Option<serde_json::Value>,
 }
 
 /// Antigravity CLI (`agy`) tool-call envelope.
@@ -444,6 +458,21 @@ pub struct GeminiHookOutput<'a> {
     pub remediation: Option<Remediation>,
 }
 
+/// Antigravity CLI (`agy`) denial output for `PreToolUse` hooks.
+///
+/// `agy` 1.4.0 rejects unknown fields with its strict protojson parser (#573).
+/// Keep this separate from Gemini's output: rule attribution and allow-once
+/// guidance belong in `reason`, never in additional top-level fields. Warnings
+/// emit no stdout so they do not make a permission decision for the host.
+#[derive(Debug, Serialize)]
+pub struct AntigravityHookOutput<'a> {
+    /// Blocking decision (`"deny"`).
+    pub decision: &'static str,
+
+    /// Human-readable explanation of the denial.
+    pub reason: Cow<'a, str>,
+}
+
 /// Hermes Agent denial output for shell `pre_tool_call` hooks.
 ///
 /// Hermes documents two block-decision wire shapes — `{"decision": "block",
@@ -670,14 +699,14 @@ pub enum HookProtocol {
     /// "...", "stepIdx": N, "transcriptPath": "...", "workspacePaths": [...]}`.
     /// The shell command is in `toolCall.args.CommandLine` and the shell tool
     /// name is `run_command`. Block decision is expressed via stdout JSON
-    /// `{"decision": "block", "reason": "..."}` with exit code 0 — verified
-    /// empirically: `agy` honors both `"block"` and `"deny"` decision keywords
-    /// and aborts the `run_command` tool, whereas a non-zero exit code is only
-    /// logged (`pre-tool hook ... failed: ... exit status 2`) and does NOT
-    /// reliably abort the tool. `agy`'s parser does not use
-    /// `deny_unknown_fields`, so dcg's ergonomics fields (`ruleId`, `packId`,
-    /// `severity`, `remediation`, …) pass through unmolested. `agy` reads its
-    /// hook config from `~/.gemini/config/hooks.json` (with
+    /// `{"decision": "deny", "reason": "..."}` with exit code 0. `agy` 1.4.0
+    /// rejects unknown fields with its strict protojson parser (#573), so
+    /// attribution and review guidance are carried only in `reason`. Do not
+    /// rely on a non-zero exit status to deny a command: it has been observed
+    /// to be logged as a hook failure without reliably aborting the tool.
+    /// Warnings leave stdout empty and preserve the host's permission flow;
+    /// the bundled 1.4.0 contract treats `"allow"` as automatic approval.
+    /// `agy` reads its hook config from `~/.gemini/config/hooks.json` (with
     /// `~/.gemini/antigravity-cli/hooks.json` symlinked to it).
     Antigravity,
     /// Charm Crush protocol (#388). Wire shape: stdin carries the flat
@@ -999,6 +1028,7 @@ pub const MAX_OVERSIZED_SCAN_BYTES: usize = 4 * 1024 * 1024;
 pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::InputRead);
         let stdin = io::stdin();
         // Read up to limit + 1 to detect overflow
         let mut handle = stdin.lock().take(max_bytes as u64 + 1);
@@ -1011,6 +1041,7 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         // Best-effort: a read error here just shortens the scan buffer, it
         // never changes the (already decided) oversized verdict.
         if buf.len() < MAX_OVERSIZED_SCAN_BYTES {
+            let _phase = crate::perf::phase(crate::perf::ProfilePhase::InputRead);
             let remaining = (MAX_OVERSIZED_SCAN_BYTES - buf.len()) as u64;
             let stdin = io::stdin();
             let mut handle = stdin.lock().take(remaining);
@@ -1025,10 +1056,13 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         });
     }
 
-    let input = String::from_utf8(buf).map_err(|e| HookReadError::InvalidUtf8 {
-        error: e.utf8_error(),
-        lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    })?;
+    let input = {
+        let _phase = crate::perf::phase(crate::perf::ProfilePhase::RequestParse);
+        String::from_utf8(buf).map_err(|e| HookReadError::InvalidUtf8 {
+            error: e.utf8_error(),
+            lossy: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        })?
+    };
 
     // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
     // a BOM; without this, BOM-prefixed but otherwise-valid hook input would
@@ -1101,10 +1135,15 @@ const HOOK_INPUT_ALIAS_GROUPS: &[(&str, &[&str])] = &[
 /// carries no reconcilable alias conflict, or still does not fit [`HookInput`]
 /// after canonicalization. Behaviour for those inputs is unchanged.
 pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::RequestParse);
+    let _phase_timer = crate::perf::PhaseTimer::start("request_parse");
     let neutralized = neutralize_lone_surrogate_escapes(json);
     let json = neutralized.as_ref();
     let first_error = match serde_json::from_str::<HookInput>(json) {
-        Ok(input) => return Ok(input),
+        Ok(mut input) => {
+            input.cursor_version = cursor_version_from_json_metadata(json);
+            return Ok(input);
+        }
         Err(err) => err,
     };
 
@@ -1139,10 +1178,60 @@ pub fn parse_hook_input(json: &str) -> Result<HookInput, serde_json::Error> {
     match serde_json::from_value::<HookInput>(serde_json::Value::Object(object)) {
         Ok(mut input) => {
             input.alias_conflict_commands = displaced_commands;
+            input.cursor_version = cursor_version_from_json_metadata(json);
             Ok(input)
         }
         Err(_) => Err(first_error),
     }
+}
+
+/// Read only Cursor's optional host marker after the primary hook parse has
+/// succeeded. The literal key spelling used by Cursor triggers this extra
+/// scan; payloads without it pay only for the presence check. JSON-escaped
+/// spellings of the key leave this optional self-heal hint unset.
+///
+/// Do not flatten metadata into HookInput: Serde buffers flattened unknown
+/// values, which can reject numbers or nesting that IgnoredAny used to skip.
+/// Here unrelated values stay ignored, duplicate markers are harmless, and
+/// any metadata error leaves the successful command/protocol parse intact.
+fn cursor_version_from_json_metadata(json: &str) -> Option<String> {
+    if !json.contains("\"cursor_version\"") {
+        return None;
+    }
+
+    struct CursorMetadataVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CursorMetadataVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a hook envelope object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut marker = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "cursor_version" {
+                    if let serde_json::Value::String(version) = map.next_value()?
+                        && !version.trim().is_empty()
+                    {
+                        marker = Some(version);
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(marker)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    serde::Deserializer::deserialize_map(&mut deserializer, CursorMetadataVisitor)
+        .ok()
+        .flatten()
 }
 
 /// Collapse duplicate alias spellings in a raw hook envelope.
@@ -1226,15 +1315,14 @@ fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value)
     match canonical {
         "tool_input" => serde_json::from_value::<ToolInput>(value.clone())
             .ok()
-            .and_then(|tool_input| extract_command_from_tool_input(&tool_input))
-            .into_iter()
-            .collect(),
-        "tool_args" => extract_command_from_tool_args(value).into_iter().collect(),
+            .map(|tool_input| extract_commands_from_tool_input(&tool_input))
+            .unwrap_or_default(),
+        "tool_args" => extract_commands_from_tool_args(value),
         "tool_call" => serde_json::from_value::<ToolCall>(value.clone())
             .ok()
-            .and_then(|tool_call| extract_command_from_tool_call(&tool_call))
-            .into_iter()
-            .collect(),
+            .filter(is_batch_shell_call)
+            .map(|tool_call| extract_commands_from_tool_call(&tool_call))
+            .unwrap_or_default(),
         "tool_calls" => value
             .as_array()
             .map(|entries| {
@@ -1242,7 +1330,7 @@ fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value)
                     .iter()
                     .filter_map(|entry| serde_json::from_value::<ToolCall>(entry.clone()).ok())
                     .filter(is_batch_shell_call)
-                    .filter_map(|call| extract_command_from_tool_call(&call))
+                    .flat_map(|call| extract_commands_from_tool_call(&call))
                     .collect()
             })
             .unwrap_or_default(),
@@ -1274,12 +1362,40 @@ fn commands_in_displaced_alias_value(canonical: &str, value: &serde_json::Value)
 /// whose structure it does not trust — malformed escapes, raw control
 /// characters inside the string, a non-string value — is dropped rather than
 /// guessed at, and an empty result keeps the caller's historic fail-open
-/// behavior. Escaped occurrences of the key inside string values
-/// (`\"command\"`) never match because the scan requires the unescaped
-/// `"command"` byte sequence.
+/// behavior. Native Antigravity envelopes instead recover command fields
+/// from the actual top-level `toolCall` / `tool_call` object. Their
+/// `CommandLine` spelling must survive the same read errors, but unrelated
+/// metadata must not become a command merely because a shell was identified.
 #[must_use]
 pub fn extract_commands_from_truncated_json(prefix: &str) -> Vec<String> {
-    extract_string_values_for_key(prefix, "\"command\"")
+    let Some(native_commands) = native_commands_from_json_prefix(prefix) else {
+        return truncated_command_key_values(prefix);
+    };
+    if !extract_tool_names_from_truncated_json(prefix)
+        .iter()
+        .any(|name| is_supported_shell_tool(Some(name)))
+    {
+        return native_commands;
+    }
+
+    // Keep the legacy all-occurrences rule when a mixed envelope also names
+    // a legacy shell tool. Neither spelling may conceal a sibling command.
+    let mut commands = truncated_command_key_values(prefix);
+    for command in native_commands {
+        append_recovered_command(&mut commands, command);
+    }
+    commands
+}
+
+/// Every `"command"` value in a truncated prefix, then every `"cmd"` value
+/// (the `exec_command` argument, #572) that is not already listed: the parsed
+/// path evaluates both keys, so the salvage scan must not judge fewer.
+fn truncated_command_key_values(prefix: &str) -> Vec<String> {
+    let mut commands = extract_string_values_for_key(prefix, "\"command\"");
+    for command in extract_string_values_for_key(prefix, "\"cmd\"") {
+        append_recovered_command(&mut commands, command);
+    }
+    commands
 }
 
 /// Best-effort extraction of the hook envelope's tool name(s) from a truncated
@@ -1304,10 +1420,12 @@ pub fn extract_tool_names_from_truncated_json(prefix: &str) -> Vec<String> {
 ///
 /// Returns the recognized shell tool name and the dialect it implies, using
 /// exactly the same recognition and dialect mapping as the normal parsed path
-/// ([`is_supported_shell_tool`] / [`shell_dialect_for_tool_name`]). Returns
-/// `None` when the prefix carries no tool name at all, or only tool names that
-/// are not shell tools — the caller must then fail open rather than deny a
-/// payload it cannot attribute to a shell.
+/// ([`is_supported_shell_tool`] / [`shell_dialect_for_tool_name`]).
+/// Native Antigravity's `toolCall.name = "run_command"` is also recognized,
+/// including the nameless-with-args form accepted by the parsed path. The
+/// native tool name is read only from the real top-level envelope; a `name`
+/// planted in metadata or a string cannot manufacture shell attribution.
+/// Returns `None` when neither envelope can be attributed to a shell.
 ///
 /// The first *recognized* name wins, so a decoy non-shell tool name planted
 /// ahead of the real one cannot suppress evaluation.
@@ -1319,6 +1437,13 @@ pub fn shell_tool_from_truncated_json(prefix: &str) -> Option<(String, ShellDial
         .map(|name| {
             let dialect = shell_dialect_for_tool_name(Some(&name));
             (name, dialect)
+        })
+        .or_else(|| {
+            json_object_prefix_fields(prefix)
+                .filter(|(key, _)| matches!(key.as_str(), "toolCall" | "tool_call"))
+                .filter_map(|(_, value)| truncated_tool_call(value))
+                .any(|call| call.native_shell)
+                .then(|| ("run_command".to_string(), ShellDialect::Unknown))
         })
 }
 
@@ -1333,9 +1458,32 @@ pub fn shell_tool_from_truncated_json(prefix: &str) -> Option<(String, ShellDial
 /// `event`, a `toolArgs` *object*, and no `tool_input` (which would make it
 /// Crush). Reasonix writes those markers before the tool arguments, so they
 /// survive truncation. A command string cannot forge a key: inside a JSON
-/// string its quotes are escaped. Returns `None` for every other shape.
+/// string its quotes are escaped. Native Antigravity's top-level `toolCall`
+/// object is recognized structurally, including escaped JSON key spellings;
+/// a real plural shell batch retains the parsed path's Claude precedence.
+/// Returns `None` when none of these envelope shapes is present.
 #[must_use]
 pub fn protocol_from_truncated_json(prefix: &str) -> Option<HookProtocol> {
+    let mut native = false;
+    for (key, value) in json_object_prefix_fields(prefix) {
+        match key.as_str() {
+            "toolCall" | "tool_call" => {
+                native |= truncated_tool_call(value).is_some_and(|call| call.native_protocol);
+            }
+            "toolCalls" | "tool_calls" | "toolcalls"
+                if json_array_prefix_values(value)
+                    .filter_map(truncated_tool_call)
+                    .any(|call| call.batch_shell) =>
+            {
+                return Some(HookProtocol::ClaudeCompatible);
+            }
+            _ => {}
+        }
+    }
+    if native {
+        return Some(HookProtocol::Antigravity);
+    }
+
     let pre_tool_use_event = extract_string_values_for_key(prefix, "\"event\"")
         .iter()
         .any(|event| event.eq_ignore_ascii_case("PreToolUse"));
@@ -1344,6 +1492,267 @@ pub fn protocol_from_truncated_json(prefix: &str) -> Option<HookProtocol> {
         .any(|key| has_object_value_for_key(prefix, key));
     let tool_input = prefix.contains("\"tool_input\"") || prefix.contains("\"toolInput\"");
     (pre_tool_use_event && object_tool_args && !tool_input).then_some(HookProtocol::Reasonix)
+}
+
+/// Fields recovered from one structurally attributable `toolCall` object.
+/// Keep the protocol and shell gates separate: a nameless object identifies
+/// Antigravity, but needs args before it can justify evaluating a command.
+struct TruncatedToolCall<'a> {
+    native_protocol: bool,
+    native_shell: bool,
+    batch_shell: bool,
+    args: Vec<&'a str>,
+}
+
+fn truncated_tool_call(value: &str) -> Option<TruncatedToolCall<'_>> {
+    if !value.trim_start().starts_with('{') {
+        return None;
+    }
+    let mut saw_name = false;
+    let mut nameless = false;
+    let mut native_name = false;
+    let mut shell_name = false;
+    let mut args = Vec::new();
+    for (key, value) in json_object_prefix_fields(value) {
+        match key.as_str() {
+            "name" => {
+                saw_name = true;
+                match serde_json::from_str::<serde_json::Value>(value) {
+                    Ok(serde_json::Value::String(name)) => {
+                        nameless |= name.is_empty();
+                        native_name |= name.eq_ignore_ascii_case("run_command");
+                        shell_name |= is_supported_shell_tool(Some(&name));
+                    }
+                    // Match ToolCall's tolerant name field: numbers become
+                    // explicit non-shell names; other valid types are absent.
+                    Ok(serde_json::Value::Number(_)) | Err(_) => {}
+                    Ok(_) => nameless = true,
+                }
+            }
+            "args" if value != "null" => args.push(value),
+            _ => {}
+        }
+    }
+    nameless |= !saw_name;
+    let nameless_shell = nameless && !args.is_empty();
+    Some(TruncatedToolCall {
+        native_protocol: native_name || nameless,
+        native_shell: native_name || nameless_shell,
+        batch_shell: native_name || shell_name || nameless_shell,
+        args,
+    })
+}
+
+/// Native recovery follows only command-bearing envelope fields. The legacy
+/// raw `command` scan is retained separately for legacy shell envelopes.
+fn native_commands_from_json_prefix(prefix: &str) -> Option<Vec<String>> {
+    let mut native_shell = false;
+    let mut commands = Vec::new();
+    for (key, value) in json_object_prefix_fields(prefix) {
+        match key.as_str() {
+            "toolCall" | "tool_call" => {
+                if let Some(call) = truncated_tool_call(value).filter(|call| call.native_shell) {
+                    native_shell = true;
+                    for args in call.args {
+                        recover_args_prefix(args, &mut commands);
+                    }
+                }
+            }
+            "toolCalls" | "tool_calls" | "toolcalls" => {
+                for call in json_array_prefix_values(value)
+                    .filter_map(truncated_tool_call)
+                    .filter(|call| call.batch_shell)
+                {
+                    for args in call.args {
+                        recover_args_prefix(args, &mut commands);
+                    }
+                }
+            }
+            "tool_input" | "toolInput" => {
+                recover_command_fields(value, &["command"], &mut commands);
+            }
+            "tool_args" | "toolArgs" => recover_args_prefix(value, &mut commands),
+            _ => {}
+        }
+    }
+    native_shell.then_some(commands)
+}
+
+fn recover_args_prefix(value: &str, commands: &mut Vec<String>) {
+    const COMMAND_KEYS: &[&str] = &["command", "CommandLine", "commandLine", "Command"];
+    if value.starts_with('"') {
+        let Some(decoded) = decode_native_json_string_prefix(value) else {
+            return;
+        };
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&decoded) {
+            for command in extract_commands_from_tool_args(&parsed) {
+                append_recovered_command(commands, command);
+            }
+        } else {
+            // Stringified args can themselves be truncated JSON. If there
+            // are no recoverable fields, preserve the normal bare-string
+            // form (including a shell command beginning with an open brace).
+            let mut recovered = Vec::new();
+            recover_command_fields(&decoded, COMMAND_KEYS, &mut recovered);
+            if recovered.is_empty() {
+                append_recovered_command(commands, decoded);
+            } else {
+                for command in recovered {
+                    append_recovered_command(commands, command);
+                }
+            }
+        }
+    } else {
+        recover_command_fields(value, COMMAND_KEYS, commands);
+    }
+}
+
+fn recover_command_fields(value: &str, keys: &[&str], commands: &mut Vec<String>) {
+    for (key, value) in json_object_prefix_fields(value) {
+        if keys.contains(&key.as_str()) {
+            if let Some(command) = decode_native_json_string_prefix(value) {
+                append_recovered_command(commands, command);
+            }
+        }
+    }
+}
+
+fn decode_native_json_string_prefix(value: &str) -> Option<String> {
+    let body = value.strip_prefix('"')?;
+    serde_json::from_str::<String>(value)
+        .ok()
+        .or_else(|| {
+            // The string itself can be truncated after a complete escape.
+            // Let serde decode valid surrogate pairs before falling back to
+            // the clean prefix of an incomplete escape. Adding only the
+            // missing quote cannot make an invalid escape or control valid.
+            json_string_prefix_end(value)
+                .is_none()
+                .then(|| serde_json::from_str::<String>(&format!("{value}\"")).ok())
+                .flatten()
+        })
+        .or_else(|| decode_json_string_prefix(body))
+}
+
+fn append_recovered_command(commands: &mut Vec<String>, command: String) {
+    if !command.is_empty() && !commands.contains(&command) {
+        commands.push(command);
+    }
+}
+
+/// Visit immediate object fields, retaining the final truncated value. Keys
+/// must be complete, valid JSON strings. Value boundaries are scanned without
+/// entering strings, so nested metadata cannot impersonate envelope fields.
+fn json_object_prefix_fields(prefix: &str) -> impl Iterator<Item = (String, &str)> {
+    let prefix = prefix.trim_start();
+    let prefix = prefix
+        .strip_prefix('\u{feff}')
+        .unwrap_or(prefix)
+        .trim_start();
+    let mut rest = prefix.strip_prefix('{');
+    std::iter::from_fn(move || {
+        let field = rest.take()?.trim_start();
+        let key_end = json_string_prefix_end(field)?;
+        let key = serde_json::from_str::<String>(&field[..key_end]).ok()?;
+        let value = field[key_end..]
+            .trim_start()
+            .strip_prefix(':')?
+            .trim_start();
+        let value_end = json_value_prefix_len(value)?;
+        rest = value[value_end..].trim_start().strip_prefix(',');
+        Some((key, &value[..value_end]))
+    })
+}
+
+fn json_array_prefix_values(prefix: &str) -> impl Iterator<Item = &str> {
+    let mut rest = prefix.trim_start().strip_prefix('[');
+    std::iter::from_fn(move || {
+        let value = rest.take()?.trim_start();
+        let value_end = json_value_prefix_len(value)?;
+        rest = value[value_end..].trim_start().strip_prefix(',');
+        Some(&value[..value_end])
+    })
+}
+
+/// Byte length through a closing quote; `None` means absent or incomplete.
+/// Escapes are validated when decoding a key/name/command, not while finding
+/// boundaries in unrelated values.
+fn json_string_prefix_end(value: &str) -> Option<usize> {
+    if !value.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
+/// Boundaries of one complete or truncated JSON value. The fixed stack keeps
+/// recovery bounded even when an unparseable payload nests containers beyond
+/// `serde_json`'s normal recursion limit. A mismatched delimiter is untrusted.
+fn json_value_prefix_len(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    match *bytes.first()? {
+        b'"' => return Some(json_string_prefix_end(value).unwrap_or(value.len())),
+        b'{' | b'[' => {}
+        _ => {
+            let end = value
+                .find(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | '}' | ']'))
+                .unwrap_or(value.len());
+            return serde_json::from_str::<serde_json::Value>(&value[..end])
+                .ok()
+                .filter(|parsed| {
+                    matches!(
+                        parsed,
+                        serde_json::Value::Null
+                            | serde_json::Value::Bool(_)
+                            | serde_json::Value::Number(_)
+                    )
+                })
+                .map(|_| end);
+        }
+    }
+
+    let mut closing = [0u8; 128];
+    let mut depth = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => match json_string_prefix_end(&value[index..]) {
+                Some(len) => {
+                    index += len;
+                    continue;
+                }
+                None => return Some(value.len()),
+            },
+            b'{' | b'[' => {
+                if depth == closing.len() {
+                    return None;
+                }
+                closing[depth] = if bytes[index] == b'{' { b'}' } else { b']' };
+                depth += 1;
+            }
+            b'}' | b']' => {
+                if closing[depth - 1] != bytes[index] {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Some(value.len())
 }
 
 /// Whether a raw JSON `key` (given with its surrounding quotes) is followed by
@@ -1499,7 +1908,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // {"CommandLine": "..."}}}`). None of the other supported agents emit a
     // `toolCall` field, so its mere presence unambiguously identifies `agy`.
     // We check this before every other protocol so the `agy`-specific deny
-    // shape (stdout `{"decision":"block",...}` + exit 0) is always used.
+    // shape (stdout `{"decision":"deny",...}` + exit 0) is always used.
     if let Some(tool_call) = input.tool_call.as_ref() {
         let tool_call_name = tool_call
             .name
@@ -1616,10 +2025,19 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // payload, letting the destructive command through.
     // `shell` is Cursor's name for Claude Code's `Bash` when Cursor runs the
     // `PreToolUse` hooks from `~/.claude/settings.json`; it reads the
-    // Claude-shaped answer (#518).
+    // Claude-shaped answer (#518). `exec_command` is the unified-exec tool;
+    // Muse Code sends it, and `shell`, with a Codex `turn_id` (#572).
     let is_claude_compatible_shell_tool = matches!(
         tool_name.as_str(),
-        "bash" | "monitor" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe" | "shell"
+        "bash"
+            | "monitor"
+            | "launch-process"
+            | "powershell"
+            | "pwsh"
+            | "cmd"
+            | "cmd.exe"
+            | "shell"
+            | "exec_command"
     ) || is_vscode_terminal_tool(&tool_name);
     let has_codex_turn_id = input
         .turn_id
@@ -1794,6 +2212,10 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // installed for Claude Code that did not know the name let every
             // Cursor command through unjudged (#518).
             | "shell"
+            // The unified-exec shell tool, argument `cmd` (see `ToolInput`).
+            // Muse Code exposes it next to `shell` (#572); a matched call
+            // that dcg did not recognize had no opinion, and so ran.
+            | "exec_command"
             // Hermes Agent shell tool. Distinct from Cursor's "terminal"
             // wrapper script which translates upstream to "Bash" before
             // invoking dcg, so the only path here is genuine Hermes input.
@@ -1810,6 +2232,29 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
 }
 
 impl HookInput {
+    /// Identify an unambiguous non-Claude host sharing Claude's response
+    /// protocol, solely to select its self-healing settings path. Call only
+    /// after [`detect_protocol`] returned [`HookProtocol::ClaudeCompatible`]
+    /// so these markers never override another protocol's wire identity.
+    #[must_use]
+    pub fn claude_compatible_host_for_self_heal(&self) -> Option<crate::agent::Agent> {
+        if self
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(is_batch_shell_call))
+        {
+            return Some(crate::agent::Agent::Custom("vscode-agent-host".to_owned()));
+        }
+        if self
+            .cursor_version
+            .as_deref()
+            .is_some_and(|version| !version.trim().is_empty())
+        {
+            return Some(crate::agent::Agent::CursorIde);
+        }
+        None
+    }
+
     /// Whether the caller asked for an explicit allow line (see
     /// [`Self::dcg_explicit_verdict`]). Only a JSON `true` counts.
     #[must_use]
@@ -1818,6 +2263,15 @@ impl HookInput {
             self.dcg_explicit_verdict,
             Some(serde_json::Value::Bool(true))
         )
+    }
+
+    /// Whether this payload is a shell tool call by its envelope alone,
+    /// whether or not a command could be extracted from it. A host that fails
+    /// closed (#572) blocks a shell call with no readable command instead of
+    /// treating it as "not a shell call".
+    #[must_use]
+    pub fn is_shell_tool_call(&self) -> bool {
+        is_shell_hook_candidate(self)
     }
 
     /// Whether the payload declares a permission mode in which no human is
@@ -2426,7 +2880,10 @@ fn command_has_powershell_shape(command: &str) -> bool {
     {
         return true;
     }
-    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+    let Ok(ast) = AstGrep::try_new(
+        crate::context::shell_parse_source(command).as_ref(),
+        SupportLang::Bash,
+    ) else {
         return true;
     };
     if ast.root().get_inner_node().has_error() {
@@ -2439,7 +2896,9 @@ fn command_has_powershell_shape(command: &str) -> bool {
             "command" if segment_has_windows_shape(node.text().as_ref()) => return true,
             // Interpreter source retains conservative Windows evidence:
             // an opaque or aliased sink can pass these strings to a shell.
-            // Only the separately proven data bodies have been masked.
+            // Only the separately proven data bodies have been masked — and,
+            // for pack activation off Windows, the proven inert interpreter
+            // bodies (`command_is_windows_shell_payload_on_host`).
             "heredoc_body" if has_candidate(node.text().as_ref()) => return true,
             _ => {}
         }
@@ -2486,12 +2945,79 @@ pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialec
     // Unknown, where the fail-closed union denied the commit (issue #412).
     // Everything outside the body is still judged, so a genuinely mislabeled
     // `Remove-Item -Recurse -Force` is down-trusted exactly as before.
+    //
+    // Interpreter source keeps widening the dialect (see the `heredoc_body`
+    // arm of `command_has_powershell_shape`), so the always-on rules still
+    // judge Windows-shaped strings an opaque sink could run. It no longer
+    // activates the disabled `windows.*` packs off Windows: that is
+    // `command_is_windows_shell_payload`'s narrower question (#569).
     let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
     if command_has_powershell_shape(visible.as_ref()) {
         ShellDialect::Unknown
     } else {
         labeled
     }
+}
+
+/// [`command_is_windows_shell_payload`] with the host platform made explicit,
+/// so both sides of its host-dependent interpreter-source rule are testable on
+/// every CI platform.
+///
+/// Activation asks whether the payload IS a Windows-shell payload, which is a
+/// narrower question than whether [`refine_shell_dialect`] should distrust the
+/// label. A proven, quoted non-shell interpreter body (`python3 - <<'PY'`, see
+/// [`crate::heredoc::mask_inert_interpreter_stdin`]) answers it no on a
+/// non-Windows host (#569). Its bytes are Python/JavaScript/… source, and the
+/// heredoc operator around them is itself proof that no PowerShell runs the
+/// payload: PowerShell reserves `<` and rejects the whole script at parse
+/// time, and cmd.exe does not exist there. What the source can hand to a shell
+/// is decided by its own runtime, and off Windows every implicit shell sink
+/// (`os.system`, `shell=True`, `child_process.exec`, Ruby/Perl `system`, PHP
+/// `shell_exec`) is `/bin/sh`. Counting a regex such as
+/// `r'[^\n]{0,40}(x|y)'` (the `^` after `(x|y)` reads as a cmd caret) or prose
+/// such as `install-l` as a Windows payload activated the disabled
+/// `windows.*` packs on Linux/macOS, whose PowerShell and cmd segmenters then
+/// judged the Python source and denied it as
+/// `windows-filesystem-semantic-unverified` — after a statement bound that
+/// 28 harmless lines stayed under and 29 crossed. The source itself still
+/// reaches the raw-shell pack scan, the language analysis and the widened
+/// dialect unchanged (#136, #278).
+///
+/// On a Windows host those implicit sinks run cmd.exe or PowerShell, so the
+/// body keeps its evidence (the packs are on there by default anyway). Off
+/// Windows the remaining routes are named by the text itself, and a command
+/// that names one keeps the evidence too ([`names_windows_shell_route`]): a
+/// PowerShell executable (`f("pwsh -c 'x; Clear-Content db'")` through an
+/// aliased `os.system`), or a Windows `.exe` program, whose shell sinks are
+/// cmd.exe even on a Linux host (WSL interop runs `python.exe - <<'PY'`).
+/// Unquoted delimiters, shell receivers, `-c`/script-file owners, rebound
+/// interpreter names and every other unproven case keep it on every host,
+/// because `mask_inert_interpreter_stdin` declines to mask them.
+fn command_is_windows_shell_payload_on_host(command: &str, host_is_windows: bool) -> bool {
+    let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    if !command_has_powershell_shape(visible.as_ref()) {
+        return false;
+    }
+    if host_is_windows || names_windows_shell_route(command) {
+        return true;
+    }
+    match crate::heredoc::mask_inert_interpreter_stdin(visible.as_ref()) {
+        std::borrow::Cow::Borrowed(_) => true,
+        std::borrow::Cow::Owned(outer) => command_has_powershell_shape(&outer),
+    }
+}
+
+/// Whether `command` names, anywhere and quoted or not, a way for interpreter
+/// source on a non-Windows host to reach a Windows shell: a PowerShell
+/// executable (`pwsh`, `powershell`, any directory or `.exe`) as a whole word,
+/// or any `.exe` program (WSL interop and Wine run them, and their implicit
+/// shell is cmd.exe). Deliberately loose: it only ever keeps conservative
+/// evidence.
+fn names_windows_shell_route(command: &str) -> bool {
+    command
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case("pwsh") || word.eq_ignore_ascii_case("powershell"))
+        || command.to_ascii_lowercase().contains(".exe")
 }
 
 /// Whether the command's own shape marks it a Windows-shell payload, which is
@@ -2509,10 +3035,11 @@ pub fn refine_shell_dialect(command: &str, labeled: ShellDialect) -> ShellDialec
 /// `Unknown` on its own must not activate the packs — it is also what an
 /// unrecognised tool name produces, which proves nothing about the payload.
 /// The command's shape is the signal, and it is the same one the refinement
-/// already trusts enough to re-decide the entire dialect on.
+/// already trusts enough to re-decide the entire dialect on — except that,
+/// off Windows, proven inert interpreter source does not count as the payload
+/// (#569; see [`command_is_windows_shell_payload_on_host`]).
 pub fn command_is_windows_shell_payload(command: &str) -> bool {
-    let visible = crate::heredoc::mask_non_expanding_data_heredocs(command);
-    command_has_powershell_shape(visible.as_ref())
+    command_is_windows_shell_payload_on_host(command, cfg!(windows))
 }
 
 pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
@@ -2567,57 +3094,70 @@ fn is_batch_shell_call(call: &ToolCall) -> bool {
     name == "run_command" || is_supported_shell_tool(Some(&name))
 }
 
-/// Extract the shell command from an Antigravity (`agy`) `toolCall` envelope.
+/// Extract every shell command from an Antigravity (`agy`) `toolCall` envelope.
 ///
 /// `agy`'s `run_command` tool carries the command in
 /// `toolCall.args.CommandLine` (PascalCase); the shared args extraction also
 /// accepts the lowercase `command` key used by other agents in case `agy` ever
 /// normalizes.
-fn extract_command_from_tool_call(tool_call: &ToolCall) -> Option<String> {
+fn extract_commands_from_tool_call(tool_call: &ToolCall) -> Vec<String> {
     tool_call
         .args
         .as_ref()
-        .and_then(extract_command_from_tool_args)
+        .map(extract_commands_from_tool_args)
+        .unwrap_or_default()
 }
 
-fn extract_command_from_tool_input(tool_input: &ToolInput) -> Option<String> {
-    match tool_input.command.as_ref() {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+/// Every non-empty command string in a `tool_input` object: `command` first
+/// (the historical primary), then a distinct `cmd` (#572). Returning only the
+/// first one would let a harmless `command` answer for a destructive `cmd`.
+fn extract_commands_from_tool_input(tool_input: &ToolInput) -> Vec<String> {
+    let mut commands: Vec<String> = Vec::new();
+    for value in [tool_input.command.as_ref(), tool_input.cmd.as_ref()] {
+        if let Some(serde_json::Value::String(s)) = value {
+            if !s.is_empty() && !commands.contains(s) {
+                commands.push(s.clone());
+            }
+        }
     }
+    commands
 }
 
-/// Extract the shell command from a `toolArgs` / `toolCall.args` /
+/// Extract every shell command from a `toolArgs` / `toolCall.args` /
 /// `toolCalls[].args` value.
 ///
 /// Accepts the dominant lowercase `command` object key (Claude / Copilot / VS
 /// Code Agent Host), the `CommandLine` / `commandLine` / `Command` variants
 /// (agy and Windows-shell payloads), a JSON-encoded string carrying any of
 /// those object forms (the Agent Host stringifies `args`), and a bare
-/// non-empty string as the command itself. `command` is checked first so
-/// precedence is unchanged for payloads that carry several keys.
-fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<String> {
+/// non-empty string as the command itself. Keep the historical primary-key
+/// order, but retain every distinct command for independent evaluation: a
+/// harmless `command` must not hide Antigravity's destructive `CommandLine`.
+/// Joining conflicting values would let one value's unterminated quote or
+/// trailing backslash absorb a sibling command, so the caller receives a list.
+fn extract_commands_from_tool_args(tool_args: &serde_json::Value) -> Vec<String> {
     match tool_args {
         serde_json::Value::Object(map) => {
+            let mut commands = Vec::new();
             for key in ["command", "CommandLine", "commandLine", "Command"] {
                 if let Some(serde_json::Value::String(s)) = map.get(key) {
-                    if !s.is_empty() {
-                        return Some(s.clone());
+                    if !s.is_empty() && !commands.contains(s) {
+                        commands.push(s.clone());
                     }
                 }
             }
-            None
+            commands
         }
         serde_json::Value::String(s) => {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                extract_command_from_tool_args(&parsed)
+                extract_commands_from_tool_args(&parsed)
             } else if s.is_empty() {
-                None
+                Vec::new()
             } else {
-                Some(s.clone())
+                vec![s.clone()]
             }
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -2740,36 +3280,34 @@ fn extract_command_with_context_inner(input: &HookInput) -> Option<ExtractedHook
             if !is_batch_shell_call(call) {
                 continue;
             }
-            if let Some(command) = call.args.as_ref().and_then(extract_command_from_tool_args) {
+            for command in extract_commands_from_tool_call(call) {
                 let entry_dialect =
                     resolve(&command, shell_dialect_for_tool_name(call.name.as_deref()));
                 commands.push((command, entry_dialect));
             }
         }
     }
-    if let Some(command) = input
+    if let Some(call) = input
         .tool_call
         .as_ref()
-        .and_then(extract_command_from_tool_call)
+        .filter(|call| is_batch_shell_call(call))
     {
-        let entry_dialect = resolve(&command, labeled);
-        commands.push((command, entry_dialect));
+        for command in extract_commands_from_tool_call(call) {
+            let entry_dialect = resolve(&command, labeled);
+            commands.push((command, entry_dialect));
+        }
     }
-    if let Some(command) = input
-        .tool_input
-        .as_ref()
-        .and_then(extract_command_from_tool_input)
-    {
-        let entry_dialect = resolve(&command, labeled);
-        commands.push((command, entry_dialect));
+    if let Some(tool_input) = input.tool_input.as_ref() {
+        for command in extract_commands_from_tool_input(tool_input) {
+            let entry_dialect = resolve(&command, labeled);
+            commands.push((command, entry_dialect));
+        }
     }
-    if let Some(command) = input
-        .tool_args
-        .as_ref()
-        .and_then(extract_command_from_tool_args)
-    {
-        let entry_dialect = resolve(&command, labeled);
-        commands.push((command, entry_dialect));
+    if let Some(args) = input.tool_args.as_ref() {
+        for command in extract_commands_from_tool_args(args) {
+            let entry_dialect = resolve(&command, labeled);
+            commands.push((command, entry_dialect));
+        }
     }
 
     let mut entries = commands.into_iter();
@@ -2820,25 +3358,98 @@ pub fn configure_colors() {
 /// ordinary commands are untouched and stay copy-pasteable.
 const MAX_EXPLAIN_HINT_COMMAND: usize = 400;
 
-/// Format the explain hint line for copy-paste convenience.
-fn format_explain_hint(command: &str) -> String {
-    // Escape double quotes in command for safe copy-paste
-    let escaped = command.replace('"', "\\\"");
-    if escaped.len() <= MAX_EXPLAIN_HINT_COMMAND {
-        return format!("Tip: dcg explain \"{escaped}\"");
+const EXPLAIN_STDIN_COMMAND: &str = "dcg test --stdin --explain";
+const EXPLAIN_STDIN_INSTRUCTION: &str = "Pass the original command on stdin as data.";
+
+/// Quote a complete argument only when it is literal in every supported shell.
+///
+/// The output APIs do not know which shell will receive a pasted hint. POSIX
+/// single-quote escaping is not portable to PowerShell or cmd.exe, and double
+/// quotes alone still expand substitutions and variables. Keep the convenient
+/// inline form for a conservative ASCII subset; other commands use stdin.
+fn inline_explain_command(command: &str, max_argument_bytes: usize) -> Option<String> {
+    if command.is_empty()
+        || command.len() > max_argument_bytes.saturating_sub(2)
+        || !command.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b' ' | b'/' | b'.' | b'_' | b'-' | b':' | b'+' | b'=' | b',' | b'@' | b'~'
+                )
+        })
+    {
+        return None;
     }
 
-    // Past the cap the tip cannot be copy-pasteable anyway, so spend the
-    // bytes on the head of the command and say how much was dropped. The
-    // elided byte count is the useful signal here, not the elided bytes.
-    let head = truncate_for_display(&escaped, MAX_EXPLAIN_HINT_COMMAND);
-    let total = command.len();
-    let elided = total.saturating_sub(MAX_EXPLAIN_HINT_COMMAND);
-    format!(
-        "Tip: dcg explain \"{head}\"\n\
-         (command truncated for this report: {elided} of {total} bytes elided; \
-         rerun `dcg explain` against the full command for the complete report)"
-    )
+    // Quoting keeps spaces in one argument; `--` also keeps a leading hyphen
+    // in command data instead of letting Clap interpret it as a dcg option.
+    Some(format!("dcg explain -- \"{command}\""))
+}
+
+fn json_character_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        '\u{0}'..='\u{1f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+/// Bound the encoded display preview without ever slicing an escape sequence.
+fn explain_command_preview(command: &str) -> (String, usize) {
+    let fits = command
+        .chars()
+        .try_fold(2_usize, |bytes, character| {
+            let next = bytes + json_character_bytes(character);
+            (next <= MAX_EXPLAIN_HINT_COMMAND).then_some(next)
+        })
+        .is_some();
+
+    let included = if fits {
+        command.len()
+    } else {
+        // Reserve the JSON quotes and the display-only ellipsis. Count the
+        // encoded size first, then serialize the whole retained source slice.
+        let mut bytes = 5;
+        let mut end = 0;
+        for (offset, character) in command.char_indices() {
+            bytes += json_character_bytes(character);
+            if bytes > MAX_EXPLAIN_HINT_COMMAND {
+                break;
+            }
+            end = offset + character.len_utf8();
+        }
+        end
+    };
+    let elided = command.len() - included;
+    let mut preview = command[..included].to_string();
+    if elided != 0 {
+        preview.push_str("...");
+    }
+    (serde_json::Value::String(preview).to_string(), elided)
+}
+
+/// Format a copyable diagnostic invocation without interpolating shell source.
+fn format_explain_hint(command: &str) -> String {
+    if let Some(invocation) = inline_explain_command(command, MAX_EXPLAIN_HINT_COMMAND) {
+        return format!("Tip: {invocation}");
+    }
+
+    let (preview, elided) = explain_command_preview(command);
+    let mut hint = format!(
+        "Tip: {EXPLAIN_STDIN_COMMAND}\n\
+         {EXPLAIN_STDIN_INSTRUCTION}\n\
+         Command preview (JSON string): {preview}"
+    );
+    if elided != 0 {
+        use std::fmt::Write as _;
+        let total = command.len();
+        let _ = write!(
+            hint,
+            "\n(command truncated for this report: {elided} of {total} bytes elided; \
+             supply the full command on stdin for the complete report)"
+        );
+    }
+    hint
 }
 
 fn build_rule_id(pack: Option<&str>, pattern: Option<&str>) -> Option<String> {
@@ -2977,12 +3588,12 @@ fn format_matched_message(
         |rule| format!("Rule: {rule}\n\n"),
     );
 
-    // The command deliberately appears ONCE, inside the `Tip:` line. A hook
+    // The command deliberately appears ONCE, in the hint or its preview. A hook
     // decision lands in the agent's transcript and is replayed on every
     // subsequent turn, so a second verbatim echo is paid for repeatedly and
     // tells the reader nothing the first did not — the agent just wrote this
-    // command and has it in context. Keeping the `Tip:` copy rather than a
-    // bare `Command:` line preserves the one form that is also actionable.
+    // command and has it in context. The diagnostic invocation remains
+    // actionable even when a shell-sensitive or long command needs stdin.
     format!(
         "{heading}\n\n\
          {explain_hint}\n\n\
@@ -3074,9 +3685,8 @@ pub(crate) fn print_colorful_warning_to(
 
     let _ = writeln!(writer, "{}", denial.render(&theme));
 
-    let escaped_cmd = command.replace('"', "\\\"");
-    let truncated_cmd = truncate_for_display(&escaped_cmd, 45);
-    let explain_cmd = format!("dcg explain \"{truncated_cmd}\"");
+    let inline_explain = inline_explain_command(command, 45);
+    let explain_cmd = inline_explain.as_deref().unwrap_or(EXPLAIN_STDIN_COMMAND);
 
     let footer_style = if theme.colors_enabled { "\x1b[90m" } else { "" };
     let reset = if theme.colors_enabled { "\x1b[0m" } else { "" };
@@ -3086,6 +3696,9 @@ pub(crate) fn print_colorful_warning_to(
         WarningAudience::HumanOperator => {
             let _ = writeln!(writer, "{footer_style}Learn more:{reset}");
             let _ = writeln!(writer, "  $ {cyan}{explain_cmd}{reset}");
+            if inline_explain.is_none() {
+                let _ = writeln!(writer, "    {EXPLAIN_STDIN_INSTRUCTION}");
+            }
 
             // Advertise the scoped single-command remedy ahead of the
             // persistent allowlist widening (GH#332).
@@ -3174,6 +3787,9 @@ pub fn print_colorful_warning(
     pattern_suggestions: &[PatternSuggestion],
     severity: Option<crate::packs::Severity>,
 ) {
+    if crate::output::is_robot_mode() {
+        return;
+    }
     let stderr = io::stderr();
     let mut handle = stderr.lock();
     print_colorful_warning_to(
@@ -3190,22 +3806,6 @@ pub fn print_colorful_warning(
         None,
         WarningAudience::HumanOperator,
     );
-}
-
-/// Truncate a string for display, appending "..." if truncated.
-fn truncate_for_display(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        // Find a safe UTF-8 boundary for truncation
-        let target = max_len.saturating_sub(3);
-        let boundary = s
-            .char_indices()
-            .take_while(|(i, _)| *i < target)
-            .last()
-            .map_or(0, |(i, c)| i + c.len_utf8());
-        format!("{}...", &s[..boundary])
-    }
 }
 
 /// Get context-specific suggestion based on the blocked command.
@@ -3428,25 +4028,12 @@ pub fn write_denial_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Antigravity => {
-            // Antigravity CLI (`agy`): stdout `{"decision":"block","reason":...}`
-            // with exit code 0 aborts the `run_command` tool. Verified
-            // empirically that `agy` honors the `"block"` keyword (and `"deny"`
-            // — both block); a non-zero exit code is only logged and does NOT
-            // reliably abort the tool, so we always emit exit 0 + JSON. We
-            // reuse GeminiHookOutput's wire shape (`decision`/`reason` plus
-            // optional `systemMessage` and dcg ergonomics fields); `agy`'s
-            // parser tolerates the extra fields.
-            let output = GeminiHookOutput {
-                decision: "block",
+            // The strict Antigravity parser rejects Gemini's extra fields.
+            // Preserve the full explanation and any minted review code in
+            // the supported reason string; the verdict remains a denial.
+            let output = AntigravityHookOutput {
+                decision: "deny",
                 reason: Cow::Owned(message),
-                system_message: Some(Cow::Owned(format!("BLOCKED by dcg: {reason}"))),
-                allow_once_code: allow_once.map(|info| info.code.clone()),
-                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
-                rule_id,
-                pack_id: pack.map(String::from),
-                severity,
-                confidence,
-                remediation,
             };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
@@ -3590,6 +4177,28 @@ pub fn write_review_request_to(
     }
 }
 
+/// Process stderr for a hook response. Robot mode suppresses diagnostics,
+/// while exit-status protocols retain their required stderr verdict reason.
+/// The writer-based formatting APIs remain independent of process settings.
+struct HookStderr(Option<io::StderrLock<'static>>);
+
+impl Write for HookStderr {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .as_mut()
+            .map_or_else(|| Ok(bytes.len()), |writer| writer.write(bytes))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.as_mut().map_or_else(|| Ok(()), Write::flush)
+    }
+}
+
+fn hook_stderr(protocol: HookProtocol) -> HookStderr {
+    let enabled = !crate::output::is_robot_mode() || protocol.blocks_by_exit_status();
+    HookStderr(enabled.then(|| io::stderr().lock()))
+}
+
 /// Output a denial response to stdout (JSON for hook protocol).
 #[cold]
 #[inline(never)]
@@ -3609,8 +4218,7 @@ pub fn output_denial_for_protocol(
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) -> io::Result<()> {
     let mut verdict = Vec::new();
-    let err = io::stderr();
-    let mut err_handle = err.lock();
+    let mut err_handle = hook_stderr(protocol);
     write_denial_to(
         &mut verdict,
         &mut err_handle,
@@ -3649,8 +4257,7 @@ pub fn output_review_request_for_protocol(
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) -> io::Result<()> {
     let mut verdict = Vec::new();
-    let err = io::stderr();
-    let mut err_handle = err.lock();
+    let mut err_handle = hook_stderr(protocol);
     write_review_request_to(
         &mut verdict,
         &mut err_handle,
@@ -3706,9 +4313,9 @@ pub fn output_denial(
 ///
 /// An indeterminate result is neither an allow nor a rule-based denial: dcg
 /// did not finish proving the command safe before its evaluation deadline.
-/// Protocols with an explicit review decision receive `ask`; protocols that
-/// cannot represent `ask` receive their documented blocking decision. This
-/// deliberately never emits an explicit allow or an empty response.
+/// Protocols with a supported native-review integration receive `ask`; the
+/// others receive their documented blocking decision. This deliberately
+/// never emits an explicit allow or an empty response.
 #[cold]
 #[inline(never)]
 pub fn write_indeterminate_to(
@@ -3833,17 +4440,11 @@ pub fn write_indeterminate_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Antigravity => {
-            let output = GeminiHookOutput {
-                decision: "block",
+            // Incomplete evaluation must also reach the strict parser as a
+            // valid denial, never as a hook error or a no-op warning.
+            let output = AntigravityHookOutput {
+                decision: "deny",
                 reason: Cow::Borrowed(reason),
-                system_message: Some(Cow::Borrowed(reason)),
-                allow_once_code: None,
-                allow_once_full_hash: None,
-                rule_id: None,
-                pack_id: None,
-                severity: None,
-                confidence: None,
-                remediation: None,
             };
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
@@ -3903,7 +4504,13 @@ pub fn output_indeterminate_from_panic(
         return None;
     }
     let mut verdict = Vec::new();
-    write_indeterminate_to(&mut verdict, &mut io::stderr(), protocol, reason, deny);
+    write_indeterminate_to(
+        &mut verdict,
+        &mut hook_stderr(protocol),
+        protocol,
+        reason,
+        deny,
+    );
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     Some(handle.write_all(&verdict).and_then(|()| handle.flush()))
@@ -3918,8 +4525,7 @@ pub fn output_indeterminate_for_protocol(
     deny: bool,
 ) -> io::Result<()> {
     let mut verdict = Vec::new();
-    let err = io::stderr();
-    let mut err_handle = err.lock();
+    let mut err_handle = hook_stderr(protocol);
     write_indeterminate_to(&mut verdict, &mut err_handle, protocol, reason, deny);
     deliver_verdict(&verdict)
 }
@@ -3967,10 +4573,16 @@ pub(crate) fn write_warning_to(
     let warn_reason = format!("DCG warn: {reason}");
 
     match protocol {
-        // Silence means "no blocking opinion" for review-capable clients.
+        // Silence means "no blocking opinion" for these clients.
         // Keeping warn distinct from ask preserves the documented policy:
         // warn proceeds, while ask requires an explicit operator decision.
-        HookProtocol::ClaudeCompatible | HookProtocol::Copilot | HookProtocol::Codex => {}
+        // In particular, agy 1.4.0's bundled contract treats `allow` as
+        // automatic approval. No stdout leaves its ordinary permission
+        // checks in control, while the warning stays on stderr.
+        HookProtocol::ClaudeCompatible
+        | HookProtocol::Copilot
+        | HookProtocol::Codex
+        | HookProtocol::Antigravity => {}
         // The warning above is on stderr; the caller exits 1, which Reasonix
         // shows as a non-blocking warning (exit 0 would hide it).
         HookProtocol::Reasonix => {}
@@ -4035,30 +4647,9 @@ pub(crate) fn write_warning_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
-        HookProtocol::Antigravity => {
-            // Antigravity CLI (`agy`) supports a "block"/"deny" decision but no
-            // documented "ask"/"warn" decision. Preserve dcg warn semantics as
-            // non-blocking by emitting an explicit "allow"; the warning text is
-            // surfaced via `reason`/`systemMessage` for any tooling that shows
-            // hook context.
-            let output = GeminiHookOutput {
-                decision: "allow",
-                reason: Cow::Owned(warn_reason.clone()),
-                system_message: Some(Cow::Owned(warn_reason)),
-                allow_once_code: None,
-                allow_once_full_hash: None,
-                rule_id,
-                pack_id: pack.map(String::from),
-                severity: None,
-                confidence: None,
-                remediation: None,
-            };
-            let _ = serde_json::to_writer(&mut *stdout, &output);
-            let _ = writeln!(stdout);
-        }
         HookProtocol::Crush => {
             // Crush's `"allow"` is an affirmative pre-approval that SKIPS the
-            // user's permission prompt, so unlike Grok/agy a warn must not be
+            // user's permission prompt, so a warn must not be
             // expressed as an explicit allow — dcg would be vouching for a
             // command it only meant to annotate. Omit `decision` ("no
             // opinion": the call proceeds through Crush's ordinary permission
@@ -4095,8 +4686,7 @@ pub fn output_warning_for_protocol(
     explanation: Option<&str>,
 ) -> io::Result<()> {
     let mut verdict = Vec::new();
-    let err = io::stderr();
-    let mut err_handle = err.lock();
+    let mut err_handle = hook_stderr(protocol);
     write_warning_to(
         &mut verdict,
         &mut err_handle,
@@ -4112,6 +4702,10 @@ pub fn output_warning_for_protocol(
 
 /// Log a blocked command to a file (if logging is enabled).
 ///
+/// Full logging redaction suppresses the command and diagnostic text. Other
+/// modes retain the legacy unconditional filtering of recognised secrets,
+/// followed by configured argument truncation.
+///
 /// # Errors
 ///
 /// Returns any I/O errors encountered while creating directories or appending
@@ -4121,6 +4715,7 @@ pub fn log_blocked_command(
     command: &str,
     reason: &str,
     pack: Option<&str>,
+    redaction: &crate::logging::RedactionConfig,
 ) -> io::Result<()> {
     use std::fs::OpenOptions;
 
@@ -4146,9 +4741,25 @@ pub fn log_blocked_command(
 
     // The log file outlives the hook invocation and a blocked command is
     // exactly where credentials turn up, so recognised secret shapes are
-    // replaced before the line is written (issue #386). This path has no
-    // redaction config of its own; pattern redaction is unconditional here.
-    let command = crate::redaction::redact_secrets(command);
+    // replaced before the line is written (issue #386). Full redaction also
+    // covers the reason, which can contain arbitrary command-derived text
+    // (#585), and avoids compiling or running secret-detection regexes.
+    let (command, reason) = if redaction.is_full() {
+        (
+            crate::logging::redact_command(command, redaction),
+            Cow::Owned(crate::logging::redact_reason(reason, redaction)),
+        )
+    } else {
+        let command = crate::redaction::redact_secrets(command);
+        let command = if redaction.enabled
+            && matches!(redaction.mode, crate::logging::RedactionMode::Arguments)
+        {
+            crate::logging::redact_command(&command, redaction)
+        } else {
+            command
+        };
+        (command, Cow::Borrowed(reason))
+    };
     writeln!(file, "[{timestamp}] [{pack_str}] {reason}")?;
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
@@ -4168,6 +4779,7 @@ pub fn log_budget_skip(
     stage: &str,
     elapsed: Duration,
     budget: Duration,
+    redaction: &crate::logging::RedactionConfig,
 ) -> io::Result<()> {
     use std::fs::OpenOptions;
 
@@ -4189,6 +4801,13 @@ pub fn log_budget_skip(
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     let timestamp = chrono_lite_timestamp();
+    // Stage labels are free text at this API boundary; apply the same policy
+    // as other diagnostic metadata before any formatter sees them.
+    let stage = if redaction.is_full() {
+        Cow::Owned(crate::logging::redact_metadata(stage, redaction))
+    } else {
+        Cow::Borrowed(stage)
+    };
     writeln!(
         file,
         "[{timestamp}] [budget] evaluation skipped due to budget at {stage}"
@@ -4199,8 +4818,17 @@ pub fn log_budget_skip(
         budget.as_millis(),
         elapsed.as_millis()
     )?;
-    // Same unconditional secret redaction as `log_blocked_command`.
-    let command = crate::redaction::redact_secrets(command);
+    // Same full/secret-pattern policy as `log_blocked_command`.
+    let command = if redaction.is_full() {
+        crate::logging::redact_command(command, redaction)
+    } else {
+        let command = crate::redaction::redact_secrets(command);
+        if redaction.enabled && matches!(redaction.mode, crate::logging::RedactionMode::Arguments) {
+            crate::logging::redact_command(&command, redaction)
+        } else {
+            command
+        }
+    };
     writeln!(file, "  Command: {command}")?;
     writeln!(file)?;
 
@@ -4871,6 +5499,98 @@ mod tests {
         }
     }
 
+    /// #569: the source of a proven, quoted non-shell interpreter heredoc is
+    /// not a Windows-shell payload. Off Windows it does not activate the
+    /// disabled `windows.*` packs; on Windows, where the interpreter's own
+    /// shell sinks run cmd.exe/PowerShell, it keeps its conservative evidence.
+    /// It still widens the dialect on every host, so the always-on rules keep
+    /// judging what an opaque sink could run (#136, 3a8c330b). The host is
+    /// explicit so both sides run on every CI platform.
+    #[test]
+    fn issue_569_inert_interpreter_source_is_not_a_windows_payload_off_windows() {
+        let tuples = " ('a', 'b'), ('c', 'd'),\n".repeat(29);
+        let inert = [
+            // The 30-byte reduction from the issue (a lone `install-l` reads
+            // as an approved-verb cmdlet).
+            "python3 - <<'PY'\ninstall-l ''''\n`\n\nPY".to_string(),
+            // The generator from the issue: the `^` after `(x|y)` reads as a
+            // cmd caret starting a command word.
+            format!(
+                "python3 - <<'EOF'\nimport re\ns = 'text'\nR = [\n{tuples}]\nfor m in re.finditer(r'[^\\n]{{0,40}}(x|y)[^\\n]{{0,40}}', s):\n    print(m.group(0))\nEOF"
+            ),
+            "python3 - <<'PY'\nimport os\nos.system(\"echo & rd /s /q C:\\\\Users\")\nPY"
+                .to_string(),
+            "python3 - <<\"PY\"\nprint('a|g^it status')\nPY".to_string(),
+            "node - <<'JS'\nconsole.log('a|Remove-Item -Recurse -Force C:/x');\nJS".to_string(),
+        ];
+        for command in &inert {
+            assert!(
+                !command_is_windows_shell_payload_on_host(command, false),
+                "{command:?}"
+            );
+            assert!(
+                command_is_windows_shell_payload_on_host(command, true),
+                "{command:?}"
+            );
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+        }
+
+        // Everything that is not a proven inert interpreter body — and inert
+        // source whose text names a route to a Windows shell off Windows (a
+        // PowerShell executable, or a WSL-interop/Wine `.exe` interpreter
+        // whose `os.system` is cmd.exe) — stays a Windows payload on every
+        // host.
+        for command in [
+            "python.exe - <<'PY'\nimport os\nos.system(\"echo & rd /s /q C:\\\\Users\")\nPY",
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run('cmd.exe /c \"x & rd /s /q C:\\\\Users\"')\nPY",
+            "bash <<'SH'\nRemove-Item -Recurse -Force C:\\x\nSH",
+            "pwsh <<'PS'\nRemove-Item -Recurse -Force C:\\x\nPS",
+            "python3 - <<PY\ninstall-l x\nRemove-Item -Recurse -Force C:\\x\nPY",
+            "python3 script.py <<'PY'\ncopy nul .git\\config\nPY",
+            "python3 -c 'import sys; exec(sys.stdin.read())' <<'PY'\nRemove-Item -Recurse -Force C:\\x\nPY",
+            "python3() { bash -s; }; python3 - <<'PY'\nRemove-Item -Recurse -Force C:\\x\nPY",
+            "Remove-Item -Recurse -Force C:\\x; python3 - <<'PY'\nprint(1)\nPY",
+            "python3 - <<'PY'\nprint(1)\nPY\nRemove-Item -Recurse -Force C:\\x",
+            "python3 - <<'PY'\nprint(1)\nPY\nformat D: /q",
+            "python3 - <<'PY'\nimport os\nf = getattr(os, 'system')\nf(\"pwsh -c 'x; Clear-Content ~/important.db'\")\nPY",
+            "python3 - <<'PY'\nimport os\nf = getattr(os, 'system')\nf(\"/usr/bin/powershell -c 'x; Remove-Item -Recurse -Force ~/x'\")\nPY",
+            "python3 - <<'PY'\nopen('x.ps1', 'w').write('x; Remove-Item -Recurse -Force ~/x')\nPY\npwsh x.ps1",
+        ] {
+            for host_is_windows in [false, true] {
+                assert!(
+                    command_is_windows_shell_payload_on_host(command, host_is_windows),
+                    "{command:?} (windows host: {host_is_windows})"
+                );
+            }
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Unknown,
+                "{command:?}"
+            );
+        }
+
+        // Commands with no Windows shape at all stay what they were.
+        for command in [
+            "python3 - <<'PY'\nprint('hello')\nPY",
+            "python3 - <<'PY'\nprint('pwsh.exe is mentioned, nothing is shaped')\nPY",
+        ] {
+            for host_is_windows in [false, true] {
+                assert!(
+                    !command_is_windows_shell_payload_on_host(command, host_is_windows),
+                    "{command:?}"
+                );
+            }
+            assert_eq!(
+                refine_shell_dialect(command, ShellDialect::Posix),
+                ShellDialect::Posix
+            );
+        }
+    }
+
     /// Windows single-FILE deletes widen the dialect (#491).
     ///
     /// `WINDOWS_DESTRUCTIVE_ALIASES` requires a switch (`-Recurse`, `/s`) to
@@ -5092,6 +5812,76 @@ mod tests {
             extract_command(&input),
             Some("git reset --hard".to_string())
         );
+    }
+
+    /// #572: Muse Code's `PreToolUse` payload for its `shell` tool (the field
+    /// set the issue captured from Muse 1.4.7/1.4.10), and its unified-exec
+    /// `exec_command` tool, whose argument Muse's own tooling reads as `cmd`
+    /// with `command` as the fallback. Both are shell calls answered in the
+    /// Codex shape; every command-bearing key is evaluated.
+    #[test]
+    fn test_muse_shell_and_exec_command_payloads_are_judged() {
+        let payload = |tool: &str, tool_input: &str| {
+            format!(
+                r#"{{"cwd":"/tmp/ws","hook_event_name":"PreToolUse","model":"unknown",
+                "permission_mode":"default","session_id":"s","tool_input":{tool_input},
+                "tool_name":"{tool}","tool_use_id":"user_shell_1","transcript_path":null,
+                "turn_id":"t1"}}"#
+            )
+        };
+        for (tool, tool_input, expected) in [
+            (
+                "shell",
+                r#"{"command":"git reset --hard"}"#,
+                vec!["git reset --hard"],
+            ),
+            (
+                "exec_command",
+                r#"{"cmd":"git reset --hard"}"#,
+                vec!["git reset --hard"],
+            ),
+            (
+                "exec_command",
+                r#"{"command":"git reset --hard"}"#,
+                vec!["git reset --hard"],
+            ),
+            // A benign `command` must not answer for a destructive `cmd`.
+            (
+                "exec_command",
+                r#"{"command":"ls","cmd":"git reset --hard"}"#,
+                vec!["ls", "git reset --hard"],
+            ),
+            ("exec_command", r#"{"command":"ls","cmd":"ls"}"#, vec!["ls"]),
+        ] {
+            let input = parse_hook_input(&payload(tool, tool_input)).expect("Muse payload parses");
+            assert!(input.is_shell_tool_call(), "{tool} is a shell tool");
+            let extracted = extract_command_with_context(&input).expect("command extracted");
+            assert_eq!(
+                extracted.protocol,
+                HookProtocol::Codex,
+                "{tool} {tool_input}"
+            );
+            let mut commands = vec![extracted.command.clone()];
+            commands.extend(extracted.additional_commands.iter().map(|(c, _)| c.clone()));
+            assert_eq!(commands, expected, "{tool} {tool_input}");
+        }
+
+        // A shell call with no readable command is still a shell call; a host
+        // that fails closed blocks it instead of reading it as "not shell".
+        let empty = parse_hook_input(&payload("exec_command", r#"{"cmd":""}"#)).unwrap();
+        assert!(empty.is_shell_tool_call());
+        assert!(extract_command_with_context(&empty).is_none());
+        let other = parse_hook_input(&payload("read_file", r#"{"path":"x"}"#)).unwrap();
+        assert!(!other.is_shell_tool_call());
+        assert!(extract_command_with_context(&other).is_none());
+
+        // The truncated-payload salvage scan reads `cmd` as well.
+        let prefix = r#"{"tool_name":"exec_command","tool_input":{"cmd":"git reset --hard"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["git reset --hard".to_string()]
+        );
+        assert!(shell_tool_from_truncated_json(prefix).is_some());
     }
 
     #[test]
@@ -5598,7 +6388,7 @@ mod tests {
     fn envelope_fields_of_the_wrong_type_never_fail_the_parse() {
         for bad in ["42", "true", "[1,2]", r#"{"k":"v"}"#, "null"] {
             let json = format!(
-                r#"{{"event":{bad},"hook_event_name":{bad},"session_id":{bad},"transcript_path":{bad},"cwd":{bad},"timestamp":{bad},"turn_id":{bad},"tool_use_id":{bad},"permission_mode":{bad},"toolCall":{bad},"toolCalls":{bad},"tool_name":"Bash","tool_input":{{"command":"git reset --hard"}}}}"#
+                r#"{{"event":{bad},"hook_event_name":{bad},"cursor_version":{bad},"session_id":{bad},"transcript_path":{bad},"cwd":{bad},"timestamp":{bad},"turn_id":{bad},"tool_use_id":{bad},"permission_mode":{bad},"toolCall":{bad},"toolCalls":{bad},"tool_name":"Bash","tool_input":{{"command":"git reset --hard"}}}}"#
             );
             let input: HookInput = serde_json::from_str(&json)
                 .unwrap_or_else(|error| panic!("{bad}: parse failed ({error}), which fails open"));
@@ -5620,6 +6410,33 @@ mod tests {
             parse_hook_input(r#"{"tool_name":{"nested":true},"tool_input":{"command":"ls"}}"#)
                 .expect("a wrong-typed tool name degrades, it does not fail the parse");
         assert!(input.tool_name.is_none());
+    }
+
+    #[test]
+    fn cursor_metadata_scan_preserves_native_batch_parsing() {
+        for (metadata, expected_marker) in [
+            (
+                r#""cursor_version":42,"cursor_version":"2026.09.28","cursor_version":null,"cursor_version":{}"#,
+                Some("2026.09.28"),
+            ),
+            (
+                r#""cursor_version":"2026.09.28","unknown":1e1000,"unknown":{"nested":[false,null]}"#,
+                Some("2026.09.28"),
+            ),
+            (r#""cursor_version":1e1000"#, None),
+            (r#""unknown":1e1000"#, None),
+            (r#""unknown":{"cursor_version":"2026.09.28"}"#, None),
+        ] {
+            let payload = format!(
+                r#"{{{metadata},"toolCalls":[{{"name":"bash","args":"{{\"command\":\"git reset --hard\"}}"}}]}}"#
+            );
+            let input = parse_hook_input(&payload)
+                .unwrap_or_else(|error| panic!("metadata rejected a native batch: {error}"));
+            assert_eq!(input.cursor_version.as_deref(), expected_marker);
+            let command = extract_command_with_context(&input).expect("native shell batch");
+            assert_eq!(command.protocol, HookProtocol::ClaudeCompatible);
+            assert_eq!(command.command, "git reset --hard");
+        }
     }
 
     #[test]
@@ -5746,6 +6563,209 @@ mod tests {
         let json = r#"{"tool_name":"Bash","tool_input":{"command":123}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(extract_command(&input), None);
+    }
+
+    #[test]
+    fn explain_hint_preserves_a_whole_literal_argument_and_leading_hyphens() {
+        use clap::Parser as _;
+
+        let _lock = test_env::lock();
+        for command in [
+            "git reset --hard",
+            "printf path/to_file-1.2",
+            "printf user@example.org:a+b=c,~/file",
+            "--help",
+            "--format=json",
+        ] {
+            let hint = format_explain_hint(command);
+            let invocation = hint.strip_prefix("Tip: ").unwrap();
+            let argv = shell_words::split(invocation).unwrap();
+            assert_eq!(argv, ["dcg", "explain", "--", command]);
+
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let Some(crate::cli::Command::Explain {
+                command: actual, ..
+            }) = cli.command
+            else {
+                panic!("hint must invoke explain: {hint}");
+            };
+            assert_eq!(actual, command, "command text must not become dcg options");
+        }
+
+        // The fallback is a supported CLI operation, not an invented
+        // `dcg explain --stdin` flag.
+        let cli = crate::cli::Cli::try_parse_from(["dcg", "test", "--stdin", "--explain"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(crate::cli::Command::TestCommand {
+                command: None,
+                stdin: true,
+                explain: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn explain_hint_keeps_shell_syntax_out_of_the_copyable_invocation() {
+        for command in [
+            "",
+            "printf $(printf SUBSTITUTED)",
+            "printf `printf SUBSTITUTED`",
+            "printf $HOME",
+            r#"printf \"; printf ESCAPED; #"#,
+            "printf 'apostrophe'",
+            "printf %PATH%",
+            "printf !PATH!",
+            r"printf C:\Users\Example",
+            "printf ^& echo CONTROL",
+            "printf first\nprintf second",
+            "printf \r\t\0\u{1b}",
+            "printf café 界 🛸",
+            "printf \u{201c}smart quotes\u{201d}",
+        ] {
+            let hint = format_explain_hint(command);
+            assert_eq!(
+                hint.lines().next(),
+                Some("Tip: dcg test --stdin --explain"),
+                "shell-sensitive source must stay off the command line: {command:?}"
+            );
+            assert!(hint.contains(EXPLAIN_STDIN_INSTRUCTION));
+            let preview = hint
+                .lines()
+                .find_map(|line| line.strip_prefix("Command preview (JSON string): "))
+                .unwrap();
+            let decoded: String = serde_json::from_str(preview).unwrap();
+            assert_eq!(decoded, command, "the display preview must preserve data");
+            assert!(!hint.contains("bytes elided"));
+        }
+    }
+
+    #[test]
+    fn explain_hint_truncation_keeps_json_complete_and_reports_exact_elision() {
+        let commands = [
+            "a".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            "\"".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            "\\".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            "\0".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            "界🛸".repeat(MAX_EXPLAIN_HINT_COMMAND),
+            format!("{}\\\"; printf HARMLESS", "a".repeat(394)),
+            format!("{}\"$(printf HARMLESS)", "a".repeat(395)),
+        ];
+        for command in commands {
+            let hint = format_explain_hint(&command);
+            assert_eq!(
+                hint.lines().next(),
+                Some("Tip: dcg test --stdin --explain"),
+                "a truncated preview must never become a runnable reproduction"
+            );
+            let preview = hint
+                .lines()
+                .find_map(|line| line.strip_prefix("Command preview (JSON string): "))
+                .unwrap();
+            assert!(preview.len() <= MAX_EXPLAIN_HINT_COMMAND);
+            let decoded: String = serde_json::from_str(preview).unwrap();
+            let included = decoded.strip_suffix("...").unwrap();
+            assert!(command.starts_with(included));
+            let elided = command.len() - included.len();
+            assert!(elided > 0);
+            assert!(hint.contains(&format!("{elided} of {} bytes elided", command.len())));
+        }
+    }
+
+    #[test]
+    fn explain_hint_inline_limit_counts_the_complete_quoted_argument() {
+        let command = "a".repeat(MAX_EXPLAIN_HINT_COMMAND - 2);
+        assert_eq!(
+            format_explain_hint(&command),
+            format!("Tip: dcg explain -- \"{command}\"")
+        );
+
+        let longer = command + "a";
+        let hint = format_explain_hint(&longer);
+        assert!(hint.starts_with("Tip: dcg test --stdin --explain\n"));
+        assert!(hint.contains("bytes elided"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explain_hint_round_trips_through_a_real_shell_without_running_source() {
+        // `dcg` is a shell function that ONLY captures argv. Every fixture
+        // that could expose the old interpolation bug uses harmless printf
+        // controls, so a regression cannot run a destructive target command.
+        for (command, expected) in [
+            ("printf hello", ["explain", "--", "printf hello"]),
+            ("--help", ["explain", "--", "--help"]),
+            (
+                "printf $(printf SUBSTITUTED)",
+                ["test", "--stdin", "--explain"],
+            ),
+            (
+                "printf `printf SUBSTITUTED`",
+                ["test", "--stdin", "--explain"],
+            ),
+            (
+                r#"printf \"; printf ESCAPED; #"#,
+                ["test", "--stdin", "--explain"],
+            ),
+            ("printf $HOME\\tail", ["test", "--stdin", "--explain"]),
+        ] {
+            let hint = format_explain_hint(command);
+            let invocation = hint.lines().next().unwrap().strip_prefix("Tip: ").unwrap();
+            let script = format!("dcg() {{ printf '%s\\0' \"$@\"; }}\n{invocation}");
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "shell rejected hint: {hint}");
+            assert!(output.stderr.is_empty(), "unexpected shell diagnostics");
+            let mut expected_bytes = Vec::new();
+            for argument in expected {
+                expected_bytes.extend_from_slice(argument.as_bytes());
+                expected_bytes.push(0);
+            }
+            assert_eq!(
+                output.stdout, expected_bytes,
+                "only literal argv may reach the capture function: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_hint_human_warning_footer_uses_the_same_safe_command_policy() {
+        for (command, expected) in [
+            ("printf hello", "dcg explain -- \"printf hello\""),
+            ("--help", "dcg explain -- \"--help\""),
+            ("printf $(printf SUBSTITUTED)", EXPLAIN_STDIN_COMMAND),
+            (
+                "printf this harmless command exceeds the footer limit",
+                EXPLAIN_STDIN_COMMAND,
+            ),
+        ] {
+            let mut output = Vec::new();
+            print_colorful_warning_to(
+                &mut output,
+                command,
+                "fixture",
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                WarningAudience::HumanOperator,
+            );
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(expected), "incorrect footer: {output}");
+            if expected == EXPLAIN_STDIN_COMMAND {
+                assert!(output.contains(EXPLAIN_STDIN_INSTRUCTION));
+                assert!(!output.contains("dcg explain \""));
+            }
+        }
     }
 
     #[test]
@@ -6674,9 +7694,30 @@ mod tests {
     //   {"toolCall":{"name":"run_command","args":{"CommandLine":"<cmd>",
     //     "Cwd":"<dir>","WaitMsBeforeAsync":500}},"conversationId":"...",
     //     "stepIdx":4,"transcriptPath":"...","workspacePaths":[...]}
-    // The block decision that `agy` honors is stdout {"decision":"block",
-    // "reason":...} with exit code 0.
+    // The strict denial contract is stdout {"decision":"deny","reason":...}
+    // with exit code 0 and no additional fields (#573).
     // =========================================================================
+
+    fn parse_antigravity_denial(stdout: &[u8]) -> String {
+        // Model the host's strict consumer, independently of dcg's output
+        // structs. Any additional field is a protocol failure, even when
+        // serde_json::Value would happily accept the document (#573).
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Denial {
+            decision: String,
+            reason: String,
+        }
+
+        let shape: serde_json::Value =
+            serde_json::from_slice(stdout).expect("Antigravity denial must be valid JSON");
+        assert!(shape.is_object(), "Antigravity denial must be an object");
+        let denial: Denial = serde_json::from_slice(stdout)
+            .expect("Antigravity denial must contain only decision and reason");
+        assert_eq!(denial.decision, "deny");
+        assert!(!denial.reason.trim().is_empty());
+        denial.reason
+    }
 
     #[test]
     fn test_antigravity_detected_via_tool_call_envelope() {
@@ -6701,6 +7742,134 @@ mod tests {
         let (command, protocol) = extract_command_with_protocol(&input).expect("command");
         assert_eq!(command, "rm -rf /");
         assert_eq!(protocol, HookProtocol::Antigravity);
+    }
+
+    #[test]
+    fn test_command_key_conflicts_are_independent_for_every_args_envelope() {
+        let args = serde_json::json!({
+            "command": "echo harmless",
+            "CommandLine": "git reset --hard",
+            "commandLine": "echo second",
+            "Command": "echo third"
+        });
+        for json in [
+            serde_json::json!({"toolCall": {"name": "run_command", "args": args}}),
+            serde_json::json!({"toolCalls": [{"name": "bash", "args": args}]}),
+            serde_json::json!({"toolCalls": [{"name": "bash", "args": args.to_string()}]}),
+            serde_json::json!({"tool_name": "Bash", "tool_args": args}),
+            serde_json::json!({"tool_name": "Bash", "tool_args": args.to_string()}),
+        ] {
+            let input = parse_hook_input(&json.to_string()).unwrap();
+            let extracted = extract_command_with_context(&input).unwrap();
+            assert_eq!(extracted.command, "echo harmless", "{json}");
+            let additional: Vec<&str> = extracted
+                .additional_commands
+                .iter()
+                .map(|(command, _)| command.as_str())
+                .collect();
+            assert_eq!(
+                additional,
+                ["git reset --hard", "echo second", "echo third"],
+                "each supported key needs its own evaluation: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_command_key_aliases_preserve_dialects_and_do_not_join_values() {
+        let input = parse_hook_input(
+            &serde_json::json!({
+                "toolCalls": [{
+                    "name": "bash",
+                    "args": {
+                        "command": "echo '\\",
+                        "CommandLine": "git reset --hard",
+                        "Command": "Remove-Item -Recurse -Force C:\\Users\\user\\Documents"
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let extracted = extract_command_with_context(&input).unwrap();
+        assert_eq!(extracted.command, "echo '\\");
+        assert_eq!(extracted.additional_commands.len(), 2);
+        assert_eq!(
+            extracted.additional_commands[0],
+            ("git reset --hard".to_string(), ShellDialect::Posix)
+        );
+        assert_eq!(extracted.additional_commands[1].1, ShellDialect::Unknown);
+    }
+
+    #[test]
+    fn test_equal_command_keys_are_evaluated_once_and_empty_keys_do_not_hide_commands() {
+        let input = parse_hook_input(
+            &serde_json::json!({
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"command": "", "CommandLine": "git status", "commandLine": "git status", "Command": null}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let extracted = extract_command_with_context(&input).unwrap();
+        assert_eq!(extracted.command, "git status");
+        assert!(extracted.additional_commands.is_empty());
+    }
+
+    #[test]
+    fn test_non_shell_sibling_command_keys_remain_data() {
+        let args = serde_json::json!({"command": "git reset --hard", "CommandLine": "rm -rf /"});
+        for json in [
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "toolCall": {"name": "Read", "args": args}
+            }),
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "tool_call": {"name": "Read", "args": {"command": "other data"}},
+                "toolCall": {"name": "Read", "args": args},
+                "toolCalls": [{"name": "Read", "args": args}]
+            }),
+        ] {
+            let input = parse_hook_input(&json.to_string()).unwrap();
+            let extracted = extract_command_with_context(&input).unwrap();
+            assert_eq!(extracted.command, "git status", "{json}");
+            assert!(extracted.additional_commands.is_empty(), "{json}");
+        }
+    }
+
+    #[test]
+    fn test_displaced_envelope_aliases_retain_every_command_key() {
+        let args = serde_json::json!({"command": "echo alias", "CommandLine": "git reset --hard"});
+        for json in [
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_args": {"command": "echo primary"},
+                "toolArgs": args
+            }),
+            serde_json::json!({
+                "tool_call": {"name": "run_command", "args": {"command": "echo primary"}},
+                "toolCall": {"name": "run_command", "args": args}
+            }),
+            serde_json::json!({
+                "tool_calls": [{"name": "bash", "args": {"command": "echo primary"}}],
+                "toolCalls": [{"name": "bash", "args": args.to_string()}]
+            }),
+        ] {
+            let input = parse_hook_input(&json.to_string()).unwrap();
+            let extracted = extract_command_with_context(&input).unwrap();
+            assert_eq!(extracted.command, "echo primary", "{json}");
+            let additional: Vec<&str> = extracted
+                .additional_commands
+                .iter()
+                .map(|(command, _)| command.as_str())
+                .collect();
+            assert_eq!(additional, ["echo alias", "git reset --hard"], "{json}");
+        }
     }
 
     #[test]
@@ -7103,64 +8272,57 @@ mod tests {
     }
 
     #[test]
-    fn test_antigravity_hook_output_block_decision_json_shape() {
-        // `agy` aborts run_command on {"decision":"block","reason":...}.
-        // Verified empirically that both "block" and "deny" keywords block;
-        // we emit "block".
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+    fn test_antigravity_denial_is_strict_with_rich_metadata() {
+        let allow_once = test_allow_once();
+        let reason = "destroys \"uncommitted\" changes\nincluding C:\\work\\重要";
+        let explanation = "Rewrites the working tree and index.";
 
-        write_denial_to(
-            &mut stdout,
-            &mut stderr,
-            HookProtocol::Antigravity,
-            "rm -rf /",
-            "catastrophic filesystem deletion",
-            Some("core.filesystem"),
-            Some("rm-rf-root"),
-            None,
-            None,
-            None,
-            Some(crate::packs::Severity::Critical),
-            None,
-            &[],
-            None,
-        );
+        // Exercise both ordinary denials and the populated allow-once /
+        // remediation path that previously leaked unsupported fields.
+        for allow_once in [None, Some(&allow_once)] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            write_denial_to(
+                &mut stdout,
+                &mut stderr,
+                HookProtocol::Antigravity,
+                "git reset --hard",
+                reason,
+                Some("core.git"),
+                Some("reset-hard"),
+                Some(explanation),
+                allow_once,
+                None,
+                Some(crate::packs::Severity::Critical),
+                Some(0.99),
+                &[],
+                None,
+            );
 
-        let stdout_str = String::from_utf8_lossy(&stdout);
-        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
-
-        assert_eq!(json["decision"], "block");
-        assert!(
-            json["reason"]
-                .as_str()
-                .unwrap()
-                .contains("catastrophic filesystem deletion"),
-            "reason must surface the explanation, got: {}",
-            json["reason"]
-        );
-        // Must NOT carry other agents' decision keys.
-        assert!(json.get("action").is_none(), "no Hermes 'action'");
-        assert!(
-            json.get("permissionDecision").is_none(),
-            "no Claude 'permissionDecision'"
-        );
-        assert!(
-            json.get("hookSpecificOutput").is_none(),
-            "no Claude 'hookSpecificOutput'"
-        );
-        assert!(json.get("continue").is_none(), "no Copilot 'continue'");
-        assert!(
-            !stderr.is_empty(),
-            "denial must still surface stderr warning text"
-        );
+            let message = parse_antigravity_denial(&stdout);
+            assert!(message.starts_with("BLOCKED by dcg"));
+            assert!(
+                message.contains(reason),
+                "reason must round-trip: {message}"
+            );
+            assert!(message.contains(explanation));
+            assert!(message.contains("Rule: core.git:reset-hard"));
+            assert_eq!(
+                message.contains("the user can approve it with: dcg allow-once abc123"),
+                allow_once.is_some(),
+                "review guidance stays in reason without granting approval: {message}"
+            );
+            assert!(
+                !stderr.is_empty(),
+                "denial must still surface stderr warning text"
+            );
+        }
     }
 
     #[test]
-    fn test_write_warning_antigravity_produces_allow() {
-        // `agy` has no "ask"/"warn" decision; a warn must NOT block, so we
-        // emit an explicit allow.
+    fn test_write_warning_antigravity_preserves_permission_checks() {
+        // A warning is not permission to execute. In agy 1.4.0, an explicit
+        // allow can bypass the host's ordinary permission checks (#573).
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -7172,13 +8334,37 @@ mod tests {
             "force push",
             Some("core.git"),
             Some("force-push"),
-            None,
+            Some("May overwrite remote changes."),
         );
 
-        let stdout_str = String::from_utf8_lossy(&stdout);
-        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
-        assert_eq!(json["decision"], "allow");
+        assert!(stdout.is_empty(), "no JSON, approval, or even newline");
+        let warning = String::from_utf8(stderr).expect("UTF-8 warning");
+        assert!(warning.contains("dcg WARNING:"));
+        assert!(warning.contains("force push"));
+        assert!(warning.contains("May overwrite remote changes."));
+        assert!(warning.contains("core.git:force-push"));
+        assert!(warning.contains("git push --force"));
+    }
+
+    #[test]
+    fn test_antigravity_indeterminate_is_a_strict_flushed_denial() {
+        let reason = "Safety evaluation timed out; command was not verified.";
+        for deny in [false, true] {
+            let mut stdout = FlushProbe::default();
+            let mut stderr = FlushProbe::default();
+            write_indeterminate_to(
+                &mut stdout,
+                &mut stderr,
+                HookProtocol::Antigravity,
+                reason,
+                deny,
+            );
+
+            assert_eq!(parse_antigravity_denial(&stdout.bytes), reason);
+            assert_eq!(stdout.flushes, 1);
+            assert_eq!(stderr.flushes, 1);
+            assert!(String::from_utf8_lossy(&stderr.bytes).contains(reason));
+        }
     }
 
     #[test]
@@ -7707,7 +8893,7 @@ mod tests {
             (HookProtocol::Gemini, "deny"),
             (HookProtocol::Hermes, "block"),
             (HookProtocol::Grok, "deny"),
-            (HookProtocol::Antigravity, "block"),
+            (HookProtocol::Antigravity, "deny"),
             (HookProtocol::Crush, "deny"),
         ];
 
@@ -7885,7 +9071,7 @@ mod tests {
             (HookProtocol::Gemini, "deny", false),
             (HookProtocol::Hermes, "block", false),
             (HookProtocol::Grok, "deny", false),
-            (HookProtocol::Antigravity, "block", false),
+            (HookProtocol::Antigravity, "deny", false),
             (HookProtocol::Crush, "deny", false),
         ];
 
@@ -7938,7 +9124,7 @@ mod tests {
             (HookProtocol::Gemini, "deny"),
             (HookProtocol::Hermes, "block"),
             (HookProtocol::Grok, "deny"),
-            (HookProtocol::Antigravity, "block"),
+            (HookProtocol::Antigravity, "deny"),
             (HookProtocol::Crush, "deny"),
         ];
         let allow = test_allow_once();
@@ -7992,6 +9178,10 @@ mod tests {
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
             assert_ne!(decision, Some("allow"), "payload: {json}");
+            if protocol == HookProtocol::Antigravity {
+                let message = parse_antigravity_denial(&stdout);
+                assert!(message.contains("dcg allow-once abc123"));
+            }
             if protocol == HookProtocol::Codex {
                 assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
                 assert_eq!(
@@ -8271,7 +9461,9 @@ mod tests {
 
     #[test]
     fn test_290_extract_no_command_key_is_none() {
-        let prefix = r#"{"tool_name":"Bash","tool_input":{"cmd":"ls"}}"#;
+        // `cmd` was this test's example of a non-command key until #572 made
+        // it one (the `exec_command` argument); any other key stays inert.
+        let prefix = r#"{"tool_name":"Bash","tool_input":{"argv":"ls","path":"x"}}"#;
         assert!(extract_commands_from_truncated_json(prefix).is_empty());
     }
 
@@ -8399,9 +9591,241 @@ mod tests {
         assert_eq!(dialect, ShellDialect::Posix);
     }
 
-    /// Issue #386: `[general] log_file` takes no redaction config and used to
-    /// write `Command: {command}` raw, so a blocked command carrying a token
-    /// landed in the log verbatim. Canaries below are synthetic.
+    #[test]
+    fn antigravity_recovery_recognizes_native_command_and_envelope_aliases() {
+        for envelope_key in ["toolCall", "tool_call"] {
+            for command_key in ["CommandLine", "commandLine", "Command", "command"] {
+                let prefix = format!(
+                    r#"{{"{envelope_key}":{{"name":"RUN_COMMAND","args":{{"{command_key}":"git reset --hard"#
+                );
+                for payload in [prefix.clone(), format!("{prefix}\"}}}}}} trailing")] {
+                    assert_eq!(
+                        shell_tool_from_truncated_json(&payload),
+                        Some(("run_command".to_string(), ShellDialect::Unknown)),
+                        "{payload}"
+                    );
+                    assert_eq!(
+                        protocol_from_truncated_json(&payload),
+                        Some(HookProtocol::Antigravity),
+                        "{payload}"
+                    );
+                    assert_eq!(
+                        extract_commands_from_truncated_json(&payload),
+                        vec!["git reset --hard"],
+                        "{payload}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_decodes_escaped_keys_and_native_name() {
+        let prefix = r#"{"tool\u0043all":{"na\u006de":"run_\u0063ommand","ar\u0067s":{"Command\u004cine":"git reset --hard"#;
+        assert_eq!(
+            protocol_from_truncated_json(prefix),
+            Some(HookProtocol::Antigravity)
+        );
+        assert!(shell_tool_from_truncated_json(prefix).is_some());
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["git reset --hard"]
+        );
+        // A complete command value can be decoded exactly even when its
+        // outer envelope is malformed. Stopping at a valid surrogate pair
+        // would drop the destructive command after the emoji.
+        let unicode = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo \ud83e\uddea\ngit reset --hard"}}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(unicode),
+            vec!["echo 🧪\ngit reset --hard"]
+        );
+        let unfinished = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo \ud83e\uddea\ngit reset --hard"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(unfinished),
+            vec!["echo 🧪\ngit reset --hard"]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_preserves_the_nameless_shell_gate() {
+        for name_field in [
+            "",
+            r#""name":"","#,
+            r#""name":null,"#,
+            r#""name":true,"#,
+            r#""name":{},"#,
+        ] {
+            let prefix =
+                format!(r#"{{"toolCall":{{{name_field}"args":{{"CommandLine":"git reset --hard"#);
+            assert!(
+                shell_tool_from_truncated_json(&prefix).is_some(),
+                "{prefix}"
+            );
+            assert_eq!(
+                protocol_from_truncated_json(&prefix),
+                Some(HookProtocol::Antigravity),
+                "{prefix}"
+            );
+            assert_eq!(
+                extract_commands_from_truncated_json(&prefix),
+                vec!["git reset --hard"],
+                "{prefix}"
+            );
+        }
+        for prefix in [r#"{"toolCall":{}"#, r#"{"toolCall":{"args":null}"#] {
+            assert!(shell_tool_from_truncated_json(prefix).is_none(), "{prefix}");
+            assert_eq!(
+                protocol_from_truncated_json(prefix),
+                Some(HookProtocol::Antigravity)
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_retains_every_command_alias_and_duplicate() {
+        let prefix = r#"{"toolCall":{"name":"run_command","args":{"command":"echo '","CommandLine":"echo harmless","CommandLine":"git reset --hard","commandLine":"git clean -fdx","Command":"git reset --hard"}}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec![
+                "echo '",
+                "echo harmless",
+                "git reset --hard",
+                "git clean -fdx"
+            ]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_decodes_stringified_and_bare_args() {
+        for args in [
+            serde_json::json!("git reset --hard"),
+            serde_json::json!(r#"{"CommandLine":"git reset --hard"}"#),
+        ] {
+            let payload = format!(
+                "{} trailing",
+                serde_json::json!({"toolCall": {"name": "run_command", "args": args}})
+            );
+            assert_eq!(
+                extract_commands_from_truncated_json(&payload),
+                vec!["git reset --hard"],
+                "{payload}"
+            );
+        }
+        let prefix =
+            r#"{"toolCall":{"name":"run_command","args":"{\"CommandLine\":\"git reset --hard"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["git reset --hard"]
+        );
+        let brace_command =
+            r#"{"toolCall":{"name":"run_command","args":"{ git reset --hard; }"}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(brace_command),
+            vec!["{ git reset --hard; }"]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_ignores_non_shell_and_planted_envelopes() {
+        for prefix in [
+            r#"{"toolCall":{"name":"readFile","args":{"CommandLine":"git reset --hard"}}} trailing"#,
+            r#"{"toolCall":{"name":42,"args":{"CommandLine":"git reset --hard"}}} trailing"#,
+            r#"{"metadata":{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"}}}} trailing"#,
+            r#"{"toolCall":{"name":"readFile","args":{"CommandLine":"git reset --hard"},"metadata":{"name":"run_command"}}} trailing"#,
+            r#"{"metadata":"\"toolCall\":{\"name\":\"run_command\",\"args\":{\"CommandLine\":\"git reset --hard\"}}"} trailing"#,
+            r#"[{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"}}}] trailing"#,
+        ] {
+            assert!(shell_tool_from_truncated_json(prefix).is_none(), "{prefix}");
+            assert_eq!(protocol_from_truncated_json(prefix), None, "{prefix}");
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_ignores_commands_in_unrelated_metadata() {
+        let prefix = r#"{"metadata":{"command":"git reset --hard","toolCall":{"name":"run_command","args":{"CommandLine":"git clean -fdx"}}},"toolCall":{"name":"run_command","args":{"metadata":{"command":"git reset --hard"},"CommandLine":"echo harmless"}}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["echo harmless"]
+        );
+        assert_eq!(
+            protocol_from_truncated_json(prefix),
+            Some(HookProtocol::Antigravity)
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_preserves_batch_protocol_precedence() {
+        for batch in [
+            r#"[{"name":"bash","args":{"command":"echo harmless"}}]"#,
+            r#"[{"name":"run_command","args":{"CommandLine":"echo harmless"}}]"#,
+            r#"[{"args":{"command":"echo harmless"}}]"#,
+        ] {
+            let prefix = format!(
+                r#"{{"toolCall":{{"name":"run_command","args":{{"CommandLine":"git reset --hard"}}}},"toolCalls":{batch}}} trailing"#
+            );
+            assert_eq!(
+                protocol_from_truncated_json(&prefix),
+                Some(HookProtocol::ClaudeCompatible),
+                "{prefix}"
+            );
+        }
+        for field in [
+            r#""toolCalls":[{"name":"readFile","args":{"command":"git reset --hard"}}]"#,
+            r#""metadata":{"toolCalls":[{"name":"bash","args":{"command":"git reset --hard"}}]}"#,
+        ] {
+            let prefix = format!(
+                r#"{{{field},"toolCall":{{"name":"run_command","args":{{"CommandLine":"echo harmless"}}}}}} trailing"#
+            );
+            assert_eq!(
+                protocol_from_truncated_json(&prefix),
+                Some(HookProtocol::Antigravity),
+                "{prefix}"
+            );
+            assert_eq!(
+                extract_commands_from_truncated_json(&prefix),
+                vec!["echo harmless"],
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_recovery_keeps_command_bearing_siblings_separate() {
+        let prefix = r#"{"toolCall":{"args":{"CommandLine":"echo '"}},"toolInput":{"command":"git reset --hard"},"toolArgs":{"Command":"git clean -fdx"}} trailing"#;
+        assert_eq!(
+            extract_commands_from_truncated_json(prefix),
+            vec!["echo '", "git reset --hard", "git clean -fdx"]
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_rejects_untrusted_strings_and_container_boundaries() {
+        for prefix in [
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard \q"}}} trailing"#,
+            "{\"toolCall\":{\"name\":\"run_command\",\"args\":{\"CommandLine\":\"git reset --hard\n\"}}} trailing",
+        ] {
+            assert!(
+                extract_commands_from_truncated_json(prefix).is_empty(),
+                "{prefix}"
+            );
+        }
+        for prefix in [
+            r#"{"metadata":[},"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"}}}"#.to_string(),
+            format!(
+                r#"{{"metadata":{}0{},"toolCall":{{"name":"run_command","args":{{"CommandLine":"git reset --hard"}}}}}}"#,
+                "[".repeat(256),
+                "]".repeat(256)
+            ),
+        ] {
+            assert!(shell_tool_from_truncated_json(&prefix).is_none(), "{prefix}");
+            assert_eq!(protocol_from_truncated_json(&prefix), None, "{prefix}");
+        }
+    }
+
+    /// Issue #386: `[general] log_file` used to write `Command: {command}` raw,
+    /// so a blocked command carrying a token landed in the log verbatim.
+    /// Secret-pattern filtering remains active without configured redaction.
+    /// Canaries below are synthetic.
     #[test]
     fn blocked_command_log_redacts_secrets() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8410,13 +9834,16 @@ mod tests {
         let command = "deploy --purge AKIAABCDEFGHIJKLMNOP \
              ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-        log_blocked_command(path, command, "destructive", Some("core")).expect("write log");
+        let redaction = crate::logging::RedactionConfig::default();
+        log_blocked_command(path, command, "destructive", Some("core"), &redaction)
+            .expect("write log");
         log_budget_skip(
             path,
             command,
             "prefilter",
             Duration::from_millis(5),
             Duration::from_millis(1),
+            &redaction,
         )
         .expect("write budget log");
 
@@ -8434,5 +9861,130 @@ mod tests {
         assert!(contents.contains("deploy --purge"), "{contents}");
         assert!(contents.contains("[AWS_ACCESS_KEY]"), "{contents}");
         assert!(contents.contains("[GITHUB_TOKEN]"), "{contents}");
+    }
+
+    #[test]
+    fn legacy_log_preserves_configured_argument_redaction_issue_585() {
+        use crate::logging::{RedactionConfig, RedactionMode};
+
+        for (enabled, mode, expected_argument) in [
+            (false, RedactionMode::Full, r#""synthetic argument""#),
+            (false, RedactionMode::Arguments, r#""synthetic argument""#),
+            (true, RedactionMode::None, r#""synthetic argument""#),
+            (true, RedactionMode::Arguments, r#""synth...""#),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let log = dir.path().join("arguments.log");
+            let path = log.to_str().expect("utf-8 path");
+            let command = r#"deploy "synthetic argument" AKIAABCDEFGHIJKLMNOP"#;
+            let redaction = RedactionConfig {
+                enabled,
+                mode,
+                max_argument_len: 5,
+            };
+            log_blocked_command(path, command, "diagnostic detail", Some("core"), &redaction)
+                .expect("blocked log");
+            log_budget_skip(
+                path,
+                command,
+                "prefilter",
+                Duration::ZERO,
+                Duration::ZERO,
+                &redaction,
+            )
+            .expect("budget log");
+
+            let contents = std::fs::read_to_string(log).expect("read log");
+            let expected_command = format!("Command: deploy {expected_argument} [AWS_ACCESS_KEY]");
+            assert_eq!(
+                contents.matches(expected_command.as_str()).count(),
+                2,
+                "{contents}"
+            );
+            assert!(!contents.contains("AKIAABCDEFGHIJKLMNOP"), "{contents}");
+            assert!(contents.contains("diagnostic detail"), "{contents}");
+            assert!(contents.contains("at prefilter"), "{contents}");
+        }
+    }
+
+    #[test]
+    fn full_redaction_covers_legacy_log_records_issue_585() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("blocked.log");
+        let path = log.to_str().expect("utf-8 path");
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let redaction = crate::logging::RedactionConfig {
+            enabled: true,
+            mode: crate::logging::RedactionMode::Full,
+            ..Default::default()
+        };
+        log_blocked_command(
+            path,
+            marker,
+            &marker.to_lowercase(),
+            Some("core"),
+            &redaction,
+        )
+        .expect("blocked log");
+        log_budget_skip(
+            path,
+            marker,
+            "prefilter",
+            Duration::ZERO,
+            Duration::ZERO,
+            &redaction,
+        )
+        .expect("budget log");
+        let log = std::fs::read_to_string(log).expect("read log");
+        assert!(
+            !log.to_lowercase().contains(&marker.to_lowercase()),
+            "{log}"
+        );
+        assert!(log.contains("[core]"));
+        assert!(log.contains("Diagnostic details redacted."));
+        assert!(log.contains("[budget]"));
+    }
+
+    #[test]
+    fn legacy_log_full_redaction_covers_entire_records_issue_585() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("full.log");
+        let path = log.to_str().expect("utf-8 path");
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let command = format!("{marker} | python -");
+        let reason = format!("unverified producer {:?}", marker.to_ascii_lowercase());
+        let redaction = crate::logging::RedactionConfig {
+            enabled: true,
+            mode: crate::logging::RedactionMode::Full,
+            ..Default::default()
+        };
+
+        log_blocked_command(path, &command, &reason, Some("heredoc.posix"), &redaction)
+            .expect("write blocked log");
+        log_budget_skip(
+            path,
+            &command,
+            &reason,
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            &redaction,
+        )
+        .expect("write budget log");
+
+        let contents = std::fs::read_to_string(&log).expect("read log");
+        assert!(
+            !contents
+                .to_ascii_lowercase()
+                .contains(&marker.to_ascii_lowercase()),
+            "synthetic command text survived full redaction: {contents}"
+        );
+        assert!(contents.contains("[heredoc.posix]"), "{contents}");
+        assert!(
+            contents.contains("Diagnostic details redacted."),
+            "{contents}"
+        );
+        assert_eq!(contents.matches("Command: [REDACTED]").count(), 2);
+        assert!(contents.contains("[budget]"), "{contents}");
+        assert!(contents.contains("Budget: 1ms, Elapsed: 5ms"), "{contents}");
     }
 }

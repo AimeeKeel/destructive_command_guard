@@ -33,6 +33,32 @@ function Write-Ok { param($msg) if (-not $Quiet) { Write-Host "[+] $msg" -Foregr
 function Write-Warn { param($msg) if (-not $Quiet) { Write-Host "[!] $msg" -ForegroundColor Yellow } }
 function Write-Err { param($msg) Write-Host "[-] $msg" -ForegroundColor Red }
 
+# Keep this resolver aligned with install.ps1. Only Claude Code honors this
+# override; the locations of Grok and other compatible integrations stay fixed.
+function Get-ClaudeConfigDir {
+  param([string]$HomeDir = $HOME)
+
+  $configDir = $env:CLAUDE_CONFIG_DIR
+  if ([string]::IsNullOrEmpty($configDir)) {
+    $configDir = Join-Path $HomeDir '.claude'
+  } elseif ($configDir -eq '~') {
+    $configDir = $HomeDir
+  } elseif ($configDir.StartsWith('~/') -or $configDir.StartsWith('~\')) {
+    $configDir = Join-Path $HomeDir $configDir.Substring(2)
+  }
+  if (-not (Split-Path -Path $configDir -IsAbsolute)) {
+    $configDir = Join-Path (Get-Location).ProviderPath $configDir
+  }
+  $configDir
+}
+
+function Unconfigure-ClaudeHook {
+  param([string]$HomeDir = $HOME)
+
+  $settingsFile = Join-Path (Get-ClaudeConfigDir -HomeDir $HomeDir) 'settings.json'
+  Remove-DcgHooksFromJsonFile -Path $settingsFile
+}
+
 function Test-CommandTokenLooksLikePath {
   param([string]$Token)
 
@@ -201,10 +227,10 @@ function Remove-DcgHooksFromJsonFile {
     [string]$EventName = "PreToolUse"
   )
 
-  if (-not (Test-Path $Path -PathType Leaf)) { return $false }
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
 
   try {
-    $config = Get-Content -Raw -Path $Path | ConvertFrom-Json
+    $config = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
   } catch {
     Write-Warn "Could not parse $Path; leaving it unchanged"
     return $false
@@ -267,7 +293,7 @@ function Remove-DcgHooksFromJsonFile {
   }
 
   if ((Test-EmptyObject $config) -and $DeleteEmptyFile) {
-    Remove-Item -Force -Path $Path
+    Remove-Item -Force -LiteralPath $Path
   } else {
     # Write UTF-8 without BOM: Codex's JSON parser rejects the BOM byte sequence
     # at offset 0 ("expected value at line 1 column 1"), and `Set-Content -Encoding UTF8`
@@ -864,9 +890,9 @@ if (-not $Yes) {
 
 $binary = Join-Path $Dest "dcg.exe"
 
-$claudeSettings = Join-Path (Join-Path $HOME ".claude") "settings.json"
-if (Remove-DcgHooksFromJsonFile -Path $claudeSettings) {
-  Write-Ok "Removed Claude Code hook"
+$claudeSettings = Join-Path (Get-ClaudeConfigDir) 'settings.json'
+if (Unconfigure-ClaudeHook) {
+  Write-Ok "Removed Claude Code hook from $claudeSettings"
 }
 
 $codexHooks = Join-Path (Join-Path $HOME ".codex") "hooks.json"

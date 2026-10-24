@@ -97,6 +97,61 @@ fn printed_literal_into_a_shell_is_judged() {
     }
 }
 
+/// `sh -c cat` only copies stdin, but a command string can run stdin itself.
+/// The `cat | sh` and `eval` targets were allowed; `sh -c sh` and `"$(cat)"`
+/// were denied only by the bounded fallback over the whole command.
+#[test]
+fn command_strings_that_run_stdin_are_shells() {
+    for command in [
+        "awk 'BEGIN{print \"git reset --hard\" | \"sh -c sh\"}'",
+        "awk 'BEGIN{print \"git reset --hard\" | \"sh -c \\\"cat | sh\\\"\"}'",
+    ] {
+        assert_eq!(
+            hook(command),
+            ("deny".to_string(), "core.git:reset-hard".to_string()),
+            "{command}"
+        );
+    }
+    // The `eval` target's own command string is unverifiable code, like the
+    // `"$(cat)"` one below: `sh -c "eval $(cat)"` is denied by itself, as its
+    // text `eval $(cat)` is at top level (#551), and that denial comes first.
+    let command = "awk 'BEGIN{print \"git reset --hard\" | \"sh -c \\\"eval $(cat)\\\"\"}'";
+    assert_eq!(
+        hook(command),
+        ("deny".to_string(), "heredoc.posix:eval-dynamic".to_string()),
+        "{command}"
+    );
+    for command in [
+        "awk 'BEGIN{print \"git reset --hard\" | \"bash -c \\\". /dev/stdin\\\"\"}'",
+        "awk 'BEGIN{print \"git reset --hard\" | \"sh -c \\\"$(cat)\\\"\"}'",
+        "awk 'BEGIN{print \"git reset --hard\" | \"sh -c \\\"read x; $x\\\"\"}'",
+    ] {
+        assert_eq!(hook(command).0, "deny", "{command}");
+    }
+    // awk applies its string escapes before /bin/sh runs the command.
+    for command in [
+        "awk 'BEGIN{system(\"echo x\\ngit reset --hard\")}'",
+        "awk 'BEGIN{system(\"echo x\\073git reset --hard\")}'",
+        "awk 'BEGIN{print \"x\" | \"sh -c '\\''echo x\\ngit reset --hard'\\''\"}'",
+    ] {
+        assert_eq!(
+            hook(command),
+            ("deny".to_string(), "core.git:reset-hard".to_string()),
+            "{command}"
+        );
+    }
+    // The printed text is what such a string runs; a harmless one is fine,
+    // and a command string that does not run stdin leaves it data.
+    for command in [
+        "awk 'BEGIN{print \"git status\" | \"sh -c sh\"}'",
+        "awk 'BEGIN{print \"git reset --hard\" | \"sh -c sort\"}'",
+        "awk 'BEGIN{print \"git reset --hard\" | \"sh -c cat\"; print \"y\"}'",
+        "awk 'BEGIN{system(\"echo a\\nprintf b\")}'",
+    ] {
+        assert_eq!(hook(command).0, "allow", "{command}");
+    }
+}
+
 #[test]
 fn computed_print_into_a_shell_is_unverified() {
     for command in [

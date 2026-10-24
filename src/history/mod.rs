@@ -35,14 +35,17 @@
 //! })?;
 //! ```
 
+mod queue_budget;
 mod schema;
 mod sqlite;
+mod storage_limits;
 
 use crate::config::{HistoryConfig, HistoryRedactionMode, resolve_config_path_value};
 use crate::logging::{RedactionConfig, RedactionMode};
+use queue_budget::{QueueBudget, Reservation, ReserveError};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
@@ -71,6 +74,34 @@ pub const ENV_HISTORY_DISABLED: &str = "DCG_HISTORY_DISABLED";
 /// They also let subprocess persistence tests distinguish a known best-effort
 /// omission from unexplained data loss. Normal robot/hook output stays silent.
 pub const ENV_HISTORY_DIAGNOSTICS: &str = "DCG_HISTORY_DIAGNOSTICS";
+
+/// Maximum admitted entries per writer, including entries in its active batch.
+pub const MAX_PENDING_HISTORY_ENTRIES: usize = 4096;
+
+/// Maximum retained entry payload per writer (16 MiB), including string
+/// capacities and entry structures. This is not a cap on SQLite's page cache,
+/// allocator overhead, or the caller's input allocation.
+pub const MAX_PENDING_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Flush requests have separate capacity; timeout does not release a queued
+/// request's slot. Shutdown never needs either an entry or a flush slot.
+pub const MAX_PENDING_HISTORY_FLUSHES: usize = 64;
+
+/// Admission result, not a durability acknowledgement. Accepted entries may
+/// still be dropped by the existing best-effort storage policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryEnqueueOutcome {
+    /// Admitted to the asynchronous writer.
+    Queued,
+    /// Collection is disabled for this writer.
+    Disabled,
+    /// Outstanding entries or their retained bytes exhausted the budget.
+    QueueFull,
+    /// This entry alone exceeds the retained-payload budget.
+    EntryTooLarge,
+    /// The worker's receiver has disconnected.
+    WorkerUnavailable,
+}
 
 /// The machine's hostname for the history `hostname` column (#514).
 ///
@@ -300,10 +331,94 @@ fn state_db_path_from(
         .join(DEFAULT_DB_FILENAME)
 }
 
+struct QueuedHistoryEntry {
+    // Drop the payload before releasing its admission capacity.
+    entry: Box<CommandEntry>,
+    reservation: Reservation,
+}
+
+struct ReservedFlush {
+    ack: mpsc::Sender<()>,
+    reservation: Reservation,
+}
+
+impl ReservedFlush {
+    fn acknowledge(self) {
+        // A caller awakened by the ack must be able to reserve a new flush.
+        drop(self.reservation);
+        let _ = self.ack.send(());
+    }
+}
+
 enum HistoryMessage {
-    Entry(Box<CommandEntry>),
-    Flush(mpsc::Sender<()>),
+    Entry(QueuedHistoryEntry),
+    Flush(ReservedFlush),
     Shutdown(mpsc::Sender<()>),
+}
+
+fn retained_entry_bytes(entry: &CommandEntry) -> usize {
+    [
+        Some(&entry.agent_type),
+        Some(&entry.working_dir),
+        Some(&entry.command),
+        entry.pack_id.as_ref(),
+        entry.pattern_name.as_ref(),
+        entry.rule_id.as_ref(),
+        entry.session_id.as_ref(),
+        entry.hostname.as_ref(),
+        entry.allowlist_layer.as_ref(),
+        entry.bypass_code.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(
+        std::mem::size_of::<CommandEntry>() + std::mem::size_of::<QueuedHistoryEntry>(),
+        |total, value| total.saturating_add(value.capacity()),
+    )
+}
+
+/// Keep reservations with the storage batch, not merely the channel messages.
+/// Fields are ordered so unwinding frees entries before returning capacity.
+struct PendingHistoryBatch {
+    entries: Vec<CommandEntry>,
+    reservations: Vec<Reservation>,
+}
+
+impl PendingHistoryBatch {
+    fn new(batch_size: usize) -> Self {
+        let capacity = batch_size.min(MAX_PENDING_HISTORY_ENTRIES);
+        Self {
+            entries: Vec::with_capacity(capacity),
+            reservations: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, queued: QueuedHistoryEntry) {
+        self.entries.push(*queued.entry);
+        self.reservations.push(queued.reservation);
+    }
+
+    fn flush(
+        &mut self,
+        db: &mut HistoryDb,
+        db_path: Option<&PathBuf>,
+        history_disabled: &mut bool,
+        max_size_bytes: u64,
+    ) {
+        flush_batch_with_recovery(
+            db,
+            &mut self.entries,
+            db_path,
+            history_disabled,
+            max_size_bytes,
+        );
+        // All current outcomes empty the batch, including best-effort drops.
+        // If a future recovery path retains entries, retain their reservations
+        // too rather than allowing unaccounted payloads to accumulate.
+        if self.entries.is_empty() {
+            self.reservations.clear();
+        }
+    }
 }
 
 /// Configuration for the history worker thread.
@@ -333,7 +448,7 @@ impl Default for WorkerConfig {
 impl From<&HistoryConfig> for WorkerConfig {
     fn from(config: &HistoryConfig) -> Self {
         Self {
-            batch_size: config.batch_size.max(1) as usize,
+            batch_size: (config.batch_size.max(1) as usize).min(MAX_PENDING_HISTORY_ENTRIES),
             flush_interval: Duration::from_millis(u64::from(config.batch_flush_interval_ms.max(1))),
             auto_prune: config.auto_prune,
             retention_days: config
@@ -350,9 +465,22 @@ impl From<&HistoryConfig> for WorkerConfig {
 #[derive(Clone)]
 pub struct HistoryFlushHandle {
     sender: mpsc::Sender<HistoryMessage>,
+    budget: Arc<QueueBudget>,
 }
 
 impl HistoryFlushHandle {
+    fn request_flush(&self) -> Option<mpsc::Receiver<()>> {
+        let reservation = self.budget.try_reserve(1).ok()?;
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.sender
+            .send(HistoryMessage::Flush(ReservedFlush {
+                ack: ack_tx,
+                reservation,
+            }))
+            .ok()?;
+        Some(ack_rx)
+    }
+
     /// Request a flush and wait up to the hook-safe bounded timeout.
     ///
     /// History is best-effort telemetry, so lock contention or a stalled
@@ -366,18 +494,25 @@ impl HistoryFlushHandle {
     /// Returns `true` only when the worker acknowledged that every entry
     /// queued before this request was processed. Processing can intentionally
     /// drop best-effort telemetry; this is not a durability acknowledgement.
+    /// Returns `false` on timeout, worker disconnection, or a full flush-request
+    /// budget. Entry saturation does not consume the separate flush budget.
     #[must_use]
     pub fn flush_sync_with_timeout(&self, timeout: Duration) -> bool {
-        let (ack_tx, ack_rx) = mpsc::channel();
-        self.sender.send(HistoryMessage::Flush(ack_tx)).is_ok()
-            && ack_rx.recv_timeout(timeout).is_ok()
+        self.request_flush()
+            .is_some_and(|ack_rx| ack_rx.recv_timeout(timeout).is_ok())
     }
 }
 
 /// Asynchronous history writer with write batching support.
+///
+/// Entry admission is bounded by count and retained bytes across both the
+/// channel and active batch. Saturation drops telemetry without waiting for
+/// storage; use [`Self::try_log`] to inspect that admission result.
 pub struct HistoryWriter {
     sender: Option<mpsc::Sender<HistoryMessage>>,
     handle: Option<thread::JoinHandle<()>>,
+    entry_budget: Option<Arc<QueueBudget>>,
+    flush_budget: Option<Arc<QueueBudget>>,
     redaction_mode: HistoryRedactionMode,
     session_id: String,
     wait_for_worker_on_drop: bool,
@@ -394,6 +529,7 @@ impl HistoryWriter {
     /// The writer is disabled when `config.enabled` is false.
     #[must_use]
     pub fn new(db_path: Option<std::path::PathBuf>, config: &HistoryConfig) -> Self {
+        let _phase = crate::perf::PhaseTimer::start("history_setup");
         if !config.enabled {
             return Self::disabled();
         }
@@ -417,7 +553,7 @@ impl HistoryWriter {
                             "storage_error"
                         };
                         history_diagnostic(status, format_args!("phase=open"));
-                        // Drain the receiver so senders don't block
+                        // Dropping the queued messages also releases their reservations.
                         drop(receiver);
                     }
                 }
@@ -438,6 +574,14 @@ impl HistoryWriter {
         Self {
             sender: Some(sender),
             handle: Some(handle),
+            entry_budget: Some(Arc::new(QueueBudget::new(
+                MAX_PENDING_HISTORY_ENTRIES,
+                MAX_PENDING_HISTORY_BYTES,
+            ))),
+            flush_budget: Some(Arc::new(QueueBudget::new(
+                MAX_PENDING_HISTORY_FLUSHES,
+                MAX_PENDING_HISTORY_FLUSHES,
+            ))),
             redaction_mode: config.redaction_mode,
             session_id,
             wait_for_worker_on_drop: true,
@@ -450,6 +594,8 @@ impl HistoryWriter {
         Self {
             sender: None,
             handle: None,
+            entry_budget: None,
+            flush_budget: None,
             redaction_mode: HistoryRedactionMode::Pattern,
             session_id: String::new(),
             wait_for_worker_on_drop: true,
@@ -465,39 +611,70 @@ impl HistoryWriter {
 
     #[must_use]
     pub fn flush_handle(&self) -> Option<HistoryFlushHandle> {
-        self.sender.as_ref().map(|sender| HistoryFlushHandle {
-            sender: sender.clone(),
-        })
+        self.sender
+            .as_ref()
+            .zip(self.flush_budget.as_ref())
+            .map(|(sender, budget)| HistoryFlushHandle {
+                sender: sender.clone(),
+                budget: Arc::clone(budget),
+            })
     }
 
-    /// Log a command entry asynchronously.
-    pub fn log(&self, mut entry: CommandEntry) {
+    /// Log a command entry asynchronously, dropping it on admission failure.
+    pub fn log(&self, entry: CommandEntry) {
+        let _ = self.try_log(entry);
+    }
+
+    /// Redact and attempt to admit an entry without waiting for the worker.
+    ///
+    /// Capacity covers the retained, redacted entry and every metadata string's
+    /// allocated capacity. A queued result is not a persistence guarantee.
+    #[must_use]
+    pub fn try_log(&self, mut entry: CommandEntry) -> HistoryEnqueueOutcome {
+        let _phase = crate::perf::PhaseTimer::start("history_enqueue_redact");
+        let (Some(sender), Some(budget)) = (&self.sender, &self.entry_budget) else {
+            return HistoryEnqueueOutcome::Disabled;
+        };
         entry.command = redact_for_history(&entry.command, self.redaction_mode);
-        // Set session ID if not already set
         if entry.session_id.is_none() && !self.session_id.is_empty() {
             entry.session_id = Some(self.session_id.clone());
         }
-        if let Some(sender) = &self.sender {
-            // Every writer path used to leave this NULL, so rows from several
-            // machines could not be told apart once merged (#514).
-            if entry.hostname.is_none() {
-                entry.hostname = local_hostname().map(str::to_string);
-            }
-            if let Err(e) = sender.send(HistoryMessage::Entry(Box::new(entry))) {
-                // Channel disconnected - worker thread likely crashed or shutdown
-                warn!(
-                    error = %e,
-                    "Failed to send history entry - worker thread unavailable"
+        // Every writer path used to leave this NULL, so rows from several
+        // machines could not be told apart once merged (#514).
+        if entry.hostname.is_none() {
+            entry.hostname = local_hostname().map(str::to_string);
+        }
+        let bytes = retained_entry_bytes(&entry);
+        let reservation = match budget.try_reserve(bytes) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                history_diagnostic(
+                    "queue_drop",
+                    format_args!("phase=admission reason={error:?} bytes={bytes}"),
                 );
+                return match error {
+                    ReserveError::Full => HistoryEnqueueOutcome::QueueFull,
+                    ReserveError::Oversized => HistoryEnqueueOutcome::EntryTooLarge,
+                };
+            }
+        };
+        match sender.send(HistoryMessage::Entry(QueuedHistoryEntry {
+            entry: Box::new(entry),
+            reservation,
+        })) {
+            Ok(()) => HistoryEnqueueOutcome::Queued,
+            Err(error) => {
+                warn!(error = %error, "Failed to send history entry - worker thread unavailable");
+                HistoryEnqueueOutcome::WorkerUnavailable
             }
         }
     }
 
-    /// Request a flush without waiting for completion.
+    /// Request a flush without waiting for completion. Repeated requests use
+    /// bounded control capacity; a saturated request queue drops the request.
     pub fn flush(&self) {
-        if let Some(sender) = &self.sender {
-            let (ack_tx, _ack_rx) = mpsc::channel();
-            let _ = sender.send(HistoryMessage::Flush(ack_tx));
+        if let Some(handle) = self.flush_handle() {
+            let _ = handle.request_flush();
         }
     }
 
@@ -541,8 +718,11 @@ impl HistoryWriter {
 
 impl Drop for HistoryWriter {
     fn drop(&mut self) {
+        let _phase = crate::perf::PhaseTimer::start("history_shutdown_wait");
         if let Some(sender) = self.sender.take() {
             let (ack_tx, ack_rx) = mpsc::channel();
+            // There is only one shutdown producer. This control message bypasses
+            // admission budgets so saturation cannot discard normal shutdown.
             if sender.send(HistoryMessage::Shutdown(ack_tx)).is_ok() && self.wait_for_worker_on_drop
             {
                 if let Some(deadline) = self.drop_wait_deadline {
@@ -655,7 +835,7 @@ fn run_history_worker(
     config: WorkerConfig,
     mut receive: impl FnMut(Option<Duration>) -> Result<HistoryMessage, mpsc::RecvTimeoutError>,
 ) {
-    let mut batch: Vec<CommandEntry> = Vec::with_capacity(config.batch_size);
+    let mut batch = PendingHistoryBatch::new(config.batch_size);
     let mut last_flush = Instant::now();
     let mut last_prune_check = Instant::now();
     let db_path = db.path().map(std::path::Path::to_path_buf);
@@ -669,7 +849,7 @@ fn run_history_worker(
         last_prune_check = Instant::now();
     }
 
-    let mut history_disabled = match db.enforce_size_limit(config.max_size_bytes) {
+    let mut history_disabled = match db.enforce_live_size_limit(config.max_size_bytes) {
         Ok(true) => false,
         Ok(false) => {
             warn!(
@@ -692,7 +872,7 @@ fn run_history_worker(
     loop {
         let timeout = history_receive_timeout(
             &config,
-            batch.is_empty(),
+            batch.entries.is_empty(),
             history_disabled,
             last_flush,
             last_prune_check,
@@ -711,17 +891,16 @@ fn run_history_worker(
                 if history_disabled {
                     continue;
                 }
-                if batch.is_empty() {
+                if batch.entries.is_empty() {
                     // Measure batch age from its first entry, not worker
                     // startup, and do not postpone it for subsequent entries.
                     last_flush = Instant::now();
                 }
-                batch.push(*entry);
+                batch.push(entry);
 
-                if batch.len() >= config.batch_size {
-                    flush_batch_with_recovery(
+                if batch.entries.len() >= config.batch_size {
+                    batch.flush(
                         &mut db,
-                        &mut batch,
                         db_path.as_ref(),
                         &mut history_disabled,
                         config.max_size_bytes,
@@ -729,27 +908,25 @@ fn run_history_worker(
                     last_flush = Instant::now();
                 }
             }
-            Ok(HistoryMessage::Flush(ack)) => {
+            Ok(HistoryMessage::Flush(request)) => {
                 // mpsc is FIFO: every entry queued before this marker has
                 // already been handled. Draining *later* messages here makes
                 // the barrier a moving target under sustained producers.
-                flush_batch_with_recovery(
+                batch.flush(
                     &mut db,
-                    &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
                     config.max_size_bytes,
                 );
                 last_flush = Instant::now();
-                let _ = ack.send(());
+                request.acknowledge();
             }
             Ok(HistoryMessage::Shutdown(ack)) => {
                 // HistoryWriter is the only entry producer, and queues this
                 // marker after its final entry. Retained flush handles cannot
                 // extend shutdown by submitting requests after the marker.
-                flush_batch_with_recovery(
+                batch.flush(
                     &mut db,
-                    &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
                     config.max_size_bytes,
@@ -761,10 +938,9 @@ fn run_history_worker(
                 return;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !batch.is_empty() && last_flush.elapsed() >= config.flush_interval {
-                    flush_batch_with_recovery(
+                if !batch.entries.is_empty() && last_flush.elapsed() >= config.flush_interval {
+                    batch.flush(
                         &mut db,
-                        &mut batch,
                         db_path.as_ref(),
                         &mut history_disabled,
                         config.max_size_bytes,
@@ -782,9 +958,8 @@ fn run_history_worker(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 debug!("History channel disconnected, performing final flush");
-                flush_batch_with_recovery(
+                batch.flush(
                     &mut db,
-                    &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
                     config.max_size_bytes,
@@ -807,8 +982,18 @@ fn recover_history_db(
         return false;
     };
 
+    // Failed COMMIT/ROLLBACK paths can retain a transaction and its writer
+    // lock. Release it before opening the replacement, otherwise recovery
+    // contends with its own old connection. Never commit partial failed work.
+    if !db.connection().is_autocommit() {
+        if let Err(error) = db.connection().execute("ROLLBACK;") {
+            error!(error = %error, "Cannot roll back history transaction before recovery");
+            return false;
+        }
+    }
+
     match HistoryDb::open(Some(path.clone())) {
-        Ok(recovered_db) => match recovered_db.enforce_size_limit(max_size_bytes) {
+        Ok(recovered_db) => match recovered_db.enforce_live_size_limit(max_size_bytes) {
             Ok(true) => {
                 *db = recovered_db;
                 true
@@ -853,7 +1038,7 @@ fn flush_batch_with_recovery(
         return;
     }
 
-    match flush_batch(db, batch) {
+    match flush_batch(db, batch, max_size_bytes) {
         FlushOutcome::Success => {}
         FlushOutcome::Contended => {
             batch.clear();
@@ -870,7 +1055,7 @@ fn flush_batch_with_recovery(
             history_diagnostic("storage_error", format_args!("phase=recovery"));
             warn!("Detected fatal history storage error; attempting DB recovery");
             if recover_history_db(db, db_path, max_size_bytes) {
-                match flush_batch(db, batch) {
+                match flush_batch(db, batch, max_size_bytes) {
                     FlushOutcome::Success => {
                         debug!("History DB recovery succeeded");
                     }
@@ -916,6 +1101,9 @@ enum FlushOutcome {
 }
 
 fn is_fatal_storage_error(error: &HistoryError) -> bool {
+    if matches!(error, HistoryError::IntegrityCheckFailed(_)) {
+        return true;
+    }
     matches!(
         error,
         HistoryError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
@@ -949,22 +1137,39 @@ fn is_contention_error(error: &HistoryError) -> bool {
     )
 }
 
-/// Flush the batch to the database.
-fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
+/// Flush the batch to the database, rechecking its cap inside each transaction.
+fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>, max_size_bytes: u64) -> FlushOutcome {
+    let _phase = crate::perf::PhaseTimer::start("history_storage_insert");
     if batch.is_empty() {
         return FlushOutcome::Success;
+    }
+    if !db.connection().is_autocommit() {
+        // An INSERT inside a leftover transaction can return Ok without
+        // committing anything. Do not retire entries on that false success.
+        error!("History connection retained an unfinished transaction; recovery required");
+        return FlushOutcome::Fatal;
     }
 
     let batch_len = batch.len();
     trace!(batch_size = batch_len, "Flushing history batch");
 
-    // Try batch insert first (more efficient)
+    // Bulk insertion is transactional: an error rolls back its whole prefix.
+    // Individual fallback inserts below instead commit one row at a time.
     if batch_len >= 2 {
-        match db.log_commands_batch(batch) {
+        match db.log_commands_batch_with_live_limit(batch, max_size_bytes) {
             Ok(()) => {
                 trace!(count = batch_len, "Batch insert succeeded");
+                batch.clear();
+                return FlushOutcome::Success;
             }
             Err(e) => {
+                // The storage layer attempts rollback on error, but cannot
+                // guarantee that rollback succeeds after a storage failure.
+                // Retain the entire batch until that transaction is aborted.
+                if !db.connection().is_autocommit() {
+                    error!(error = %e, "Failed history batch left an active transaction");
+                    return FlushOutcome::Fatal;
+                }
                 if is_contention_error(&e) {
                     debug!(
                         batch_size = batch_len,
@@ -988,92 +1193,70 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                     batch_size = batch_len,
                     "Batch insert failed, falling back to individual inserts"
                 );
-                // Fallback to individual inserts on error
-                let mut success_count = 0;
-                let mut error_count = 0;
-                for entry in batch.iter() {
-                    match db.log_command(entry) {
-                        Ok(_id) => success_count += 1,
-                        Err(insert_err) => {
-                            if is_contention_error(&insert_err) {
-                                debug!(
-                                    "History database became busy during fallback; dropping remaining telemetry"
-                                );
-                                return FlushOutcome::Contended;
-                            }
-                            if is_capacity_error(&insert_err) {
-                                return FlushOutcome::CapacityReached;
-                            }
-                            if is_fatal_storage_error(&insert_err) {
-                                error!(
-                                    error = %insert_err,
-                                    command = %entry.command,
-                                    "Fatal history storage error in single-row insert"
-                                );
-                                return FlushOutcome::Fatal;
-                            }
-                            error_count += 1;
-                            history_diagnostic("storage_error", format_args!("phase=insert"));
-                            // Log first few errors, then summarize
-                            if error_count <= 3 {
-                                error!(
-                                    error = %insert_err,
-                                    command = %entry.command,
-                                    "Failed to insert history entry"
-                                );
-                            }
-                        }
-                    }
-                }
-                if error_count > 3 {
-                    error!(
-                        total_errors = error_count,
-                        "Additional history insert errors suppressed"
-                    );
-                }
-                if error_count > 0 {
-                    warn!(
-                        success = success_count,
-                        failed = error_count,
-                        "History batch recovery completed with errors"
-                    );
-                }
-            }
-        }
-    } else {
-        // Single entry, use regular insert
-        for entry in batch.iter() {
-            match db.log_command(entry) {
-                Ok(_id) => trace!(command = %entry.command, "Inserted history entry"),
-                Err(e) => {
-                    if is_contention_error(&e) {
-                        debug!("History database is busy; dropping best-effort telemetry entry");
-                        return FlushOutcome::Contended;
-                    }
-                    if is_capacity_error(&e) {
-                        return FlushOutcome::CapacityReached;
-                    }
-                    if is_fatal_storage_error(&e) {
-                        error!(
-                            error = %e,
-                            command = %entry.command,
-                            "Fatal history storage error in single-row insert"
-                        );
-                        return FlushOutcome::Fatal;
-                    }
-                    error!(
-                        error = %e,
-                        command = %entry.command,
-                        "Failed to insert history entry"
-                    );
-                    history_diagnostic("storage_error", format_args!("phase=insert"));
-                }
             }
         }
     }
 
-    batch.clear();
-    FlushOutcome::Success
+    flush_individual_entries(batch, |entry| {
+        db.log_command_with_live_limit(entry, max_size_bytes)
+    })
+}
+
+/// Retire the processed prefix even when a later insert stops the batch.
+///
+/// Successful individual inserts are already committed; replaying them after
+/// recovery duplicates history. Permanently rejected entries are processed too
+/// and must not reappear when recovery removes a connection-local constraint.
+/// Only the terminally failing entry and the unattempted suffix remain. This
+/// does not resolve an ambiguous commit of the failing entry itself.
+fn flush_individual_entries(
+    batch: &mut Vec<CommandEntry>,
+    mut insert: impl FnMut(&CommandEntry) -> Result<i64, HistoryError>,
+) -> FlushOutcome {
+    let mut processed = 0;
+    let mut error_count = 0;
+    let mut outcome = FlushOutcome::Success;
+
+    for (index, entry) in batch.iter().enumerate() {
+        match insert(entry) {
+            Ok(_id) => trace!("Inserted history entry"),
+            Err(e) => {
+                if is_contention_error(&e) {
+                    debug!("History database became busy; dropping remaining telemetry");
+                    outcome = FlushOutcome::Contended;
+                    break;
+                }
+                if is_capacity_error(&e) {
+                    outcome = FlushOutcome::CapacityReached;
+                    break;
+                }
+                if is_fatal_storage_error(&e) {
+                    error!(error = %e, "Fatal history storage error in single-row insert");
+                    outcome = FlushOutcome::Fatal;
+                    break;
+                }
+                error_count += 1;
+                history_diagnostic("storage_error", format_args!("phase=insert"));
+                if error_count <= 3 {
+                    error!(error = %e, "Failed to insert history entry");
+                }
+            }
+        }
+        processed = index + 1;
+    }
+
+    // Mutate only after the iteration borrow ends, and shift the suffix once
+    // rather than repeatedly removing the first element (quadratic work).
+    drop(batch.drain(..processed));
+    if error_count > 0 {
+        warn!(
+            success = processed - error_count,
+            failed = error_count,
+            remaining = batch.len(),
+            "History individual inserts completed with rejected entries"
+        );
+    }
+    outcome
 }
 
 /// Check if pruning is needed and perform it.
@@ -1133,6 +1316,341 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry_message(entry: CommandEntry) -> HistoryMessage {
+        let budget = Arc::new(QueueBudget::new(1, MAX_PENDING_HISTORY_BYTES));
+        let reservation = budget.try_reserve(retained_entry_bytes(&entry)).unwrap();
+        HistoryMessage::Entry(QueuedHistoryEntry {
+            entry: Box::new(entry),
+            reservation,
+        })
+    }
+
+    fn test_flush_message(ack: mpsc::Sender<()>) -> HistoryMessage {
+        let budget = Arc::new(QueueBudget::new(1, 1));
+        HistoryMessage::Flush(ReservedFlush {
+            ack,
+            reservation: budget.try_reserve(1).unwrap(),
+        })
+    }
+
+    fn recovery_test_entries(commands: &[&str]) -> Vec<CommandEntry> {
+        commands
+            .iter()
+            .map(|command| CommandEntry {
+                command: (*command).to_string(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn injected_storage_error(code: i32) -> HistoryError {
+        HistoryError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("injected between real SQLite inserts".to_string()),
+        ))
+    }
+
+    fn reject_recovery_test_entry(db: &HistoryDb) {
+        db.connection()
+            .execute(
+                "CREATE TEMP TRIGGER reject_history_probe BEFORE INSERT ON commands
+                 WHEN new.command = 'rejected'
+                 BEGIN SELECT RAISE(ABORT, 'test entry rejected'); END;",
+            )
+            .expect("install connection-local rejection trigger");
+    }
+
+    fn assert_fts_probe_count(path: &Path, term: &str, expected: i64) {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open FTS observer");
+        // COUNT(*) without MATCH can read the external content table and
+        // would not prove that the search index itself was updated.
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands_fts WHERE commands_fts MATCH ?1",
+                [term],
+                |row| row.get(0),
+            )
+            .expect("query actual FTS postings");
+        assert_eq!(count, expected, "unexpected FTS count for {term}");
+    }
+
+    #[test]
+    fn unfinished_transaction_is_rolled_back_before_recovery_replays_batch() {
+        for commands in [&["only"][..], &["prefix", "tail"][..]] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("unfinished-transaction.db");
+            let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+            let mut batch = recovery_test_entries(commands);
+            db.connection().execute("BEGIN IMMEDIATE;").unwrap();
+            db.log_command(&batch[0]).unwrap();
+            assert!(!db.connection().is_autocommit());
+            assert!(persisted_test_commands(&path).is_empty());
+
+            assert_eq!(
+                flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
+                FlushOutcome::Fatal
+            );
+            assert_eq!(
+                batch.len(),
+                commands.len(),
+                "uncommitted entries must remain queued"
+            );
+            assert_eq!(db.count_commands().unwrap(), 1);
+
+            // Exercise the production recovery path, not a simulated reopen.
+            // It must release its own old lock and discard the uncommitted
+            // prefix before retrying the full batch exactly once.
+            let mut disabled = false;
+            flush_batch_with_recovery(
+                &mut db,
+                &mut batch,
+                Some(&path),
+                &mut disabled,
+                WorkerConfig::default().max_size_bytes,
+            );
+            assert!(
+                !disabled,
+                "recovery must not contend with its own transaction"
+            );
+            assert!(db.connection().is_autocommit());
+            assert!(batch.is_empty());
+            assert_eq!(persisted_test_commands(&path), commands);
+            for command in commands {
+                assert_fts_probe_count(&path, command, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_bulk_commit_rolls_back_without_replaying_contended_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("commit-contention.db");
+        let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+        // A rollback-journal reader permits BEGIN IMMEDIATE and the INSERTs,
+        // but prevents COMMIT. This tests a different boundary from a competing
+        // writer that rejects BEGIN before any entry has been attempted.
+        db.connection()
+            .execute("PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let before: i64 = reader
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+        let mut batch = recovery_test_entries(&["droppedfirst", "droppedsecond"]);
+        let mut disabled = false;
+        let max_size = WorkerConfig::default().max_size_bytes;
+        flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
+        assert!(
+            !disabled,
+            "ordinary commit contention must not disable the writer"
+        );
+        assert!(
+            db.connection().is_autocommit(),
+            "failed COMMIT must be rolled back"
+        );
+        assert!(batch.is_empty(), "contended telemetry remains best-effort");
+        reader.execute_batch("ROLLBACK;").unwrap();
+        drop(reader);
+        assert!(persisted_test_commands(&path).is_empty());
+
+        batch = recovery_test_entries(&["afterunlock"]);
+        flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
+        assert!(!disabled);
+        assert!(batch.is_empty());
+        assert_eq!(persisted_test_commands(&path), vec!["afterunlock"]);
+        assert_fts_probe_count(&path, "droppedfirst", 0);
+        assert_fts_probe_count(&path, "droppedsecond", 0);
+        assert_fts_probe_count(&path, "afterunlock", 1);
+    }
+
+    #[test]
+    fn batch_fallback_keeps_good_rows_and_legitimate_repeated_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fallback-repeated.db");
+        let db = HistoryDb::open(Some(path.clone())).unwrap();
+        reject_recovery_test_entry(&db);
+        let mut batch = recovery_test_entries(&["repeatable", "rejected", "repeatable"]);
+
+        // The first row must be rolled back when the bulk insert hits the
+        // trigger. Fallback then commits the two distinct, identical events.
+        assert!(db.log_commands_batch(&batch).is_err());
+        assert!(db.connection().is_autocommit());
+        assert!(persisted_test_commands(&path).is_empty());
+        assert_eq!(
+            flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
+            FlushOutcome::Success
+        );
+        assert!(batch.is_empty());
+        assert_eq!(
+            persisted_test_commands(&path),
+            vec!["repeatable", "repeatable"]
+        );
+        assert_fts_probe_count(&path, "repeatable", 2);
+        assert_fts_probe_count(&path, "rejected", 0);
+        assert_eq!(
+            flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
+            FlushOutcome::Success
+        );
+        assert_eq!(db.count_commands().unwrap(), 2);
+    }
+
+    #[test]
+    fn fatal_fallback_recovery_retries_only_the_unprocessed_suffix() {
+        let commands = ["prefix", "middle", "tail"];
+        for fail_at in 0..commands.len() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("fallback-recovery.db");
+            let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+            let mut batch = recovery_test_entries(&commands);
+            let mut attempted = 0;
+            let result = flush_individual_entries(&mut batch, |entry| {
+                let index = attempted;
+                attempted += 1;
+                if index == fail_at {
+                    Err(injected_storage_error(rusqlite::ffi::SQLITE_IOERR))
+                } else {
+                    db.log_command(entry)
+                }
+            });
+            assert_eq!(result, FlushOutcome::Fatal);
+            assert_eq!(attempted, fail_at + 1);
+            assert_eq!(persisted_test_commands(&path), commands[..fail_at]);
+            assert_eq!(
+                batch
+                    .iter()
+                    .map(|entry| entry.command.as_str())
+                    .collect::<Vec<_>>(),
+                commands[fail_at..]
+            );
+
+            let max_size = WorkerConfig::default().max_size_bytes;
+            assert!(recover_history_db(&mut db, Some(&path), max_size));
+            let mut disabled = false;
+            flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
+            assert!(!disabled);
+            assert!(batch.is_empty());
+            assert_eq!(persisted_test_commands(&path), commands);
+            for command in commands {
+                assert_fts_probe_count(&path, command, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_recovery_cannot_resurrect_a_previously_rejected_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fallback-rejected-prefix.db");
+        let mut db = HistoryDb::open(Some(path.clone())).unwrap();
+        reject_recovery_test_entry(&db);
+        let mut batch = recovery_test_entries(&["committed", "rejected", "pending", "tail"]);
+        let result = flush_individual_entries(&mut batch, |entry| {
+            if entry.command == "pending" {
+                Err(injected_storage_error(rusqlite::ffi::SQLITE_IOERR))
+            } else {
+                db.log_command(entry)
+            }
+        });
+        assert_eq!(result, FlushOutcome::Fatal);
+        assert_eq!(persisted_test_commands(&path), vec!["committed"]);
+        assert_eq!(
+            batch
+                .iter()
+                .map(|entry| entry.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pending", "tail"]
+        );
+
+        // Reopening removes the TEMP trigger. Retrying the original batch
+        // would now duplicate "committed" AND incorrectly insert "rejected".
+        let max_size = WorkerConfig::default().max_size_bytes;
+        assert!(recover_history_db(&mut db, Some(&path), max_size));
+        let mut disabled = false;
+        flush_batch_with_recovery(&mut db, &mut batch, Some(&path), &mut disabled, max_size);
+        assert!(!disabled);
+        assert!(batch.is_empty());
+        assert_eq!(
+            persisted_test_commands(&path),
+            vec!["committed", "pending", "tail"]
+        );
+        assert_fts_probe_count(&path, "committed", 1);
+        assert_fts_probe_count(&path, "rejected", 0);
+    }
+
+    #[test]
+    fn terminal_fallback_errors_preserve_only_unprocessed_entries() {
+        for (code, expected) in [
+            (rusqlite::ffi::SQLITE_BUSY, FlushOutcome::Contended),
+            (rusqlite::ffi::SQLITE_LOCKED, FlushOutcome::Contended),
+            (rusqlite::ffi::SQLITE_FULL, FlushOutcome::CapacityReached),
+            (rusqlite::ffi::SQLITE_IOERR, FlushOutcome::Fatal),
+        ] {
+            let db = HistoryDb::open_in_memory().unwrap();
+            let mut batch = recovery_test_entries(&["committed", "pending", "unattempted"]);
+            let mut attempted = 0;
+            let result = flush_individual_entries(&mut batch, |entry| {
+                attempted += 1;
+                if entry.command == "pending" {
+                    Err(injected_storage_error(code))
+                } else {
+                    db.log_command(entry)
+                }
+            });
+            assert_eq!(result, expected);
+            assert_eq!(attempted, 2);
+            assert_eq!(db.count_commands().unwrap(), 1);
+            assert_eq!(
+                batch
+                    .iter()
+                    .map(|entry| entry.command.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["pending", "unattempted"]
+            );
+        }
+    }
+
+    #[test]
+    fn individual_flush_handles_empty_and_single_rejected_batches() {
+        let db = HistoryDb::open_in_memory().unwrap();
+        let mut empty = Vec::new();
+        assert_eq!(
+            flush_individual_entries(&mut empty, |_| panic!("empty batch must not insert")),
+            FlushOutcome::Success
+        );
+        reject_recovery_test_entry(&db);
+        let mut batch = recovery_test_entries(&["rejected"]);
+        assert_eq!(
+            flush_batch(&db, &mut batch, WorkerConfig::default().max_size_bytes),
+            FlushOutcome::Success
+        );
+        assert!(
+            batch.is_empty(),
+            "permanently rejected entries are not retried"
+        );
+        assert_eq!(db.count_commands().unwrap(), 0);
+    }
+
+    #[test]
+    fn integrity_failures_preserve_entries_for_recovery() {
+        let mut batch = recovery_test_entries(&["pending", "unattempted"]);
+        assert_eq!(
+            flush_individual_entries(&mut batch, |_| {
+                Err(HistoryError::IntegrityCheckFailed(
+                    "rollback left a transaction active".to_string(),
+                ))
+            }),
+            FlushOutcome::Fatal
+        );
+        assert_eq!(
+            batch.len(),
+            2,
+            "failed cleanup must not retire the pending entry"
+        );
+    }
 
     #[test]
     fn hostname_normalization_rejects_empty_and_control_characters_514() {
@@ -1253,25 +1771,25 @@ mod tests {
         // but neither a later entry nor a later control message.
         for index in 0..257 {
             sender
-                .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                .send(test_entry_message(CommandEntry {
                     command: format!("before-{index}"),
                     ..Default::default()
-                })))
+                }))
                 .unwrap();
         }
         let (first_tx, first_rx) = mpsc::channel();
         let (empty_tx, empty_rx) = mpsc::channel();
         let (last_tx, last_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        sender.send(HistoryMessage::Flush(first_tx)).unwrap();
-        sender.send(HistoryMessage::Flush(empty_tx)).unwrap();
+        sender.send(test_flush_message(first_tx)).unwrap();
+        sender.send(test_flush_message(empty_tx)).unwrap();
         sender
-            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+            .send(test_entry_message(CommandEntry {
                 command: "after-marker".to_string(),
                 ..Default::default()
-            })))
+            }))
             .unwrap();
-        sender.send(HistoryMessage::Flush(last_tx)).unwrap();
+        sender.send(test_flush_message(last_tx)).unwrap();
         sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
         drop(sender);
 
@@ -1316,10 +1834,10 @@ mod tests {
         let db = HistoryDb::open(Some(path.clone())).unwrap();
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+            .send(test_entry_message(CommandEntry {
                 command: "timer-flush".to_string(),
                 ..Default::default()
-            })))
+            }))
             .unwrap();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
@@ -1352,15 +1870,15 @@ mod tests {
         let db = HistoryDb::open(Some(path.clone())).unwrap();
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+            .send(test_entry_message(CommandEntry {
                 command: "final-entry".to_string(),
                 ..Default::default()
-            })))
+            }))
             .unwrap();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (late_tx, late_rx) = mpsc::channel();
         sender.send(HistoryMessage::Shutdown(shutdown_tx)).unwrap();
-        sender.send(HistoryMessage::Flush(late_tx)).unwrap();
+        sender.send(test_flush_message(late_tx)).unwrap();
         // Retaining this sender models a cloned flush handle at writer drop.
         history_worker(db, receiver, WorkerConfig::default());
         shutdown_rx.try_recv().expect("shutdown completed");
@@ -1388,10 +1906,10 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         for index in 0..3 {
             sender
-                .send(HistoryMessage::Entry(Box::new(CommandEntry {
+                .send(test_entry_message(CommandEntry {
                     command: format!("last-{index}"),
                     ..Default::default()
-                })))
+                }))
                 .unwrap();
         }
         drop(sender);
@@ -1407,12 +1925,13 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let flush = HistoryFlushHandle {
             sender: sender.clone(),
+            budget: Arc::new(QueueBudget::new(1, 1)),
         };
         sender
-            .send(HistoryMessage::Entry(Box::new(CommandEntry {
+            .send(test_entry_message(CommandEntry {
                 command: "queued exactly once".to_string(),
                 ..Default::default()
-            })))
+            }))
             .unwrap();
 
         // No worker is running: this must time out, regardless of host speed.
@@ -1420,11 +1939,14 @@ mod tests {
         let HistoryMessage::Entry(entry) = receiver.try_recv().unwrap() else {
             panic!("timing out must leave the original entry queued");
         };
-        assert_eq!(entry.command, "queued exactly once");
-        let HistoryMessage::Flush(ack) = receiver.try_recv().unwrap() else {
+        assert_eq!(entry.entry.command, "queued exactly once");
+        let HistoryMessage::Flush(request) = receiver.try_recv().unwrap() else {
             panic!("flush request must follow the entry");
         };
-        assert!(ack.send(()).is_err(), "expired waiter must be disconnected");
+        assert!(
+            request.ack.send(()).is_err(),
+            "expired waiter must be disconnected"
+        );
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -1445,8 +1967,8 @@ mod tests {
         for canary in [
             "AKIAABCDEFGHIJKLMNOP",
             "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-            "sk_live_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
             "sk_live_QUOTEDLONGTOKEN",
+            "sk_live_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         ] {
             assert!(
                 !stored.contains(canary),
@@ -1501,6 +2023,8 @@ mod tests {
         let mut writer = HistoryWriter {
             sender: None,
             handle: Some(handle),
+            entry_budget: None,
+            flush_budget: None,
             redaction_mode: HistoryRedactionMode::Pattern,
             session_id: String::new(),
             wait_for_worker_on_drop: true,

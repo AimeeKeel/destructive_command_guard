@@ -21,6 +21,8 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
 | Oh My Pi (`omp`) | Explicit bridge / process | Generated extension passes `--agent omp`; exact `omp` and `oh-my-pi` process names are fallback matches |
 | Crush | Environment | `CRUSH=1` (set by Crush for hook subprocesses and `bash`-tool commands; the generic `AGENT`/`AI_AGENT` markers are not consulted). Hook payloads are recognized by their `event: "PreToolUse"` + `tool_input` envelope — see [crush-integration.md](crush-integration.md) |
+| Muse Code | Explicit flag only | The hook written by `dcg install --muse` passes `--agent muse` (Muse clears the hook environment). Its payload looks like Codex's (`turn_id`), so without the flag `[agents.codex-cli]` applies; the identity is never taken from the payload or a process name — see [muse-integration.md](muse-integration.md) |
+| Amp | Explicit bridge | The plugin written by `dcg install --amp` passes `--agent amp`; no environment marker or process name is consulted — see [amp-integration.md](amp-integration.md) |
 | Pi | Environment | `PI_CODING_AGENT=true` |
 | Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last among environment markers so agents with their own markers win — environment detection still precedes parent-process detection) |
 
@@ -435,6 +437,7 @@ How hosts read exit 2 with nothing on stdout:
 | Codex CLI | Blocks in current releases (exit 2 with the reason on stderr is documented); some earlier builds logged it as a hook failure and failed open |
 | Hermes | Blocks in current releases (a `pre_tool_call` hook exiting 2 blocks even with no JSON on stdout); earlier builds only warned |
 | Reasonix | Blocks — exit 2 is its only blocking channel, so dcg always uses it there |
+| Muse Code | Not documented: a non-zero exit is a hook failure, which Muse hands to the handler's `onFailure` fallback when one is declared |
 | Antigravity (`agy`) | Logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON, but visible |
 
 Hook mode never exits 2 for any other reason, and never exits 141: every

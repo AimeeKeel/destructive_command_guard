@@ -6,15 +6,632 @@
 //! - chown -R on system directories
 //! - setfacl with dangerous patterns
 
+use crate::destructive_pattern;
 use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
-use crate::{destructive_pattern, safe_pattern};
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PosixPermissionDecision {
+    NoMatch,
+    NonDestructive,
+    Destructive(Vec<&'static str>),
+}
+
+struct PermissionWord {
+    text: String,
+    ordinary_relative: bool,
+    expands_home: bool,
+}
+
+/// Decode a literal word, retaining the home spellings already protected by
+/// this pack. Other expansions cannot prove a complete argv and must leave the
+/// conservative matcher in charge. Quoted option values remain single words.
+fn permission_word(raw: &str) -> Option<PermissionWord> {
+    let mut decoded = shell_words::split(raw).ok()?;
+    if decoded.len() != 1 {
+        return None;
+    }
+    let text = decoded.pop()?;
+    let mut single = false;
+    let mut double = false;
+    let mut expands_home = false;
+    let mut chars = raw.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '\\' if !single => {
+                let (_, next) = chars.peek().copied()?;
+                if !double || matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                    chars.next();
+                }
+            }
+            '$' if !single => {
+                // `$HOME_suffix` is another variable. Only a leading HOME
+                // expansion followed by a path boundary is modeled here.
+                if index != 0 && !(index == 1 && raw.starts_with('"')) {
+                    return None;
+                }
+                let tail = &raw[index..];
+                let variable = if tail.starts_with("${HOME}") {
+                    "${HOME}"
+                } else if tail.starts_with("$HOME") {
+                    "$HOME"
+                } else {
+                    return None;
+                };
+                if !tail[variable.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|next| next == '/' || double && next == '"')
+                {
+                    return None;
+                }
+                for _ in 1..variable.len() {
+                    chars.next();
+                }
+                expands_home = true;
+            }
+            '`' if !single => return None,
+            '~' if !single && !double && index == 0 => {
+                if !raw[1..].is_empty() && !raw[1..].starts_with('/') {
+                    return None;
+                }
+                expands_home = true;
+            }
+            '*' | '?' | '[' | ']' | '{' | '}' | '<' | '>' | '(' | ')' | ';' | '&' | '|'
+                if !single && !double =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some(PermissionWord {
+        ordinary_relative: !text.is_empty()
+            && !text.starts_with('/')
+            && !raw.starts_with(['/', '~', '$', '"', '\''])
+            && !expands_home,
+        text,
+        expands_home,
+    })
+}
+
+struct PermissionInvocation {
+    executable: String,
+    recursive: bool,
+    mode_or_owner: Option<PermissionWord>,
+    targets: Vec<PermissionWord>,
+}
+
+fn permission_invocation(command: &str) -> Option<PermissionInvocation> {
+    use crate::normalize::{
+        NormalizeTokenKind, strip_wrapper_prefixes, tokenize_for_normalization,
+    };
+
+    // Validate before stripping wrappers: unresolved shell code in a wrapper
+    // cannot establish that the remaining text is a complete invocation.
+    let tokens = tokenize_for_normalization(command);
+    for token in &tokens {
+        if token.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        permission_word(token.text(command)?)?;
+    }
+    let stripped = strip_wrapper_prefixes(command);
+    if stripped.wrapper_limit_reached {
+        return None;
+    }
+    let command = stripped.normalized.as_ref();
+    let words = tokenize_for_normalization(command)
+        .iter()
+        .map(|token| permission_word(token.text(command)?))
+        .collect::<Option<Vec<_>>>()?;
+    let mut words = words.into_iter();
+    let executable = words.next()?.text.rsplit('/').next()?.to_string();
+    if executable == "setfacl" {
+        return setfacl_invocation(words);
+    }
+    if !matches!(executable.as_str(), "chmod" | "chown" | "chgrp") {
+        return None;
+    }
+    let mut recursive = false;
+    let mut reference = false;
+    let mut options = true;
+    let mut operands = Vec::new();
+    while let Some(word) = words.next() {
+        if options && word.text == "--" {
+            options = false;
+        } else if options && word.text.starts_with("--") {
+            let (name, value) = word.text[2..]
+                .split_once('=')
+                .map_or((&word.text[2..], None), |(name, value)| (name, Some(value)));
+            let mut candidates = [
+                "recursive",
+                "reference",
+                "changes",
+                "silent",
+                "quiet",
+                "verbose",
+                "preserve-root",
+                "no-preserve-root",
+                "dereference",
+                "no-dereference",
+                "from",
+            ]
+            .into_iter()
+            .filter(|candidate| {
+                *candidate == name || !name.is_empty() && candidate.starts_with(name)
+            })
+            .filter(|candidate| executable == "chown" || *candidate != "from");
+            let option = candidates.next()?;
+            if candidates.next().is_some() {
+                return None;
+            }
+            match option {
+                "reference" | "from" => {
+                    if value.is_none() {
+                        words.next()?;
+                    }
+                    reference |= option == "reference";
+                }
+                _ if value.is_some() => return None,
+                "recursive" => recursive = true,
+                _ => {}
+            }
+        } else if options
+            && word.text.starts_with('-')
+            && word.text.len() > 1
+            && word.text[1..]
+                .chars()
+                .all(|flag| matches!(flag, 'c' | 'f' | 'v' | 'R' | 'H' | 'L' | 'P' | 'h'))
+        {
+            recursive |= word.text.contains('R');
+        } else if options
+            && word.text.starts_with('-')
+            && !(executable == "chmod" && chmod_mode(&word.text).is_some())
+        {
+            return None;
+        } else {
+            operands.push(word);
+        }
+    }
+    let mut operands = operands.into_iter();
+    let mode_or_owner = if reference {
+        None
+    } else {
+        Some(operands.next()?)
+    };
+    if executable == "chmod"
+        && mode_or_owner
+            .as_ref()
+            .is_some_and(|mode| chmod_mode(&mode.text).is_none())
+    {
+        return None;
+    }
+    let targets: Vec<_> = operands.collect();
+    if targets.is_empty() {
+        return None;
+    }
+    Some(PermissionInvocation {
+        executable,
+        recursive,
+        mode_or_owner,
+        targets,
+    })
+}
+
+/// Resolve exact long options before considering unique abbreviations. In
+/// particular, --modify and --remove are not ambiguous with their -file forms.
+fn setfacl_long_option(name: &str) -> Option<char> {
+    const OPTIONS: &[(&str, char)] = &[
+        ("set", 's'),
+        ("set-file", 'S'),
+        ("mask", 'r'),
+        ("recursive", 'R'),
+        ("logical", 'L'),
+        ("physical", 'P'),
+        ("restore", 'B'),
+        ("test", 't'),
+        ("modify", 'm'),
+        ("modify-file", 'M'),
+        ("remove", 'x'),
+        ("remove-file", 'X'),
+        ("default", 'd'),
+        ("no-mask", 'n'),
+        ("remove-all", 'b'),
+        ("remove-default", 'k'),
+        ("version", 'v'),
+        ("help", 'h'),
+    ];
+    if let Some((_, option)) = OPTIONS.iter().find(|(candidate, _)| *candidate == name) {
+        return Some(*option);
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let mut candidates = OPTIONS
+        .iter()
+        .filter(|(candidate, _)| candidate.starts_with(name));
+    let (_, option) = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(*option)
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum SetfaclSequence {
+    #[default]
+    Empty,
+    Operations,
+    Files,
+}
+
+#[derive(Default)]
+struct SetfaclState {
+    recursive: bool,
+    test: bool,
+    sequence: SetfaclSequence,
+}
+
+impl SetfaclState {
+    /// The native utility processes operands as it reads them. ANY option
+    /// following a file starts a new ACL operation sequence, but recursion and
+    /// test mode persist. `--` is not an option event and does not clear it.
+    fn option(&mut self, option: char) -> Option<bool> {
+        if self.sequence == SetfaclSequence::Files {
+            self.sequence = SetfaclSequence::Empty;
+        }
+        match option {
+            'R' => self.recursive = true,
+            't' => self.test = true,
+            'b' | 'k' | 'm' | 'M' | 'x' | 'X' | 's' | 'S' => {
+                self.sequence = SetfaclSequence::Operations;
+            }
+            'L' | 'P' | 'n' | 'r' | 'd' => {}
+            'h' | 'v' => return Some(true),
+            // Restore names targets inside an external stream and has separate
+            // ownership/mode effects. Even --test cannot prove it harmless here.
+            _ => return None,
+        }
+        Some(false)
+    }
+}
+
+/// Add a denial for an explicit protected target under FreeBSD's operand
+/// ordering. Its getopt stops at the first filename: later -P/--test/--help
+/// words are filenames, not GNU option events that reset or end the sequence.
+/// A GNU-only non-destructive interpretation cannot exempt that mutation.
+///
+/// This is a deny-only check, not proof that other BSD invocations are safe.
+/// Unknown options and indirect target streams retain the existing fallback.
+/// Borrow the decoded words; do not clone argv or inspect the host filesystem.
+fn setfacl_bsd_protected_target(words: &[PermissionWord]) -> Option<usize> {
+    let mut recursive = false;
+    let mut operation = false;
+    let mut symlink_only = false;
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if word.text == "--" {
+            index += 1;
+            break;
+        }
+        if !word.text.starts_with('-') || word.text == "-" {
+            break;
+        }
+        index += 1;
+        for (offset, option) in word.text[1..].char_indices() {
+            match option {
+                'R' => recursive = true,
+                'b' | 'k' => operation = true,
+                'h' => symlink_only = true,
+                'H' | 'L' | 'P' | 'n' | 'd' => {}
+                'm' | 'M' | 'x' | 'X' => {
+                    if offset + 2 == word.text.len() {
+                        words.get(index)?;
+                        index += 1;
+                    }
+                    operation = true;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    // FreeBSD rejects -R with -h before opening any target. Unlike GNU's
+    // help option, -h alone controls symlinks, but it cannot enable recursion.
+    // A leading '-' selects stdin targets, not the later argv filenames.
+    if !recursive || !operation || symlink_only || words.get(index)?.text == "-" {
+        return None;
+    }
+    words[index..]
+        .iter()
+        .position(protected_permission_target)
+        .map(|offset| index + offset)
+}
+
+/// Project an ordered ACL invocation onto the recursive effects this pack
+/// already claims. `targets` contains only a target reached with an ACL
+/// operation, recursion enabled and test mode disabled; it is NOT a bag of
+/// every path-like argument. There is no new rule or default-on policy here.
+///
+/// Linux acl `tools/setfacl.c` uses `getopt`'s `RETURN_IN_ORDER` mode and calls
+/// `next_file` immediately. A trailing --test/--help/invalid option cannot undo
+/// an earlier target. Return the first proven protected mutation before any
+/// subsequent option can discard it. Unsupported argv retains regex fallback.
+fn setfacl_invocation(
+    mut words: std::vec::IntoIter<PermissionWord>,
+) -> Option<PermissionInvocation> {
+    let mut invocation = PermissionInvocation {
+        executable: "setfacl".to_string(),
+        recursive: true,
+        mode_or_owner: None,
+        targets: Vec::new(),
+    };
+    if let Some(index) = setfacl_bsd_protected_target(words.as_slice()) {
+        invocation.targets.push(words.nth(index)?);
+        return Some(invocation);
+    }
+    let mut state = SetfaclState::default();
+    let mut options = true;
+    while let Some(word) = words.next() {
+        if options && word.text == "--" {
+            options = false;
+            continue;
+        }
+        if !options || !word.text.starts_with('-') || word.text == "-" {
+            // An operand without an ACL operation ends the native invocation;
+            // later options do not retroactively make that operand actionable.
+            if state.sequence == SetfaclSequence::Empty {
+                return Some(invocation);
+            }
+            // A bare dash reads TARGETS from stdin, unlike -M/-X's ACL input.
+            // The literal word does not establish which trees will be changed.
+            if word.text == "-" {
+                return None;
+            }
+            state.sequence = SetfaclSequence::Files;
+            if state.recursive && !state.test && protected_permission_target(&word) {
+                invocation.targets.push(word);
+                return Some(invocation);
+            }
+            continue;
+        }
+        if let Some(long) = word.text.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            let option = setfacl_long_option(name)?;
+            if matches!(option, 's' | 'S' | 'm' | 'M' | 'x' | 'X' | 'B') {
+                if value.is_none() {
+                    words.next()?;
+                }
+            } else if value.is_some() {
+                return None;
+            }
+            if state.option(option)? {
+                return Some(invocation);
+            }
+        } else {
+            for (index, option) in word.text[1..].char_indices() {
+                // s/S/r/t/B are long-option return codes, NOT short options.
+                if !matches!(
+                    option,
+                    'b' | 'k' | 'n' | 'd' | 'v' | 'h' | 'm' | 'M' | 'x' | 'X' | 'R' | 'L' | 'P'
+                ) {
+                    return None;
+                }
+                let takes_value = matches!(option, 'm' | 'M' | 'x' | 'X');
+                if takes_value && index + 2 == word.text.len() {
+                    words.next()?;
+                }
+                if state.option(option)? {
+                    return Some(invocation);
+                }
+                if takes_value {
+                    // All remaining bytes belong to this option's value, not
+                    // more flags. A filename such as -R must never enable -R.
+                    break;
+                }
+            }
+        }
+    }
+    Some(invocation)
+}
+
+/// Return the existing chmod predicates for a supported literal mode. Complex
+/// symbolic expressions retain the regex fallback instead of being mistaken
+/// for harmless modes or targets containing flag-like data.
+fn chmod_mode(mode: &str) -> Option<(bool, bool, bool)> {
+    if (3..=4).contains(&mode.len()) && mode.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        let bits = u16::from_str_radix(mode, 8).ok()?;
+        return Some((bits == 0o777, bits & 0o4000 != 0, bits & 0o2000 != 0));
+    }
+    let operation = mode.strip_prefix(['u', 'g', 'o', 'a']).unwrap_or(mode);
+    let permissions = operation.strip_prefix(['+', '-'])?;
+    if permissions.is_empty()
+        || !permissions
+            .chars()
+            .all(|ch| matches!(ch, 'r' | 'w' | 'x' | 'X' | 's' | 't'))
+    {
+        return None;
+    }
+    // `s` is an unordered permission letter: u+xs sets the same special bit
+    // as u+sx. An omitted class or `a` selects both user and group; o+s has no
+    // effect. Keep the accepted grammar and relative-file exemption unchanged.
+    let sets_special = operation.starts_with('+') && permissions.contains('s');
+    Some((
+        false,
+        sets_special && mode.starts_with(['u', 'a', '+']),
+        sets_special && mode.starts_with(['g', 'a', '+']),
+    ))
+}
+
+fn routine_chmod(invocation: &PermissionInvocation) -> bool {
+    invocation.executable == "chmod"
+        && !invocation.recursive
+        && invocation
+            .mode_or_owner
+            .as_ref()
+            .is_some_and(|mode| mode.ordinary_relative)
+        && invocation
+            .targets
+            .iter()
+            .all(|target| target.ordinary_relative)
+}
+
+fn protected_permission_target(target: &PermissionWord) -> bool {
+    if target.expands_home {
+        // permission_word has already proved that this is a leading home
+        // expansion, not a quoted literal or a different variable. A path
+        // returning to (or escaping above) that root is not project-scoped.
+        let suffix = target
+            .text
+            .strip_prefix("${HOME}")
+            .or_else(|| target.text.strip_prefix("$HOME"))
+            .or_else(|| target.text.strip_prefix('~'));
+        let Some(suffix) = suffix else {
+            return true;
+        };
+        let mut depth = 0_usize;
+        for component in suffix.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    let Some(parent_depth) = depth.checked_sub(1) else {
+                        return true;
+                    };
+                    depth = parent_depth;
+                }
+                _ => depth += 1,
+            }
+        }
+        return depth == 0;
+    }
+    let Some(path) = target.text.strip_prefix('/') else {
+        return false;
+    };
+    let path = path.trim_end_matches('/');
+    if protected_permission_components(path.split('/')) {
+        return true;
+    }
+    if !path
+        .split('/')
+        .any(|component| matches!(component, "" | "." | ".."))
+    {
+        return false;
+    }
+
+    // This is an additional DENY-only view, never a filesystem safety proof.
+    // Keep the raw-path decision above: symlinks can change what `..` means,
+    // so reducing `/etc/../tmp` must not turn an existing denial into allow.
+    // No local filesystem lookup is valid evidence for a remote receiver.
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                let _ = components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    protected_permission_components(components.into_iter())
+}
+
+fn protected_permission_components<'a>(mut components: impl Iterator<Item = &'a str>) -> bool {
+    let root = components.next().unwrap_or_default();
+    if root.is_empty() {
+        return true;
+    }
+    if matches!(root, "home" | "Users") {
+        return components.count() <= 1;
+    }
+    // Retain the authored rules' named-tree word boundary as well as their
+    // home-depth carve-out; this argv repair does not narrow target coverage.
+    [
+        "bin", "boot", "dev", "etc", "lib64", "lib", "opt", "proc", "root", "run", "sbin", "srv",
+        "sys", "usr", "var",
+    ]
+    .iter()
+    .any(|name| {
+        root.strip_prefix(*name).is_some_and(|suffix| {
+            suffix
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+        })
+    })
+}
+
+pub(crate) fn posix_chmod_is_safe(command: &str) -> bool {
+    permission_invocation(command)
+        .as_ref()
+        .is_some_and(routine_chmod)
+}
+
+/// Classify a fully understood POSIX invocation, returning every matching rule
+/// in authored order. An exception for chmod-777 must not silently exempt a
+/// recursive system-tree mutation. Unsupported syntax retains the old matcher.
+pub(crate) fn posix_permission_decision(
+    command: &str,
+    dialect: crate::normalize::ShellDialect,
+) -> PosixPermissionDecision {
+    if !matches!(
+        dialect,
+        crate::normalize::ShellDialect::Posix | crate::normalize::ShellDialect::Unknown
+    ) {
+        return PosixPermissionDecision::NoMatch;
+    }
+    let Some(invocation) = permission_invocation(command) else {
+        return PosixPermissionDecision::NoMatch;
+    };
+    if routine_chmod(&invocation) {
+        return PosixPermissionDecision::NonDestructive;
+    }
+    let mut rules = Vec::new();
+    let mode = invocation
+        .mode_or_owner
+        .as_ref()
+        .map(|word| word.text.as_str());
+    let chmod_bits = (invocation.executable == "chmod")
+        .then(|| mode.and_then(chmod_mode))
+        .flatten();
+    if chmod_bits.is_some_and(|bits| bits.0) {
+        rules.push("chmod-777");
+    }
+    if invocation.recursive && invocation.targets.iter().any(protected_permission_target) {
+        rules.push(match invocation.executable.as_str() {
+            "chmod" => "chmod-recursive-root",
+            "chown" => "chown-recursive-root",
+            "setfacl" => "setfacl-all",
+            _ => "chgrp-recursive-root",
+        });
+    }
+    if chmod_bits.is_some_and(|bits| bits.1) {
+        rules.push("chmod-setuid");
+    }
+    if chmod_bits.is_some_and(|bits| bits.2) {
+        rules.push("chmod-setgid");
+    }
+    if invocation.executable == "chown"
+        && mode.is_some_and(|owner| owner == "root" || owner.starts_with("root:"))
+    {
+        rules.push("chown-to-root");
+    }
+    if rules.is_empty() {
+        PosixPermissionDecision::NonDestructive
+    } else {
+        PosixPermissionDecision::Destructive(rules)
+    }
+}
 
 /// Anchor a read-only exemption to the command the segment actually runs.
 ///
 /// Mirrors `system::disk`'s macro of the same shape. The sudo group admits only
 /// `-n`, never arbitrary options: `sudo -u stat chmod -R 777 /etc` passes `stat`
-/// as `-u`'s *value*, so a prefix that skipped `-\S+` would find the tool name
+/// as `-u`'s *value*, so a prefix that skipped `-\S+` options would find the tool name
 /// it was looking for and exempt the chmod behind it. The evaluator's sudo table
 /// knows `-u` consumes a value and normalises that command to `chmod …` today,
 /// which is why nothing was reachable through it — but an exemption that can
@@ -81,32 +698,9 @@ pub fn create_pack() -> Pack {
 
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
-        // A non-recursive chmod on an ordinary file is routine, so it is
-        // exempted. The exemption keyed only on "the target does not begin with
-        // `/`", and a safe match short-circuits the whole pack, so every other
-        // way of naming an absolute or home path walked straight through it:
-        //
-        //   chmod 777 /etc/shadow        denied
-        //   chmod 777 "/etc/shadow"      ALLOWED   <- same file, one quote
-        //   chmod 777 ~/.ssh/id_rsa      ALLOWED
-        //   chmod 777 $HOME/.ssh/id_rsa  ALLOWED
-        //   chmod 4755 ~/bin/tool        ALLOWED   <- setuid, same cause
-        //
-        // The quoted spelling is the sharpest: the shell unquotes it to the
-        // identical path, so the deny and the allow name the same file. This is
-        // the `~`/`$HOME` family that #489 fixed for the RECURSIVE rules, in
-        // the one place that is a safe pattern rather than a destructive one —
-        // and `quote_bypass_does_not_evade_system_dir_block` pinned only the
-        // recursive half.
-        //
-        // Excluding `~`, `$`, `"` and `'` alongside `/` costs nothing real:
-        // those four never begin an ordinary relative filename, and a target
-        // that is genuinely plain (`notes.txt`, `./build`) still matches. The
-        // exemption is narrowed, never a destructive pattern widened.
-        safe_pattern!(
-            "chmod-non-recursive",
-            r#"chmod\s+(?!-[rR])(?:\d{3,4}|[ugoa][+-][rwxXst]+)\s+[^/~$"']"#
-        ),
+        // The chmod exemption is now proven by routine_chmod: every target
+        // must be ordinary and no later argument may turn on recursion.
+        // Prefix matches also let a reference filename forge a safe command.
         // stat is safe (read-only), but only when stat is what runs. As a bare
         // word it matched anywhere in the segment, and a safe match
         // short-circuits the pack, so `chmod -R 777 /etc --reference=/tmp/stat`
@@ -127,6 +721,12 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 }
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
+    // These are also the fallback when a later expansion prevents a complete
+    // argv proof. Do not recover a truncated prefix as NonDestructive or skip
+    // the remaining rules after an allowlist hit. In that fallback, dot/parent
+    // components and repeated separators are unverified ancestry, not evidence
+    // of a bounded project target. Complete literal project paths still take
+    // the semantic NonDestructive path above. Retain every legacy regex hit.
     vec![
         // chmod 777 (world writable)
         // These patterns use unbounded .* gap-matchers, so on a full command
@@ -174,7 +774,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // quotes but not single ones, so it takes an optional `"` only.
         destructive_pattern!(
             "chmod-recursive-root",
-            r#"chmod\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chmod\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))|(?:['"]?/|~/|"?\$(?:HOME|\{HOME\})/)(?:(?:[^\s"';&|]*/)?\.{1,2}(?:/|[\s"']|$)|(?:[^\s"';&|]*/)?/))"#,
             "chmod -R on system directories can break system permissions.",
             Critical,
             "Recursively changing permissions on system directories can render the system \
@@ -188,7 +788,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chown -R on root or system directories
         destructive_pattern!(
             "chown-recursive-root",
-            r#"chown\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chown\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))|(?:['"]?/|~/|"?\$(?:HOME|\{HOME\})/)(?:(?:[^\s"';&|]*/)?\.{1,2}(?:/|[\s"']|$)|(?:[^\s"';&|]*/)?/))"#,
             "chown -R on system directories can break system ownership.",
             High,
             "Recursive ownership changes on system directories can disrupt services, \
@@ -209,7 +809,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // the effect is the same kind of change to the same metadata.
         destructive_pattern!(
             "chgrp-recursive-root",
-            r#"chgrp\s+(?:.*(?:-[rR]|--recursive)).*\s+(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))"#,
+            r#"chgrp\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))|(?:['"]?/|~/|"?\$(?:HOME|\{HOME\})/)(?:(?:[^\s"';&|]*/)?\.{1,2}(?:/|[\s"']|$)|(?:[^\s"';&|]*/)?/))"#,
             "chgrp -R on system directories can break system group ownership.",
             High,
             "Recursive group changes on system directories can disrupt services that \
@@ -294,7 +894,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chmod u+s (setuid)
         destructive_pattern!(
             "chmod-setuid",
-            r"chmod\s+.*u\+s|chmod\s+[4-7]\d{3}",
+            r#"chmod\s+.*u\+s|chmod\s+[4-7]\d{3}|chmod\s+(?:.*\s+)?["']?0*[4-7][0-7]{3}(?:[\s"']|$)|chmod\s+(?:.*\s+)?["']?(?:[ugoa]*[ua][ugoa]*)?\+[rwxXst]*s[rwxXst]*(?:[\s"']|$)"#,
             "Setting setuid bit (chmod u+s) is a security-sensitive operation.",
             High,
             "The setuid bit causes a program to run with the file owner's privileges \
@@ -309,7 +909,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chmod g+s (setgid)
         destructive_pattern!(
             "chmod-setgid",
-            r"chmod\s+.*g\+s|chmod\s+[2367]\d{3}",
+            r#"chmod\s+.*g\+s|chmod\s+[2367]\d{3}|chmod\s+(?:.*\s+)?["']?0*[2367][0-7]{3}(?:[\s"']|$)|chmod\s+(?:.*\s+)?["']?(?:[ugoa]*[ga][ugoa]*)?\+[rwxXst]*s[rwxXst]*(?:[\s"']|$)"#,
             "Setting setgid bit (chmod g+s) is a security-sensitive operation.",
             High,
             "The setgid bit on an executable causes it to run with the file group's \
@@ -330,7 +930,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Transferring file ownership to root makes the files inaccessible to normal \
              users and may break applications that need to write to those files. Services \
              running as non-root users will lose access.\n\n\
-             Check who currently owns the file:\n  \
+             Check the current owner first:\n  \
              ls -la <path>\n\n\
              Consider using group ownership instead:\n  \
              chgrp <group> <path>",
@@ -339,7 +939,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // setfacl with dangerous patterns
         destructive_pattern!(
             "setfacl-all",
-            r#"setfacl\s+.*-[rR].*\s+['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))"#,
+            r#"setfacl\s+(?:.*(?:-[a-zA-Z]*[rR]|--recursive)).*\s+(?:(?:['"]?/(?:(?:bin|boot|dev|etc|lib64|lib|opt|proc|root|run|sbin|srv|sys|usr|var)\b|(?:home|Users)(?:/[^/\s"']+)?/?(?:[\s"']|$)|['"]?(?:\s|$))|~/?(?:[\s"']|$)|"?\$\{?HOME\}?/?(?:[\s"']|$))|(?:['"]?/|~/|"?\$(?:HOME|\{HOME\})/)(?:(?:[^\s"';&|]*/)?\.{1,2}(?:/|[\s"']|$)|(?:[^\s"';&|]*/)?/))"#,
             "setfacl -R on system directories can modify access control across the filesystem.",
             Critical,
             "Recursively modifying ACLs on system directories changes fine-grained access \
@@ -358,8 +958,376 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::normalize::ShellDialect;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn setfacl_recursive_effects_use_target_roles_and_aliases() {
+        let pack = create_pack();
+        for target in [
+            "/etc",
+            "/./etc",
+            "/tmp/../etc",
+            "/home//user",
+            "/home/user/project/..",
+            "/Users/user/.",
+            "~/.",
+            "$HOME/project/..",
+            "\"${HOME}/project/..\"",
+        ] {
+            for options in [
+                "-Rb",
+                "-bR",
+                "-bLR",
+                "--rec --remove-all",
+                "--recursive --modify=u:app:rwx",
+                "--recursive --remove=u:app",
+                "-R --set=u::rwx,g::r-x,o::---",
+                "-R --set-file=/tmp/acl",
+                "-RM/tmp/acl",
+                "-RX/tmp/acl",
+                "-R --modify-file /tmp/acl",
+                "-R --remove-file /tmp/acl",
+            ] {
+                let command = format!("setfacl {options} {target}");
+                assert_eq!(
+                    posix_permission_decision(&command, ShellDialect::Posix),
+                    PosixPermissionDecision::Destructive(vec!["setfacl-all"]),
+                    "{command:?}"
+                );
+                assert!(!pack.matches_safe(&command), "{command:?}");
+                assert_blocks_with_pattern(&pack, &command, "setfacl-all");
+            }
+        }
+        for command in [
+            "sudo -n /usr/bin/setfacl -bR /tmp/../etc",
+            "setfacl -R -b ./project /tmp/../etc",
+            "setfacl -R -b -- /tmp/../etc",
+            "setfacl -R -m u:app:rwx /etc",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+    }
+
+    #[test]
+    fn setfacl_later_options_cannot_erase_a_protected_mutation() {
+        let pack = create_pack();
+        for prefix in [
+            "setfacl -R -b /etc",
+            "setfacl -bR /tmp/../etc",
+            "setfacl --rec --remove-all ~/project/..",
+        ] {
+            for suffix in [
+                " --test",
+                " --test -b ./project",
+                " --help",
+                " --version",
+                " -vh",
+                " --unknown",
+                " --restore=/tmp/backup",
+                " -M",
+                " --test=invalid",
+            ] {
+                let command = format!("{prefix}{suffix}");
+                assert_eq!(
+                    posix_permission_decision(&command, ShellDialect::Posix),
+                    PosixPermissionDecision::Destructive(vec!["setfacl-all"]),
+                    "{command:?}"
+                );
+                assert_blocks_with_pattern(&pack, &command, "setfacl-all");
+            }
+        }
+    }
+
+    #[test]
+    fn setfacl_test_and_terminal_options_apply_only_when_reached() {
+        let pack = create_pack();
+        for command in [
+            "setfacl --test -Rb /etc",
+            "setfacl --te -bR /tmp/../etc",
+            "setfacl -R --test --remove-all /etc",
+            "setfacl --test -R -M /tmp/acl /etc",
+            "setfacl --help -Rb /etc",
+            "setfacl -hRb /etc",
+            "setfacl --version -Rb /etc",
+            "setfacl -vRb /etc",
+            // The first target is non-recursive. The later test flag applies
+            // only to subsequent targets, and never gets mistaken for a value.
+            "setfacl -b /etc --test -Rb /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn setfacl_acl_values_are_neither_options_nor_target_paths() {
+        let pack = create_pack();
+        for command in [
+            "setfacl -M -R /etc",
+            "setfacl -M-R /etc",
+            "setfacl --modify-file=-R /etc",
+            "setfacl -R -M /etc/acl ./project",
+            "setfacl -R -M /etc/acl /home/user/project",
+            "setfacl -R --remove-file /etc/acl ./project",
+            "setfacl -R --set-file=/etc/acl ./project",
+            "setfacl -R --modify-file '/etc/-R --test' ./project",
+            "setfacl -b -- -R /etc",
+            "setfacl --remove-all /etc",
+            "setfacl --remove=u:app /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, command);
+        }
+        // A test-looking VALUE does not enable test mode.
+        for command in [
+            "setfacl -R -M --test /etc",
+            "setfacl -RM--test /etc",
+            "setfacl --recursive --modify-file=--test /etc",
+            "setfacl -R -X --test /etc",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+    }
+
+    #[test]
+    fn setfacl_operation_sequences_follow_native_operand_order() {
+        let pack = create_pack();
+        for command in [
+            "setfacl -b /etc -R -b ./project",
+            // Any option after a target clears the GNU ACL sequence. When
+            // recursion already applies, a BSD target interpretation can still
+            // mutate /etc, so only the explicit leading test form is harmless.
+            "setfacl -b ./project -R /etc",
+            "setfacl --test -Rb ./project -P /etc",
+            // -- does not clear the current operation sequence.
+            "setfacl -b ./project -- /etc",
+            // Invalid leading operands stop before later options can run.
+            "setfacl /tmp/file -Rb /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, command);
+        }
+        for command in [
+            "setfacl -b ./project -R -b /etc",
+            "setfacl -Rb ./project -P -b /etc",
+            "setfacl -Rb ./project -- /etc",
+            // --test is a TARGET after --, not a reason to skip /etc.
+            "setfacl -Rb ./project -- --test /etc",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+    }
+
+    #[test]
+    fn bsd_setfacl_operands_cannot_inherit_gnu_option_exemptions() {
+        let pack = create_pack();
+        for command in [
+            "setfacl -Rb ./project -P /etc",
+            "setfacl -Rb ./project --test -b /etc",
+            "setfacl -Rb ./project --help /etc",
+            "setfacl -Rb ./project --version /etc",
+            "setfacl -Rb ./project -M /tmp/../etc",
+            "setfacl -HRb /etc",
+            "setfacl -Rb ./project --restore=/tmp/backup /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(vec!["setfacl-all"]),
+                "{command:?}"
+            );
+            assert_blocks_with_pattern(&pack, command, "setfacl-all");
+        }
+        for command in [
+            "setfacl --test -Rb ./project -P /etc",
+            "setfacl --help -Rb /etc",
+            "setfacl -hRb /etc",
+            "setfacl -Rb ./project -P ./second",
+            "setfacl -R -M /etc/acl ./project",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn setfacl_unsupported_inputs_keep_the_conservative_fallback() {
+        for command in [
+            "setfacl -R -M",
+            "setfacl -R --modify-file",
+            "setfacl --re -b /etc",
+            "setfacl --test=1 -Rb /etc",
+            "setfacl -r -b /etc",
+            "setfacl -t -Rb /etc",
+            "setfacl -s u::rwx /etc",
+            "setfacl -R -b -",
+            "setfacl --restore=/tmp/backup",
+            "setfacl --test --restore=/tmp/backup",
+            "setfacl -R -m $ACL /etc",
+            "setfacl -R -b /tmp/*",
+            "setfacl -R -b /etc; echo done",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NoMatch,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setfacl_keeps_project_and_literal_home_carve_outs() {
+        let pack = create_pack();
+        for target in [
+            "./project",
+            "/tmp/work",
+            "/home/user/project",
+            "/home/user/project/src/..",
+            "/Users/user/project",
+            "~/project",
+            "\"$HOME/project\"",
+            "'~/project/..'",
+            "'$HOME/project/..'",
+            "/etc_backup",
+            "/etcetera",
+        ] {
+            let command = format!("setfacl -Rb {target}");
+            assert_eq!(
+                posix_permission_decision(&command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+            assert_allows(&pack, &command);
+        }
+    }
+
+    #[test]
+    fn chmod_exemption_requires_the_complete_invocation() {
+        let pack = create_pack();
+        for command in [
+            "chmod 755 file -R /etc",
+            "chmod 755 --recursive /etc",
+            "chmod 777 notes /etc/shadow",
+            "chmod 777 notes $HOME/.ssh/id_rsa",
+            "chmod 4755 notes ~/bin/tool",
+            "chmod -R --reference=\"chmod 777 notes\" /etc",
+            "chown -R --reference=\"chmod 777 notes\" /etc",
+            "chgrp -R --reference=\"chmod 777 notes\" /etc",
+            "chmod 777 notes $other_targets",
+            "chmod 777 notes --unknown-option",
+        ] {
+            assert!(!pack.matches_safe(command), "{command:?}");
+            assert!(
+                !pack.matches_safe_with_deadline(command, None),
+                "{command:?}"
+            );
+        }
+        for command in [
+            "chmod 777 notes",
+            "chmod 4755 ./tool",
+            "chmod u+x ./script.sh",
+        ] {
+            assert!(pack.matches_safe(command), "{command:?}");
+            assert!(
+                pack.matches_safe_with_deadline(command, None),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_permission_roles_distinguish_options_values_and_operands() {
+        for command in [
+            "chmod -R --reference=/etc/passwd ./project",
+            "chmod --reference '-vR' /etc",
+            "chmod 644 notes -- -R /etc",
+            "chmod -- -r /etc",
+            "chown --from=root nobody /tmp/file",
+            "chown --from -vR nobody /etc",
+            "chown -vR --reference /etc/passwd ./project",
+            "chgrp -vR --reference /etc/passwd ./project",
+            "chgrp staff -- -R /etc",
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NonDestructive,
+                "{command:?}"
+            );
+        }
+        for (command, rule) in [
+            ("chmod -vR 755 /etc", "chmod-recursive-root"),
+            ("chmod 755 /etc -fvR", "chmod-recursive-root"),
+            ("chmod --rec --ref=/tmp/mode /etc", "chmod-recursive-root"),
+            ("chown nobody /etc -vR", "chown-recursive-root"),
+            ("chgrp -vR staff /Users/user", "chgrp-recursive-root"),
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(vec![rule]),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_permissions_keep_every_independent_rule_identity() {
+        for (command, rules) in [
+            (
+                "chmod -vR 777 /etc",
+                vec!["chmod-777", "chmod-recursive-root"],
+            ),
+            ("chmod 6755 /etc/file", vec!["chmod-setuid", "chmod-setgid"]),
+            (
+                "chown -vR root /etc",
+                vec!["chown-recursive-root", "chown-to-root"],
+            ),
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(rules),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_permission_argv_never_proves_safety() {
+        for command in [
+            "chmod -vR $(cat mode) /etc",
+            "chmod 777 file $targets",
+            "chmod 777 file*",
+            "chmod 777 'unterminated",
+            "chmod --reference",
+            "chmod --unknown=755 /etc",
+            "chmod --re 755 /etc",
+            "chmod 755 notes; chmod 777 /etc",
+            "echo 'chmod 777 notes'",
+        ] {
+            assert!(!posix_chmod_is_safe(command), "{command:?}");
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NoMatch,
+                "{command:?}"
+            );
+        }
+    }
 
     #[test]
     fn read_only_tool_names_in_argument_data_do_not_disarm_the_pack_issue_448() {
@@ -389,7 +1357,7 @@ mod tests {
     #[test]
     fn ls_long_form_in_argument_data_does_not_disarm_the_pack_issue_448() {
         // `ls\s+.*-l` unanchored could be found inside another command's
-        // arguments. `chmod -R 777 /etc ls -l` was allowed against v0.14.4.
+        // arguments, and a safe match short-circuits the pack (#448).
         let pack = create_pack();
         for command in ["chmod -R 777 /etc ls -l", "chown -R nobody /etc ls -al"] {
             assert!(
@@ -832,5 +1800,246 @@ mod tests {
         assert_blocks_with_pattern(&pack, "chmod -R 755 /etc", "chmod-recursive-root");
         assert_blocks_with_pattern(&pack, "chown -R user:group /var", "chown-recursive-root");
         assert_blocks_with_pattern(&pack, "setfacl -R -m u:app:rwx /etc", "setfacl-all");
+    }
+
+    #[test]
+    fn recursive_permission_aliases_retain_their_exact_rules() {
+        let pack = create_pack();
+        for (executable, operand, rule) in [
+            ("chmod", "000", "chmod-recursive-root"),
+            ("chown", "nobody", "chown-recursive-root"),
+            ("chgrp", "nogroup", "chgrp-recursive-root"),
+        ] {
+            for target in [
+                "/./etc",
+                "/tmp/../etc",
+                "/tmp/cache/../../usr",
+                "/tmp/../../etc",
+                "/home//user",
+                "/home/user/project/..",
+                "/home/user/.",
+                "/Users/user/project/..",
+                "'/tmp/../etc'",
+                "\"/tmp/../etc\"",
+                "~",
+                "~/.",
+                "~/project/..",
+                "~/project/../.",
+                "~/../elsewhere",
+                "$HOME/.",
+                "$HOME/project/..",
+                "${HOME}/project/..",
+                "\"$HOME/project/..\"",
+                "\"${HOME}/project/..\"",
+            ] {
+                for command in [
+                    format!("{executable} -R {operand} {target}"),
+                    format!("{executable} {operand} {target} -vR"),
+                    format!("{executable} --recursive {operand} {target}"),
+                    format!("{executable} -R --reference=/tmp/reference {target}"),
+                ] {
+                    assert_eq!(
+                        posix_permission_decision(&command, ShellDialect::Posix),
+                        PosixPermissionDecision::Destructive(vec![rule]),
+                        "{command:?}"
+                    );
+                    assert!(!pack.matches_safe(&command), "{command:?}");
+                    assert_blocks_with_pattern(&pack, &command, rule);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn permission_aliases_preserve_every_independent_rule() {
+        for (command, rules) in [
+            (
+                "chmod -R 777 /tmp/../etc",
+                vec!["chmod-777", "chmod-recursive-root"],
+            ),
+            (
+                "chmod -R 6755 /tmp/../etc",
+                vec!["chmod-recursive-root", "chmod-setuid", "chmod-setgid"],
+            ),
+            (
+                "chown -R root /tmp/../etc",
+                vec!["chown-recursive-root", "chown-to-root"],
+            ),
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(rules),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_aliases_do_not_reinterpret_literal_home_names() {
+        for target in [
+            "'~/project/..'",
+            "\"~/project/..\"",
+            "'$HOME/project/..'",
+            "'${HOME}/project/..'",
+            "/tmp/work",
+            "/tmp/./work",
+            "/home/user/project",
+            "/home/user/./project",
+            "/home/user/project/src/..",
+            "/Users/user/project",
+            "~/project",
+            "~/project/src/..",
+            "$HOME/project",
+            "${HOME}/project",
+            "${HOME}/project//build/..",
+            "/etc_backup",
+            "/etcetera",
+        ] {
+            let word = permission_word(target).expect("literal target or modeled home expansion");
+            assert!(!protected_permission_target(&word), "{target:?}");
+            for (executable, operand) in
+                [("chmod", "000"), ("chown", "nobody"), ("chgrp", "nogroup")]
+            {
+                let command = format!("{executable} -R {operand} {target}");
+                assert_eq!(
+                    posix_permission_decision(&command, ShellDialect::Posix),
+                    PosixPermissionDecision::NonDestructive,
+                    "{command:?}"
+                );
+            }
+        }
+        for target in [
+            "$HOME_suffix/..",
+            "$TARGET/..",
+            "/tmp/$(name)/..",
+            "/tmp/*/..",
+        ] {
+            assert!(permission_word(target).is_none(), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn alias_view_never_weakens_an_existing_raw_path_denial() {
+        for target in [
+            "/",
+            "/etc/../tmp",
+            "/var/cache/../../tmp",
+            "/usr/../home/user/project",
+            "/etc-other/../tmp",
+            "//tmp/project",
+            "/home/user",
+            "/Users/user",
+        ] {
+            let word = permission_word(target).expect("literal target");
+            assert!(protected_permission_target(&word), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn symbolic_special_bits_do_not_depend_on_permission_letter_order() {
+        let pack = create_pack();
+        for (mode, setuid, setgid) in [
+            ("u+s", true, false),
+            ("u+xs", true, false),
+            ("u+rws", true, false),
+            ("g+s", false, true),
+            ("g+xs", false, true),
+            ("g+rs", false, true),
+            ("a+s", true, true),
+            ("+s", true, true),
+            ("a+xs", true, true),
+        ] {
+            assert_eq!(chmod_mode(mode), Some((false, setuid, setgid)), "{mode}");
+            let mut rules = Vec::new();
+            if setuid {
+                rules.push("chmod-setuid");
+            }
+            if setgid {
+                rules.push("chmod-setgid");
+            }
+            let command = format!("chmod {mode} /tmp/file");
+            assert_eq!(
+                posix_permission_decision(&command, ShellDialect::Posix),
+                PosixPermissionDecision::Destructive(rules.clone()),
+                "{command}"
+            );
+            assert_blocks_with_pattern(&pack, &command, rules[0]);
+        }
+        for mode in ["u-s", "g-s", "a-s", "o+s", "u+x"] {
+            assert_eq!(chmod_mode(mode), Some((false, false, false)), "{mode}");
+            assert_allows(&pack, &format!("chmod {mode} /tmp/file"));
+        }
+        // Do not broaden which mode grammar can prove the relative-file
+        // exemption. Unsupported compound modes retain their fallback.
+        assert_eq!(chmod_mode("ug+s"), None);
+        assert_eq!(chmod_mode("u+s,g-s"), None);
+        assert_allows(&pack, "chmod u+xs ./file");
+    }
+
+    #[test]
+    fn unresolved_argv_keeps_recursive_alias_and_bundle_backstops() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("chmod -R 000 /tmp/../etc", "chmod-recursive-root"),
+            ("chmod -R 000 /./etc", "chmod-recursive-root"),
+            ("chown -R nobody /tmp/../etc", "chown-recursive-root"),
+            ("chgrp -R staff /home//user", "chgrp-recursive-root"),
+            ("setfacl -bR /etc", "setfacl-all"),
+            ("setfacl -bR /tmp/../etc", "setfacl-all"),
+            ("setfacl -R -b ~/project/..", "setfacl-all"),
+            ("setfacl -R -b \"${HOME}/project/..\"", "setfacl-all"),
+        ] {
+            for suffix in [" \"$EXTRA\"", " $EXTRA"] {
+                let command = format!("{command}{suffix}");
+                // This remains unresolved; no truncated argv is promoted to
+                // a safety proof or a complete list of permission effects.
+                assert_eq!(
+                    posix_permission_decision(&command, ShellDialect::Posix),
+                    PosixPermissionDecision::NoMatch,
+                    "{command}"
+                );
+                assert!(!pack.matches_safe(&command), "{command}");
+                assert_blocks_with_pattern(&pack, &command, rule);
+            }
+        }
+        // The broader alias backstop is used only without a complete proof.
+        for command in [
+            "chmod -R 755 /tmp/./project",
+            "chown -R nobody /tmp/project/..",
+            "chgrp -R staff /home/user/project/src/..",
+            "setfacl -Rb /tmp//project",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    #[test]
+    fn unresolved_modes_keep_all_independent_special_bit_rules() {
+        let pack = create_pack();
+        for (command, expected) in [
+            (
+                "chmod -R 6755 /tmp/../etc \"$EXTRA\"",
+                vec!["chmod-recursive-root", "chmod-setuid", "chmod-setgid"],
+            ),
+            (
+                "chmod a+xs /tmp/file \"$EXTRA\"",
+                vec!["chmod-setuid", "chmod-setgid"],
+            ),
+            ("chmod u+xs /tmp/file \"$EXTRA\"", vec!["chmod-setuid"]),
+            ("chmod -R 2755 /tmp/file \"$EXTRA\"", vec!["chmod-setgid"]),
+        ] {
+            assert_eq!(
+                posix_permission_decision(command, ShellDialect::Posix),
+                PosixPermissionDecision::NoMatch,
+                "{command}"
+            );
+            let hits: Vec<_> = pack
+                .destructive_patterns
+                .iter()
+                .filter(|pattern| pattern.regex.is_match(command))
+                .filter_map(|pattern| pattern.name)
+                .collect();
+            assert_eq!(hits, expected, "{command}");
+        }
     }
 }

@@ -778,6 +778,360 @@ fn documented_global_boolean_env_values_do_not_fail_clap_parsing() {
     }
 }
 
+// Issue #549: evaluate recursive-delete inputs only. No Python interpreter or
+// deletion command is ever executed by these regressions.
+mod python_temp_root_tests {
+    use super::*;
+
+    const TEMP_ROOTS: [&str; 4] = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
+
+    struct TestEnv {
+        root: tempfile::TempDir,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            Self::with_heredoc_limit("")
+        }
+
+        fn with_heredoc_limit(limit: &str) -> Self {
+            let root = tempfile::tempdir().expect("create isolated CLI environment");
+            std::fs::create_dir_all(root.path().join("home/.config/dcg")).unwrap();
+            std::fs::create_dir_all(root.path().join("tmp")).unwrap();
+            std::fs::write(
+                root.path().join("config.toml"),
+                format!(
+                    "[heredoc]\nenabled = true\ntimeout_ms = 5000\n{limit}\n\
+                 [history]\nenabled = false\n\
+                 [packs]\ndisabled = [\"windows.filesystem\", \"windows.system\"]\n"
+                ),
+            )
+            .expect("write isolated policy config");
+            Self { root }
+        }
+
+        fn assert_verdict(&self, command: &str, expected: &str) {
+            let home = self.root.path().join("home");
+            let scratch = self.root.path().join("tmp");
+            let config = self.root.path().join("config.toml");
+            let mut child = Command::new(dcg_binary())
+                .args([
+                    "test",
+                    "--stdin",
+                    "--dialect",
+                    "posix",
+                    "--format",
+                    "json",
+                    "--config",
+                ])
+                .arg(&config)
+                .env_clear()
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("APPDATA", home.join("appdata"))
+                .env("LOCALAPPDATA", home.join("localappdata"))
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("TMPDIR", &scratch)
+                .env("TEMP", &scratch)
+                .env("TMP", &scratch)
+                .env("DCG_CONFIG", &config)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                // These are semantic regressions. A scheduling delay must not
+                // replace a completed verdict with the bounded fallback.
+                .env("DCG_AST_TIMEOUT_MS", "5000")
+                .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                .current_dir(self.root.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn dcg test");
+            child
+                .stdin
+                .take()
+                .expect("dcg stdin")
+                .write_all(command.as_bytes())
+                .expect("send command as inert evaluation input");
+            let output = child.wait_with_output().expect("wait for dcg test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let result: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!("invalid verdict JSON for {command:?}: {error}\n{stdout}\n{stderr}")
+                });
+            assert_eq!(
+                result["decision"], expected,
+                "unexpected verdict for {command:?}\n{stdout}\n{stderr}"
+            );
+        }
+
+        fn assert_python_target(&self, target: &str, expected: &str) {
+            let body = format!("import shutil; shutil.rmtree('{target}')");
+            self.assert_python_body(&body, expected);
+        }
+
+        fn assert_python_body(&self, body: &str, expected: &str) {
+            self.assert_verdict(&format!("python3 -c \"{body}\""), expected);
+            self.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), expected);
+        }
+    }
+
+    #[test]
+    fn python_temp_roots_and_normalized_aliases_deny_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            for suffix in ["", "/", "//", "/.", "/./", "//.//./", "/build/.."] {
+                env.assert_python_target(&format!("{root}{suffix}"), "deny");
+            }
+        }
+        for target in [
+            "/./tmp",
+            "//tmp",
+            "/var//tmp",
+            "/private/./tmp",
+            "/private//var/./tmp",
+        ] {
+            env.assert_python_target(target, "deny");
+        }
+    }
+
+    #[test]
+    fn python_temp_traversal_and_prefix_lookalikes_deny_issue_549() {
+        let env = TestEnv::new();
+        for target in [
+            "/tmp/../etc",
+            "/tmp/build/../../etc",
+            "/var/tmp/../../etc",
+            "/private/tmp/../../etc",
+            "/private/var/tmp/../../../etc",
+            "/tmp//..//etc",
+            // Preserve the established rejection of every parent component,
+            // even when lexical normalization would land inside a temp tree.
+            "/tmp/build/../cache",
+            "/tmp/../tmp/build",
+            "/tmp-backup/build",
+            "/private/tmp-backup/build",
+            "/var/tmpfile/build",
+        ] {
+            env.assert_python_target(target, "deny");
+        }
+    }
+
+    #[test]
+    fn python_actual_temp_descendants_allow_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            for suffix in [
+                "/build",
+                "/build/",
+                "//build//",
+                "/./build/.",
+                "/build..cache",
+            ] {
+                env.assert_python_target(&format!("{root}{suffix}"), "allow");
+            }
+        }
+        for target in [
+            "/./tmp/build",
+            "/var//tmp/./build",
+            "/private/./tmp/build",
+            "/private//var/tmp/build",
+            "/tmp/.hidden",
+        ] {
+            env.assert_python_target(target, "allow");
+        }
+    }
+
+    #[test]
+    fn python_execution_forms_preserve_temp_boundary_issue_549() {
+        let env = TestEnv::new();
+        for (target, expected) in [("/tmp/.", "deny"), ("/tmp/build", "allow")] {
+            for command in [
+                format!("python -c 'import shutil; shutil.rmtree(\"{target}\")'"),
+                format!("python3 -I -c \"import shutil; shutil.rmtree('{target}')\""),
+                format!(
+                    "python3 -W ignore::DeprecationWarning -c \"import shutil; shutil.rmtree('{target}')\""
+                ),
+                format!(
+                    "python3 -c \"import shutil as sh; sh.rmtree('{target}', ignore_errors=True)\""
+                ),
+                format!("python3 -c \"import shutil; shutil.rmtree(path='{target}')\""),
+                format!("python3 -c \"import shutil; shutil.rmtree(('{target}'))\""),
+                format!("python3 <<'PY'\nimport shutil as sh\nsh.rmtree('{target}')\nPY"),
+                format!("python3 -I - <<'PY'\nimport shutil\nshutil.rmtree('{target}')\nPY"),
+            ] {
+                env.assert_verdict(&command, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn python_temp_exemption_cannot_borrow_unrelated_evidence_issue_549() {
+        let env = TestEnv::new();
+        for call in [
+            "shutil.rmtree('/tmp/build' + '/..')",
+            "shutil.rmtree('/tmp/build' + '/../../home/user/Documents')",
+            "shutil.rmtree('/tmp/build' + suffix)",
+            "shutil.rmtree('/tmp/build'[:-5])",
+            "shutil.rmtree(Path('/tmp/build').parent)",
+            "shutil.rmtree(os.path.join('/tmp/build', '../../etc'))",
+            "shutil.rmtree('/tmp/\\x2e')",
+            "shutil.rmtree(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+            "shutil.rmtree(Path(tempfile.mkdtemp()).parent)",
+            "shutil.rmtree(tempfile.mkdtemp() + '/..')",
+        ] {
+            let body = format!("import os, shutil, tempfile; from pathlib import Path; {call}");
+            env.assert_verdict(&format!("python3 -c \"{body}\""), "deny");
+            env.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "deny");
+        }
+    }
+
+    #[test]
+    fn python_fresh_temp_cleanup_and_inert_examples_remain_allowed_issue_549() {
+        let env = TestEnv::new();
+        for body in [
+            "import shutil, tempfile; shutil.rmtree(tempfile.mkdtemp())",
+            "import shutil; from tempfile import mkdtemp; shutil.rmtree(mkdtemp())",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.mkdtemp())",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.mkdtemp(prefix='build-'))",
+            "import shutil; import tempfile as tf; shutil.rmtree(tf.TemporaryDirectory().name)",
+        ] {
+            env.assert_verdict(&format!("python3 -c \"{body}\""), "allow");
+            env.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "allow");
+        }
+        env.assert_verdict(
+            "cat <<'PY'\nimport shutil\nshutil.rmtree('/tmp')\nPY",
+            "allow",
+        );
+        env.assert_verdict("python3 -c \"print('shutil.rmtree(/tmp)')\"", "allow");
+    }
+
+    #[test]
+    fn shell_temp_cleanup_policy_remains_supported_issue_549() {
+        let env = TestEnv::new();
+        for root in TEMP_ROOTS {
+            env.assert_verdict(&format!("rm -rf {root}"), "deny");
+            env.assert_verdict(&format!("rm -rf {root}/build"), "allow");
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_preserves_temp_root_boundary() {
+        let env = TestEnv::new();
+        for (import, function) in [
+            ("from shutil import rmtree", "rmtree"),
+            ("from shutil import rmtree as wipe", "wipe"),
+        ] {
+            for root in TEMP_ROOTS {
+                for (suffix, expected) in [
+                    ("", "deny"),
+                    ("//.//", "deny"),
+                    ("/build/..", "deny"),
+                    ("/build", "allow"),
+                    ("/./build/.", "allow"),
+                ] {
+                    env.assert_python_body(
+                        &format!("{import}; {function}('{root}{suffix}')"),
+                        expected,
+                    );
+                }
+            }
+            for target in [
+                "/etc",
+                "/tmp/../etc",
+                "/private/var/tmp/../../../etc",
+                "/tmp/build/../cache",
+                "/tmp-backup/build",
+            ] {
+                env.assert_python_body(&format!("{import}; {function}('{target}')"), "deny");
+            }
+        }
+    }
+
+    #[test]
+    fn python_imported_rmtree_handles_grouping_and_complete_targets() {
+        let env = TestEnv::new();
+        for body in [
+            "from shutil import copytree, rmtree as wipe; wipe('/tmp')",
+            "from shutil import (copytree, rmtree as wipe); wipe('/private/tmp/.')",
+            "from shutil import (\n    copytree,\n    rmtree as wipe,\n)\nwipe('/var/tmp')",
+            "from shutil import rmtree as wipe; wipe(path='/private/var/tmp')",
+            "from shutil import rmtree as wipe; wipe(('/tmp/.'))",
+            "from shutil import rmtree as wipe; wipe('/tmp/build' + '/..')",
+            "from shutil import rmtree as wipe; suffix = '/..'; wipe('/tmp/build' + suffix)",
+            "from shutil import rmtree as wipe; wipe('/tmp/build'[:-5])",
+            "from shutil import rmtree as wipe; import tempfile; wipe(path='/tmp', onerror=lambda *args: tempfile.mkdtemp())",
+        ] {
+            env.assert_python_body(body, "deny");
+        }
+        for body in [
+            "from shutil import copytree, rmtree as wipe; wipe('/tmp/build')",
+            "from shutil import (\n    rmtree as wipe,\n)\nwipe('/private//var/./tmp/build')",
+            "from shutil import rmtree as wipe; wipe(path='/var/tmp/build', ignore_errors=True)",
+            "from shutil import rmtree as wipe; wipe('/tmp/' + 'build')",
+            "from shutil import rmtree as wipe; import tempfile; wipe(tempfile.mkdtemp())",
+            "from shutil import rmtree; from tempfile import mkdtemp; rmtree(mkdtemp())",
+        ] {
+            env.assert_python_body(body, "allow");
+        }
+        env.assert_verdict(
+            "python -I -W ignore::DeprecationWarning -c 'from shutil import rmtree as wipe; wipe(\"/tmp\")'",
+            "deny",
+        );
+        env.assert_verdict(
+            "python3 -I <<'PY'\nfrom shutil import rmtree as wipe\nwipe('/tmp/build')\nPY",
+            "allow",
+        );
+    }
+
+    #[test]
+    fn python_imported_rmtree_respects_bindings_and_scope() {
+        let env = TestEnv::new();
+        for body in [
+            "from shutil import rmtree as wipe; print('imported for later cleanup')",
+            "from project_helpers import rmtree; rmtree('/tmp')",
+            "from project_helpers import rmtree as wipe; wipe('/tmp')",
+            "def rmtree(path):\n    print(path)\nrmtree('/tmp')",
+            "from shutil import rmtree as wipe; wipe = print; wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef wipe(path):\n    print(path)\nwipe('/tmp')",
+            "from shutil import rmtree as wipe; from project_helpers import wipe; wipe('/tmp')",
+            "from shutil import rmtree as wipe\ndef report(wipe):\n    wipe('/tmp')\nreport(print)",
+            "wipe = print\ndef load_cleanup():\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print\n# from shutil import rmtree as wipe\nwipe('/tmp')",
+            "wipe = print; example = 'from shutil import rmtree as wipe'; wipe('/tmp')",
+        ] {
+            env.assert_python_body(body, "allow");
+        }
+        for body in [
+            "def cleanup():\n    from shutil import rmtree as wipe\n    wipe('/tmp')\ncleanup()",
+            "from shutil import rmtree as wipe\ndef cleanup():\n    wipe('/tmp')\ncleanup()",
+            "import os\nfrom shutil import rmtree as wipe\nif os.getenv('DRY_RUN'):\n    wipe = print\nwipe('/tmp')",
+            "import os\nwipe = print\nif os.getenv('CLEANUP'):\n    from shutil import rmtree as wipe\nwipe('/tmp')",
+        ] {
+            env.assert_python_body(body, "deny");
+        }
+        env.assert_verdict(
+            "cat <<'PY'\nfrom shutil import rmtree as wipe\nwipe('/tmp')\nPY",
+            "allow",
+        );
+    }
+
+    #[test]
+    fn python_imported_rmtree_keeps_protection_when_extraction_is_incomplete() {
+        // Input-size limits force the fallback deterministically, without
+        // relying on scheduler delays, AST timing, or repeated attempts.
+        let line_limited = TestEnv::with_heredoc_limit("max_body_lines = 1");
+        let byte_limited = TestEnv::with_heredoc_limit("max_body_bytes = 1");
+        for root in TEMP_ROOTS {
+            let body = format!("from shutil import rmtree as wipe\nwipe('{root}')");
+            line_limited.assert_verdict(&format!("python3 - <<'PY'\n{body}\nPY"), "deny");
+            byte_limited.assert_python_body(&body, "deny");
+        }
+    }
+}
+
 // ============================================================================
 // DCG EXPLAIN Tests
 // ============================================================================
@@ -1418,6 +1772,115 @@ mod allow_once_flow_tests {
         assert_eq!(entries[1]["mode"], "allow");
     }
 
+    /// Issue #585: inspect the complete persisted record, not just `command`.
+    /// Candidate pipelines are evaluated by the hook and are never executed.
+    #[test]
+    fn full_logging_redaction_suppresses_diagnostics_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        for format in ["json", "text"] {
+            for mode in ["deny", "warn"] {
+                let env = FlowTestEnv::new();
+                let log_path = env.temp.path().join("decisions.log");
+                let audit_path = env.temp.path().join("audit.log");
+                let config_path = env.temp.path().join("config.toml");
+                let config = format!(
+                    "[general]\nlog_file = {:?}\n\
+                     [history]\nenabled = false\n\
+                     [packs]\nenabled = [\"windows\"]\n\
+                     [policy.rules]\n\"core.git:reset-hard\" = {mode:?}\n\
+                     [logging]\nenabled = true\nfile = {:?}\nformat = {format:?}\n\
+                     caller_env = \"DCG_TEST_CALLER\"\n\
+                     [logging.redaction]\nenabled = true\nmode = \"full\"\n\
+                     [logging.events]\ndeny = true\nwarn = true\nallow = true\n",
+                    audit_path.to_string_lossy(),
+                    log_path.to_string_lossy(),
+                );
+                std::fs::write(&config_path, &config).expect("write config");
+                // Redemption runs through the CLI, which must load the same
+                // redaction policy as the hook under both platform spellings.
+                for dir in [
+                    env.xdg_config_dir.join("dcg"),
+                    env.home_dir.join(".config").join("dcg"),
+                ] {
+                    std::fs::create_dir_all(&dir).expect("config dir");
+                    std::fs::write(dir.join("config.toml"), &config).expect("write config");
+                }
+                let config_str = config_path.to_str().expect("config path");
+                let extra_env = [
+                    ("DCG_CONFIG", config_str),
+                    ("DCG_TEST_CALLER", MARKER),
+                    ("DCG_PACKS", "core.git,core.filesystem,windows"),
+                    ("DCG_SELF_HEAL_HOOK", "0"),
+                    ("DCG_HOOK_TIMEOUT_MS", "10000"),
+                ];
+                let pipeline = format!("{MARKER} | python -");
+                let pipeline_result = env.run_hook_with_env(&pipeline, &extra_env);
+                // Unverified embedded execution remains denied even when the
+                // ordinary git rule is configured to warn.
+                assert_is_denial(&pipeline_result);
+                let git_result =
+                    env.run_hook_with_env(&format!("git reset --hard {MARKER}"), &extra_env);
+                if mode == "deny" {
+                    assert_is_denial(&git_result);
+                } else {
+                    assert_is_allowed(&git_result);
+                    assert!(!git_result.stderr_str().is_empty(), "warning retained");
+                }
+                assert_is_allowed(
+                    &env.run_hook_with_env(&format!("git status -- {MARKER}"), &extra_env),
+                );
+
+                let log = std::fs::read_to_string(&log_path).expect("decision log");
+                assert_eq!(log.lines().count(), 3, "{log}");
+                assert!(
+                    !log.to_lowercase().contains(&MARKER.to_lowercase()),
+                    "{log}"
+                );
+                assert!(log.contains("core.git:reset-hard"), "stable rule ID: {log}");
+                if format == "json" {
+                    let records: Vec<serde_json::Value> = log
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("JSON record"))
+                        .collect();
+                    assert_eq!(records[0]["decision"], "deny");
+                    assert_eq!(records[1]["decision"], mode);
+                    assert_eq!(records[2]["decision"], "allow");
+                    assert_eq!(records[0]["command"], "[REDACTED]");
+                    assert_eq!(records[0]["reason"], "Diagnostic details redacted.");
+                } else {
+                    assert!(log.lines().next().unwrap().contains("DENY"));
+                    assert!(log.lines().nth(1).unwrap().contains(&mode.to_uppercase()));
+                    assert!(log.lines().nth(2).unwrap().contains("ALLOW"));
+                }
+                if mode == "deny" {
+                    let code = extract_code_from_denial(&git_result.stdout_str())
+                        .expect("allow-once code");
+                    let granted = env.run_cli(&["allow-once", &code, "--yes"]);
+                    assert!(granted.status.success(), "{granted:?}");
+                    assert_is_allowed(
+                        &env.run_hook_with_env(&format!("git reset --hard {MARKER}"), &extra_env),
+                    );
+                    let log = std::fs::read_to_string(&log_path).expect("decision log after grant");
+                    assert!(
+                        !log.to_lowercase().contains(&MARKER.to_lowercase()),
+                        "{log}"
+                    );
+                }
+                let audit = std::fs::read_to_string(&audit_path).expect("allow-once audit");
+                assert!(audit.contains("code_issued"), "{audit}");
+                if mode == "deny" {
+                    for event in ["code_resolved", "allow_granted"] {
+                        assert!(audit.contains(event), "{audit}");
+                    }
+                }
+                assert!(
+                    !audit.to_lowercase().contains(&MARKER.to_lowercase()),
+                    "{audit}"
+                );
+            }
+        }
+    }
+
     /// `[logging] caller_env` attributes each record to a caller the built-in
     /// agent detection does not know (#378), sanitized to a single line.
     #[test]
@@ -1454,6 +1917,327 @@ mod allow_once_flow_tests {
             entries[1].get("caller").is_none(),
             "unset variable, no label: {log}"
         );
+    }
+
+    /// Exercise the actual single-payload hook and its persisted structured
+    /// log. Candidate commands are JSON input to dcg; they are never executed.
+    fn run_structured_logging_hook(
+        command: &str,
+        format: &str,
+        redaction: &str,
+        policy_mode: &str,
+        caller: &str,
+    ) -> (HookRunOutput, String) {
+        let env = FlowTestEnv::new();
+        let config_path = env.temp.path().join("config.toml");
+        let log_path = env.temp.path().join("decisions.log");
+        let temp_path = env.temp.path().join("tmp");
+        std::fs::create_dir_all(&temp_path).expect("isolated temporary directory");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[packs]\nenabled = [\"windows\"]\n\
+                 [history]\nenabled = false\n\
+                 [logging]\nenabled = true\nfile = {:?}\nformat = \"{format}\"\n\
+                 caller_env = \"DCG_TEST_CALLER\"\n\
+                 [logging.redaction]\n{redaction}\n\
+                 [logging.events]\ndeny = true\nwarn = true\nallow = true\n\
+                 [policy.rules]\n\"heredoc.posix:pipeline-consumer\" = \"{policy_mode}\"\n",
+                log_path.to_string_lossy()
+            ),
+        )
+        .expect("write isolated structured logging config");
+        let payload = serde_json::json!({
+            "turn_id": "synthetic-redaction-repro",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        });
+        let mut child = Command::new(dcg_binary())
+            .arg("hook")
+            .env_clear()
+            .env("HOME", &env.home_dir)
+            .env("USERPROFILE", &env.home_dir)
+            .env("XDG_CONFIG_HOME", &env.xdg_config_dir)
+            .env("TMPDIR", &temp_path)
+            .env("TEMP", &temp_path)
+            .env("TMP", &temp_path)
+            .env("DCG_CONFIG", &config_path)
+            .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            .env("DCG_PENDING_EXCEPTIONS_PATH", &env.pending_path)
+            .env("DCG_ALLOW_ONCE_PATH", &env.allow_once_path)
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
+            .env("DCG_DIALECT", "posix")
+            .env("DCG_TEST_CALLER", caller)
+            .env("NO_COLOR", "1")
+            .env("TERM", "dumb")
+            .current_dir(env.temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn structured logging hook");
+        serde_json::to_writer(child.stdin.take().expect("hook stdin"), &payload)
+            .expect("write synthetic hook payload");
+        let output = child.wait_with_output().expect("wait for logging hook");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_else(|error| {
+            panic!(
+                "read structured log: {error}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        (
+            HookRunOutput {
+                command: command.to_string(),
+                output,
+            },
+            log,
+        )
+    }
+
+    #[test]
+    fn logging_full_redaction_covers_entire_records_and_preserves_decisions_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let pipeline = format!("{MARKER} | python -");
+        let allowed = format!("echo {MARKER}");
+        for format in ["json", "text"] {
+            for (command, policy_mode, decision) in [
+                (pipeline.as_str(), "deny", "deny"),
+                (pipeline.as_str(), "warn", "warn"),
+                (allowed.as_str(), "deny", "allow"),
+            ] {
+                let (result, log) = run_structured_logging_hook(
+                    command,
+                    format,
+                    "enabled = true\nmode = \"full\"",
+                    policy_mode,
+                    MARKER,
+                );
+                match decision {
+                    "deny" => {
+                        let stdout = assert_is_denial(&result);
+                        assert!(
+                            stdout
+                                .to_ascii_lowercase()
+                                .contains(&MARKER.to_ascii_lowercase()),
+                            "log redaction must not remove the live hook's actionable diagnostic: {stdout}"
+                        );
+                    }
+                    "warn" => {
+                        assert_is_allowed(&result);
+                        assert!(result.stderr_str().contains("WARNING"));
+                    }
+                    _ => assert_is_allowed(&result),
+                }
+                assert_eq!(log.lines().count(), 1, "one record per decision: {log}");
+                assert!(
+                    !log.to_ascii_lowercase()
+                        .contains(&MARKER.to_ascii_lowercase()),
+                    "full redaction leaked into the complete {format} {decision} record: {log}"
+                );
+                if format == "json" {
+                    let entry: serde_json::Value =
+                        serde_json::from_str(log.trim()).expect("JSON log record");
+                    assert_eq!(entry["command"], "[REDACTED]", "{log}");
+                    assert_eq!(entry["decision"], decision, "{log}");
+                    assert_eq!(entry["mode"], decision, "{log}");
+                    if let Some(normalized) = entry.get("normalized_command") {
+                        assert_eq!(normalized, "[REDACTED]", "{log}");
+                    }
+                    if decision != "allow" {
+                        assert_eq!(entry["rule_id"], "heredoc.posix:pipeline-consumer", "{log}");
+                        assert_eq!(entry["pack_id"], "heredoc.posix", "{log}");
+                        assert_eq!(entry["pattern_name"], "pipeline-consumer", "{log}");
+                        assert!(
+                            entry["reason"].as_str().is_some_and(|r| !r.is_empty()),
+                            "{log}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        log.contains(&format!(" {} ", decision.to_ascii_uppercase())),
+                        "{log}"
+                    );
+                    assert!(log.contains("\"[REDACTED]\""), "{log}");
+                    if decision != "allow" {
+                        assert!(log.contains("heredoc.posix:pipeline-consumer"), "{log}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logging_without_redaction_preserves_dynamic_diagnostics_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        for format in ["json", "text"] {
+            for redaction in [
+                "enabled = false\nmode = \"full\"",
+                "enabled = true\nmode = \"none\"",
+            ] {
+                let command = format!("{MARKER} | python -");
+                let (result, log) =
+                    run_structured_logging_hook(&command, format, redaction, "deny", "agent-7");
+                assert_is_denial(&result);
+                assert_eq!(log.lines().count(), 1, "{log}");
+                // A positive control for the reported secondary leak: the
+                // diagnostic contains the lowercased executable, independently
+                // of the original command's spelling.
+                let reason = if format == "json" {
+                    let entry: serde_json::Value =
+                        serde_json::from_str(log.trim()).expect("JSON log record");
+                    assert_eq!(entry["command"], command, "{log}");
+                    assert_eq!(entry["decision"], "deny", "{log}");
+                    assert_eq!(entry["caller"], "agent-7", "{log}");
+                    entry["reason"]
+                        .as_str()
+                        .expect("diagnostic reason")
+                        .to_string()
+                } else {
+                    assert!(log.contains(&command), "{log}");
+                    log.split_once(" -- ")
+                        .expect("text diagnostic reason")
+                        .1
+                        .to_string()
+                };
+                assert!(reason.contains(&MARKER.to_ascii_lowercase()), "{reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn logging_full_redaction_covers_allow_once_audit_lifecycle_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        for format in ["json", "text"] {
+            let env = FlowTestEnv::new();
+            let log_path = env.temp.path().join("dcg-audit.log");
+            let config = format!(
+                "[general]\nlog_file = {:?}\n\
+                 [history]\nenabled = false\n\
+                 [logging]\nformat = \"{format}\"\n\
+                 [logging.redaction]\nenabled = true\nmode = \"full\"\n",
+                log_path.to_string_lossy()
+            );
+            for dir in [
+                env.xdg_config_dir.join("dcg"),
+                env.home_dir.join(".config").join("dcg"),
+            ] {
+                std::fs::create_dir_all(&dir).expect("isolated config directory");
+                std::fs::write(dir.join("config.toml"), &config).expect("write audit config");
+            }
+            let temp_path = env.temp.path().join("tmp");
+            std::fs::create_dir_all(&temp_path).expect("isolated temporary directory");
+            let temp_string = temp_path.to_string_lossy();
+            let extra_env = [
+                ("DCG_SELF_HEAL_HOOK", "0"),
+                ("DCG_HOOK_TIMEOUT_MS", "5000"),
+                ("DCG_DIALECT", "posix"),
+                ("TMPDIR", temp_string.as_ref()),
+                ("TEMP", temp_string.as_ref()),
+                ("TMP", temp_string.as_ref()),
+            ];
+            let command = format!("{MARKER} | python -");
+            let denial = assert_is_denial(&env.run_hook_with_env(&command, &extra_env));
+            let code = extract_code_from_denial(&denial).expect("denial carries allow-once code");
+            let redemption = env.run_cli(&["allow-once", &code, "--yes"]);
+            assert!(
+                redemption.status.success(),
+                "allow-once redemption failed: {}",
+                String::from_utf8_lossy(&redemption.stderr)
+            );
+            assert_is_allowed(&env.run_hook_with_env(&command, &extra_env));
+            // Redacting audit data must not change single-use enforcement.
+            let second_denial = assert_is_denial(&env.run_hook_with_env(&command, &extra_env));
+            let second_code = extract_code_from_denial(&second_denial)
+                .expect("a fresh denial carries a revocable code");
+
+            let log = std::fs::read_to_string(&log_path).expect("read allow-once audit log");
+            assert!(
+                !log.to_ascii_lowercase()
+                    .contains(&MARKER.to_ascii_lowercase()),
+                "full redaction leaked into the complete {format} audit log: {log}"
+            );
+            // The general log also carries legacy text diagnostics for both
+            // denials, even when allow-once events use JSON. Check those bytes
+            // as well as the structured lifecycle records.
+            assert_eq!(log.matches("  Command: [REDACTED]").count(), 2, "{log}");
+            let expected_events = [
+                "code_issued",
+                "code_resolved",
+                "allow_granted",
+                "entry_consumed",
+            ];
+            if format == "json" {
+                let entries: Vec<serde_json::Value> = log
+                    .lines()
+                    .filter(|line| line.starts_with('{'))
+                    .map(|line| serde_json::from_str(line).expect("JSON audit record"))
+                    .collect();
+                assert_eq!(entries.len(), 5, "{log}");
+                for event in expected_events {
+                    assert!(entries.iter().any(|entry| entry["event"] == event), "{log}");
+                }
+                for entry in entries {
+                    for field in ["command", "cwd", "full_hash", "short_code"] {
+                        assert_eq!(entry[field], "[REDACTED]", "{field}: {log}");
+                    }
+                }
+            } else {
+                for event in expected_events {
+                    assert!(log.contains(&format!("[allow-once:{event}]")), "{log}");
+                }
+                let audit_lines: Vec<_> = log
+                    .lines()
+                    .filter(|line| line.contains("[allow-once:"))
+                    .collect();
+                assert_eq!(audit_lines.len(), 5, "{log}");
+                for line in audit_lines {
+                    assert_eq!(
+                        line.split_ascii_whitespace()
+                            .find(|field| field.starts_with("code=")),
+                        Some("code=[REDACTED]"),
+                        "{line}"
+                    );
+                }
+                assert!(
+                    !log.contains(env.temp.path().to_string_lossy().as_ref()),
+                    "full redaction must hide audit path metadata: {log}"
+                );
+            }
+
+            // Management actions use the same audit file. Their target and
+            // resolved hash also derive from the command and must be redacted.
+            let revoke = env.run_cli(&["allow-once", "revoke", &second_code, "--yes", "--json"]);
+            assert!(
+                revoke.status.success(),
+                "revoke failed\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&revoke.stdout),
+                String::from_utf8_lossy(&revoke.stderr)
+            );
+            let revoked: serde_json::Value =
+                serde_json::from_slice(&revoke.stdout).expect("JSON revoke result");
+            assert_eq!(revoked["status"], "ok");
+            assert_eq!(revoked["pending"]["removed"], 1);
+            let full_hash = revoked["full_hash"]
+                .as_str()
+                .expect("resolved command hash");
+            let log = std::fs::read_to_string(&log_path).expect("read management audit log");
+            assert!(
+                !log.to_ascii_lowercase()
+                    .contains(&MARKER.to_ascii_lowercase()),
+                "full redaction leaked into the complete {format} management log: {log}"
+            );
+            assert!(!log.contains(full_hash), "{log}");
+            let management_details: Vec<_> = log
+                .lines()
+                .filter_map(|line| line.split_once("[allow-once] revoke: "))
+                .map(|(_, details)| details)
+                .collect();
+            assert_eq!(management_details, vec!["[REDACTED]"], "{log}");
+            assert!(!management_details[0].contains(&second_code), "{log}");
+        }
     }
 
     /// An allow-once grant is consumed by its first use unless `--reusable`
@@ -2164,6 +2948,1330 @@ mod config_tests {
         (home_dir, xdg_config_dir, bin_dir)
     }
 
+    fn run_hook_policy_install(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let tmp = home.join("tmp");
+        std::fs::create_dir_all(&tmp).expect("isolated installer temp directory");
+        std::process::Command::new(dcg_binary())
+            .args(args)
+            .env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("REASONIX_HOME", home.join(".reasonix"))
+            .env("TMPDIR", &tmp)
+            .env("TEMP", &tmp)
+            .env("TMP", &tmp)
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("NO_COLOR", "1")
+            .current_dir(home)
+            .output()
+            .expect("run isolated dcg install")
+    }
+
+    fn native_settings_json_path(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
+        home.join(match agent {
+            "" => ".claude/settings.json",
+            "--grok" => ".grok/hooks/dcg.json",
+            "--agy" => ".gemini/config/hooks.json",
+            "--reasonix" => ".reasonix/settings.json",
+            "--crush" => ".config/crush/crush.json",
+            "--muse" => ".config/muse/settings.json",
+            _ => panic!("unsupported settings fixture: {agent}"),
+        })
+    }
+
+    fn native_settings_json_entries(agent: &str, fields: &str) -> String {
+        let hook = match agent {
+            "--reasonix" => format!(r#"{{"match":"bash","command":"/retired/dcg",{fields}}}"#),
+            "--crush" => format!(r#"{{"matcher":"^bash$","command":"/retired/dcg",{fields}}}"#),
+            _ => format!(r#"{{"type":"command","command":"/retired/dcg",{fields}}}"#),
+        };
+        if matches!(agent, "--reasonix" | "--crush") {
+            format!("[{hook}]")
+        } else {
+            format!(r#"[{{"matcher":"Bash","hooks":[{hook}]}}]"#)
+        }
+    }
+
+    fn native_settings_json_document(agent: &str, hooks: &str, extra: &str) -> String {
+        let schema = if agent == "--muse" {
+            r#""schema_version":1,"#
+        } else {
+            ""
+        };
+        format!(r#"{{{schema}"hooks":{{{hooks}}}{extra}}}"#)
+    }
+
+    fn assert_native_settings_json_duplicates_are_refused(agent: &str) {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), agent);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut fixtures = Vec::new();
+        for fields in [
+            r#""onFailure":"block","onFailure":"continue","timeout":15"#,
+            r#""onFailure":"block","on\u0046ailure":"continue","timeout":15"#,
+            r#""onFailure":"block","timeout":15,"timeout":5"#,
+            r#""onFailure":"block","timeout":15,"command":"audit-only"#,
+            r#""onFailure":"block","onFailure":"block","timeout":15"#,
+        ] {
+            let entries = native_settings_json_entries(agent, fields);
+            fixtures.push(native_settings_json_document(
+                agent,
+                &format!(r#""PreToolUse":{entries}"#),
+                "",
+            ));
+        }
+        let entries = native_settings_json_entries(agent, r#""onFailure":"block","timeout":15"#);
+        fixtures.push(native_settings_json_document(
+            agent,
+            &format!(r#""PreToolUse":{entries},"PreToolUse":[]"#),
+            "",
+        ));
+        fixtures.push(native_settings_json_document(
+            agent,
+            &format!(r#""PreToolUse":{entries}"#),
+            r#", "hooks":{}"#,
+        ));
+        fixtures.push(native_settings_json_document(
+            agent,
+            &format!(r#""PreToolUse":{entries}"#),
+            r#", "operator":{"policy":"strict","policy":"observe"}"#,
+        ));
+
+        for original in fixtures {
+            for force in [false, true] {
+                std::fs::write(&path, original.as_bytes()).unwrap();
+                let mut args = vec!["install"];
+                if !agent.is_empty() {
+                    args.push(agent);
+                }
+                if force {
+                    args.push("--force");
+                }
+                let output = run_hook_policy_install(home.path(), &args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse ambiguous settings: {original}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .to_ascii_lowercase()
+                        .contains("duplicate"),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn native_settings_json_claude_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("");
+    }
+
+    #[test]
+    fn native_settings_json_grok_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--grok");
+    }
+
+    #[test]
+    fn native_settings_json_antigravity_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--agy");
+    }
+
+    #[test]
+    fn native_settings_json_reasonix_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--reasonix");
+    }
+
+    #[test]
+    fn native_settings_json_crush_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--crush");
+    }
+
+    #[test]
+    fn native_settings_json_muse_refuses_duplicate_keys() {
+        assert_native_settings_json_duplicates_are_refused("--muse");
+    }
+
+    #[test]
+    fn native_settings_json_unique_nested_fields_survive_repair_and_repeats() {
+        for agent in ["", "--grok", "--agy", "--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = native_settings_json_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let entries =
+                native_settings_json_entries(agent, r#""onFailure":"block","timeout":15"#);
+            let original = native_settings_json_document(
+                agent,
+                &format!(r#""PreToolUse":{entries}"#),
+                r#", "operator":{"first":{"name":"one","value":true},"second":{"name":"two","value":false},"Policy":null,"policy":[-9223372036854775808,18446744073709551615,1.25,"\u2603"]}"#,
+            );
+            let original_value: serde_json::Value = serde_json::from_str(&original).unwrap();
+            std::fs::write(&path, original.as_bytes()).unwrap();
+            let mut repaired = None;
+            for force in [false, true, false] {
+                let mut args = vec!["install"];
+                if !agent.is_empty() {
+                    args.push(agent);
+                }
+                if force {
+                    args.push("--force");
+                }
+                let output = run_hook_policy_install(home.path(), &args);
+                assert!(
+                    output.status.success(),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let bytes = std::fs::read(&path).unwrap();
+                let settings: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(settings["operator"], original_value["operator"]);
+                let guard = if matches!(agent, "--reasonix" | "--crush") {
+                    &settings["hooks"]["PreToolUse"][0]
+                } else {
+                    &settings["hooks"]["PreToolUse"][0]["hooks"][0]
+                };
+                assert_eq!(guard["onFailure"], "block");
+                assert_eq!(guard["timeout"], 15);
+                if let Some(previous) = &repaired {
+                    assert_eq!(
+                        &settings, previous,
+                        "{args:?} must preserve repaired settings"
+                    );
+                } else {
+                    repaired = Some(settings);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_settings_json_uninstall_refuses_ambiguous_operator_data() {
+        for agent in ["", "--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = native_settings_json_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let entries =
+                native_settings_json_entries(agent, r#""onFailure":"block","timeout":15"#);
+            let original = native_settings_json_document(
+                agent,
+                &format!(r#""PreToolUse":{entries}"#),
+                r#", "operator":{"policy":"strict","policy":"observe"}"#,
+            );
+            std::fs::write(&path, original.as_bytes()).unwrap();
+            let mut args = vec!["uninstall"];
+            if !agent.is_empty() {
+                args.push(agent);
+            }
+            let output = run_hook_policy_install(home.path(), &args);
+            assert!(
+                !output.status.success(),
+                "{args:?} must not discard operator data"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .to_ascii_lowercase()
+                    .contains("duplicate")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn native_settings_json_self_heal_keeps_ambiguous_file_and_still_blocks() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), "");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let entries = native_settings_json_entries(
+            "",
+            r#""onFailure":"block","onFailure":"continue","timeout":15"#,
+        );
+        let original = native_settings_json_document("", &format!(r#""PreToolUse":{entries}"#), "");
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        let tmp = home.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        for _ in 0..2 {
+            let mut child = Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("CLAUDE_CONFIG_DIR", home.path().join(".claude"))
+                .env("TMPDIR", &tmp)
+                .env("TEMP", &tmp)
+                .env("TMP", &tmp)
+                .env("DCG_SELF_HEAL_HOOK", "1")
+                .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                .env("DCG_PACKS", "core.git,core.filesystem")
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("NO_COLOR", "1")
+                .current_dir(home.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#)
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let denial: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(denial["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .to_ascii_lowercase()
+                    .contains("duplicate"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn native_settings_json_doctor_reports_ambiguity_without_repairing_it() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), "");
+        assert!(
+            run_hook_policy_install(home.path(), &["install"])
+                .status
+                .success()
+        );
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let original = format!(
+            r#"{{"operator":{{"policy":"strict","policy":"observe"}},"hooks":{}}}"#,
+            serde_json::to_string(&current["hooks"]).unwrap()
+        );
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        for args in [
+            &["doctor", "--format", "json"][..],
+            &["doctor", "--fix", "--format", "json"][..],
+        ] {
+            let output = run_hook_policy_install(home.path(), args);
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let wiring = report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["id"] == "hook_wiring")
+                .unwrap();
+            assert_eq!(wiring["status"], "error", "{wiring}");
+            assert_ne!(wiring["fixed"], true);
+            assert!(
+                wiring["message"]
+                    .as_str()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("duplicate")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn native_settings_json_grok_doctor_rejects_invalid_native_with_healthy_compat() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), "--grok");
+        for args in [&["install"][..], &["install", "--grok"][..]] {
+            let output = run_hook_policy_install(home.path(), args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let command =
+            serde_json::to_string(&current["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
+                .unwrap();
+        let duplicate_hook = format!(
+            r#"{{"type":"command","command":{command},"onFailure":"block","onFailure":"continue","timeout":15}}"#
+        );
+        let duplicate = native_settings_json_document(
+            "--grok",
+            &format!(r#""PreToolUse":[{{"matcher":"Bash","hooks":[{duplicate_hook}]}}]"#),
+            "",
+        );
+        for (original, diagnostic) in [("{".to_string(), None), (duplicate, Some("duplicate"))] {
+            std::fs::write(&path, original.as_bytes()).unwrap();
+            for args in [
+                &["doctor", "--format", "json"][..],
+                &["doctor", "--fix", "--format", "json"][..],
+            ] {
+                let output = run_hook_policy_install(home.path(), args);
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "doctor must emit one JSON document: {error}; stdout: {}; stderr: {}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        )
+                    });
+                let checks = report["checks"].as_array().unwrap();
+                let compat = checks
+                    .iter()
+                    .find(|check| check["id"] == "hook_wiring")
+                    .unwrap();
+                assert_eq!(compat["status"], "ok", "{compat}");
+                let native = checks
+                    .iter()
+                    .find(|check| check["id"] == "grok_hook")
+                    .unwrap();
+                assert_eq!(native["status"], "error", "{native}");
+                assert_ne!(native["fixed"], true);
+                assert_eq!(report["ok"], false);
+                let message = native["message"].as_str().unwrap().to_ascii_lowercase();
+                assert!(message.contains("invalid native grok"), "{native}");
+                if let Some(diagnostic) = diagnostic {
+                    assert!(message.contains(diagnostic), "{native}");
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn native_settings_json_grok_doctor_does_not_claim_async_policy_is_fixed() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = native_settings_json_path(home.path(), "--grok");
+        for args in [&["install"][..], &["install", "--grok"][..]] {
+            let output = run_hook_policy_install(home.path(), args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let hook = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+        hook["async"] = true.into();
+        hook["onFailure"] = "block".into();
+        hook["timeout"] = 15.into();
+        let expected = settings.clone();
+        settings["hooks"]["PreToolUse"][0]["matcher"] = "run_terminal_cmd".into();
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = "/retired/dcg".into();
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        for _ in 0..2 {
+            let output =
+                run_hook_policy_install(home.path(), &["doctor", "--fix", "--format", "json"]);
+            let report: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!(
+                        "doctor must emit one JSON document: {error}; stdout: {}; stderr: {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            let native = report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["id"] == "grok_hook")
+                .unwrap();
+            assert_eq!(native["status"], "error", "{native}");
+            assert_ne!(native["fixed"], true);
+            assert_eq!(report["ok"], false);
+            assert!(
+                native["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("synchronously"),
+                "{native}"
+            );
+            let repaired: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(repaired, expected, "repair must retain operator policy");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_settings_json_claude_and_antigravity_refuse_dangling_managed_links() {
+        for agent in ["", "--agy"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = native_settings_json_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let target = home.path().join("unavailable-operator-settings.json");
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            for force in [false, true] {
+                let mut args = vec!["install"];
+                if !agent.is_empty() {
+                    args.push(agent);
+                }
+                if force {
+                    args.push("--force");
+                }
+                let output = run_hook_policy_install(home.path(), &args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse a dangling link"
+                );
+                assert_eq!(std::fs::read_link(&path).unwrap(), target);
+                assert!(
+                    !target.exists(),
+                    "a missing managed target must stay missing"
+                );
+            }
+        }
+    }
+
+    fn agent_policy_settings_path(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
+        home.join(match agent {
+            "--reasonix" => ".reasonix/settings.json",
+            "--crush" => ".config/crush/crush.json",
+            "--muse" => ".config/muse/settings.json",
+            _ => panic!("unsupported fixture agent: {agent}"),
+        })
+    }
+
+    fn agent_policy_fixture(agent: &str) -> serde_json::Value {
+        let mut first = serde_json::json!({"command": "/retired/dcg"});
+        let mut protected = serde_json::json!({
+            "command": "\"C:\\old tools\\dcg.exe\"",
+            "onFailure": "block",
+            "timeout": 15,
+            "description": "Operator-managed safety policy",
+            "future": {"enabled": true, "labels": ["security", "interactive"]}
+        });
+        let mut last = serde_json::json!({
+            "command": "/older/dcg",
+            "statusMessage": "Checking safety"
+        });
+        let mut settings = serde_json::json!({
+            "model": "operator-model",
+            "operator": {"managed": true},
+            "hooks": {"Stop": [{"command": "after-audit"}]}
+        });
+        match agent {
+            "--reasonix" => {
+                protected["match"] = serde_json::json!("pwsh");
+                last["match"] = serde_json::json!("write");
+                settings["hooks"]["PreToolUse"] = serde_json::json!([
+                    {"match": "bash", "command": first["command"]},
+                    {"match": "read", "command": "/usr/bin/logger /opt/dcg"},
+                    protected,
+                    last,
+                    {"match": "write", "command": "write-audit", "timeout": 7}
+                ]);
+            }
+            "--crush" => {
+                protected["matcher"] = serde_json::json!("^bash$");
+                last["matcher"] = serde_json::json!(".*");
+                settings["hooks"]["PreToolUse"] = serde_json::json!([
+                    {"matcher": ".*", "command": first["command"]},
+                    {"matcher": "^read$", "command": "/usr/bin/logger /opt/dcg"}
+                ]);
+                settings["hooks"]["pre_tool_use"] = serde_json::json!([
+                    protected,
+                    {"matcher": "^write$", "command": "write-audit", "timeout": 7}
+                ]);
+                settings["hooks"]["pre-tool-use"] = serde_json::json!([last]);
+            }
+            "--muse" => {
+                first["type"] = serde_json::json!("command");
+                protected["type"] = serde_json::json!("command");
+                last["type"] = serde_json::json!("command");
+                settings["schema_version"] = serde_json::json!(1);
+                settings["hooks"]["PreToolUse"] = serde_json::json!([
+                    {"matcher": "^(shell|exec_command|bash)$", "hooks": [
+                        first,
+                        {"type": "command", "command": "shell-audit"}
+                    ]},
+                    {"matcher": "^exec_command$", "hooks": [
+                        protected,
+                        {"type": "command", "command": "terminal-audit"}
+                    ]},
+                    {"matcher": "^write_file$", "hooks": [last]},
+                    {"matcher": "^read_file$", "hooks": [
+                        {"type": "command", "command": "/usr/bin/logger /opt/dcg"}
+                    ]}
+                ]);
+            }
+            _ => panic!("unsupported fixture agent: {agent}"),
+        }
+        settings
+    }
+
+    fn agent_policy_guard<'a>(
+        settings: &'a serde_json::Value,
+        agent: &str,
+    ) -> &'a serde_json::Value {
+        let first = &settings["hooks"]["PreToolUse"][0];
+        if agent == "--muse" {
+            &first["hooks"][0]
+        } else {
+            first
+        }
+    }
+
+    fn assert_agent_policy_repair_and_repeat(agent: &str) {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = agent_policy_settings_path(home.path(), agent);
+        let fresh = run_hook_policy_install(home.path(), &["install", agent]);
+        assert!(
+            fresh.status.success(),
+            "{agent}: {}",
+            String::from_utf8_lossy(&fresh.stderr)
+        );
+        let fresh: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let desired = agent_policy_guard(&fresh, agent);
+        let original = agent_policy_fixture(agent);
+
+        // Both ordinary upgrades and an explicit repair must preserve the
+        // complete policy, even when it lives on a later stale registration.
+        for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+            std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+            let repaired = run_hook_policy_install(home.path(), args);
+            assert!(
+                repaired.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&repaired.stderr)
+            );
+            let installed_bytes = std::fs::read(&path).unwrap();
+            let installed: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+            let guard = agent_policy_guard(&installed, agent);
+            assert_eq!(guard["command"], desired["command"], "{agent}");
+            assert_eq!(guard["onFailure"], "block", "{agent}");
+            assert_eq!(guard["timeout"], 15, "{agent}");
+            assert_eq!(guard["description"], "Operator-managed safety policy");
+            assert_eq!(guard["statusMessage"], "Checking safety", "{agent}");
+            assert_eq!(
+                guard["future"],
+                serde_json::json!({"enabled": true, "labels": ["security", "interactive"]})
+            );
+            assert_eq!(installed["model"], original["model"]);
+            assert_eq!(installed["operator"], original["operator"]);
+            assert_eq!(installed["hooks"]["Stop"], original["hooks"]["Stop"]);
+            let entries = installed["hooks"]["PreToolUse"].as_array().unwrap();
+            match agent {
+                "--reasonix" => {
+                    assert_eq!(guard["match"], "bash|pwsh");
+                    assert_eq!(entries.len(), 3);
+                    assert_eq!(entries[1], original["hooks"]["PreToolUse"][1]);
+                    assert_eq!(entries[2], original["hooks"]["PreToolUse"][4]);
+                }
+                "--crush" => {
+                    assert_eq!(guard["matcher"], "^bash$");
+                    assert_eq!(entries.len(), 2);
+                    assert_eq!(entries[1], original["hooks"]["PreToolUse"][1]);
+                    assert_eq!(
+                        installed["hooks"]["pre_tool_use"],
+                        serde_json::json!([original["hooks"]["pre_tool_use"][1]])
+                    );
+                    assert!(
+                        installed["hooks"]["pre-tool-use"]
+                            .as_array()
+                            .is_none_or(Vec::is_empty)
+                    );
+                }
+                "--muse" => {
+                    assert_eq!(installed["schema_version"], 1);
+                    assert_eq!(entries[0]["matcher"], "^(shell|exec_command|bash)$");
+                    assert_eq!(guard["type"], "command");
+                    assert!(
+                        guard["command"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with(" --agent muse")
+                    );
+                    let audits: Vec<_> = entries
+                        .iter()
+                        .flat_map(|group| {
+                            group["hooks"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter(|handler| handler["command"] != guard["command"])
+                                .map(|handler| (group["matcher"].clone(), handler.clone()))
+                        })
+                        .collect();
+                    assert_eq!(
+                        audits,
+                        vec![
+                            (
+                                serde_json::json!("^(shell|exec_command|bash)$"),
+                                serde_json::json!({"type": "command", "command": "shell-audit"})
+                            ),
+                            (
+                                serde_json::json!("^exec_command$"),
+                                serde_json::json!({"type": "command", "command": "terminal-audit"})
+                            ),
+                            (
+                                serde_json::json!("^read_file$"),
+                                serde_json::json!({"type": "command", "command": "/usr/bin/logger /opt/dcg"})
+                            )
+                        ]
+                    );
+                    assert_eq!(
+                        entries
+                            .iter()
+                            .flat_map(|group| group["hooks"].as_array().unwrap())
+                            .filter(|handler| handler["command"] == guard["command"])
+                            .count(),
+                        1
+                    );
+                }
+                _ => unreachable!(),
+            }
+            for repeated_args in [
+                &["install", agent, "--force"][..],
+                &["install", agent][..],
+                &["install", agent][..],
+            ] {
+                let repeated = run_hook_policy_install(home.path(), repeated_args);
+                assert!(
+                    repeated.status.success(),
+                    "{repeated_args:?}: {}",
+                    String::from_utf8_lossy(&repeated.stderr)
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    installed_bytes,
+                    "{repeated_args:?} changed an already repaired configuration"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_agent_hook_policy_reasonix_preserves_block_across_repair_and_repeat() {
+        assert_agent_policy_repair_and_repeat("--reasonix");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_crush_preserves_block_across_repair_and_repeat() {
+        assert_agent_policy_repair_and_repeat("--crush");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_muse_preserves_block_across_repair_and_repeat() {
+        assert_agent_policy_repair_and_repeat("--muse");
+    }
+
+    fn assert_agent_policy_conflicts_preserve_file(agent: &str) {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let path = agent_policy_settings_path(home.path(), agent);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (field, conflicting_value) in [
+            ("onFailure", serde_json::json!("continue")),
+            ("timeout", serde_json::json!(5)),
+            ("future", serde_json::json!({"enabled": false})),
+        ] {
+            let mut original = agent_policy_fixture(agent);
+            let first = if agent == "--muse" {
+                &mut original["hooks"]["PreToolUse"][0]["hooks"][0]
+            } else {
+                &mut original["hooks"]["PreToolUse"][0]
+            };
+            first[field] = conflicting_value;
+            let original = serde_json::to_vec(&original).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                let output = run_hook_policy_install(home.path(), args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse conflicting {field}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains(field),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn native_agent_hook_policy_reasonix_conflicts_preserve_previous_file() {
+        assert_agent_policy_conflicts_preserve_file("--reasonix");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_crush_conflicts_preserve_previous_file() {
+        assert_agent_policy_conflicts_preserve_file("--crush");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_muse_conflicts_preserve_previous_file() {
+        assert_agent_policy_conflicts_preserve_file("--muse");
+    }
+
+    #[test]
+    fn native_agent_hook_policy_malformed_files_and_read_errors_are_not_replaced() {
+        for agent in ["--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = agent_policy_settings_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            for original in [
+                b"{\"hooks\": ".to_vec(),
+                b"{\"invalid_utf8\":\"\xff\"}".to_vec(),
+                b"[]".to_vec(),
+                b"{\"hooks\":[]}".to_vec(),
+                b"{\"hooks\":{\"PreToolUse\":{}}}".to_vec(),
+            ] {
+                std::fs::write(&path, &original).unwrap();
+                for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                    let output = run_hook_policy_install(home.path(), args);
+                    assert!(
+                        !output.status.success(),
+                        "{args:?} must refuse {original:?}"
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                }
+            }
+
+            let unreadable_home = tempfile::tempdir().expect("isolated unreadable HOME");
+            let directory = agent_policy_settings_path(unreadable_home.path(), agent);
+            std::fs::create_dir_all(&directory).unwrap();
+            let sentinel = directory.join("managed-data");
+            std::fs::write(&sentinel, b"preserve this directory").unwrap();
+            for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                let output = run_hook_policy_install(unreadable_home.path(), args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse a read error"
+                );
+                assert!(directory.is_dir());
+                assert_eq!(
+                    std::fs::read(&sentinel).unwrap(),
+                    b"preserve this directory"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_agent_hook_policy_managed_symlinks_and_permissions_survive_updates() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for agent in ["--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = agent_policy_settings_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let target = home.path().join("managed-settings.json");
+            std::fs::write(
+                &target,
+                serde_json::to_vec(&agent_policy_fixture(agent)).unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            symlink(&target, &path).unwrap();
+            for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                let output = run_hook_policy_install(home.path(), args);
+                assert!(
+                    output.status.success(),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    std::fs::symlink_metadata(&path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(std::fs::read_link(&path).unwrap(), target);
+                assert_eq!(
+                    std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+                let installed: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+                let guard = agent_policy_guard(&installed, agent);
+                assert_eq!(guard["onFailure"], "block");
+                assert_eq!(guard["timeout"], 15);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_agent_hook_policy_broken_managed_symlinks_are_not_created_over() {
+        use std::os::unix::fs::symlink;
+
+        for agent in ["--reasonix", "--crush", "--muse"] {
+            let home = tempfile::tempdir().expect("isolated HOME");
+            let path = agent_policy_settings_path(home.path(), agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let missing_target = home.path().join("unavailable-managed-settings.json");
+            symlink(&missing_target, &path).unwrap();
+            for args in [&["install", agent][..], &["install", agent, "--force"][..]] {
+                let output = run_hook_policy_install(home.path(), args);
+                assert!(
+                    !output.status.success(),
+                    "{args:?} must refuse an unavailable managed configuration"
+                );
+                assert!(
+                    std::fs::symlink_metadata(&path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(std::fs::read_link(&path).unwrap(), missing_target);
+                assert!(!missing_target.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_install_force_preserves_block_across_duplicate_repair_and_repeat() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let settings_path = home.path().join(".claude/settings.json");
+        let created = run_hook_policy_install(home.path(), &["install"]);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let fresh: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        let desired = fresh["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+        let original = serde_json::json!({
+            "model": "operator-model",
+            "hooks": {"PreToolUse": [
+                {"matcher": "Bash|PowerShell|Monitor", "label": "keep", "hooks": [desired.clone()]},
+                {"matcher": "Bash", "label": "legacy", "hooks": [
+                    {"type": "command", "command": "dcg", "onFailure": "block", "timeout": 15},
+                    {"type": "command", "command": "bash-audit", "timeout": 7}
+                ]},
+                {"matcher": "Write", "hooks": [
+                    {"type": "command", "command": "\"C:\\old installation\\dcg.exe\"", "statusMessage": "Checking safety"},
+                    {"type": "command", "command": "write-audit"}
+                ]}
+            ]}
+        });
+        std::fs::write(&settings_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        let repaired = run_hook_policy_install(home.path(), &["install", "--force"]);
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        let installed_bytes = std::fs::read(&settings_path).unwrap();
+        let installed: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+        let entries = installed["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["matcher"], "Bash|PowerShell|Monitor");
+        assert_eq!(entries[0]["label"], "keep");
+        let hook = &entries[0]["hooks"][0];
+        for key in ["type", "command", "shell"] {
+            assert_eq!(hook.get(key), desired.get(key));
+        }
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(hook["timeout"], 15);
+        assert_eq!(hook["statusMessage"], "Checking safety");
+        assert_eq!(entries[1]["matcher"], "Bash");
+        assert_eq!(entries[1]["label"], "legacy");
+        assert_eq!(
+            entries[1]["hooks"],
+            serde_json::json!([{"type": "command", "command": "bash-audit", "timeout": 7}])
+        );
+        assert_eq!(entries[2]["matcher"], "Write");
+        assert_eq!(
+            entries[2]["hooks"],
+            serde_json::json!([{"type": "command", "command": "write-audit"}])
+        );
+        assert_eq!(installed["model"], "operator-model");
+
+        for args in [&["install", "--force"][..], &["install"][..]] {
+            let repeated = run_hook_policy_install(home.path(), args);
+            assert!(
+                repeated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&repeated.stderr)
+            );
+            assert_eq!(std::fs::read(&settings_path).unwrap(), installed_bytes);
+        }
+    }
+
+    #[test]
+    fn native_hook_policy_install_refuses_conflicting_failure_policies_without_rewriting() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let claude = home.path().join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        let settings_path = claude.join("settings.json");
+        let original = serde_json::to_vec(&serde_json::json!({
+            "hooks": {"PreToolUse": [
+                {"matcher": "Bash|PowerShell|Monitor", "hooks": [{"type": "command", "command": "dcg", "onFailure": "block"}]},
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "/old/dcg", "onFailure": "continue"}]}
+            ]}
+        })).unwrap();
+        std::fs::write(&settings_path, &original).unwrap();
+
+        for args in [&["install"][..], &["install", "--force"][..]] {
+            let output = run_hook_policy_install(home.path(), args);
+            assert!(
+                !output.status.success(),
+                "conflicting policies must fail even with --force"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("onFailure"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&settings_path).unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_hook_policy_install_keeps_managed_symlink_and_private_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let claude = home.path().join(".claude");
+        let managed = home.path().join("managed");
+        std::fs::create_dir(&claude).unwrap();
+        std::fs::create_dir(&managed).unwrap();
+        let target = managed.join("settings.json");
+        let settings_path = claude.join("settings.json");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"
+                }]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &settings_path).unwrap();
+
+        let output = run_hook_policy_install(home.path(), &["install", "--force"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::fs::symlink_metadata(&settings_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+            "block"
+        );
+    }
+
+    #[test]
+    fn grok_hook_policy_force_preserves_block_across_duplicate_repair_and_repeat() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        let created = run_hook_policy_install(home.path(), &["install", "--grok"]);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let fresh: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+        let desired = fresh["hooks"]["PreToolUse"][0]["hooks"][0].clone();
+        assert_eq!(desired["timeout"], 5, "new installs keep Grok's default");
+        let original = serde_json::json!({
+            "description": "Operator-managed Grok safety hooks",
+            "operator": {"team": "security"},
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "label": "canonical", "hooks": [
+                        {"type": "command", "command": desired["command"]},
+                        {"type": "command", "command": "bash-audit"}
+                    ]},
+                    {"matcher": "run_terminal_cmd", "label": "keep this scope", "hooks": [
+                        {"type": "command", "command": "\"C:\\old tools\\dcg.exe\"", "onFailure": "block", "timeout": 15, "future": {"enabled": true}},
+                        {"type": "command", "command": "terminal-audit"}
+                    ]},
+                    {"matcher": "Write", "hooks": [
+                        {"type": "command", "command": "/older/dcg", "statusMessage": "Checking safety"}
+                    ]}
+                ],
+                "PostToolUse": [{"matcher": "*", "hooks": [{"command": "after-audit"}]}]
+            }
+        });
+        std::fs::write(&hook_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        let repaired = run_hook_policy_install(home.path(), &["install", "--grok", "--force"]);
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        let installed_bytes = std::fs::read(&hook_path).unwrap();
+        let installed: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+        let entries = installed["hooks"]["PreToolUse"].as_array().unwrap();
+        let hook = &entries[0]["hooks"][0];
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(hook["timeout"], 15);
+        assert_eq!(hook["future"], serde_json::json!({"enabled": true}));
+        assert_eq!(hook["statusMessage"], "Checking safety");
+        for key in ["type", "command", "shell"] {
+            assert_eq!(hook.get(key), desired.get(key));
+        }
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["matcher"], "Bash");
+        assert_eq!(entries[0]["label"], "canonical");
+        assert_eq!(
+            entries[0]["hooks"][1],
+            original["hooks"]["PreToolUse"][0]["hooks"][1]
+        );
+        assert_eq!(entries[1]["matcher"], "run_terminal_cmd");
+        assert_eq!(entries[1]["label"], "keep this scope");
+        assert_eq!(
+            entries[1]["hooks"],
+            serde_json::json!([{"type": "command", "command": "terminal-audit"}])
+        );
+        assert_eq!(installed["description"], original["description"]);
+        assert_eq!(installed["operator"], original["operator"]);
+        assert_eq!(
+            installed["hooks"]["PostToolUse"],
+            original["hooks"]["PostToolUse"]
+        );
+
+        for args in [
+            &["install", "--grok", "--force"][..],
+            &["install", "--grok"][..],
+        ] {
+            let repeated = run_hook_policy_install(home.path(), args);
+            assert!(
+                repeated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&repeated.stderr)
+            );
+            assert_eq!(std::fs::read(&hook_path).unwrap(), installed_bytes);
+        }
+    }
+
+    #[test]
+    fn grok_hook_policy_nonforce_repairs_a_stale_command_and_legacy_matcher() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook_path,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "run_terminal_cmd", "hooks": [{
+                    "type": "command", "command": "/retired/dcg", "timeout": 15, "onFailure": "block"
+                }]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let output = run_hook_policy_install(home.path(), &["install", "--grok"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let installed_bytes = std::fs::read(&hook_path).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["matcher"], "Bash");
+        let hook = &entries[0]["hooks"][0];
+        assert_ne!(hook["command"], "/retired/dcg");
+        assert_eq!(hook["timeout"], 15);
+        assert_eq!(hook["onFailure"], "block");
+
+        let repeated = run_hook_policy_install(home.path(), &["install", "--grok"]);
+        assert!(repeated.status.success());
+        assert_eq!(std::fs::read(&hook_path).unwrap(), installed_bytes);
+    }
+
+    #[test]
+    fn grok_hook_policy_repair_preserves_other_programs_with_dcg_path_arguments() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        let audit = serde_json::json!({
+            "matcher": "Read", "label": "unrelated audit scope", "hooks": [
+                {"type": "command", "command": "/usr/bin/logger /opt/dcg"}
+            ]
+        });
+        let original = serde_json::json!({
+            "hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "/retired/dcg", "timeout": 15, "onFailure": "block"
+                }]},
+                audit.clone()
+            ]}
+        });
+        std::fs::write(&hook_path, serde_json::to_vec(&original).unwrap()).unwrap();
+
+        let repaired = run_hook_policy_install(home.path(), &["install", "--grok"]);
+        assert!(
+            repaired.status.success(),
+            "{}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        let installed_bytes = std::fs::read(&hook_path).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&installed_bytes).unwrap();
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "a dcg argument does not make logger a guard"
+        );
+        assert_eq!(entries[1], audit, "unrelated audit hook keeps its scope");
+        let guard = &entries[0]["hooks"][0];
+        assert_ne!(guard["command"], "/retired/dcg");
+        assert_eq!(guard["timeout"], 15);
+        assert_eq!(guard["onFailure"], "block");
+
+        for args in [
+            &["install", "--grok", "--force"][..],
+            &["install", "--grok"][..],
+        ] {
+            let repeated = run_hook_policy_install(home.path(), args);
+            assert!(
+                repeated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&repeated.stderr)
+            );
+            assert_eq!(std::fs::read(&hook_path).unwrap(), installed_bytes);
+        }
+    }
+
+    #[test]
+    fn grok_hook_policy_rejects_invalid_files_and_conflicts_without_rewriting() {
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        let fixtures = [
+            b"{\"hooks\": ".to_vec(),
+            b" ".to_vec(),
+            serde_json::to_vec(&serde_json::json!([])).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"hooks": []})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"hooks": {"PreToolUse": {}}})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": null}
+            ]}}))
+            .unwrap(),
+            serde_json::to_vec(&serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"command": "dcg", "onFailure": "block"}]},
+                {"matcher": "Write", "hooks": [{"command": "/old/dcg", "onFailure": "continue"}]}
+            ]}}))
+            .unwrap(),
+        ];
+        for original in fixtures {
+            std::fs::write(&hook_path, &original).unwrap();
+            for args in [
+                &["install", "--grok"][..],
+                &["install", "--grok", "--force"][..],
+            ] {
+                let output = run_hook_policy_install(home.path(), args);
+                assert!(
+                    !output.status.success(),
+                    "invalid or conflicting settings must fail for {args:?}"
+                );
+                assert_eq!(std::fs::read(&hook_path).unwrap(), original);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_hook_policy_install_keeps_managed_symlink_and_private_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().expect("isolated HOME");
+        let hook_path = home.path().join(".grok/hooks/dcg.json");
+        std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        let target = home.path().join("managed-grok.json");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+                    "type": "command", "command": "dcg", "timeout": 15, "onFailure": "block"
+                }]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &hook_path).unwrap();
+
+        let output = run_hook_policy_install(home.path(), &["install", "--grok", "--force"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::fs::symlink_metadata(&hook_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+            "block"
+        );
+    }
+
+    /// The machine-wide config file the binary always reads
+    /// (`system_config_dir()` in `src/config.rs`).
+    fn machine_config_path() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::env::var_os("ProgramData")
+                .filter(|dir| !dir.is_empty())
+                .map_or_else(
+                    || std::path::PathBuf::from(r"C:\ProgramData"),
+                    std::path::PathBuf::from,
+                )
+                .join("dcg")
+                .join("config.toml")
+        } else if cfg!(target_os = "macos") {
+            std::path::PathBuf::from("/private/etc/dcg/config.toml")
+        } else {
+            std::path::PathBuf::from("/etc/dcg/config.toml")
+        }
+    }
+
+    /// The host's machine-wide config, when it exists AND `doctor` reports it
+    /// loaded.
+    ///
+    /// That layer is trusted policy with no environment override (an agent
+    /// must not be able to shed it), so the scratch HOME/XDG these tests use
+    /// cannot hide it. On a host with dcg installed system-wide (a machine-wide
+    /// `/etc/dcg/config.toml`) doctor correctly reports one
+    /// loaded file instead of built-in defaults, and `--fix` correctly leaves
+    /// the user config alone. Requiring both the file and doctor's own report
+    /// keeps the strict expectations on every host without such a file.
+    fn loaded_machine_config(doctor_output: &str) -> Option<std::path::PathBuf> {
+        let path = machine_config_path();
+        (path.is_file() && doctor_output.contains(&format!("system: {} [loaded;", path.display())))
+            .then_some(path)
+    }
+
     /// #320: a pinned install refuses `dcg update` before any network or
     /// installer work, with an actionable message naming the escape hatch.
     #[test]
@@ -2477,6 +4585,300 @@ mod config_tests {
         assert_eq!(entries.len(), 1, "{settings}");
         assert_eq!(entries[0]["command"], "node check.js");
         assert_eq!(settings["theme"], "dark");
+    }
+
+    /// #572: `dcg install --muse` merges a `hooks.PreToolUse` matcher group
+    /// into `$XDG_CONFIG_HOME/muse/settings.json`, keeps `schema_version` and
+    /// every other key, and is idempotent. The installed command is then run
+    /// the way Muse runs it (through the shell, a Codex-shaped payload with
+    /// `turn_id` on stdin, a cleared environment): a destructive `shell` or
+    /// `exec_command` call gets the minimal `hookSpecificOutput` deny with a
+    /// non-empty reason on exit 0, which Muse enforces; a safe call gets empty
+    /// stdout, because Muse rejects a bare `allow`. `[agents.muse]` applies and
+    /// `[agents.codex-cli]` does not. A payload dcg cannot read, or a shell
+    /// call without a readable command, is blocked. `dcg uninstall --muse`
+    /// removes exactly what it added.
+    #[test]
+    fn install_muse_hook_blocks_through_the_installed_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (home_dir, xdg_config_dir, _bin_dir) = setup_doctor_env(&temp);
+        let settings_path = xdg_config_dir.join("muse").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).expect("muse dir");
+        std::fs::write(
+            &settings_path,
+            r#"{"schema_version":1,"model":"muse-spark-1.2","hooks":{"PreToolUse":[{"matcher":"^write_file$","hooks":[{"type":"command","command":"audit-writes"}]}],"SessionStart":[{"hooks":[{"type":"command","command":"hello"}]}]}}"#,
+        )
+        .expect("seed settings.json");
+
+        let run = |args: &[&str]| {
+            std::process::Command::new(dcg_binary())
+                .args(args)
+                .env_clear()
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                .env("APPDATA", temp.path().join("appdata"))
+                .env("LOCALAPPDATA", temp.path().join("localappdata"))
+                .current_dir(temp.path())
+                .output()
+                .expect("run dcg")
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read"))
+                .expect("settings.json stays valid JSON")
+        };
+
+        let output = run(&["install", "--muse"]);
+        assert!(
+            output.status.success(),
+            "install --muse: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let settings = read();
+        assert_eq!(settings["schema_version"], 1);
+        assert_eq!(
+            settings["model"], "muse-spark-1.2",
+            "unrelated settings kept"
+        );
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "hello"
+        );
+        let groups = settings["hooks"]["PreToolUse"].as_array().expect("array");
+        assert_eq!(groups.len(), 2, "{settings}");
+        assert_eq!(groups[0]["matcher"], "^(shell|exec_command|bash)$");
+        assert_eq!(groups[1]["hooks"][0]["command"], "audit-writes");
+        let handler = groups[0]["hooks"][0].as_object().expect("handler object");
+        let mut handler_keys: Vec<&str> = handler.keys().map(String::as_str).collect();
+        handler_keys.sort_unstable();
+        assert_eq!(
+            handler_keys,
+            vec!["command", "type"],
+            "only fields Muse accepts are written"
+        );
+        assert_eq!(handler["type"], "command");
+        let mut group_keys: Vec<&str> = groups[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        group_keys.sort_unstable();
+        assert_eq!(
+            group_keys,
+            vec!["hooks", "matcher"],
+            "Muse rejects unknown group fields"
+        );
+        let command = handler["command"].as_str().expect("command").to_string();
+        assert!(command.ends_with(" --agent muse"), "{command}");
+
+        assert!(
+            String::from_utf8_lossy(&run(&["install", "--muse"]).stdout)
+                .contains("already installed")
+        );
+        assert_eq!(read(), settings, "a second install is a no-op");
+        assert!(
+            !run(&["install", "--muse", "--project"]).status.success(),
+            "Muse project hooks are not a dcg install target"
+        );
+
+        // The installed command, run the way Muse runs a hook.
+        #[cfg(unix)]
+        {
+            let dcg_config = xdg_config_dir.join("dcg").join("config.toml");
+            std::fs::create_dir_all(dcg_config.parent().unwrap()).expect("dcg config dir");
+            let hook = |payload: &str| {
+                let mut child = std::process::Command::new("sh")
+                    .args(["-c", &command])
+                    .env_clear()
+                    .env("HOME", &home_dir)
+                    .env("XDG_CONFIG_HOME", &xdg_config_dir)
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("DCG_SELF_HEAL_HOOK", "0")
+                    .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                    .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                    .current_dir(temp.path())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn installed hook");
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(payload.as_bytes())
+                    .unwrap();
+                child.wait_with_output().expect("hook output")
+            };
+            let muse_payload = |tool: &str, tool_input: serde_json::Value| {
+                serde_json::json!({
+                    "cwd": temp.path(),
+                    "hook_event_name": "PreToolUse",
+                    "model": "unknown",
+                    "permission_mode": "default",
+                    "session_id": "s",
+                    "tool_input": tool_input,
+                    "tool_name": tool,
+                    "tool_use_id": "user_shell_1",
+                    "transcript_path": null,
+                    "turn_id": "t1",
+                })
+                .to_string()
+            };
+            let assert_denied = |output: &std::process::Output, label: &str| {
+                assert_eq!(output.status.code(), Some(0), "{label}: Muse reads exit 0");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let verdict: serde_json::Value = serde_json::from_str(stdout.trim())
+                    .unwrap_or_else(|e| panic!("{label}: deny JSON ({e}): {stdout}"));
+                let specific = verdict["hookSpecificOutput"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{label}: {verdict}"));
+                assert_eq!(verdict.as_object().unwrap().len(), 1, "{label}: {verdict}");
+                let mut keys: Vec<&str> = specific.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    vec![
+                        "hookEventName",
+                        "permissionDecision",
+                        "permissionDecisionReason"
+                    ],
+                    "{label}: the minimal Codex shape"
+                );
+                assert_eq!(specific["permissionDecision"], "deny", "{label}");
+                assert!(
+                    specific["permissionDecisionReason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("BLOCKED by dcg")),
+                    "{label}: Muse requires a non-empty reason: {verdict}"
+                );
+            };
+            let assert_allowed = |output: &std::process::Output, label: &str| {
+                assert_eq!(output.status.code(), Some(0), "{label}");
+                assert!(
+                    output.stdout.is_empty(),
+                    "{label}: Muse rejects a bare allow, so an allow is silent: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            };
+
+            std::fs::write(&dcg_config, "[general]\nself_heal_hook = false\n").expect("dcg config");
+            let shell_deny = hook(&muse_payload(
+                "shell",
+                serde_json::json!({"command": "git reset --hard"}),
+            ));
+            assert_denied(&shell_deny, "shell git reset --hard");
+            assert!(
+                String::from_utf8_lossy(&shell_deny.stdout).contains("core.git:reset-hard"),
+                "{}",
+                String::from_utf8_lossy(&shell_deny.stdout)
+            );
+            assert_denied(
+                &hook(&muse_payload(
+                    "exec_command",
+                    serde_json::json!({"cmd": "git reset --hard"}),
+                )),
+                "exec_command cmd",
+            );
+            assert_denied(
+                &hook(&muse_payload(
+                    "exec_command",
+                    serde_json::json!({"command": "ls", "cmd": "git reset --hard"}),
+                )),
+                "a benign command beside a destructive cmd",
+            );
+            assert_allowed(
+                &hook(&muse_payload(
+                    "shell",
+                    serde_json::json!({"command": "git status"}),
+                )),
+                "shell git status",
+            );
+            assert_allowed(
+                &hook(&muse_payload(
+                    "exec_command",
+                    serde_json::json!({"cmd": "git status"}),
+                )),
+                "exec_command git status",
+            );
+            assert_allowed(
+                &hook(&muse_payload(
+                    "read_file",
+                    serde_json::json!({"path": "README.md"}),
+                )),
+                "a non-shell tool",
+            );
+
+            // Fail closed on what dcg cannot read.
+            assert_denied(&hook("{\"tool_name\":\"shell\","), "truncated JSON");
+            assert_denied(
+                &hook(&muse_payload(
+                    "exec_command",
+                    serde_json::json!({"argv": ["git", "reset", "--hard"]}),
+                )),
+                "a shell call without a readable command",
+            );
+
+            // The [agents.muse] profile applies, [agents.codex-cli] does not.
+            let amend = muse_payload(
+                "shell",
+                serde_json::json!({"command": "git commit --amend -m x"}),
+            );
+            std::fs::write(
+                &dcg_config,
+                "[general]\nself_heal_hook = false\n[agents.codex-cli]\nextra_packs = [\"strict_git\"]\n",
+            )
+            .expect("dcg config");
+            assert_allowed(&hook(&amend), "[agents.codex-cli] does not apply to Muse");
+            std::fs::write(
+                &dcg_config,
+                "[general]\nself_heal_hook = false\n[agents.muse]\nextra_packs = [\"strict_git\"]\n",
+            )
+            .expect("dcg config");
+            assert_denied(&hook(&amend), "[agents.muse] applies");
+        }
+
+        let muse_doctor_check = |args: &[&str]| -> serde_json::Value {
+            let output = run(args);
+            let report: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                    panic!(
+                        "doctor JSON ({e}): {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    )
+                });
+            report["checks"]
+                .as_array()
+                .expect("checks")
+                .iter()
+                .find(|check| check["id"] == "muse_hook")
+                .cloned()
+                .unwrap_or_else(|| panic!("muse_hook check missing: {report}"))
+        };
+        assert_eq!(
+            muse_doctor_check(&["doctor", "--format", "json"])["status"],
+            "ok"
+        );
+
+        let output = run(&["uninstall", "--muse"]);
+        assert!(output.status.success());
+        let after = read();
+        let groups = after["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{after}");
+        assert_eq!(groups[0]["hooks"][0]["command"], "audit-writes");
+        assert_eq!(after["schema_version"], 1);
+        assert_eq!(after["model"], "muse-spark-1.2");
+
+        let missing = muse_doctor_check(&["doctor", "--format", "json"]);
+        assert_eq!(missing["status"], "error", "{missing}");
+        assert_eq!(read(), after, "doctor without --fix changes nothing");
+        let fixed = muse_doctor_check(&["doctor", "--fix", "--format", "json"]);
+        assert_eq!(fixed["fixed"], true, "{fixed}");
+        assert_eq!(
+            read()["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            command.as_str()
+        );
     }
 
     /// #388: `dcg install --crush` merges a flat `hooks.PreToolUse` entry into
@@ -3268,10 +5670,19 @@ mod config_tests {
             combined.contains("dcg doctor"),
             "expected header in doctor output\noutput:\n{combined}"
         );
-        assert!(
-            combined.contains("Checking configuration... USING DEFAULTS"),
-            "expected defaults notice\noutput:\n{combined}"
-        );
+        if let Some(machine_config) = loaded_machine_config(&combined) {
+            assert!(
+                combined.contains("Checking configuration... ")
+                    && !combined.contains("USING DEFAULTS"),
+                "{} is loaded, so doctor must not claim built-in defaults\noutput:\n{combined}",
+                machine_config.display()
+            );
+        } else {
+            assert!(
+                combined.contains("Checking configuration... USING DEFAULTS"),
+                "expected defaults notice\noutput:\n{combined}"
+            );
+        }
         assert!(
             combined.contains("Checking allowlist entries... NONE"),
             "expected allowlist none notice\noutput:\n{combined}"
@@ -3416,7 +5827,23 @@ mod config_tests {
         );
 
         let config_path = xdg_config_dir.join("dcg").join("config.toml");
-        let config_contents = std::fs::read_to_string(&config_path).expect("read config.toml");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(machine_config) = loaded_machine_config(&combined) {
+            // A loaded trusted layer is not "no configuration", so there is
+            // nothing for --fix to create.
+            assert!(
+                !config_path.exists(),
+                "{} is loaded; doctor --fix must not add a default user config\noutput:\n{combined}",
+                machine_config.display()
+            );
+            return;
+        }
+        let config_contents = std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|error| panic!("read config.toml: {error}\noutput:\n{combined}"));
         assert!(
             !config_contents.trim().is_empty(),
             "expected config.toml to be created"
@@ -3548,6 +5975,713 @@ mod config_tests {
             checks.iter().any(|c| c["id"] == "binary_path"),
             "expected binary_path check in JSON output"
         );
+    }
+
+    /// Keep allowlist audits isolated from the operator's policy and session.
+    fn allowlist_doctor_command(temp: &tempfile::TempDir) -> Command {
+        let mut command = Command::new(dcg_binary());
+        command
+            .env_clear()
+            .env("HOME", temp.path().join("home"))
+            .env("USERPROFILE", temp.path().join("home"))
+            .env("XDG_CONFIG_HOME", temp.path().join("xdg_config"))
+            .env("ProgramData", temp.path().join("system"))
+            .env("TMPDIR", temp.path())
+            .env("TEMP", temp.path())
+            .env("TMP", temp.path())
+            .env("PATH", temp.path().join("bin"))
+            .env("USER", "doctor-audit-reviewer")
+            .env("DCG_SESSION_ID", "doctor-audit-session")
+            .env(
+                "DCG_ALLOWLIST_SYSTEM_PATH",
+                temp.path().join("system-allowlist.toml"),
+            )
+            .env("DCG_SELF_HEAL_HOOK", "0")
+            .env("DCG_NO_UPDATE_CHECK", "1")
+            .env("NO_COLOR", "1")
+            .env("DCG_NO_RICH", "1")
+            .current_dir(temp.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn write_doctor_allowlist(path: &std::path::Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("allowlist parent"))
+            .expect("allowlist directory");
+        std::fs::write(path, contents).expect("write allowlist fixture");
+    }
+
+    fn parse_allowlist_doctor_report(output: &std::process::Output) -> serde_json::Value {
+        // Parsing the entire stream also rejects a second document or prose
+        // accidentally printed by doctor --fix before the JSON report.
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "invalid doctor JSON ({e}): stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(report["schema_version"], 1, "{report}");
+        let fields = report.as_object().expect("doctor report object");
+        assert_eq!(
+            fields.len(),
+            5,
+            "doctor v1 top-level shape changed: {report}"
+        );
+        assert!(report["issues"].is_u64(), "{report}");
+        assert!(report["fixed"].is_u64(), "{report}");
+        assert!(report["ok"].is_boolean(), "{report}");
+        for check in report["checks"].as_array().expect("doctor checks") {
+            assert!(check["id"].is_string(), "{check}");
+            assert!(check["name"].is_string(), "{check}");
+            assert!(check["message"].is_string(), "{check}");
+            assert!(
+                matches!(
+                    check["status"].as_str(),
+                    Some("ok" | "warning" | "error" | "skipped")
+                ),
+                "{check}"
+            );
+            if let Some(remediation) = check.get("remediation") {
+                assert!(remediation.is_string(), "{check}");
+            }
+            if let Some(fixed) = check.get("fixed") {
+                assert!(fixed.is_boolean(), "{check}");
+            }
+        }
+        report
+    }
+
+    fn allowlist_doctor_check(report: &serde_json::Value) -> &serde_json::Value {
+        report["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["id"] == "allowlists")
+            .expect("existing allowlists check")
+    }
+
+    /// #545's exact reproduction must produce actionable warnings in every
+    /// renderer, while the diagnostic and --fix preserve the granted policy.
+    #[test]
+    fn doctor_warns_about_global_indefinite_user_rule_issue_545() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let path = xdg_config.join("dcg/allowlist.toml");
+        let added = allowlist_doctor_command(&temp)
+            .args([
+                "allowlist",
+                "add",
+                "core.filesystem:rm-rf-general",
+                "-r",
+                "test",
+                "--user",
+            ])
+            .output()
+            .expect("run reported allowlist add command");
+        assert!(
+            added.status.success(),
+            "allowlist add: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        let original = std::fs::read(&path).expect("CLI-created allowlist");
+        let file: toml::Value =
+            toml::from_str(std::str::from_utf8(&original).expect("allowlist UTF-8"))
+                .expect("allowlist TOML");
+        let entry = &file["allow"][0];
+        let added_at = entry["added_at"].as_str().expect("CLI audit timestamp");
+        assert!(entry.get("expires_at").is_none());
+        assert!(entry.get("paths").is_none());
+
+        for args in [
+            vec!["doctor", "--format", "json"],
+            vec!["doctor", "--strict", "--format", "json"],
+            vec!["doctor", "--fix", "--strict", "--format", "json"],
+        ] {
+            let output = allowlist_doctor_command(&temp)
+                .args(&args)
+                .output()
+                .expect("run allowlist doctor");
+            let report = parse_allowlist_doctor_report(&output);
+            assert!(output.status.success(), "{args:?}: {report}");
+            assert_eq!(
+                report["ok"], true,
+                "warnings keep the exit contract: {report}"
+            );
+            let check = allowlist_doctor_check(&report);
+            assert_eq!(check["status"], "warning", "{args:?}: {check}");
+            let message = check["message"].as_str().expect("allowlist message");
+            for expected in [
+                "active globally scoped, indefinite allowlist exception",
+                "core.filesystem:rm-rf-general",
+                "HIGH RISK",
+                "destructive filesystem protection",
+                "user:",
+                "test",
+                "doctor-audit-reviewer",
+                added_at,
+                &path.display().to_string(),
+            ] {
+                assert!(message.contains(expected), "missing {expected:?}: {check}");
+            }
+            let remediation = check["remediation"].as_str().expect("audit remediation");
+            for expected in ["paths", "expires_at", "allow-once"] {
+                assert!(
+                    remediation.contains(expected),
+                    "missing actionable {expected:?}: {check}"
+                );
+            }
+            assert_ne!(
+                check["fixed"], true,
+                "doctor cannot fix an exception: {check}"
+            );
+            let fixed_checks = report["checks"]
+                .as_array()
+                .expect("checks")
+                .iter()
+                .filter(|check| check["fixed"] == true)
+                .count();
+            assert_eq!(
+                report["fixed"],
+                serde_json::json!(fixed_checks),
+                "allowlist warnings must not receive an extra fix count: {report}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("allowlist after doctor"),
+                original,
+                "{args:?} must preserve allowlist bytes"
+            );
+        }
+
+        let pretty = allowlist_doctor_command(&temp)
+            .args(["doctor", "--strict"])
+            .output()
+            .expect("run pretty doctor");
+        assert!(pretty.status.success());
+        let stdout = String::from_utf8_lossy(&pretty.stdout);
+        assert!(
+            stdout.contains("Checking allowlist entries... WARNING"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("core.filesystem:rm-rf-general"), "{stdout}");
+        assert!(
+            stdout.contains("destructive filesystem protection"),
+            "{stdout}"
+        );
+        assert_eq!(std::fs::read(&path).expect("unchanged allowlist"), original);
+    }
+
+    #[test]
+    fn doctor_recognizes_effectively_global_allowlist_paths_and_metadata() {
+        for extra in [
+            "",
+            "paths = []",
+            "paths = [\"*\"]",
+            "paths = [\"**/\"]",
+            "paths = [\"**/*\"]",
+            "paths = [\"**/**\"]",
+            "paths = [\"**/**/**\"]",
+            "paths = [\"/reviewed/workspace/**\", \"*\"]",
+            "paths = [\"/reviewed/workspace/**\", \"**/*\"]",
+            "session = false",
+            "conditions = { AUDIT_REVIEWED = \"yes\" }",
+            "environments = [\"not-the-current-environment\"]",
+            "context = \"string-argument\"",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (_, xdg_config, _) = setup_doctor_env(&temp);
+            let path = xdg_config.join("dcg/allowlist.toml");
+            let original = format!(
+                "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"reviewed exception\"\n{extra}\n"
+            );
+            write_doctor_allowlist(&path, &original);
+            let output = allowlist_doctor_command(&temp)
+                .env("AUDIT_REVIEWED", "yes")
+                .args(["doctor", "--format", "json"])
+                .output()
+                .expect("run global-scope audit");
+            let report = parse_allowlist_doctor_report(&output);
+            let check = allowlist_doctor_check(&report);
+            assert_eq!(check["status"], "warning", "{extra:?}: {check}");
+            let message = check["message"].as_str().expect("message");
+            assert!(
+                message.contains("active globally scoped, indefinite allowlist exception"),
+                "{extra:?} must not hide an unrestricted grant: {check}"
+            );
+            assert!(message.contains("destructive Git protection"), "{check}");
+            assert!(message.contains("core.git:reset-hard"), "{check}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_audits_only_active_rules_including_external_packs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let config_dir = xdg_config.join("dcg");
+        let allowlist_path = config_dir.join("allowlist.toml");
+        let pack_path = config_dir.join("packs/custom.yaml");
+        std::fs::create_dir_all(pack_path.parent().expect("pack parent"))
+            .expect("custom pack directory");
+        std::fs::write(
+            &pack_path,
+            r#"
+schema_version: 1
+id: custom.deploy
+name: Custom Deploy Rules
+version: 1.0.0
+keywords: [deploy]
+destructive_patterns:
+  - name: prod-deploy
+    pattern: deploy\s+--env\s*=?\s*prod
+    severity: critical
+    description: Direct production deployment blocked
+"#,
+        )
+        .expect("valid external pack fixture");
+
+        let original = [
+            "unknown.audit.pack:destroy",
+            "core:reset-hard",
+            "core.git:typo",
+            "core.git:reset-*",
+            "core.git:reset-hard",
+            "containers.docker:system-prune",
+            "custom.deploy:prod-deploy",
+            "custom.deploy:missing-rule",
+        ]
+        .map(|rule| format!("[[allow]]\nrule = \"{rule}\"\nreason = \"namespace audit\"\n"))
+        .join("\n");
+        write_doctor_allowlist(&allowlist_path, &original);
+        let quoted_pack_path = toml::Value::String(pack_path.to_string_lossy().into_owned());
+
+        for (optional_active, config) in [
+            (
+                false,
+                "[packs]\nenabled = [\"core\", \"containers.docker\", \"unknown.audit.pack\"]\ndisabled = [\"containers.docker\"]\n"
+                    .to_string(),
+            ),
+            (
+                true,
+                format!(
+                    "[packs]\nenabled = [\"core\", \"containers.docker\", \"unknown.audit.pack\"]\ncustom_paths = [{quoted_pack_path}]\n"
+                ),
+            ),
+        ] {
+            std::fs::write(config_dir.join("config.toml"), config).expect("active pack config");
+            let output = allowlist_doctor_command(&temp)
+                .args(["doctor", "--format", "json"])
+                .output()
+                .expect("audit configured pack namespaces");
+            let report = parse_allowlist_doctor_report(&output);
+            assert!(output.status.success(), "{report}");
+            let check = allowlist_doctor_check(&report);
+            assert_eq!(check["status"], "warning", "{check}");
+            let message = check["message"].as_str().expect("message");
+            for (rule, expected_active) in [
+                ("unknown.audit.pack:destroy", false),
+                ("core:reset-hard", false),
+                ("core.git:typo", false),
+                ("core.git:reset-*", false),
+                ("core.git:reset-hard", true),
+                ("containers.docker:system-prune", optional_active),
+                ("custom.deploy:prod-deploy", optional_active),
+                ("custom.deploy:missing-rule", false),
+            ] {
+                let warning = format!(
+                    "active globally scoped, indefinite allowlist exception for rule {rule}"
+                );
+                assert_eq!(
+                    message.contains(&warning),
+                    expected_active,
+                    "optional_active={optional_active}, rule={rule}: {check}"
+                );
+            }
+            assert_eq!(
+                message
+                    .matches("active globally scoped, indefinite allowlist exception")
+                    .count(),
+                if optional_active { 3 } else { 1 },
+                "the audit must expand groups into concrete active packs: {check}"
+            );
+            assert_eq!(std::fs::read_to_string(&allowlist_path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_does_not_call_scoped_expiring_or_inactive_exceptions_unrestricted() {
+        for extra in [
+            "paths = [\"/reviewed/workspace/**\"]",
+            "paths = [\"**/reviewed/**\"]",
+            "paths = [\"**/*.rs\"]",
+            "paths = [\"*/reviewed\"]",
+            "expires_at = \"2099-12-31T23:59:59Z\"",
+            "expires_at = \"2099-12-31\"",
+            "expires_at = \"2000-01-01T00:00:00Z\"",
+            "ttl = \"1h\"\nadded_at = \"2099-01-01T00:00:00Z\"",
+            "ttl = \"1h\"\nadded_at = \"2000-01-01T00:00:00Z\"",
+            "ttl = \"1h\"",
+            "ttl = \"1h\"\nadded_at = \"invalid-audit-date\"",
+            "session = true\nsession_id = \"doctor-audit-session\"",
+            "session = true\nsession_id = \"different-session\"",
+            "conditions = { AUDIT_REVIEWED = \"yes\" }",
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (_, xdg_config, _) = setup_doctor_env(&temp);
+            let path = xdg_config.join("dcg/allowlist.toml");
+            let original = format!(
+                "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"bounded exception\"\n{extra}\n"
+            );
+            write_doctor_allowlist(&path, &original);
+            let output = allowlist_doctor_command(&temp)
+                .args(["doctor", "--format", "json"])
+                .output()
+                .expect("run bounded-exception audit");
+            let report = parse_allowlist_doctor_report(&output);
+            let check = allowlist_doctor_check(&report);
+            assert!(output.status.success(), "{extra:?}: {report}");
+            let message = check["message"].as_str().expect("message");
+            assert!(
+                !message.contains("active globally scoped, indefinite allowlist exception"),
+                "{extra:?} is not an unrestricted indefinite grant: {check}"
+            );
+            if extra.starts_with("paths =") || extra.contains("2099") {
+                assert_eq!(check["status"], "ok", "{extra:?}: {check}");
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_preserves_working_path_scoped_and_exact_command_exceptions() {
+        for scoped in [true, false] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (_, xdg_config, _) = setup_doctor_env(&temp);
+            let path = xdg_config.join("dcg/allowlist.toml");
+            let approved = temp.path().join("approved");
+            std::fs::create_dir_all(&approved).expect("approved directory");
+            let original = if scoped {
+                let scope = toml::Value::String(approved.to_string_lossy().into_owned());
+                format!(
+                    "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"scoped maintenance\"\npaths = [{scope}]\n"
+                )
+            } else {
+                "[[allow]]\nexact_command = \"git reset --hard\"\nreason = \"reviewed exact command\"\n"
+                    .to_string()
+            };
+            write_doctor_allowlist(&path, &original);
+
+            for after_audit in [false, true] {
+                if after_audit {
+                    let output = allowlist_doctor_command(&temp)
+                        .current_dir(&approved)
+                        .args(["doctor", "--format", "json"])
+                        .output()
+                        .expect("audit safe exception");
+                    let report = parse_allowlist_doctor_report(&output);
+                    let check = allowlist_doctor_check(&report);
+                    assert_eq!(check["status"], "ok", "scoped={scoped}: {check}");
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+                }
+                for allowed in [true, false] {
+                    let cwd = if allowed || !scoped {
+                        approved.as_path()
+                    } else {
+                        temp.path()
+                    };
+                    let command = if allowed || scoped {
+                        "git reset --hard"
+                    } else {
+                        "git reset --hard HEAD~1"
+                    };
+                    let output = allowlist_doctor_command(&temp)
+                        .current_dir(cwd)
+                        .args(["test", "--format", "json", command])
+                        .output()
+                        .expect("evaluate scoped allowance without executing it");
+                    let evaluation: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).expect("evaluation JSON");
+                    assert_eq!(
+                        evaluation["decision"],
+                        if allowed { "allow" } else { "deny" },
+                        "scoped={scoped}, after_audit={after_audit}: {evaluation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_audits_project_user_and_system_allowlists_from_nested_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let project_config = temp.path().join(".dcg.toml");
+        std::fs::write(&project_config, "").expect("trusted project config");
+        let nested = temp.path().join("src/nested");
+        std::fs::create_dir_all(&nested).expect("nested working directory");
+        let fixtures = [
+            (
+                "project",
+                temp.path().join(".dcg/allowlist.toml"),
+                "core.filesystem:rm-rf-root-home",
+            ),
+            (
+                "user",
+                xdg_config.join("dcg/allowlist.toml"),
+                "core.git:reset-hard",
+            ),
+            (
+                "system",
+                temp.path().join("system-allowlist.toml"),
+                "core.git:stash-clear",
+            ),
+        ];
+        let mut originals = Vec::new();
+        for (layer, path, rule) in &fixtures {
+            let mut contents = format!(
+                "[[allow]]\nrule = \"{rule}\"\nreason = \"{layer} maintenance\"\nadded_by = \"{layer}-reviewer\"\nadded_at = \"2026-08-01T12:00:00Z\"\n"
+            );
+            if *layer == "project" {
+                // A scoped higher-priority exception does not neutralize an
+                // unrestricted user grant for the same rule elsewhere.
+                contents.push_str(
+                    "\n[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"scoped project override\"\npaths = [\"/reviewed/workspace/**\"]\n",
+                );
+            }
+            write_doctor_allowlist(path, &contents);
+            originals.push(contents);
+        }
+        let output = allowlist_doctor_command(&temp)
+            .env("DCG_CONFIG", &project_config)
+            .current_dir(&nested)
+            .args(["doctor", "--format", "json", "--strict"])
+            .output()
+            .expect("audit all layers");
+        let report = parse_allowlist_doctor_report(&output);
+        assert!(output.status.success(), "{report}");
+        let check = allowlist_doctor_check(&report);
+        assert_eq!(check["status"], "warning", "{check}");
+        let message = check["message"].as_str().expect("message");
+        assert_eq!(
+            message
+                .matches("active globally scoped, indefinite allowlist exception")
+                .count(),
+            3,
+            "each active unrestricted layer must be reported: {check}"
+        );
+        for ((layer, path, rule), original) in fixtures.iter().zip(originals) {
+            for expected in [
+                format!("{layer}:"),
+                path.display().to_string(),
+                (*rule).to_string(),
+            ] {
+                assert!(message.contains(&expected), "missing {expected:?}: {check}");
+            }
+            assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_warns_for_universal_globs_in_every_layer_without_changing_grants_545() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let project_config = temp.path().join(".dcg.toml");
+        std::fs::write(&project_config, "").expect("trusted project config");
+        let nested = temp.path().join("src/nested");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        let fixtures = [
+            (
+                "project",
+                temp.path().join(".dcg/allowlist.toml"),
+                "core.git:reset-hard",
+                "**/",
+                "git reset --hard",
+            ),
+            (
+                "user",
+                xdg_config.join("dcg/allowlist.toml"),
+                "core.git:clean-force",
+                "**/*",
+                "git clean -fd",
+            ),
+            (
+                "system",
+                temp.path().join("system-allowlist.toml"),
+                "core.git:stash-clear",
+                "**/**",
+                "git stash clear",
+            ),
+        ];
+        let mut originals = Vec::new();
+        for (layer, path, rule, pattern, _) in &fixtures {
+            let contents = format!(
+                "[[allow]]\nrule = \"{rule}\"\nreason = \"{layer} wildcard maintenance\"\npaths = [\"{pattern}\"]\nadded_by = \"{layer}-reviewer\"\n"
+            );
+            write_doctor_allowlist(path, &contents);
+            originals.push(contents);
+        }
+        for after_audit in [false, true] {
+            if after_audit {
+                let output = allowlist_doctor_command(&temp)
+                    .env("DCG_CONFIG", &project_config)
+                    .current_dir(&nested)
+                    .args(["doctor", "--fix", "--strict", "--format", "json"])
+                    .output()
+                    .expect("audit universal globs across all layers");
+                let report = parse_allowlist_doctor_report(&output);
+                assert!(output.status.success(), "{report}");
+                let check = allowlist_doctor_check(&report);
+                assert_eq!(check["status"], "warning", "{check}");
+                assert_ne!(check["fixed"], true, "doctor must preserve grants: {check}");
+                let message = check["message"].as_str().expect("audit message");
+                assert_eq!(
+                    message
+                        .matches("active globally scoped, indefinite allowlist exception")
+                        .count(),
+                    fixtures.len(),
+                    "universal scope must be diagnosed in every layer: {check}"
+                );
+                for ((layer, path, rule, _, _), original) in fixtures.iter().zip(&originals) {
+                    for expected in [
+                        format!("{layer}:"),
+                        (*rule).to_string(),
+                        format!("{layer}-reviewer"),
+                    ] {
+                        assert!(message.contains(&expected), "missing {expected:?}: {check}");
+                    }
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), *original);
+                }
+            }
+            for (_, _, _, _, command) in &fixtures {
+                for cwd in [temp.path(), nested.as_path()] {
+                    let output = allowlist_doctor_command(&temp)
+                        .env("DCG_CONFIG", &project_config)
+                        .current_dir(cwd)
+                        .args(["test", "--format", "json", command])
+                        .output()
+                        .expect("evaluate granted command as inert data");
+                    let evaluation: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).expect("evaluation JSON");
+                    assert_eq!(
+                        evaluation["decision"], "allow",
+                        "the audit must not change matching: after_audit={after_audit}, {command:?}: {evaluation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_reports_untrusted_project_allowlist_as_inactive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        setup_doctor_env(&temp);
+        std::fs::write(temp.path().join(".dcg.toml"), "").expect("untrusted project config");
+        let path = temp.path().join(".dcg/allowlist.toml");
+        let original =
+            "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"inactive project rule\"\n";
+        write_doctor_allowlist(&path, original);
+        let output = allowlist_doctor_command(&temp)
+            .args(["doctor", "--format", "json"])
+            .output()
+            .expect("audit untrusted project");
+        let report = parse_allowlist_doctor_report(&output);
+        let check = allowlist_doctor_check(&report);
+        assert_eq!(check["status"], "warning", "{check}");
+        let message = check["message"].as_str().expect("message");
+        assert!(message.contains("inactive"), "{check}");
+        assert!(message.contains("untrusted"), "{check}");
+        assert!(message.contains(&path.display().to_string()), "{check}");
+        assert!(
+            !message.contains("active globally scoped, indefinite allowlist exception"),
+            "untrusted repository policy must not be reported as active: {check}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn doctor_reports_active_risk_alongside_malformed_allowlist_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let path = xdg_config.join("dcg/allowlist.toml");
+        let original = r#"
+[[allow]]
+rule = "core.filesystem:rm-rf-general"
+reason = "invalid expiry makes this row inactive"
+expires_at = "not-a-date"
+
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "active despite malformed audit timestamp"
+added_by = "migration-reviewer"
+added_at = "invalid-audit-date"
+"#;
+        write_doctor_allowlist(&path, original);
+        for strict in [false, true] {
+            let mut command = allowlist_doctor_command(&temp);
+            command.args(["doctor", "--format", "json"]);
+            if strict {
+                command.arg("--strict");
+            }
+            let output = command.output().expect("audit malformed metadata");
+            let report = parse_allowlist_doctor_report(&output);
+            let check = allowlist_doctor_check(&report);
+            assert_eq!(check["status"], "error", "{check}");
+            assert_eq!(report["ok"], false, "{report}");
+            assert_eq!(output.status.success(), !strict, "{report}");
+            let message = check["message"].as_str().expect("message");
+            assert!(message.contains("not-a-date"), "{check}");
+            assert!(
+                message.contains("entry 2"),
+                "retain source row numbers: {check}"
+            );
+            assert!(
+                message.contains("active globally scoped, indefinite allowlist exception for rule core.git:reset-hard"),
+                "a parse error must not hide another row's active risk: {check}"
+            );
+            assert!(message.contains("migration-reviewer"), "{check}");
+            assert!(message.contains("invalid-audit-date"), "{check}");
+            assert!(
+                !message.contains("active globally scoped, indefinite allowlist exception for rule core.filesystem:rm-rf-general"),
+                "a rejected expiry row must not be described as active: {check}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn doctor_audits_non_string_expiration_as_runtime_interprets_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, xdg_config, _) = setup_doctor_env(&temp);
+        let path = xdg_config.join("dcg/allowlist.toml");
+        // The loader ignores values of the wrong type for these optional
+        // fields. Their presence must not make doctor invent an expiration.
+        let original = r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "mistyped optional metadata"
+expires_at = 123
+added_at = false
+added_by = 456
+"#;
+        write_doctor_allowlist(&path, original);
+        let output = allowlist_doctor_command(&temp)
+            .args(["doctor", "--format", "json"])
+            .output()
+            .expect("audit mistyped metadata");
+        let report = parse_allowlist_doctor_report(&output);
+        let check = allowlist_doctor_check(&report);
+        assert_eq!(check["status"], "warning", "{check}");
+        let message = check["message"].as_str().expect("message");
+        assert!(
+            message.contains("active globally scoped, indefinite allowlist exception for rule core.git:reset-hard"),
+            "{check}"
+        );
+        assert!(!message.contains("added_by=456"), "{check}");
+        assert!(!message.contains("added_at=false"), "{check}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     /// Run `dcg doctor --format json` in an isolated HOME and return the
@@ -4846,23 +7980,56 @@ block = [
     }
 
     #[test]
-    fn hook_mode_missing_dcg_config_fails_open() {
-        // If the user sets DCG_CONFIG incorrectly, hook mode must not break
-        // workflows (fail-open). It should behave as if no config was loaded.
-        let missing = std::ffi::OsStr::new("/tmp/dcg_config_missing_should_not_exist");
-        let result = run_dcg_hook_with_env("git status", &[("DCG_CONFIG", missing)]);
+    fn hook_mode_missing_dcg_config_fails_closed() {
+        // An explicitly selected config that does not exist is an unknown
+        // policy, not the default one: the custom packs, policy rules and
+        // fail_closed it was meant to carry are missing. Since #568
+        // (5b1d5bf) hook mode denies every shell command with the reason
+        // instead of silently evaluating with built-in defaults; it used to
+        // fail open here.
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let missing = scratch
+            .path()
+            .join("dcg_config_missing_should_not_exist.toml");
+        let result = run_dcg_hook_with_env("git status", &[("DCG_CONFIG", missing.as_os_str())]);
 
         assert!(
             result.output.status.success(),
-            "hook mode should exit successfully\nstdout:\n{}\nstderr:\n{}",
+            "hook protocol denial still exits 0\nstdout:\n{}\nstderr:\n{}",
             result.stdout_str(),
             result.stderr_str()
         );
+        let json: serde_json::Value = serde_json::from_str(result.stdout_str().trim())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "expected a JSON denial for a missing DCG_CONFIG ({error})\nstdout:\n{}\nstderr:\n{}",
+                    result.stdout_str(),
+                    result.stderr_str()
+                )
+            });
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{json}"
+        );
+        let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("denial carries a reason");
         assert!(
-            result.stdout_str().trim().is_empty(),
-            "expected allow (no stdout) even with missing DCG_CONFIG\nstdout:\n{}\nstderr:\n{}",
-            result.stdout_str(),
-            result.stderr_str()
+            reason.contains("DCG configuration error")
+                && reason.contains("dcg_config_missing_should_not_exist.toml")
+                && reason.contains("does not exist"),
+            "the reason must name the missing file: {reason}"
+        );
+
+        // Control: the same harmless command is allowed when no config is
+        // selected, so the denial above comes from the missing selection.
+        let control = run_dcg_hook("git status");
+        assert!(control.output.status.success());
+        assert!(
+            control.stdout_str().trim().is_empty(),
+            "git status without DCG_CONFIG must stay allowed\nstdout:\n{}\nstderr:\n{}",
+            control.stdout_str(),
+            control.stderr_str()
         );
     }
 

@@ -72,17 +72,32 @@ fn path_included_modules(source: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Files pulled in by `#[path]` from modules that are themselves declared.
+/// Files pulled in by `#[path]` from modules that are themselves part of the
+/// crate, followed transitively.
 ///
 /// Reading only DECLARED parents is what keeps this from weakening the guard.
 /// An orphaned file is never compiled, so a `#[path]` written inside one pulls
 /// nothing in — and if it were counted, one orphan could vouch for another.
+///
+/// A file that joined the crate through `#[path]` is compiled like any other,
+/// so its own `#[path]` attributes count too: `ast_matcher.rs` pulls in
+/// `ast_source_analysis.rs`, which pulls in `ast_pattern_engine.rs`. Reading
+/// one hop only reported that last file as an orphan. A top-level file's
+/// `#[path]` is relative to `src/`, which is the only directory read here.
 fn path_includes_of_declared(src: &Path, declared: &BTreeSet<&str>) -> BTreeSet<String> {
-    declared
-        .iter()
-        .filter_map(|parent| std::fs::read_to_string(src.join(format!("{parent}.rs"))).ok())
-        .flat_map(|text| path_included_modules(&text))
-        .collect()
+    let mut included = BTreeSet::new();
+    let mut pending: Vec<String> = declared.iter().map(|name| (*name).to_owned()).collect();
+    while let Some(parent) = pending.pop() {
+        let Ok(text) = std::fs::read_to_string(src.join(format!("{parent}.rs"))) else {
+            continue;
+        };
+        for child in path_included_modules(&text) {
+            if !declared.contains(child.as_str()) && included.insert(child.clone()) {
+                pending.push(child);
+            }
+        }
+    }
+    included
 }
 
 /// Stems of `*.rs` files directly under `dir`, excluding the crate roots, that
@@ -127,12 +142,16 @@ fn every_top_level_source_file_is_declared_in_a_crate_root() {
 
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     // `#[path]` can sit in a declared module (`ast_matcher.rs` pulls in
-    // `ast_pattern_engine.rs`) or in a root itself; a root's own attribute is
-    // relative to `src/` too, and reading only the children would report the
-    // file it names as an orphan.
-    let mut included = path_includes_of_declared(&src, &declared);
-    included.extend(path_included_modules(&lib));
-    included.extend(path_included_modules(&main));
+    // `ast_source_analysis.rs`, which pulls in `ast_pattern_engine.rs`) or in
+    // a root itself; a root's own attribute is relative to `src/` too, and
+    // reading only the children would report the file it names as an orphan.
+    // Root includes join first, so their own includes are followed as well.
+    let root_included: BTreeSet<String> = path_included_modules(&lib)
+        .into_iter()
+        .chain(path_included_modules(&main))
+        .collect();
+    declared.extend(root_included.iter().map(String::as_str));
+    let included = path_includes_of_declared(&src, &declared);
     declared.extend(included.iter().map(String::as_str));
     let orphaned = orphaned_modules(&src, &declared);
 
@@ -227,6 +246,31 @@ mod detection_is_not_vacuous {
         assert!(
             !included.contains("smuggled"),
             "an orphan is never compiled, so its #[path] cannot vouch for anything"
+        );
+    }
+
+    #[test]
+    fn a_path_include_chain_counts_only_when_it_starts_at_a_declared_module() {
+        let directory = tempfile::tempdir().expect("create a temporary source directory");
+        let source = directory.path();
+        for (name, text) in [
+            ("parent.rs", "#[path = \"middle.rs\"]\nmod middle;\n"),
+            ("middle.rs", "#[path = \"leaf.rs\"]\nmod leaf;\n"),
+            ("leaf.rs", "#[path = \"middle.rs\"]\nmod cycle;\n"),
+            ("orphan.rs", "#[path = \"relay.rs\"]\nmod relay;\n"),
+            ("relay.rs", "#[path = \"smuggled.rs\"]\nmod smuggled;\n"),
+        ] {
+            std::fs::write(source.join(name), text).expect("write a synthetic module");
+        }
+
+        let declared = BTreeSet::from(["parent"]);
+        let included = path_includes_of_declared(source, &declared);
+
+        assert_eq!(
+            included,
+            BTreeSet::from(["leaf".to_owned(), "middle".to_owned()]),
+            "a #[path] file is compiled, so its own #[path] includes are part of the crate \
+             (a cycle terminates); a chain that starts at an orphan pulls nothing in"
         );
     }
 

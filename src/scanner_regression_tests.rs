@@ -78,3 +78,60 @@ fn bash_unicode_braces_are_safe_with_concurrent_cached_parsers() {
         }
     });
 }
+
+#[test]
+fn stdin_data_does_not_borrow_program_source_proof_560() {
+    use crate::heredoc::{mask_inert_interpreter_stdin, range_is_inert_interpreter_stdin};
+    for header in [
+        "python3 -c 'import os,sys; os.system(sys.stdin.read())' <<'DCG_STDIN'",
+        "python3 <<'DCG_STDIN' -c 'import os,sys; os.system(sys.stdin.read())'",
+        "python3 script.py <<'DCG_STDIN'",
+        "python3 <<'DCG_STDIN' script.py",
+        "node -e 'process.stdin.on(\"data\", console.log)' <<'DCG_STDIN'",
+        "node <<'DCG_STDIN' -e 'process.stdin.on(\"data\", console.log)'",
+        "node <<'DCG_STDIN' script.js",
+        "ruby <<'DCG_STDIN' -e 'puts STDIN.read'",
+        "perl <<'DCG_STDIN' -e 'print <STDIN>'",
+        "php <<'DCG_STDIN' -r 'echo stream_get_contents(STDIN);'",
+    ] {
+        for body in ["git reset --hard", "print('quoted shell-looking data')"] {
+            let command = format!("{header}\n{body}\nDCG_STDIN");
+            let range = header.len() + 1..header.len() + 1 + body.len();
+            assert!(
+                !range_is_inert_interpreter_stdin(&command, &range),
+                "{header}"
+            );
+            assert_eq!(
+                mask_inert_interpreter_stdin(&command).as_ref(),
+                command,
+                "{header}"
+            );
+        }
+    }
+}
+
+#[test]
+fn program_stdin_preserves_outer_shell_boundaries_560() {
+    use crate::heredoc::{mask_inert_interpreter_stdin, range_is_inert_interpreter_stdin};
+    for (header, body) in [
+        (
+            "python3 - <<'DCG_STDIN'",
+            "print('literal shell-like text')",
+        ),
+        (
+            "node - <<'DCG_STDIN'",
+            "console.log('literal shell-like text');",
+        ),
+    ] {
+        let command = format!("{header}\n{body}\nDCG_STDIN\ngit status");
+        let range = header.len() + 1..header.len() + 1 + body.len();
+        assert!(
+            range_is_inert_interpreter_stdin(&command, &range),
+            "{header}"
+        );
+        let masked = mask_inert_interpreter_stdin(&command);
+        assert_eq!(masked.len(), command.len());
+        assert_eq!(&masked[..range.start], &command[..range.start]);
+        assert_eq!(&masked[range.end..], &command[range.end..]);
+    }
+}

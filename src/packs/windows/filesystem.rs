@@ -45,12 +45,23 @@ const WINDOWS_FILESYSTEM_UNVERIFIED_REASON: &str = "The Windows filesystem comma
 /// `Unverified` is intentionally distinct from `NoMatch`: the former means a
 /// protected executable or destructive option can be produced only after
 /// runtime shell expansion, so the evaluator must fail closed.
+///
+/// `Incomplete` is distinct from both: the whole-command size or statement
+/// bound stopped the pass before it inspected every statement, so it found
+/// neither a protected role nor proof of its absence. That is an incomplete
+/// analysis, not evidence about any rule, and attributing it to
+/// `windows-filesystem-semantic-unverified` named a finding that did not
+/// exist (#569: 29 lines of quoted Python tuples crossed the statement bound
+/// where 28 did not). The evaluator still runs this pack's patterns, so a
+/// visible destructive spelling denies under its own rule, and otherwise
+/// returns the configured incomplete-analysis outcome (`Indeterminate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowsFilesystemSemanticDecision {
     NoMatch,
     Safe,
     Destructive(&'static str),
     Unverified,
+    Incomplete,
 }
 
 #[derive(Debug, Default)]
@@ -1785,6 +1796,7 @@ fn powershell_call_operator_analysis(command: &str) -> PowerShellCallOperatorAna
     let mut saw_word_in_statement = false;
     let mut saw_safe = false;
     let mut saw_unverified = false;
+    let mut saw_incomplete = false;
     let mut inert_target_spans = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
@@ -1855,6 +1867,7 @@ fn powershell_call_operator_analysis(command: &str) -> PowerShellCallOperatorAna
                             };
                         }
                         WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+                        WindowsFilesystemSemanticDecision::Incomplete => saw_incomplete = true,
                         WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
                         WindowsFilesystemSemanticDecision::NoMatch => {}
                     }
@@ -1866,6 +1879,8 @@ fn powershell_call_operator_analysis(command: &str) -> PowerShellCallOperatorAna
 
     let decision = if saw_unverified {
         Some(WindowsFilesystemSemanticDecision::Unverified)
+    } else if saw_incomplete {
+        Some(WindowsFilesystemSemanticDecision::Incomplete)
     } else if saw_safe {
         Some(WindowsFilesystemSemanticDecision::Safe)
     } else {
@@ -1954,6 +1969,10 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
         if decisions.contains(&WindowsFilesystemSemanticDecision::Unverified) {
             return WindowsFilesystemSemanticDecision::Unverified;
         }
+        // A view that gave up cannot be cleared by a view that finished.
+        if decisions.contains(&WindowsFilesystemSemanticDecision::Incomplete) {
+            return WindowsFilesystemSemanticDecision::Incomplete;
+        }
         return if decisions.contains(&WindowsFilesystemSemanticDecision::Safe) {
             WindowsFilesystemSemanticDecision::Safe
         } else {
@@ -1963,9 +1982,11 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
 
     if command.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES {
         // Do not allocate or tokenize an attacker-controlled oversized shell
-        // program.  Callers invoke this pass only for the enabled Windows pack;
-        // failing closed is the only sound bounded result.
-        return WindowsFilesystemSemanticDecision::Unverified;
+        // program.  Callers invoke this pass only for the enabled Windows pack,
+        // and an unanalyzed program is never a clean one: the evaluator turns
+        // this into the configured incomplete-analysis outcome unless one of
+        // the pack's own patterns denies first.
+        return WindowsFilesystemSemanticDecision::Incomplete;
     }
 
     if dialect == ShellDialect::PowerShell {
@@ -2021,20 +2042,25 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
 
     let segments = crate::packs::split_command_segments_in_dialect(command, dialect);
     if segments.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS {
+        // The statement bound stops the pass before any statement is read, so
+        // a protected spelling or dialect escape somewhere in the text is only
+        // a reason the analysis was needed, not a finding (#569).
         return if has_dialect_syntax || has_literal_keyword {
-            WindowsFilesystemSemanticDecision::Unverified
+            WindowsFilesystemSemanticDecision::Incomplete
         } else {
             WindowsFilesystemSemanticDecision::NoMatch
         };
     }
     let mut saw_safe = false;
     let mut saw_unverified = false;
+    let mut saw_incomplete = false;
     let call_analysis = if dialect == ShellDialect::PowerShell {
         let analysis = powershell_call_operator_analysis(command);
         if let Some(decision) = analysis.decision {
             match decision {
                 decision @ WindowsFilesystemSemanticDecision::Destructive(_) => return decision,
                 WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+                WindowsFilesystemSemanticDecision::Incomplete => saw_incomplete = true,
                 WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
                 WindowsFilesystemSemanticDecision::NoMatch => {}
             }
@@ -2099,12 +2125,15 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
         match decision {
             decision @ WindowsFilesystemSemanticDecision::Destructive(_) => return decision,
             WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+            WindowsFilesystemSemanticDecision::Incomplete => saw_incomplete = true,
             WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
             WindowsFilesystemSemanticDecision::NoMatch => {}
         }
     }
     if saw_unverified {
         WindowsFilesystemSemanticDecision::Unverified
+    } else if saw_incomplete {
+        WindowsFilesystemSemanticDecision::Incomplete
     } else if saw_safe {
         WindowsFilesystemSemanticDecision::Safe
     } else {
@@ -3540,6 +3569,81 @@ mod tests {
             ),
             WindowsFilesystemSemanticDecision::Destructive("clear-content"),
             "an inert call target must not hide a later destructive statement",
+        );
+    }
+
+    /// #569: the whole-command bounds stop the pass before it reads any
+    /// statement. That is an incomplete analysis, never an `Unverified`
+    /// finding (which asserts a protected role behind unresolved syntax).
+    #[test]
+    fn issue_569_whole_command_bounds_report_incomplete_not_unverified() {
+        let over_statement_bound =
+            "Write-Output 'rm x'; ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS + 4);
+        let cmd_over_statement_bound =
+            "echo rd & ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS + 4);
+        let over_byte_bound =
+            "Write-Output 'rm x'\n".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES / 16);
+        assert!(over_byte_bound.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES);
+        for (command, dialect) in [
+            (over_statement_bound.as_str(), ShellDialect::PowerShell),
+            (over_statement_bound.as_str(), ShellDialect::Unknown),
+            (cmd_over_statement_bound.as_str(), ShellDialect::Cmd),
+            (cmd_over_statement_bound.as_str(), ShellDialect::Unknown),
+            (over_byte_bound.as_str(), ShellDialect::PowerShell),
+            (over_byte_bound.as_str(), ShellDialect::Cmd),
+            (over_byte_bound.as_str(), ShellDialect::Unknown),
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                WindowsFilesystemSemanticDecision::Incomplete,
+                "{dialect:?}: {} bytes",
+                command.len()
+            );
+            // The pack must still be selected so the evaluator can report it.
+            // (Cmd selects it through its keyword rows instead.)
+            if dialect != ShellDialect::Cmd {
+                assert!(
+                    windows_filesystem_semantic_scan_required(command, dialect),
+                    "{dialect:?}"
+                );
+            }
+        }
+
+        // Neither a protected spelling nor dialect syntax: nothing to analyze.
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &"echo a; ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS + 4),
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch
+        );
+        // A caller-proven POSIX command is never judged by this pack.
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(&over_byte_bound, ShellDialect::Posix),
+            WindowsFilesystemSemanticDecision::NoMatch
+        );
+        // A real finding in either Unknown view still outranks a view that
+        // gave up: the bound is checked per view, and `Unverified`/
+        // `Destructive` keep their precedence. PowerShell splits every `;`
+        // (over the bound); cmd.exe keeps them in one statement and splits
+        // only at `&`, so its view reads `rd /s` in full.
+        let destructive_in_cmd = format!(
+            "{}& rd /s /q C:\\src",
+            "echo a; ".repeat(MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS + 4)
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &destructive_in_cmd,
+                ShellDialect::PowerShell
+            ),
+            WindowsFilesystemSemanticDecision::Incomplete
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                &destructive_in_cmd,
+                ShellDialect::Unknown
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("rd-recursive")
         );
     }
 }

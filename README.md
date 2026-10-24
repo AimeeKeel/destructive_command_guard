@@ -13,7 +13,7 @@
 
 A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot CLI, VS Code Copilot Chat, Cursor, Hermes Agent, Grok (xAI), Posit Assistant, Oh My Pi, and related tools.
 
-**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Posit Assistant](https://positron.posit.co/assistant/) (Positron/RStudio extension, standalone server, and `pa` terminal client), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (native `tool.execute.before` plugin via `dcg install --opencode` — see [docs/opencode-integration.md](docs/opencode-integration.md)), [Oh My Pi (`omp`)](https://omp.sh) (native `tool_call` extension via `dcg install --omp`), [Crush](https://github.com/charmbracelet/crush) (native `hooks.PreToolUse` entry in `crush.json` via `dcg install --crush` — see [docs/crush-integration.md](docs/crush-integration.md)), [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) (native `hooks.PreToolUse` entry in `settings.json` via `dcg install --reasonix` — see [docs/reasonix-integration.md](docs/reasonix-integration.md)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
+**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [VS Code Copilot Chat](https://code.visualstudio.com/docs/agent-customization/hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Posit Assistant](https://positron.posit.co/assistant/) (Positron/RStudio extension, standalone server, and `pa` terminal client), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (native `tool.execute.before` plugin via `dcg install --opencode` — see [docs/opencode-integration.md](docs/opencode-integration.md)), [Oh My Pi (`omp`)](https://omp.sh) (native `tool_call` extension via `dcg install --omp`), [Crush](https://github.com/charmbracelet/crush) (native `hooks.PreToolUse` entry in `crush.json` via `dcg install --crush` — see [docs/crush-integration.md](docs/crush-integration.md)), [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) (native `hooks.PreToolUse` entry in `settings.json` via `dcg install --reasonix` — see [docs/reasonix-integration.md](docs/reasonix-integration.md)), [Muse Code](https://dev.meta.ai/docs/muse-code) (native `hooks.PreToolUse` matcher group in `~/.config/muse/settings.json` via `dcg install --muse` — see [docs/muse-integration.md](docs/muse-integration.md)), [Amp](https://ampcode.com) (native `tool.call` plugin via `dcg install --amp` — see [docs/amp-integration.md](docs/amp-integration.md)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -305,6 +305,16 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 - `system.disk` - Protects against destructive disk operations including dd to devices, mkfs, partition table modifications (fdisk/parted), RAID management (mdadm), btrfs filesystem operations, device-mapper (dmsetup), network block devices (nbd-client), and LVM commands (pvremove, vgremove, lvremove, lvreduce, pvmove).
 - `system.permissions` - Protects against dangerous permission changes like chmod 777, recursive chmod/chown on system directories.
 - `system.services` - Protects against dangerous service operations like stopping critical services and modifying init configuration.
+
+When `system.permissions` is enabled, POSIX `chmod`, `chown`, and `chgrp`
+checks use the complete invocation: recursive options can occur after targets
+or in flag bundles, and option values such as `--reference="chmod 777 notes"`
+remain filename data. The ordinary relative-file `chmod` exemption requires
+every target to qualify and no recursive option. Thus `chmod 755 notes -vR /etc`
+and `chmod 777 notes /etc/shadow` require review. Independent rule matches stay
+separate: granting `chmod-777` does not also grant `chmod-recursive-root`, and
+granting `chmod-setuid` does not exempt a simultaneous `chmod-setgid` match.
+Unsupported or dynamic arguments retain conservative pattern checks.
 
 ### CI/CD Packs
 - `cicd.circleci` - Protects against destructive CircleCI operations like deleting contexts, removing secrets, deleting orbs/namespaces, or removing pipelines.
@@ -914,6 +924,7 @@ an oversized extracted command as proof that execution is safe.
 | Transient hook stdin I/O error | Allow with an audit warning | Always fail-open because the payload was not attacker-controlled |
 | Extracted command exceeds `max_command_bytes` | Explicit indeterminate result | Review-capable clients receive `ask` (`unverified_decision = "deny"` turns this into a deny); other clients block |
 | Absolute evaluation deadline expires | Explicit indeterminate result | Review-capable clients receive `ask` (`unverified_decision = "deny"` turns this into a deny); other clients block |
+| A safety regex fails during evaluation, including backtracking work exhaustion | Incomplete analysis, never a silent allow | Proven blocking findings retain their denial; otherwise request review or block according to the unverified policy. Warning/log policy and confidence or rebase-recovery exemptions cannot hide the incomplete analysis |
 | Heredoc extraction/parse/AST failure | Run the bounded fallback scanner | `fallback_on_parse_error = false` or `fallback_on_timeout = false` blocks |
 | OpenCode plugin or Oh My Pi bridge: dcg cannot be started (missing or not executable) | Allow with a visible diagnostic, so a broken install does not block every command | OMP: `DCG_UNVERIFIED_DECISION=deny` in its environment blocks; the config-file setting cannot apply because dcg never read it |
 | OpenCode plugin or Oh My Pi bridge: dcg started but gave no verdict (killed by a signal or the bridge's timeout, an unexpected exit status; for OpenCode also exit 0 without its explicit allow line) | Block, with the reason and a visible diagnostic; a deny dcg wrote before dying still stands | `DCG_BRIDGE_CRASH_DECISION=allow` in the agent's environment lets such commands through; `DCG_UNVERIFIED_DECISION=deny` still blocks |
@@ -1138,14 +1149,16 @@ present.
 - **VS Code Copilot Chat:** Current VS Code releases load `~/.claude/settings.json` by default, so the Claude Code hook installed by dcg also protects Copilot Chat without a second bridge or duplicate hook. dcg recognizes VS Code's documented `runTerminalCommand` shell tool plus the observed compatibility names `run_in_terminal` and `runInTerminal`, reads `tool_input.command`, and returns VS Code's documented `hookSpecificOutput` deny. The newer Copilot **Agent Host** (and the Agents window built on it) sends a batched envelope instead — `{"toolCalls": [{"name": "powershell", "args": "{\"command\": …}"}]}` with JSON-encoded argument strings; dcg evaluates every shell entry in the batch independently and a single destructive entry denies the request (#252). Agent hooks are still a VS Code preview feature and can be disabled by organization policy; use **Developer: Show Agent Debug Logs** or the **GitHub Copilot Chat Hooks** output channel to confirm that the hook loaded.
 - **Cursor IDE:** Hooks are configured through `~/.cursor/hooks.json` plus a generated bridge (`dcg-pre-shell.ps1` on Windows). The installer inserts dcg first in `beforeShellExecution`, collapses duplicate dcg entries, and preserves coexisting Cursor hooks. The bridge blocks a command it cannot verify: a payload it cannot read, or a dcg that ran but gave no verdict (killed, timed out, non-zero exit, no answer). Set `DCG_BRIDGE_CRASH_DECISION=allow` to let those through instead; only a dcg that cannot be started at all is allowed, with a notice on stderr. Cursor also runs the `PreToolUse` hooks in `~/.claude/settings.json` for its `Shell` tool, and dcg judges those payloads too.
 - **Hermes Agent:** [NousResearch's Hermes Agent](https://github.com/NousResearch/hermes-agent) declares shell hooks in its `config.yaml` under `hooks.pre_tool_call`. Hermes resolves its data root from `HERMES_HOME` when set, else `%LOCALAPPDATA%\hermes` on native Windows and `~/.hermes` on Linux/macOS — both installers write the hook to that resolved path (`install.ps1` never writes to `%USERPROFILE%\.hermes` unless `HERMES_HOME` points there, since native Windows Hermes would never read it). The installer merges a single `matcher: "terminal"` entry that invokes dcg directly — no wrapper script — because Hermes' input JSON (`hook_event_name: "pre_tool_call"`, `tool_name: "terminal"`, `tool_input.command`) deserializes straight into dcg's existing `HookInput`. Hermes [explicitly documents](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md) that "non-zero exit codes... never abort the agent loop", so dcg switches to Hermes' JSON block protocol on output: `{"decision":"block","reason":...}` (plus the alternate `{"action":"block","message":...}` form for cross-version compatibility). The installer also sets `hooks_auto_accept: true` if not already set; Hermes silently drops un-allowlisted hooks in non-TTY runs (gateway/cron) without it. `unconfigure_hermes` in `uninstall.sh` removes only the dcg-owned entry and leaves `hooks_auto_accept` alone (other Hermes hooks may rely on it).
-- **Grok (xAI):** [Grok Build / Grok CLI](https://x.ai/news/grok-build-cli) auto-discovers every `*.json` under `~/.grok/hooks/`. `dcg install --grok` writes a self-contained `~/.grok/hooks/dcg.json` with a `PreToolUse` / `matcher: "Bash"` entry — Grok internally aliases Claude-style `"Bash"` to its own `run_terminal_cmd` tool, so a single rule covers every shell command. dcg detects Grok at runtime from the camelCase wire shape (`hookEventName: "pre_tool_use"`, `toolName: "run_terminal_cmd"`) or from the `GROK_SESSION_ID` / `GROK_HOOK_EVENT` / `GROK_WORKSPACE_ROOT` environment variables, and switches its output to Grok's JSON contract: `{"decision":"deny","reason":...}` (note `"deny"`, not Hermes' `"block"`). Grok also picks up dcg automatically through its `~/.claude/settings.json` compatibility layer, so existing Claude Code users get protection with no additional install step. Add `--project` to write `<repo>/.grok/hooks/dcg.json` for a per-repo install (Grok requires `/hooks-trust` the first time it opens a repo with hooks).
-- **Antigravity CLI (`agy`):** [Google Antigravity's `agy` CLI](https://antigravity.google) ships a Claude-Code-compatible hooks system. `dcg install --agy` merges a `PreToolUse` / `matcher: "Bash"` entry into `~/.gemini/config/hooks.json` (the canonical path; `agy` migrates the legacy `~/.gemini/antigravity-cli/hooks.json` here and symlinks the old path to it). `agy` runs the hook before its `run_command` shell tool; dcg detects `agy` at runtime from the distinctive nested `toolCall` envelope (`{"toolCall":{"name":"run_command","args":{"CommandLine":"…"}},"conversationId":…,"stepIdx":…}`) — the shell command is read from `toolCall.args.CommandLine` — or from the `ANTIGRAVITY_CONVERSATION_ID` environment variable / `agy` parent-process name. dcg switches its output to `agy`'s JSON contract: `{"decision":"block","reason":…}` with exit code 0 (verified: `agy` honors both `"block"` and `"deny"` and aborts the tool; a non-zero exit code is only logged and does NOT reliably block, so dcg always emits exit 0 + JSON). Add `--project` to write `<repo>/.gemini/config/hooks.json` for a per-repo install. Restart `agy` (start a new session) after installing.
+- **Grok (xAI):** [Grok Build / Grok CLI](https://x.ai/news/grok-build-cli) auto-discovers every `*.json` under `~/.grok/hooks/`. `dcg install --grok` writes a self-contained `~/.grok/hooks/dcg.json` with a `PreToolUse` / `matcher: "Bash"` entry — Grok internally aliases Claude-style `"Bash"` to its own `run_terminal_cmd` tool, so a single rule covers every shell command. dcg detects Grok at runtime from the camelCase wire shape (`hookEventName: "pre_tool_use"`, `toolName: "run_terminal_cmd"`) or from the `GROK_SESSION_ID` / `GROK_HOOK_EVENT` / `GROK_WORKSPACE_ROOT` environment variables, and switches its output to Grok's JSON contract: `{"decision":"deny","reason":...}` (note `"deny"`, not Hermes' `"block"`). Grok also reads `~/.claude/settings.json` when its Claude compatibility hooks are enabled, as documented in its [hook locations](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/10-hooks.md#hook-locations). That compatibility location does **not** follow `CLAUDE_CONFIG_DIR`: DCG checks Grok's default compatibility file separately, and a hook installed only in a relocated Claude directory does not protect Grok. Use `dcg install --grok` for that setup. Add `--project` to write `<repo>/.grok/hooks/dcg.json` for a per-repo install (Grok requires `/hooks-trust` the first time it opens a repo with hooks).
+- **Antigravity CLI (`agy`):** [Google Antigravity's `agy` CLI](https://antigravity.google) ships a Claude-Code-compatible hooks system. `dcg install --agy` merges a `PreToolUse` / `matcher: "Bash"` entry into `~/.gemini/config/hooks.json` (the canonical path; `agy` migrates the legacy `~/.gemini/antigravity-cli/hooks.json` here and symlinks the old path to it). `agy` runs the hook before its `run_command` shell tool; dcg detects `agy` at runtime from the distinctive nested `toolCall` envelope (`{"toolCall":{"name":"run_command","args":{"CommandLine":"…"}},"conversationId":…,"stepIdx":…}`) — the shell command is read from `toolCall.args.CommandLine` — or from the `ANTIGRAVITY_CONVERSATION_ID` environment variable / `agy` parent-process name. dcg follows `agy`'s [PreToolUse output contract](https://antigravity.google/docs/hooks): denials contain only `{"decision":"deny","reason":…}` on stdout with exit code 0. Antigravity CLI 1.4.0's strict `protojson` parser rejects extra fields such as `systemMessage`, `ruleId`, and `remediation` ([#573](https://github.com/Dicklesworthstone/destructive_command_guard/issues/573)); the explanation remains in `reason`. Warnings go to stderr with empty stdout and exit code 0, so dcg supplies no permission decision and leaves ordinary permission checks to `agy`. Add `--project` to write `<repo>/.gemini/config/hooks.json` for a per-repo install. Restart `agy` (start a new session) after installing.
 - **Posit Assistant:** [Posit Assistant](https://positron.posit.co/assistant/) reads Claude-Code-compatible lifecycle hooks from `~/.posit/assistant/settings.json` (global) and `<workspace>/.posit/assistant/settings.json` (project). The installer merges one `PreToolUse` entry into the **global** file, so a single install covers the Positron/RStudio extension, the standalone server, and the `pa` terminal client across every workspace. No protocol work was needed on dcg's side: the `PreToolUse` stdin is the snake_case Claude shape (`tool_name`, `tool_input.command`, `tool_use_id`, `permission_mode`), exit code 2 blocks with stderr shown as the reason, and `hookSpecificOutput.permissionDecision` (`allow`/`deny`/`ask`) is read on exit 0 — dcg's existing Claude-compatible response answers all of it. Three details differ from the Claude Code entry: the matcher is **lowercase** `"bash|powershell"` (a simple matcher string is an *exact* match — or a `|`/`,`-separated list of exact matches — against the tool name, so a copied Claude `"Bash"` matcher would never fire; listing both names covers a Windows PowerShell host with one entry); only documented handler fields are written (`type`, `command`, `timeout`), so there is **no `shell` field** — the command path is quoted instead, since shell-form hooks run through `cmd.exe` on Windows; and `timeout` is in **seconds**. dcg identifies the agent at runtime from `PA_PROJECT_DIR`, which the hook contract sets in the hook subprocess (also used to keep a `powershell` tool name from being answered with Codex's minimal deny shape). Existing matcher groups are left structurally intact rather than consolidated — hook config is additive, so a user's `matcher: "bash,edit"` group keeps working untouched — and `unconfigure_posit_assistant` in `uninstall.sh` removes only dcg-owned entries and never deletes the settings file, since unrelated settings live there too. Note: Posit's hooks documentation is not public yet; this contract was verified empirically and is pinned by tests in `src/hook.rs`.
 - **OpenCode:** First-party plugin support (#318). `dcg install --opencode` writes a native `tool.execute.before` plugin to `~/.config/opencode/plugins/dcg-guard.js` (add `--project` for `<repo>/.opencode/plugins/dcg-guard.js`). The plugin routes every OpenCode `bash` tool call through dcg's Claude-compatible hook protocol — spawning the absolute dcg binary path embedded at install time with `OPENCODE=1` in the environment — and aborts the tool call by throwing when dcg denies (an `ask` verdict also fails closed, since OpenCode has no operator-review state). The plugin asks dcg for an explicit allow line, so a dcg that ran but gave no verdict (killed, a non-zero exit, or exit 0 with nothing on stdout) blocks the command unless `DCG_BRIDGE_CRASH_DECISION=allow`; only a dcg that cannot be started at all (missing) fails open, with a stderr notice. The file carries a `dcg-opencode-plugin` ownership marker: the installer refuses to overwrite a user-owned file of the same name, and the uninstaller deletes only marker-carrying files. `install.sh` configures it automatically when OpenCode is detected; `dcg doctor` reports an `opencode_plugin` check (error + `--fix`able when OpenCode is in use but unguarded, since there is no Claude-compat fallback). Restart OpenCode after installing. See [docs/opencode-integration.md](docs/opencode-integration.md). An earlier [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js) by aspiers pioneered this approach.
 - **Oh My Pi (`omp`):** First-class native extension support. `dcg install --omp` writes a marker-owned ExtensionAPI module to the active OMP user profile (normally `~/.omp/agent/extensions/dcg-guard.ts`); add `--project` for `<cwd>/.omp/extensions/dcg-guard.ts`. OMP's native project-extension discovery is cwd-only: it does not require Git and does not walk ancestors, so run the project install from the same directory where you launch OMP. The extension intercepts `bash` through OMP's pre-execution `tool_call` event and sends the raw command to the embedded absolute dcg pathname as `dcg --robot test --stdin --agent omp` with the dialect that matches OMP's selected backend. The private bridge pins `--format json`, so ambient `DCG_FORMAT` cannot redirect or invalidate its compact protocol while remaining available to supported environment-conditioned policy. The install-time pathname is authoritative against ambient `DCG_BIN` redirection, but it does not attest a hash, inode/file ID, signature, or immutable executable object: Bun resolves the pathname for each guarded call, and replacing bytes at that pathname changes what a later callback executes. `dcg doctor` compares the marker-owned extension with source generated for the doctor process's pathname at inspection time; it does not attest executable bytes or an extension already loaded by a running OMP session. Rebind deliberately with `/desired/path/dcg install --omp --force` (add `--project` for project scope), then restart OMP; protect the binary, extension, and their parent directories from writers not trusted to control OMP execution. Ordinary and managed-async calls use OMP's embedded Brush shell and therefore pass `--dialect posix`, including on native Windows; an eligible local `pty: true` call instead maps OMP's configured external shell to `posix`, `cmd`, or `ps`. `PI_NO_PTY=1` keeps the embedded POSIX route. The bridge returns `{ block: true, reason }` for dcg deny/ask/indeterminate results. No shell is used to spawn dcg. A dcg that cannot be started is reported and fails open; a dcg that started and then died without a blocking verdict (a signal, including the bridge's own timeout kill, or an exit status dcg never uses for a verdict) is reported and blocks unless `DCG_BRIDGE_CRASH_DECISION=allow`; dcg evaluation failures and local-PTY shell-resolution failures remain blocking. Bun enforces a 30-second parent-side `SIGKILL` backstop on the direct dcg child, and the bridge immediately arms an independent 30.5-second observation watchdog after successful spawn. Direct-child exit or exit-observation rejection switches to a 250-millisecond pipe-drain grace because a descendant can inherit stdout/stderr after the direct child is gone; expiry cancels the local readers, while an exit-observation fault or hard deadline also attempts one direct-child `SIGKILL`. All watchdogs are cleared after observation, late exit settlement/rejection remains consumed, and there is no retry or replacement process. A complete deny/ask/indeterminate frame or stdout overflow retained before cancellation remains absorbing; status, stream, kill, and deadline faults remain visible. These generous ceilings are separate from dcg's ordinary configurable 1-second/3-second evaluation budgets, but deliberately cap an explicit evaluator budget longer than 30 seconds on the OMP bridge. After observation the bridge reads Bun's `signalCode`, so an ordinary numeric exit 137 remains distinguishable from `SIGKILL` and signal diagnostics name the exact signal. dcg's blocking exit 1 cannot be erased by a signal/status observation fault, and other abnormal exit statuses remain visible even when a deny-like verdict is authoritative. **Residual process limit:** an in-process timer cannot preempt a synchronous `Bun.spawn` or JavaScript event-loop stall, and Bun's kill targets the direct child rather than proving process-group/descendant termination; local reader cancellation bounds a standards-compliant callback but does not claim surviving descendants were reaped. The canonical agent/profile key is `omp` (alias `oh-my-pi`), deliberately distinct from legacy Pi. With `[history] enabled = true`, robot-boundary decisions are persisted with `agent_type = "omp"`; ordinary human `dcg test` diagnostics remain outside command history. Named profiles follow `OMP_PROFILE` over `PI_PROFILE`; `PI_CONFIG_DIR` selects a config directory name relative to the user's home (drive-qualified values are rejected on Windows), and `PI_CODING_AGENT_DIR` remains supported for the default profile. Both platform installers auto-configure detected OMP installations, `dcg doctor` reports the `omp_extension` check, and uninstallers remove only files carrying the `dcg-omp-extension` marker. Restart `omp` after installing. **Known ACP limitation:** OMP routes a foreground non-PTY call through the configured external shell when an ACP client advertises terminal support, but its public ExtensionAPI exposes neither that terminal capability nor the selected backend (and both ACP and JSON-RPC report `mode: "rpc"`). The bridge therefore keeps non-PTY RPC analysis POSIX instead of guessing and importing Cmd/PowerShell false positives; ACP-terminal calls do not yet have exact Cmd/PowerShell-specific coverage until OMP exposes that routing state.
   - **OMP deadline and signal detail:** The 30.5-second observation limit is one monotonic absolute deadline, not a fresh allowance after exit. A post-exit or rejected-exit drain is `min(250 ms, remaining absolute budget)`; a hard-budget-clamped drain retains hard-deadline provenance and never kills again. A successful direct-child `kill("SIGKILL")` request is also distinct from an observed signal: diagnostics name SIGKILL only when Bun's later `signalCode` read actually exposes it. Standards-compliant Web Stream cancellation closes pending reads even if its underlying cancel algorithm rejects; dcg consumes that rejection while retaining already observed blocking frames or overflow. A non-standard synchronous cancel fault that also leaves its pending read unsettled remains outside the JavaScript boundary.
 - **Crush:** First-class hook support (#388). [Crush](https://github.com/charmbracelet/crush) runs Claude-Code-style `PreToolUse` hooks declared as flat `{name, matcher, command, timeout}` entries in the `hooks` object of its `crush.json`. `dcg install --crush` merges a `matcher: "^bash$"` entry into `~/.config/crush/crush.json` — resolved exactly as Crush does, honoring the `CRUSH_GLOBAL_CONFIG` directory override and `XDG_CONFIG_HOME`, and `~/.config` on Windows too — preserving every other key and hook (add `--project` for the repo root's `crush.json`; `dcg uninstall --crush` removes the entry). Crush pipes `{"event":"PreToolUse","tool_name":"bash","tool_input":{"command":…}}` to dcg's stdin; dcg recognizes the envelope without an `--agent` flag and answers with Crush's own `{"decision":"deny","reason":…}` on exit 0. Before this, that payload was routed to the Copilot arm and answered with a flat `permissionDecision` Crush does not read, so a block silently became "no opinion". dcg never answers `"allow"` (in Crush that pre-approves the call and skips the user's permission prompt); allowed commands stay silent, warnings travel as `context`, and review requests fail closed. Crush sets `CRUSH=1` for hook subprocesses, which is what dcg's agent detection keys on. `install.sh`/`install.ps1` configure it automatically when Crush is detected, and `dcg doctor` reports a `crush_hook` check. See [docs/crush-integration.md](docs/crush-integration.md).
 - **Reasonix:** First-class hook support (#358). [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) runs `PreToolUse` hooks declared in its `settings.json`. `dcg install --reasonix` merges a `{"match":"bash|pwsh","command":…,"timeout":5000}` entry into `<Reasonix home>/settings.json` (`$REASONIX_HOME`, else `~/.reasonix`, or `%APPDATA%\reasonix` on Windows) and keeps every other key and hook. Add `--project` to write `.reasonix/settings.json` at the repo root instead; `dcg uninstall --reasonix` removes the entry. Reasonix pipes `{"event":"PreToolUse","toolName":…,"toolArgs":{"command":…}}` to dcg and reads only the exit status. dcg blocks with exit 2 and puts the reason on stderr; a warning exits 1, which Reasonix shows without blocking. Reasonix has no "ask", so review requests block. Before this change dcg answered that payload as if it came from Copilot, with a JSON deny on exit 0, so Reasonix ran the command anyway. On Windows, a PowerShell command can arrive labeled `bash`, so dcg judges the command text rather than the label, as it does for Codex. `install.sh`/`install.ps1` configure the hook when Reasonix is detected, the uninstallers remove it, and `dcg doctor` reports a `reasonix_hook` check. See [docs/reasonix-integration.md](docs/reasonix-integration.md).
+- **Muse Code:** First-class hook support (#572). [Muse Code](https://dev.meta.ai/docs/muse-code), Meta's terminal coding agent, runs `PreToolUse` hooks from the `hooks` block of `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`. `dcg install --muse` merges a `{"matcher":"^(shell|exec_command|bash)$","hooks":[{"type":"command","command":"<dcg> --agent muse"}]}` group into that file, keeps `schema_version` (adding `1` when it is missing, refusing any other value) and every other key, and `dcg uninstall --muse` removes it. Muse sends a Codex-shaped payload (`turn_id`), with the command in `tool_input.command` (`shell`) or `tool_input.cmd` (`exec_command`); dcg evaluates both keys. It answers with the minimal `hookSpecificOutput` deny Muse enforces on exit 0, and with empty stdout for an allow, because Muse rejects a bare `allow`. Muse clears the hook environment, so `--agent muse` in the command is what selects the `[agents.muse]` profile; without it `[agents.codex-cli]` applied. With `--agent muse`, an unreadable payload or a shell call with no readable command is denied. `dcg doctor` reports a `muse_hook` check. The installers do not configure Muse yet, so run `dcg install --muse` once, then start a new Muse session. See [docs/muse-integration.md](docs/muse-integration.md).
+- **Amp:** First-party plugin support (#577). [Amp](https://ampcode.com) does not ask before running tools, and its documented control point is a plugin whose `tool.call` handler runs before every tool call. `dcg install --amp` writes a marker-owned plugin to `${XDG_CONFIG_HOME:-~/.config}/amp/plugins/dcg-guard.js` (a system plugin for every project; add `--project` for `<repo>/.amp/plugins/dcg-guard.js`), and `dcg uninstall --amp` removes it. For each shell call (Amp's `shellCommandFromToolCall` helper, plus the raw `cmd`/`command` inputs) the plugin runs `dcg --agent amp` with an explicit-verdict request and returns `reject-and-continue` with dcg's reason on a deny. A review (`ask`) opens Amp's confirmation dialog, and declining it, or a session without a UI, rejects. When dcg gives no verdict (missing, killed, timed out, non-zero exit, unreadable output), the call is rejected unless `DCG_BRIDGE_CRASH_DECISION=allow`. The handler never throws, and the plugin refuses to load on an Amp without `amp.on`. `--agent amp` selects `[agents.amp]`. `dcg doctor` reports an `amp_plugin` check. Reload Amp's plugins after installing. See [docs/amp-integration.md](docs/amp-integration.md).
 - **Pi:** Not auto-configured. [Pi](https://github.com/earendil-works/pi) intercepts shell commands through user-authored TypeScript extensions (`pi.on("tool_call", …)`, auto-loaded from `~/.pi/agent/extensions/*.ts` or `<repo>/.pi/extensions/*.ts`). A ready-to-use `dcg-guard.ts` extension that routes each `bash` command through `dcg --robot test` (exit 1 = deny) and blocks with the dcg reason is documented in [docs/pi-integration.md](docs/pi-integration.md).
 
 </details>
@@ -1285,7 +1298,46 @@ Options:
 
 ## Claude Code Configuration
 
-Add to `~/.claude/settings.json`:
+DCG uses `$CLAUDE_CONFIG_DIR/settings.json` when `CLAUDE_CONFIG_DIR` is set
+and non-empty; otherwise it uses `~/.claude/settings.json` (on Windows,
+`%USERPROFILE%\.claude\settings.json`). This applies to `dcg install`,
+`dcg uninstall`, `dcg doctor`, `dcg setup`, hook self-healing, the shell
+startup check, and the Bash and PowerShell installers. `XDG_CONFIG_HOME` does
+not override this choice. The [Claude Code environment-variable reference](https://code.claude.com/docs/en/env-vars)
+documents `CLAUDE_CONFIG_DIR` as the user configuration directory override.
+
+Use the same environment for Claude Code and DCG when installing or checking
+a separate profile. For example:
+
+```bash
+export CLAUDE_CONFIG_DIR="$HOME/.nightforge/claude"
+dcg install
+dcg doctor --strict
+```
+
+In PowerShell, set `$env:CLAUDE_CONFIG_DIR = "$HOME\.nightforge\claude"`
+before running the same DCG commands or the installer. A leading `~`, `~/`,
+or native Windows `~\` is expanded to the user's home; relative paths are
+resolved from the command's current directory. Prefer an absolute path when
+starting sessions in different workspaces. An unset or empty value preserves
+the default location. Only the selected user settings are changed, with
+unrelated keys and hooks preserved. Project installation with `--project`
+continues to use `<repo>/.claude/settings.json`.
+
+Doctor reports the settings path it checked in both human-readable and JSON
+output. A hook in the default directory cannot satisfy the check for a
+different active directory: `dcg doctor --strict` fails until the selected
+settings have a valid hook. `dcg doctor --fix` repairs that selected file.
+
+Grok's Claude compatibility layer continues to read `~/.claude/settings.json`
+and does **not** honor `CLAUDE_CONFIG_DIR`; doctor checks that default file
+separately. Other integrations keep their own configuration locations. For Grok
+with an alternate Claude configuration, prefer `dcg install --grok`.
+Self-healing also uses the identified host's settings: an invocation from
+another recognized host does not repair the relocated Claude configuration
+merely because it inherited `CLAUDE_CONFIG_DIR`.
+
+For a manual installation, add the following to the active `settings.json`:
 
 ```json
 {
@@ -1434,6 +1486,48 @@ to dcg's stdin and reads only the exit status. dcg exits 2 to block, and
 Reasonix shows the reason from stderr. Reasonix has no "ask" answer, so
 review requests block too. See
 [docs/reasonix-integration.md](docs/reasonix-integration.md).
+
+## Muse Code Configuration
+
+`dcg install --muse` does this for you (and `dcg uninstall --muse` undoes it).
+By hand, add a matcher group to `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`,
+which must declare `"schema_version": 1`:
+
+```json
+{
+  "schema_version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(shell|exec_command|bash)$",
+        "hooks": [
+          { "type": "command", "command": "/absolute/path/to/dcg --agent muse" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Keep `--agent muse`: Muse runs hooks in a cleared environment, and the flag is
+how dcg knows the request came from Muse (it selects `[agents.muse]` and fails
+closed on payloads it cannot read). Muse refuses the call when dcg prints a
+`hookSpecificOutput` deny; dcg prints nothing for an allowed command. Start a
+new Muse session after editing the file. See
+[docs/muse-integration.md](docs/muse-integration.md).
+
+## Amp Configuration
+
+Amp has no hook file; dcg guards it through a plugin. `dcg install --amp`
+writes `${XDG_CONFIG_HOME:-~/.config}/amp/plugins/dcg-guard.js` (or, with
+`--project`, `<repo>/.amp/plugins/dcg-guard.js`); `dcg uninstall --amp`
+removes the user-level file, and only if dcg wrote it. Reload Amp's plugins
+(Ctrl+O, then `plugins: reload`) or restart Amp, and check `amp plugins list`.
+The plugin rejects a destructive shell command with dcg's reason, asks
+through Amp's confirmation dialog when a dcg rule asks for review, and rejects
+any call it cannot verify. Do not edit the generated file; `dcg doctor` flags
+an edited copy and `dcg install --amp` restores it. See
+[docs/amp-integration.md](docs/amp-integration.md).
 
 ## CLI Usage
 
@@ -2210,6 +2304,22 @@ transforming `cat` flags, and mutable producer lookup cannot establish a
 literal-source proof. Quoted shell arguments are similarly kept intact during
 dialect selection: the `|^` in `sed 's|^\./||'` does not start a cmd command.
 
+A quoted heredoc written by a plain `cat > file` and immediately consumed by
+`node file`, `python3 file`, `ruby file`, `perl file`, or `php file` also reaches
+the corresponding language checks. This bounded proof requires the same literal
+file path and an unmodified overwrite; an optional literal `mkdir` setup is
+supported. A script file handed to a supported POSIX shell such as `bash` or
+`sh` receives shell analysis. Append writes, transformations, wrappers, extra
+consumers and ambiguous control flow keep their conservative treatment. For a proven
+JavaScript file, an AST-confirmed `=>` arrow is not a shell redirect. Shell
+command strings elsewhere in the source still receive the raw safety checks.
+
+Recognized literal `sed`, `awk 1` and `tac` reads before a quoted heredoc write
+do not make the newly written body executable. This ordering proof applies only
+to bounded synchronous readers in a straight-line command sequence. Later
+execution, including `sed e`, `awk` with `system()`, shell wrappers and remote
+consumers, still keeps the body visible to safety analysis.
+
 Embedded process calls retain every argument position when reconstructed. For
 example, `subprocess.run(["git", "-C", path, "diff", "HEAD"])` keeps the unknown
 `path` as the operand of `-C`; it cannot turn `diff` into that operand. Literal
@@ -2450,6 +2560,76 @@ r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f"     // Complex but no lookahead
 ### Performance Budget System
 
 dcg operates under strict latency constraints - every shell command passes through the hook, so even small delays compound into noticeable sluggishness. `src/perf.rs` is the source of truth for performance budgets, CI benchmark expectations, and hook-mode deadlines.
+
+For a structured phase breakdown of a real hook invocation, set
+`DCG_PROFILE=1`. DCG appends one `DCG_PROFILE ` JSON line to stderr, with call
+counts and inclusive/exclusive wall times for request parsing, normalization,
+heredoc detection/extraction, pattern evaluation, AST work, and history
+recording. Main-thread and worker measurements are separate; worker time can
+overlap the hook's wait and must not be added to its total. Incomplete calls
+remain visible when a deadline expires. Input waiting has its own phase, and
+the hook total excludes process startup and CLI setup. The profile contains
+no command text. The existing `DCG_LOG=dcg_perf=debug` trace also remains
+available, including database open/insert events; its durations are inclusive
+and cannot be summed across nested or overlapping events. Disabled timers do
+not read the clock. See the [issue #555 measurement guide](docs/performance-issue-555.md)
+for the schema, accounting rules, and security controls.
+
+To reproduce issue #555 against a live incumbent in the same run:
+
+```bash
+python3 scripts/perf_baseline.py --bin target/release/dcg \
+  --compare-bin /path/to/incumbent/dcg --warmup 3 --runs 30 \
+  --history-profiles disabled,enabled,seeded,locked \
+  --history-seed-rows 247625 \
+  --output /tmp/dcg-hook-comparison.json
+cargo bench --locked --bench heredoc_perf -- issue_555
+cargo bench --locked --bench hook_latency -- issue_555
+```
+
+The comparison alternates incumbent/candidate order, validates every timed
+verdict, retains raw samples, and pairs each full hook with a bypass process.
+It tests 16 command shapes: ordinary and compound commands, 40/300-line
+executable Python and quoted data, commit-message substitutions, destructive
+Python at either end, nested interpreters, executable substitutions, and
+incomplete syntax. The command above selects four history profiles: disabled,
+enabled with a small database, seeded with 247,625 synthetic rows, and
+deliberately write-locked. Without `--history-profiles`, only disabled and
+enabled run. Each binary receives a separate database. On Unix the runner
+records child user+system CPU separately from wall time; instrumented probes
+run outside the timed samples. This diagnostic comparison is separate from
+the source-bound absolute latency gate, which also retains the 1/40/300-line
+scaling cases, and does not certify a loaded production database. CPU includes
+process startup; wall minus CPU is not solely storage contention. History has
+a background worker, but normal hook shutdown waits for it within the existing
+bounded budget. A quoted delimiter suppresses shell expansion; it does **not**
+stop `python3 -` or another interpreter executing its heredoc body.
+
+The earlier stdin-provenance optimization avoids repeated walks for each
+segment when their required raw pipeline/`exec`-redirect bytes are absent.
+Possible matches retain the complete readers; no heredoc body or security rule
+is skipped. Its [retained comparison evidence](perf/baselines/2026-10-12-issue-555-comparison.json)
+used an earlier 33-case interface (11 shapes across three history modes),
+before the broader AST and profiling changes described in the measurement
+guide. That interleaved Linux comparison on 2026-10-12 (25 measured pairs per
+case, 5 warmups, load average 6.3 at start, self-healing disabled) measured the
+following 300-line Python heredoc medians against the incumbent readers:
+
+| History mode | Incumbent wall | Candidate wall | Incumbent CPU | Candidate CPU |
+|---|---:|---:|---:|---:|
+| Disabled | 106.9 ms | 78.0 ms | 103.6 ms | 76.9 ms |
+| Enabled, small database | 124.2 ms | 98.3 ms | 121.0 ms | 91.9 ms |
+| Write-locked database | 196.1 ms | 150.9 ms | 146.8 ms | 117.6 ms |
+
+All 33 cases in that earlier comparison retained their expected verdicts. The
+40-line case improved only modestly (36.1 to 34.9 ms with history off); short and compound
+commands were essentially unchanged. The bypass process floor was about
+2–3 ms. Lock contention added roughly 50 ms to the short-command hook while
+CPU stayed near 11 ms, independently demonstrating storage wait on the
+normal shutdown path. These are diagnostic measurements on a changing host,
+not universal latencies or a reproduction of the reporter's 275 MB database.
+The initial run under concurrent compiler memory pressure was rejected on an
+unexpected `ask`, never counted as a successful fast allow.
 
 **Latency Tiers**:
 
@@ -2703,7 +2883,8 @@ high-signal formatting.
 | JSON-hook deny | Claude Code, Gemini CLI, Copilot CLI, VS Code Copilot Chat, Posit Assistant, compatible hooks | Denial JSON | Rich or plain warning |
 | Hermes block | Hermes Agent shell hook (`pre_tool_call`) | `{"decision":"block","reason":...,"action":"block","message":...}` | Rich or plain warning |
 | Grok deny | Grok (xAI) PreToolUse hook (`pre_tool_use` event, `run_terminal_cmd` tool) | `{"decision":"deny","reason":...}` (exit 0) | Rich or plain warning |
-| Antigravity block | Antigravity CLI (`agy`) PreToolUse hook (`toolCall.name: "run_command"`) | `{"decision":"block","reason":...}` (exit 0) | Rich or plain warning |
+| Antigravity deny | Antigravity CLI (`agy`) PreToolUse hook (`toolCall.name: "run_command"`) | Only `{"decision":"deny","reason":...}` (exit 0) | Rich or plain warning |
+| Antigravity warn | Antigravity CLI (`agy`) command with a warn policy | Empty (exit 0; ordinary permission checks remain with `agy`) | Rich or plain warning |
 | Codex deny | Codex CLI 0.144.x hook input | Minimal `hookSpecificOutput` deny JSON | Deny reason with command, rule, and remediation |
 | Robot mode | `--robot` or `DCG_ROBOT=1` | JSON | Silent |
 | Plain fallback | `DCG_NO_RICH=1`, `NO_COLOR=1`, `DCG_NO_COLOR=1`, `TERM=dumb`, `CI=1`, non-TTY output, or `--legacy-output` | Mode-specific data | Plain text only |
@@ -2828,7 +3009,10 @@ While dcg provides comprehensive protection across many tools and platforms, som
 - **Bugs in allowed commands**: A `git commit` that accidentally includes wrong files
 - **Commands in scripts**: If an agent runs `./deploy.sh`, we don't inspect what's inside the script
 - **Dynamic stdin producers for protected REPL binaries** ([#191](https://github.com/Dicklesworthstone/destructive_command_guard/issues/191)): dcg traces bounded literal `echo`/`printf` pipelines, single-file `cat` pipelines, `< file` redirects, and literal command substitutions into `redis-cli`, `psql`, `mysql`/`mariadb`, `mongosh`/`mongo`, and `sqlite3`; the reconstructed payload is evaluated by the consumer's own pack. It deliberately does not execute arbitrary producers to discover their output. An unknown/dynamic producer, missing or non-regular file, non-UTF-8 file, or payload over 256 KiB therefore fails closed as the stable high-severity rule `<pack>:stdin-unverified` (which can be explicitly allowlisted after review) instead of silently recreating the bypass. Direct arguments, heredocs, and here-strings remain covered by their existing paths. `kubectl delete -f -` / `--filename=-` is blocked directly unless it is a genuine client/server dry-run.
+- **Files opened after a wrapper changes the execution environment**: recognized directory, user, and home/environment changes (such as `env -C other`, `sudo -D other`, `sudo -u other`, or `env HOME=...`) invalidate the caller's local file evidence. A benign local `migration.sql` cannot clear `env -C other psql -X -f migration.sql`; the guarded database client reports `<pack>:stdin-unverified` because the file it will open has not been verified. The same boundary applies to file-producing commands, database includes and shell escapes, PostgreSQL startup files, and sed program files (`core.filesystem:sed-exec-unverified`). Literal payloads still receive normal destructive-command analysis. The caller's own `$(cat file)` substitution or `< file` redirect retains its local source meaning, but includes inside that input use the consumer's execution environment. For example, `env -C other psql -X < checked.sql` checks the caller's `checked.sql`, while an include inside it cannot borrow the caller's working directory. `-X`/`--no-psqlrc` disables only PostgreSQL startup files; it does not exempt the command's SQL or include files. These unverified denials use the normal exact-command review path, including the single-use code in Codex's `permissionDecisionReason`; see [Codex integration](docs/codex-integration.md).
 - **Unverifiable embedded-execution sinks** ([#261](https://github.com/Dicklesworthstone/destructive_command_guard/issues/261)): `eval "$(cmd)"`, `source <(cmd)`, dynamic `Invoke-Expression` input, invoked ScriptBlocks, and pipeline consumers whose executable source dcg cannot statically reconstruct fail closed under stable rule ids in the `heredoc.*` family (`heredoc.posix:eval-dynamic`, `heredoc.posix:pipeline-consumer`, `heredoc.posix:process-substitution`, `heredoc.powershell:invoke-expression-dynamic`, …), so each denial can be reviewed and allowlisted (`dcg allowlist add 'heredoc.posix:eval-dynamic' -r "reviewed" --user`) or tuned via `[policy.rules]`. One narrow carve-out exists: the documented shell-init idioms (`eval "$(ssh-agent -s)"`, `eval "$(brew shellenv)"`, `eval "$(direnv hook bash)"`, `eval "$(pyenv init -)"`, `rbenv`/`starship`/`zoxide`/`mise` init/activate, and `source <(kubectl completion bash)`) are recognized as **exact literal argv shapes** — one plain producer segment, no chaining, redirection, nesting, quoting tricks, or path-qualified executables — and downgrade to a recorded warning under `heredoc.posix:eval-init-idiom`. Every near miss keeps the hard denial, and posture can promote the idioms back with `[policy.rules] "heredoc.posix:eval-init-idiom" = "deny"`. Note the residual: the allowance rests on the producer binary's *identity*; PATH order, shell functions, and aliases are outside dcg's static view.
+
+- **Executable GNU tar helpers**: in POSIX command views, dcg inspects checkpoint `exec` actions, `--to-command`, compression helpers (`-I`/`--use-compress-program`), volume scripts, and remote `--rmt-command` payloads. It preserves GNU tar's shell versus argument-vector behavior and option ownership, so ordinary archive names, exclusions, checkpoint messages, and proven inactive helpers remain data. Bounded literal `TAR_OPTIONS` values are supported; unresolved expansion or unsupported decoding requires review. An unresolved option cannot hide a visible destructive helper behind an apparent mode change, terminator, or override. Helper reads cannot rely on local file contents when tar may write archive/member files, selects an output file, or runs under a caller output redirect. Proven read-only operations retain the caller's filesystem scope; native tar `-C` alone does not change a helper's process directory. Unknown helper commands and executable archive input fail closed under `core.filesystem:tar-exec-unverified`; known destructive helpers retain their own rule IDs. These denials use the same exact-command, single-use review flow and Codex `permissionDecisionReason` code. dcg does not execute helpers or unpack archives to discover their input.
 
 ### Threat Model
 
@@ -2838,14 +3022,15 @@ This hook assumes the AI agent is **well-intentioned but fallible**. It's design
 
 ### Hook not blocking commands
 
-1. **Check hook registration**: Verify `~/.claude/settings.json` contains the hook configuration
+1. **Check hook registration**: Run `dcg doctor --strict` with the same `CLAUDE_CONFIG_DIR` as Claude Code and verify the reported settings path contains the hook configuration
 2. **Restart Claude Code**: Configuration changes require a restart
 3. **Check binary location**: Ensure `dcg` is in your PATH
 4. **Test manually**: Run `echo '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | dcg`
 
 ### Hook silently removed (recommended: add shell startup check)
 
-Claude Code can silently remove the dcg hook when it rewrites `~/.claude/settings.json`. This means you may lose protection without any warning.
+Claude Code can silently remove the dcg hook when it rewrites the active user
+`settings.json`. This means you may lose protection without any warning.
 
 **Automatic setup** -- `dcg setup` installs the hook *and* offers to add a shell startup check:
 
@@ -3069,6 +3254,7 @@ without executing shell code ([#536](https://github.com/Dicklesworthstone/destru
 |-------------|---------|
 | A literal assignment on the redirect's `&&` success path | `true && S=/tmp/d && echo hi > "$S/x"` |
 | A known variable with a literal suffix | `S=/tmp/d; T="$S/sub"; echo hi > "$T/x"` |
+| A literal prefix and suffix around one proven scalar or loop variable | `for i in 1 2 3; do echo hi > "/tmp/run-$i.log"; done` |
 | PID digits inside a literal `/tmp/` path | `echo hi > "/tmp/d-$$.log"` |
 | A supported `mktemp` substitution with an explicit temporary root | `D=$(mktemp -d /tmp/v-XXXXXX); echo hi > "$D/p"` or `D=$(mktemp -d -p /tmp); echo hi > "$D/p"` |
 
@@ -3084,6 +3270,13 @@ syntax, templates for hidden directories, `/etc` roots, dynamic `$TMPDIR`
 roots, and `-u`/`--dry-run` keep their denials. This built-in proof does not add
 a configurable dynamic-path exemption, and every other redirect and command
 is still checked.
+
+The loop proof also supports a single path assignment from the iteration
+variable immediately before the redirect, such as
+`for i in 1 2; do log="/tmp/run-$i.log"; echo hi > "$log"; done`.
+Every literal list value must yield a benign final path. Computed lists,
+conditional bindings, shell-maintained variables, later mutation within the
+loop, and additional expansions do not qualify.
 
 **Filesystem evidence belongs to the environment running the script.** The
 new-home-file allowance uses local filesystem checks and therefore applies
@@ -3102,6 +3295,23 @@ With the PostgreSQL pack enabled, remote `psql` startup files are unverified
 too; `-X` / `--no-psqlrc` disables those startup files so a literal SQL command
 can be evaluated directly. dcg does not connect to the other environment to
 inspect its files.
+
+Literal script text piped into `ssh host`, an explicit remote stdin-reading
+shell, or an interactive `docker` / `podman` / `nerdctl` / `kubectl` / `oc`
+`exec` shell receives the same filesystem boundary. This includes supported
+process-substitution inputs. For example, `printf '%s\n' 'echo x > ~/notes.txt'
+| ssh host` cannot borrow local evidence that the file is new. Unknown script
+producers, compound remote dispatch, and unsupported carrier options require
+review through the existing unverified-source denial. Grouped and transformed
+producers retain the same conservative source checks as local shell pipelines.
+
+Ordinary data consumers such as `ssh host cat` and `docker exec -i container
+cat` do not execute their input as program text. Disabled stdin and detached
+container exec also remain data paths. SSH's local command-execution options
+need separate review even with `-n`, because they can use the caller's stdin.
+Local output redirects on the carrier still use local creation checks. An
+exact-command `dcg allow-once` review remains available for a required operation;
+these checks do not add allowlist entries or inspect remote files.
 
 **Credential and login files are never exempted by path.**
 `core.filesystem:credential-file-write` (writes to `~/.ssh/*`,
@@ -3128,6 +3338,18 @@ does not inspect archive members or infer their paths from the archive's name.
 Credential-directory writes retain `core.filesystem:credential-file-write`,
 while `.git` writes retain `core.filesystem:git-internals-write`, so a grant for
 one does not exempt the other.
+
+Shell redirects into `.git` retain the separate Critical rules
+`core.filesystem:redirect-truncate-git-internals-relative` and
+`core.filesystem:redirect-append-git-internals-relative`. Targets are decoded
+using the payload's shell dialect, so `echo x >> .git\config` is protected in
+PowerShell and Cmd on any host. When the shell is unknown, dcg checks each
+supported interpretation. An explicitly POSIX payload retains POSIX escape
+semantics. A grant for the generic dynamic-path rule cannot exempt a known
+Git target, and a grant for Git truncation does not exempt append or credential
+writes elsewhere in the same command. Other dynamic redirect targets still
+require their own review. For a required one-off write, use the exact-command
+`dcg allow-once` review path.
 
 **Glob semantics.**
 
@@ -3321,7 +3543,7 @@ See [Escape Hatch / Bypass](#escape-hatch--bypass). Options include `DCG_BYPASS=
 
 **Q: Does this work with other AI coding tools?**
 
-Yes. dcg natively supports Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Cursor IDE, OpenCode, Oh My Pi (`omp`), Crush, and Reasonix interception paths. Aider has limited git-hook support, and Continue is detected but cannot be auto-configured because it does not expose a pre-execution shell hook.
+Yes. dcg natively supports Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Cursor IDE, OpenCode, Oh My Pi (`omp`), Crush, Reasonix, Muse Code, and Amp interception paths. Aider has limited git-hook support, and Continue is detected but cannot be auto-configured because it does not expose a pre-execution shell hook.
 
 **Q: What about database, Docker, Kubernetes, and cloud commands?**
 

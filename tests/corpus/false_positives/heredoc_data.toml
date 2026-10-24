@@ -183,6 +183,20 @@ expected = "allow"
 # bodies. The bodies are NOT masked: the literal cases in
 # true_positives/git_destructive.toml prove they still flow through the
 # conservative raw-shell scan (#136/#278).
+#
+# Since #544 a body carrying substitution markers (`$(`, backticks, `\`) is
+# also read as Python/JavaScript source by the bounded literal recovery, and
+# "unverified or incomplete analysis cannot silently approve a command"
+# (CHANGELOG, #544). fb60af1 applied that to these exact shapes: raw Markdown
+# fed to `python3 -` and the raw #363 prose assert Indeterminate, and the
+# prose inside `print("""…""")` is the allow case. The old #357 node and #363
+# fixtures were such invalid programs. That recovery also runs under the
+# production 20 ms budget here (this harness sets no DCG_AST_TIMEOUT_MS), so
+# a fixture that triggers it is load-dependent. The two cases below therefore
+# test the same outer-shell boundary with valid, trigger-free programs; the
+# `$(…)` and backticked forms, valid and invalid, are pinned with a test
+# budget by the evaluator's `quoted_interpreter_heredoc_is_not_dynamic_branch_evidence_357`
+# and `placeholder_gt_in_quoted_interpreter_body_is_not_a_redirect_363`.
 # ============================================================================
 
 [[case]]
@@ -192,7 +206,7 @@ expected = "allow"
 
 [[case]]
 description = "quoted node heredoc body is not dynamic-branch evidence (#357)"
-command = "node - <<'JS'\ngit branch $(cat name)\nJS"
+command = "node - <<'JS'\n// git branch $name\nconsole.log(\"git branch ${name}\", 'git branch $name');\nJS"
 expected = "allow"
 
 [[case]]
@@ -212,7 +226,7 @@ expected = "allow"
 
 [[case]]
 description = "doc prose with <x> placeholders in a quoted python heredoc (#363)"
-command = "python3 - <<'PYEOF'\n- `DATA_DIR` resolves *inside each instance*: `~/.app/instances/<i>/store-data/` — sqlite `index.db` (+ `-wal`/`-shm`) plus `logs/`, `records/`, `blocks/`, `.meta/`, `.backup/`.\n- Every instance's `gw.json` is identically `{\"search\": {\"bm25\": {\"language\": \"en\"}}}` — the **local** backend. No cloud block on any instance.\n- The package DOES ship a Cloud client (`~/.app/plugins/vendor-plugin/src/core/store/client.ts`, wants `url`/`user`/`apiKey`, auth header `Bearer acct=x&api_key=y`) — but it is **dormant**. No url/user/apiKey exists in any instance `.env`, any gw config, or anywhere under `~/.app`.\nPYEOF"
+command = "python3 - <<'PYEOF'\nprint(\"\"\"- DATA_DIR resolves *inside each instance*: ~/.app/instances/<i>/store-data/ — sqlite index.db (+ -wal/-shm) plus logs/, records/, blocks/, .meta/, .backup/.\n- Every instance's gw.json is identically {\"search\": {\"bm25\": {\"language\": \"en\"}}} — the **local** backend. No cloud block on any instance.\n- The package DOES ship a Cloud client (~/.app/plugins/vendor-plugin/src/core/store/client.ts, wants url/user/apiKey, auth header Bearer acct=x&api_key=y) — but it is **dormant**. No url/user/apiKey exists in any instance .env, any gw config, or anywhere under ~/.app.\n\"\"\")\nPYEOF"
 expected = "allow"
 
 [[case]]

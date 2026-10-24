@@ -14,6 +14,17 @@
 #
 set -euo pipefail
 
+# Keep this resolver in sync with install.sh and the Rust CLI.
+claude_config_dir() {
+    local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    case "$dir" in
+        '~') dir="$HOME" ;;
+        '~/'*) dir="$HOME/${dir#\~/}" ;;
+    esac
+    case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
+    printf '%s\n' "$dir"
+}
+
 # Defaults
 YES=0
 KEEP_CONFIG=0
@@ -340,7 +351,11 @@ PYEOF
 
 # Remove dcg hook from Claude Code settings
 unconfigure_claude_code() {
-    local settings="$HOME/.claude/settings.json"
+    local settings
+    # Preserve literal trailing newlines in the active directory name.
+    settings="$(claude_config_dir; printf .)"
+    settings="${settings%$'\n.'}"
+    settings="${settings%/}/settings.json"
 
     if [ ! -f "$settings" ]; then
         return 0
@@ -1661,7 +1676,10 @@ main() {
     # Default history.db location since 0.15 (#381); older installs keep it
     # in $config_dir, which remove_state_directories also handles.
     local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/dcg"
-    local claude_settings="$HOME/.claude/settings.json"
+    local claude_settings
+    claude_settings="$(claude_config_dir; printf .)"
+    claude_settings="${claude_settings%$'\n.'}"
+    claude_settings="${claude_settings%/}/settings.json"
     local gemini_settings="$HOME/.gemini/settings.json"
     local aider_config="$HOME/.aider.conf.yml"
     local copilot_hook_file="${COPILOT_HOME:-$HOME/.copilot}/hooks/dcg.json"
@@ -1674,7 +1692,7 @@ main() {
     local aider_configured=0
 
     # Agent hooks
-    if json_settings_has_dcg_command_hook "$claude_settings" "PreToolUse" "Bash"; then
+    if json_settings_has_dcg_command_hook "$claude_settings" "PreToolUse"; then
         log "  • Claude Code hook ($claude_settings)"
         found_anything=1
     fi

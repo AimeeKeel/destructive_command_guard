@@ -125,9 +125,10 @@ report() {
 # Core assertion: run a payload, then check decision JSON + exit code +
 # stream separation all at once.
 #
-#   assert_case <harness> <case> <payload> <expect: deny|allow>
+#   assert_case <harness> <case> <payload> <expect: deny|allow|warn>
 #               <jq filter yielding the harness's decision value>
 #               <expected decision value>
+# `warn` requires empty stdout plus a human-visible stderr warning.
 # ---------------------------------------------------------------------------
 assert_case() {
   local harness="$1" case_name="$2" payload="$3" expect="$4" filter="$5" want="$6"
@@ -155,9 +156,15 @@ assert_case() {
     return
   fi
 
-  if [[ "$expect" == allow ]]; then
-    if [[ -n "$stdout_data" ]]; then
-      report fail "$harness" "$case_name" "allow must emit empty stdout, got: ${stdout_data:0:160}"
+  if [[ "$expect" == allow || "$expect" == warn ]]; then
+    # Inspect the file itself: command substitution strips trailing newlines
+    # and would accept a response that wrote bytes when it must stay silent.
+    if [[ -s "$out_file" ]]; then
+      report fail "$harness" "$case_name" "$expect must emit zero stdout bytes, got: ${stdout_data:0:160}"
+      return
+    fi
+    if [[ "$expect" == warn ]] && ! grep -q 'WARNING' "$err_file"; then
+      report fail "$harness" "$case_name" "advisory warning lost its stderr diagnostic"
       return
     fi
     report pass "$harness" "$case_name"
@@ -176,6 +183,15 @@ assert_case() {
   got="$(printf '%s' "$stdout_data" | jq -r "$filter" 2>/dev/null)"
   if [[ "$got" != "$want" ]]; then
     report fail "$harness" "$case_name" "decision field: want '$want', got '$got' (filter $filter)"
+    return
+  fi
+  if [[ "$harness" == agy ]] && ! jq -e -s '
+      length == 1 and (.[0] |
+        type == "object" and keys == ["decision", "reason"] and
+        .decision == "deny" and (.reason | type == "string" and length > 0))
+    ' "$out_file" >/dev/null 2>&1; then
+    report fail "$harness" "$case_name" \
+      "strict agy denial requires exactly decision=deny and nonempty reason; extra fields or documents are rejected"
     return
   fi
   # Human-facing output belongs on stderr and must never pollute stdout.
@@ -406,14 +422,23 @@ GROK_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
 assert_case grok deny "$GROK_DENY" deny '.decision' deny
 assert_case grok allow "$GROK_ALLOW" allow '.' ''
 
-# --- Antigravity CLI (agy): nested toolCall envelope, decision:"block" -----
+# --- Antigravity CLI (agy): strict decision:"deny" + reason only (#573) -----
 $JSON_OUTPUT || echo "Antigravity CLI (agy)"
 AGY_DENY=$(jq -nc --arg c "$DENY_CMD" \
   '{toolCall:{name:"run_command",args:{CommandLine:$c}},conversationId:"conv_e2e",stepIdx:1}')
 AGY_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" \
   '{toolCall:{name:"run_command",args:{CommandLine:$c}},conversationId:"conv_e2e",stepIdx:2}')
-assert_case agy deny "$AGY_DENY" deny '.decision' block
+AGY_WARN=$(jq -nc --arg c 'git stash drop' \
+  '{toolCall:{name:"run_command",args:{CommandLine:$c}},conversationId:"conv_e2e",stepIdx:3}')
+assert_case agy deny "$AGY_DENY" deny '.decision' deny
 assert_case agy allow "$AGY_ALLOW" allow '.' ''
+# An explicit allow could pre-approve the tool call and bypass its ordinary
+# permission checks. A dcg warning is advisory: zero stdout, stderr warning.
+assert_case agy warn-preserves-permission-checks "$AGY_WARN" warn '.' ''
+assert_case agy warn-cannot-mask-deny \
+  "$(jq -nc --arg c 'git stash drop; git reset --hard' \
+    '{toolCall:{name:"run_command",args:{CommandLine:$c}},conversationId:"conv_e2e",stepIdx:4}')" \
+  deny '.decision' deny
 
 # --- Crush (Charm): flat event/tool_name/tool_input envelope, decision:"deny"
 # The stdin shape is what crush's hooks.BuildPayload marshals (#388). Crush

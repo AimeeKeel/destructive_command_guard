@@ -1,0 +1,65 @@
+name: Manual stdin-owner candidate validation (not a production fix)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-candidate:
+    if: github.repository == 'Dicklesworthstone/destructive_command_guard'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 450a2897648cfef276b9428a47942f21ce94d914
+          persist-credentials: false
+      - name: Apply the candidate only in the temporary checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 450a2897648cfef276b9428a47942f21ce94d914
+          test "$(git rev-parse HEAD:src/heredoc.rs)" = dbf76224a368893f4efd4cafa453e5b79f0c05f0
+          test "$(git rev-parse HEAD:src/scanner_regression_tests.rs)" = 4f6573a5848338615c6718be8b4e65fe9d88b21e
+          gh api repos/Dicklesworthstone/destructive_command_guard/git/blobs/10fcd23b455a1e516dc8716a86da5a07250d8702 --jq .content | base64 --decode > "$RUNNER_TEMP/stdin-owner.patch"
+          test "$(git hash-object "$RUNNER_TEMP/stdin-owner.patch")" = 10fcd23b455a1e516dc8716a86da5a07250d8702
+          git apply --check --whitespace=error "$RUNNER_TEMP/stdin-owner.patch"
+          git apply --whitespace=error "$RUNNER_TEMP/stdin-owner.patch"
+          git diff --check
+          test "$(git diff --name-only)" = $'src/heredoc.rs\nsrc/scanner_regression_tests.rs'
+          git diff --stat
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain
+      - name: Run source-boundary regressions
+        run: |
+          set -o pipefail
+          cargo test --locked --lib scanner_regression_tests:: -- --nocapture --test-threads=1 2>&1 | tee stdin-owner-unit.log
+      - name: Check all targets
+        run: cargo check --locked --all-targets
+      - name: Check formatting and Clippy
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Run CLI and hook integration regressions
+        run: |
+          set -o pipefail
+          cargo test --locked --test repro_560_source_boundaries --test repro_419_opencode_plugin_executes -- --nocapture --test-threads=1 2>&1 | tee stdin-owner-integration.log
+      - name: Retain candidate source and logs without publishing repository changes
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stdin-owner-candidate-${{ github.sha }}
+          retention-days: 7
+          path: |
+            src/heredoc.rs
+            src/scanner_regression_tests.rs
+            stdin-owner-unit.log
+            stdin-owner-integration.log

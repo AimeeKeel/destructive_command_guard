@@ -32,7 +32,23 @@ try {
 
     $content = Get-Content -Raw $profilePath
     Check ($content.Contains('# dcg: warn if the Claude Code hook')) "marker present"
-    Check ($content.Contains('Hook missing from ~/.claude/settings.json')) "warning text present"
+    Check ($content.Contains('Hook missing from $dcgSettings')) "warning names the checked settings path"
+    Check ($content.Contains('$env:CLAUDE_CONFIG_DIR')) "startup check resolves the active Claude configuration"
+
+    $savedClaudeDir = $env:CLAUDE_CONFIG_DIR
+    try {
+        $env:CLAUDE_CONFIG_DIR = Join-Path $tmp 'active config'
+        New-Item -ItemType Directory -Force $env:CLAUDE_CONFIG_DIR | Out-Null
+        $activeSettings = Join-Path $env:CLAUDE_CONFIG_DIR 'settings.json'
+        [System.IO.File]::WriteAllText($activeSettings, '{}')
+        # A function is sufficient for the profile's Get-Command dcg guard.
+        function dcg { }
+        $warning = (& ([scriptblock]::Create($script:DcgProfileCheckBlock)) 6>&1 | Out-String)
+        Check ($warning.Contains($activeSettings)) "missing active hook warns with its path"
+        [System.IO.File]::WriteAllText($activeSettings, '{"hooks":{"PreToolUse":[{"hooks":[{"command":"dcg"}]}]}}')
+        $warning = (& ([scriptblock]::Create($script:DcgProfileCheckBlock)) 6>&1 | Out-String)
+        Check ([string]::IsNullOrWhiteSpace($warning)) "protected active configuration is quiet"
+    } finally { $env:CLAUDE_CONFIG_DIR = $savedClaudeDir }
 
     $perr = $null
     [void][System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$null, [ref]$perr)
@@ -200,6 +216,52 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     Check ($s9 -eq 'updated') "current main + stale other host reports 'updated' (got '$s9')"
     $s10 = Add-DcgProfileCheck -ProfilePath $mainPath2 -AlsoRepairPaths @($otherStale2)
     Check ($s10 -eq 'already') "main + other host both current reports 'already' (got '$s10')"
+
+    # Execute the shipped block against isolated configurations. For default
+    # cases substitute only the read-only $HOME variable's name in the test
+    # copy, so the operator's actual settings can never be read or changed.
+    $savedClaudeConfigDir = $env:CLAUDE_CONFIG_DIR
+    try {
+        function dcg { }
+        $selectedDir = Join-Path $tmp 'active config [work]'
+        New-Item -ItemType Directory -Path $selectedDir | Out-Null
+        $selectedSettings = Join-Path $selectedDir 'settings.json'
+        $env:CLAUDE_CONFIG_DIR = $selectedDir
+        $blockToRun = [scriptblock]::Create($script:DcgProfileCheckBlock)
+        $missingWarning = & $blockToRun 6>&1 | Out-String
+        Check ($missingWarning.Contains("Hook missing from $selectedSettings")) 'missing active settings emits a warning naming its path'
+
+        Set-Content -LiteralPath $selectedSettings -Value '{"model":"keep-me"}'
+        $unprotectedWarning = & $blockToRun 6>&1 | Out-String
+        Check ($unprotectedWarning.Contains("Hook missing from $selectedSettings")) 'unprotected active settings emits a warning'
+
+        Set-Content -LiteralPath $selectedSettings -Value '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":[{"type":"command","command":"dcg"}]}]}}'
+        $protectedOutput = & $blockToRun 6>&1 | Out-String
+        Check ([string]::IsNullOrWhiteSpace($protectedOutput)) 'protected active settings does not emit a warning'
+
+        Push-Location $tmp
+        try {
+            $env:CLAUDE_CONFIG_DIR = 'relative config'
+            $relativeSettings = Join-Path (Join-Path $tmp 'relative config') 'settings.json'
+            $relativeWarning = & $blockToRun 6>&1 | Out-String
+            Check ($relativeWarning.Contains("Hook missing from $relativeSettings")) 'relative selection is resolved from the current directory at startup'
+        } finally { Pop-Location }
+
+        $dcgTestHome = Join-Path $tmp 'default-home'
+        New-Item -ItemType Directory -Path $dcgTestHome | Out-Null
+        $defaultBlock = [scriptblock]::Create($script:DcgProfileCheckBlock.Replace('$HOME', '$dcgTestHome'))
+        foreach ($selector in @($null, '')) {
+            $env:CLAUDE_CONFIG_DIR = $selector
+            $defaultMissingOutput = & $defaultBlock 6>&1 | Out-String
+            Check ([string]::IsNullOrWhiteSpace($defaultMissingOutput)) 'unset/empty selection keeps the legacy skip when default settings are absent'
+        }
+        $defaultDir = Join-Path $dcgTestHome '.claude'
+        New-Item -ItemType Directory -Path $defaultDir | Out-Null
+        $defaultSettings = Join-Path $defaultDir 'settings.json'
+        Set-Content -LiteralPath $defaultSettings -Value '{"model":"keep-default-model"}'
+        $defaultUnprotectedOutput = & $defaultBlock 6>&1 | Out-String
+        Check ($defaultUnprotectedOutput.Contains("Hook missing from $defaultSettings")) 'an existing default file without a hook still warns'
+    } finally { $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
 } finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
