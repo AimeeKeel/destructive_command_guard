@@ -15933,7 +15933,25 @@ fn command_may_rebind_dcg(visible: &str) -> bool {
     }
     let unquoted: String = visible
         .chars()
-        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .filter(|c| {
+            // PowerShell accepts these Unicode quote characters as string
+            // delimiters too (the same set the Windows-shell lexer folds),
+            // so a definer split by them (`Set-Al\u{2018}ias\u{2019}`, which
+            // resolves to `Set-Alias`) must read as the word it spells here,
+            // not survive as a false separator that hides the rebinding (#584).
+            !matches!(
+                c,
+                '\'' | '"'
+                    | '\\'
+                    | '\u{2018}'
+                    | '\u{2019}'
+                    | '\u{201A}'
+                    | '\u{201B}'
+                    | '\u{201C}'
+                    | '\u{201D}'
+                    | '\u{201E}'
+            )
+        })
         .map(|c| c.to_ascii_lowercase())
         .collect();
     if unquoted.contains("function:") || unquoted.contains("alias:") {
@@ -54719,6 +54737,65 @@ mod tests {
                 EvaluationDecision::Allow,
                 "{command:?}"
             );
+        }
+    }
+
+    /// A definer word split by the Unicode quote characters PowerShell accepts
+    /// as string delimiters (`Set-Al\u{2018}ias\u{2019}`, which it resolves to
+    /// `Set-Alias`) must count as a possible rebinding, exactly like an
+    /// ASCII-quote-split one. Before this was handled the mask still applied in
+    /// full — taking in the call operator — so a destructive aliased deletion
+    /// `Set-Al\u{2018}ias\u{2019} dcg Remove-Item; & dcg test -Recurse -Force …`
+    /// was allowed although its plainly spelled twin denied (#584).
+    #[test]
+    fn issue_584_unicode_quote_definers_are_not_a_mask_bypass() {
+        let ls = "\u{2018}";
+        let rs = "\u{2019}";
+        let ld = "\u{201C}";
+        let rd = "\u{201D}";
+
+        // Bare dcg call: the whole mask is withheld, so the command is
+        // unchanged and the dcg call is judged as written.
+        for command in [
+            format!("Set-Al{ls}ias{rs} dcg Remove-Item; dcg test -Recurse -Force C:\\x"),
+            format!("Set-Al{ld}ias{rd} dcg Remove-Item; dcg test -Recurse -Force C:\\x"),
+            format!("s{ls}a{rs}l dcg Remove-Item; dcg test -Recurse -Force C:\\x"),
+            format!("New-Al{ls}ias{rs} dcg Remove-Item; dcg test -Recurse -Force C:\\x"),
+            format!("f{ls}u{rs}nction dcg {{ Remove-Item -Recurse -Force C:\\x }}; dcg test"),
+        ] {
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                assert_eq!(
+                    mask_dcg_self_inspection_segments(&command, dialect).as_ref(),
+                    command,
+                    "{dialect:?} {command:?}",
+                );
+            }
+        }
+
+        // The call-operator form keeps the operator visible (never masked
+        // away), and the command stays denied in both dialects.
+        for command in [
+            format!("Set-Al{ls}ias{rs} dcg Remove-Item; & dcg test -Recurse -Force C:\\x"),
+            format!("s{ls}a{rs}l dcg Remove-Item; & dcg test -Recurse -Force C:\\x"),
+            format!("f{ls}u{rs}nction dcg {{ Remove-Item -Recurse -Force C:\\x }}; & dcg test"),
+        ] {
+            let operator = command.rfind("& dcg").expect("call operator");
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                let masked = mask_dcg_self_inspection_segments(&command, dialect);
+                assert_eq!(masked.len(), command.len(), "{dialect:?} {command:?}");
+                assert_eq!(
+                    &masked[..=operator],
+                    &command[..=operator],
+                    "{dialect:?} {command:?}",
+                );
+                assert!(!masked.contains("dcg test"), "{dialect:?} {command:?}");
+                let result = evaluate_with_pack_ids_in_dialect(&command, ISSUE_584_PACKS, dialect);
+                assert_eq!(
+                    result.decision,
+                    EvaluationDecision::Deny,
+                    "{dialect:?} {command:?}",
+                );
+            }
         }
     }
 
