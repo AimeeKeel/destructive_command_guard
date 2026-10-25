@@ -26288,7 +26288,8 @@ fn filesystem_pre_rm_pattern_excluding_dynamic(name: Option<&str>) -> bool {
 /// `&&` chain, explicit tmp-rooted `mktemp -d`, and decimal `$$` components.
 /// A literal prefix may precede one proven variable (#526), including a
 /// literal for-loop variable and an immediately derived loop-local path.
-/// These additional forms must resolve under a tmp-family root. Rebinding,
+/// These additional forms must resolve under a tmp-family root, including a
+/// verified local startup `TMPDIR` (#590). Rebinding,
 /// unknown values, unsupported control flow, traversal, protected files, and
 /// additional non-fd redirects all retain the dynamic-path denial.
 fn statically_safe_variable_redirect(
@@ -26440,6 +26441,87 @@ fn redirect_path_has_tmp_root(path: &str) -> bool {
     ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"]
         .iter()
         .any(|prefix| path.starts_with(prefix))
+        || redirect_path_is_under_startup_tmpdir(path)
+}
+
+/// Startup `TMPDIR` is a local root hint, never a source of shell bindings.
+/// A fully proven literal path below it may receive the redirect-only temp
+/// proof (#590), but `$TMPDIR` itself still needs an assignment in the source.
+/// Cache the bounded filesystem check once per process; changing TMPDIR in a
+/// candidate command cannot grant a new root.
+static STARTUP_TMPDIR_REDIRECT_ROOT: LazyLock<Option<String>> = LazyLock::new(|| {
+    if !cfg!(unix) {
+        return None;
+    }
+    let root = std::env::var("TMPDIR").ok()?;
+    let root = root.trim_end_matches('/');
+    if root.is_empty()
+        || root.len() > MAX_REDIRECT_VALUE_BYTES
+        || !Path::new(root).is_absolute()
+        || root.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return None;
+    }
+    let canonical = fs::canonicalize(root).ok()?;
+    if !canonical.is_dir()
+        || !startup_tmpdir_root_is_unprotected(Path::new(root))
+        || !startup_tmpdir_root_is_unprotected(&canonical)
+    {
+        return None;
+    }
+    Some(root.to_string())
+});
+
+/// A supplied temp directory cannot turn a home/system tree into scratch.
+/// Reuse the existing sensitive-redirect rule instead of maintaining a second
+/// list of protected roots; the canonical spelling also catches root symlinks.
+fn startup_tmpdir_root_is_unprotected(root: &Path) -> bool {
+    if root.parent().is_none() {
+        return false;
+    }
+    if let Some(home) = crate::config::home_dir() {
+        let canonical_home = fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+        if [&home, &canonical_home]
+            .iter()
+            .any(|home| root.starts_with(home) || home.starts_with(root))
+        {
+            return false;
+        }
+    }
+    let Some(path) = root.to_str() else {
+        return false;
+    };
+    // macOS resolves `/etc` and `/var` through `/private`; that spelling
+    // must not make an otherwise protected system tree an eligible root.
+    let system_path = path.strip_prefix("/private/").map_or_else(
+        || Cow::Borrowed(path),
+        |rest| Cow::Owned(format!("/{rest}")),
+    );
+    let target = format!("{system_path}/dcg-scratch-root-check");
+    if crate::packs::core::credential_files::names_protected_file(&shell_words::quote(&target)) {
+        return false;
+    }
+    let Some(pattern) = REGISTRY.get("core.filesystem").and_then(|pack| {
+        pack.destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some("redirect-truncate-root-home"))
+    }) else {
+        return false;
+    };
+    !pattern
+        .regex
+        .is_match(&format!(": > {}", shell_words::quote(&target)))
+}
+
+fn redirect_path_is_under_startup_tmpdir(path: &str) -> bool {
+    if NonlocalFilesystemScope::active() {
+        return false;
+    }
+    STARTUP_TMPDIR_REDIRECT_ROOT.as_ref().is_some_and(|root| {
+        path.strip_prefix(root)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            .is_some_and(|suffix| !suffix.is_empty())
+    })
 }
 
 /// A PID cannot introduce separators, traversal, quoting, or further expansion.
@@ -26680,7 +26762,8 @@ fn parse_posix_variable_with_literal_affixes(token: &str) -> Option<(&str, &str,
 /// Redirect operators whose targets are proven in their complete shell source.
 /// The source supplies assignment and loop scope that an extracted command
 /// alone does not retain. Strict scope and a temporary root are required for
-/// this additional route, which must never depend on local filesystem state.
+/// this additional route. A remote filesystem scope keeps this proof lexical:
+/// only a local source may borrow the verified startup TMPDIR hint.
 fn proven_bash_redirect_offsets(source: &str) -> Vec<usize> {
     if source.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES
         || !source.contains('>')
@@ -26917,6 +27000,8 @@ fn embedded_bash_proven_redirect_offsets(command: &str) -> Vec<usize> {
             literal_bash_source_range(command, content).map(|range| (content, range))
         })
         .flat_map(|(content, range)| {
+            let _filesystem_scope =
+                NonlocalFilesystemScope::enter(extracted_script_is_nonlocal(command, content));
             proven_bash_redirect_offsets(&content.content)
                 .into_iter()
                 .map(move |offset| range.start + offset)
@@ -28084,8 +28169,8 @@ fn value_expands_when_unquoted(value: &str) -> bool {
 }
 
 /// Would a *direct literal* redirect to this path be allowed today? Only the
-/// tmp family and traversal-free relative paths qualify; everything else
-/// keeps the fail-closed dynamic-path denial.
+/// tmp family, a verified local startup TMPDIR, and traversal-free relative
+/// paths qualify; everything else keeps the fail-closed dynamic-path denial.
 fn resolved_redirect_target_is_benign(path: &str) -> bool {
     // A temporary root is not sufficient: a copied value can still name
     // /tmp/repo/.git/config or a credential file. The other rules see the
@@ -28098,6 +28183,9 @@ fn resolved_redirect_target_is_benign(path: &str) -> bool {
         if let Some(rest) = path.strip_prefix(prefix) {
             return !rest.is_empty() && no_traversal(rest);
         }
+    }
+    if redirect_path_is_under_startup_tmpdir(path) {
+        return no_traversal(path);
     }
     !path.is_empty() && !path.starts_with(['/', '~', '-']) && no_traversal(path)
 }
@@ -30564,7 +30652,22 @@ fn command_pattern_match_is_inert_quoted_data(
     span: MatchSpan,
     source_context: Option<(&str, usize)>,
 ) -> bool {
-    if !matches!(pack_id, "core.git" | "core.filesystem")
+    // Global-option support must not turn an agent name containing a dcg
+    // command into an invocation. Apply the existing source-aware quote
+    // check only to the dcg-command branches of these rules; environment
+    // assignments and the other guardrails retain their existing treatment.
+    let guardrail_dcg_invocation = pack_id == "careful_company_running_windows.guardrails"
+        && matches!(
+            pattern_name,
+            Some("dcg-bypass-or-uninstall" | "dcg-policy-self-weakening")
+        )
+        && command
+            .get(span.start..span.end)
+            .and_then(|matched| matched.split_ascii_whitespace().next())
+            .is_some_and(|word| {
+                word.eq_ignore_ascii_case("dcg") || word.eq_ignore_ascii_case("dcg.exe")
+            });
+    if (!matches!(pack_id, "core.git" | "core.filesystem") && !guardrail_dcg_invocation)
         || is_core_filesystem_redirect_rule(pack_id, pattern_name)
     {
         return false;
@@ -30896,6 +30999,10 @@ fn range_intersects_conservatively_scanned_interpreter_input(
             return false;
         }
 
+        // Additional written-script identities add language-aware checks,
+        // not a new raw-shell interpretation of otherwise quoted text.
+        // Preserve the original receiver here; e.g. console.log's literal
+        // does not become a git command when the script gains argv.
         let Some(target) = content.target_command.as_deref() else {
             return false;
         };
@@ -33412,7 +33519,7 @@ fn evaluate_heredoc(
                         info.reason = wrap_embedded_shell_denial_reason(
                             &info.reason,
                             content.heredoc_type.is_some(),
-                            content.target_command.as_deref(),
+                            content.execution_target(),
                             line_number,
                         );
                         info.source = MatchSource::HeredocAst; // Mark as heredoc source
@@ -33925,7 +34032,7 @@ fn reconstructed_interpreter_commands_verdict(
                 info.reason = wrap_embedded_shell_denial_reason(
                     &info.reason,
                     content.heredoc_type.is_some(),
-                    content.target_command.as_deref(),
+                    content.execution_target(),
                     content.content[..reconstructed.start.min(content.content.len())]
                         .bytes()
                         .filter(|byte| *byte == b'\n')
@@ -34059,9 +34166,11 @@ fn heredoc_content_is_exempt(
     // /bin/sh, and skipping it because awk happens to be a data sink for
     // its stdin conflated the two channels and let the payload through
     // (#399). Gate on the body actually being stdin-bound, exactly as the
-    // structured-sink branch below already does.
+    // structured-sink branch below already does. A proven written-script
+    // consumer adds language-aware checks even when cat/tee received the
+    // original heredoc; it does not change that receiver's raw-shell role.
     let non_executing_target = content.heredoc_type.is_some()
-        && content.target_command.as_deref().is_some_and(|cmd| {
+        && content.execution_target().is_some_and(|cmd| {
             crate::heredoc::is_non_executing_heredoc_command(cmd) && target_not_overridden(cmd)
         });
     // Structured stdin data sinks (`git commit -F - <<'EOF'`, `spx session
@@ -34072,13 +34181,10 @@ fn heredoc_content_is_exempt(
     // the body scannable (fail-closed).
     let structured_stdin_sink = content.heredoc_type.is_some()
         && crate::heredoc::is_structured_stdin_data_sink(command, content.byte_range.start)
-        && content
-            .target_command
-            .as_deref()
-            .is_none_or(target_not_overridden);
+        && content.execution_target().is_none_or(target_not_overridden);
     if non_executing_target || structured_stdin_sink {
         tracing::trace!(
-            target_command = ?content.target_command,
+            target_command = ?content.execution_target(),
             "Skipping heredoc content analysis for non-executing target"
         );
         return true; // this heredoc is just data
@@ -52135,6 +52241,7 @@ mod tests {
                 quoted: true,
                 heredoc_type: Some(crate::heredoc::HeredocType::Standard),
                 target_command: Some("python3".to_string()),
+                additional_execution_target: None,
             };
             for transient in [
                 MatchError::Timeout {

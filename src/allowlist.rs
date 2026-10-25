@@ -822,11 +822,28 @@ fn segment_is_dcg_inspection_call(segment: &str) -> bool {
     if !is_dcg_binary_name(arg0) {
         return false;
     }
-    // Skip leading global option flags (`--robot`, `--no-color`, `-v`, ...) and
-    // require the first non-flag token to be a known diagnostic subcommand.
-    for token in tokens {
-        if token.starts_with('-') {
-            continue;
+    // Global options have the same arity here as in `cli::Cli`. In particular,
+    // `dcg --agent test allow-once ...` is a grant, not a diagnostic: `test`
+    // is the agent name. Skipping flags without consuming their values would
+    // exempt the whole mutating command before the guardrails pack sees it.
+    while let Some(token) = tokens.next() {
+        match token.as_str() {
+            "--agent" => {
+                if tokens.next().is_none() {
+                    return false;
+                }
+                continue;
+            }
+            "--robot" | "--verbose" | "--quiet" | "--legacy-output" | "--no-color"
+            | "--no-suggestions" | "-q" => continue,
+            _ if token.starts_with("--agent=") => continue,
+            _ if token.starts_with('-') => {
+                if token.len() > 1 && token[1..].bytes().all(|byte| byte == b'v') {
+                    continue;
+                }
+                return false;
+            }
+            _ => {}
         }
         return DCG_INSPECTION_SUBCOMMANDS.contains(&token.as_str());
     }
@@ -4149,6 +4166,29 @@ mod tests {
         assert!(is_dcg_self_inspection_call(
             "dcg explain --verbose \"rm -rf ~\""
         ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_consumes_global_option_values() {
+        for command in [
+            "dcg --agent codex --robot test 'rm -rf /'",
+            "dcg --agent='test' -vv explain 'git reset --hard'",
+            "dcg --no-suggestions --legacy-output --no-color classify 'git clean -fd'",
+        ] {
+            assert!(is_dcg_self_inspection_call(command), "{command}");
+            assert!(is_dcg_self_inspection_segment(command), "{command}");
+        }
+        for command in [
+            "dcg --agent test allow-once abc123 --yes",
+            "dcg --agent explain uninstall",
+            "dcg --agent classify allowlist add core.git:reset-hard --reason reviewed",
+            "dcg --agent test",
+            "dcg --agent",
+            "dcg --unknown-option test 'rm -rf /'",
+        ] {
+            assert!(!is_dcg_self_inspection_call(command), "{command}");
+            assert!(!is_dcg_self_inspection_segment(command), "{command}");
+        }
     }
 
     #[test]

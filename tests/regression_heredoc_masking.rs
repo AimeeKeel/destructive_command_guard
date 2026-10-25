@@ -328,6 +328,142 @@ EOF";
     }
 
     #[test]
+    fn written_script_arguments_cannot_skip_python_and_node_safety_checks() {
+        for (body, consumer, expected_rule) in [
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 /tmp/program argument",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 -I /tmp/program",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 -IuB -- /tmp/program --argument",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 /tmp/program \"$USER\"",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "import shutil\nshutil.rmtree('/home/user')",
+                "python3 -I /tmp/program \"$@\" $1",
+                "heredoc.python:shutil_rmtree",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node /tmp/program argument",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node -- /tmp/program --eval",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node --no-warnings /tmp/program argument",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node /tmp/program \"${USER}\"",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+            (
+                "require('fs').rmSync('/home/user', {recursive: true});",
+                "node -- /tmp/program *.txt",
+                "heredoc.javascript:fs_rmsync.catastrophic",
+            ),
+        ] {
+            for writer in [
+                "tee /tmp/program <<'EOF' >/dev/null",
+                "cat >/tmp/program <<'EOF'",
+            ] {
+                let command = format!("{writer}\n{body}\nEOF\n{consumer}");
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(
+                    decision, "deny",
+                    "script arguments cannot hide source: {command:?}"
+                );
+                assert_eq!(
+                    rule, expected_rule,
+                    "typed safety check required: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn written_script_arguments_preserve_safe_programs_and_document_data() {
+        for command in [
+            "tee /tmp/program <<'EOF' >/dev/null\nprint('hello')\nEOF\npython3 -I /tmp/program argument",
+            "cat >/tmp/program <<'EOF'\nprint('hello')\nEOF\npython3 -- /tmp/program --argument",
+            "tee /tmp/program <<'EOF' >/dev/null\nconsole.log('hello');\nEOF\nnode -- /tmp/program argument",
+            "tee /tmp/program <<'EOF' >/dev/null\nconsole.log('hello');\nEOF\nnode --no-warnings /tmp/program argument",
+            "tee /tmp/program <<'EOF' >/dev/null\nprint('hello')\nEOF\npython3 /tmp/program \"$USER\"",
+            "tee /tmp/program <<'EOF' >/dev/null\nconsole.log('hello');\nEOF\nnode /tmp/program \"$@\"",
+            "tee /tmp/program <<'EOF' >/dev/null\nimport shutil\nshutil.rmtree('/home/user')\nEOF\ncat /tmp/program",
+            "tee /tmp/program <<'EOF' >/dev/null\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF\nwc -l /tmp/program",
+            "tee /tmp/program <<'EOF' >/dev/null\nimport shutil\nshutil.rmtree('/home/user')\nEOF\npython3 -c 'print(1)' /tmp/program \"$USER\"",
+            "tee /tmp/program <<'EOF' >/dev/null\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF\nnode -e 'console.log(1)' /tmp/program \"$USER\"",
+        ] {
+            let (decision, rule) = hook_decision(command);
+            assert_eq!(decision, "allow", "{command:?}: {rule}");
+        }
+    }
+
+    #[test]
+    fn written_script_arguments_keep_executed_substitutions_visible() {
+        for (body, consumer) in [
+            (
+                "print('hello')",
+                "python3 /tmp/program \"$(git reset --hard)\"",
+            ),
+            (
+                "console.log('hello');",
+                "node -- /tmp/program \"$(git reset --hard)\"",
+            ),
+        ] {
+            let command = format!("tee /tmp/program <<'EOF' >/dev/null\n{body}\nEOF\n{consumer}");
+            let (decision, rule) = hook_decision(&command);
+            assert_eq!(decision, "deny", "{command:?}: {rule}");
+            assert_eq!(rule, "core.git:reset-hard", "{command:?}");
+        }
+    }
+
+    #[test]
+    fn written_script_arguments_keep_print_and_execution_roles_distinct() {
+        for consumer in [
+            "node /tmp/program.js argument",
+            "node --no-warnings -- /tmp/program.js argument",
+            "node /tmp/program.js \"$USER\"",
+        ] {
+            for (body, expected) in [
+                ("console.log('git reset --hard');", "allow"),
+                (
+                    "require('child_process').execSync('git reset --hard');",
+                    "deny",
+                ),
+                (
+                    "console.log('git reset --hard');\nrequire('fs').rmSync('/home/user', {recursive: true});",
+                    "deny",
+                ),
+            ] {
+                let command =
+                    format!("tee /tmp/program.js <<'EOF' >/dev/null\n{body}\nEOF\n{consumer}");
+                let (decision, rule) = hook_decision(&command);
+                assert_eq!(decision, expected, "{command:?}: {rule}");
+            }
+        }
+    }
+
+    #[test]
     fn issue_540_literal_tee_output_paths_keep_their_interpreter_identity() {
         for (writer, consumer) in [
             ("tee /tmp/program.py <<'PY'", "python3 /tmp/program.py"),

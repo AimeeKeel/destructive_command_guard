@@ -3874,6 +3874,7 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
         .as_bytes()
         .iter()
         .any(|b| matches!(b, b'\'' | b'"' | b'\\' | b'<' | b'>'))
+        || (dialect == ShellDialect::PowerShell && command.contains('`'))
         || command.to_ascii_lowercase().contains(".exe");
 
     if !needs_normalization {
@@ -3900,12 +3901,21 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
     let mut segment_has_cmd = false;
     let mut current_cmd_word: Option<String> = None;
     let mut wrapper: NormalizeWrapper = NormalizeWrapper::None;
+    // Some(false): dcg's global prefix; Some(true): the same prefix after
+    // `allowlist`. Stop at a real subcommand, unknown option or shell stop-
+    // parsing marker, so argument data cannot become command syntax.
+    let mut dcg_global_prefix: Option<bool> = None;
+    let mut dcg_agent_value = false;
+    let mut dcg_decoder = ShellTokenDecoder::new(dialect);
 
     for tok in &tokens {
         if tok.kind == NormalizeTokenKind::Separator {
             segment_has_cmd = false;
             current_cmd_word = None;
             wrapper = NormalizeWrapper::None;
+            dcg_global_prefix = None;
+            dcg_agent_value = false;
+            dcg_decoder = ShellTokenDecoder::new(dialect);
             continue;
         }
 
@@ -3915,6 +3925,49 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
         };
 
         if segment_has_cmd {
+            if let Some(after_allowlist) = dcg_global_prefix {
+                if let Some(decoded) = dcg_decoder.decode(token_text, ShellTokenRole::Syntax) {
+                    let word = decoded.as_ref();
+                    let may_replace = if std::mem::take(&mut dcg_agent_value) {
+                        // --agent consumes exactly one argv word. Decode an
+                        // ordinary name, but preserve spaces, paths, runtime
+                        // expansions and metacharacters as opaque data.
+                        Some(looks_like_subcommand_word(word))
+                    } else if word == "--agent" {
+                        dcg_agent_value = true;
+                        Some(true)
+                    } else if let Some(value) = word.strip_prefix("--agent=") {
+                        Some(value.is_empty() || looks_like_subcommand_word(value))
+                    } else if matches!(
+                        word,
+                        "--robot"
+                            | "--verbose"
+                            | "--quiet"
+                            | "--legacy-output"
+                            | "--no-color"
+                            | "--no-suggestions"
+                            | "-q"
+                    ) || word
+                        .strip_prefix('-')
+                        .is_some_and(|flags| !flags.is_empty() && flags.bytes().all(|b| b == b'v'))
+                    {
+                        Some(true)
+                    } else if word == "allowlist" && !after_allowlist {
+                        dcg_global_prefix = Some(true);
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    if let Some(may_replace) = may_replace {
+                        if may_replace && word != token_text {
+                            replacements.push((tok.byte_range.clone(), decoded.into_owned()));
+                        }
+                        continue;
+                    }
+                }
+                dcg_global_prefix = None;
+            }
+
             // Check if we should skip dequoting for this command
             if let Some(cmd) = &current_cmd_word {
                 if crate::context::SAFE_STRING_REGISTRY.is_all_args_data(cmd) {
@@ -3975,6 +4028,14 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
         let replacement = normalize_command_word_token_in_dialect(current, dialect);
         // Track the normalized command word for safe registry checks
         current_cmd_word = Some(replacement.clone().unwrap_or_else(|| current.to_string()));
+        if matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell)
+            && current_cmd_word.as_deref().is_some_and(|word| {
+                let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+                name.eq_ignore_ascii_case("dcg") || name.eq_ignore_ascii_case("dcg.exe")
+            })
+        {
+            dcg_global_prefix = Some(false);
+        }
 
         if let Some(repl) = replacement {
             replacements.push((tok.byte_range.clone(), repl));
@@ -5852,6 +5913,76 @@ mod tests {
         assert_eq!(
             dequote_segment_command_words(r#"git "reset" --hard"#).as_ref(),
             "git reset --hard"
+        );
+    }
+
+    #[test]
+    fn dcg_global_option_syntax_is_decoded_without_promoting_agent_data() {
+        for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+            for (command, expected) in [
+                (
+                    "dcg --a'gent'=codex --ro'bot' uninstall",
+                    "dcg --agent=codex --robot uninstall",
+                ),
+                (
+                    "dcg --agent co'dex' --robot uninstall",
+                    "dcg --agent codex --robot uninstall",
+                ),
+                (
+                    "dcg allowlist --a'gent'=codex --no'-color' add rule",
+                    "dcg allowlist --agent=codex --no-color add rule",
+                ),
+                (
+                    "dcg --a'gent'= --robot uninstall",
+                    "dcg --agent= --robot uninstall",
+                ),
+                (
+                    "dcg '--agent=codex' --robot uninstall",
+                    "dcg --agent=codex --robot uninstall",
+                ),
+            ] {
+                assert_eq!(
+                    normalize_command_in_dialect(command, dialect),
+                    expected,
+                    "{dialect:?}: {command}"
+                );
+            }
+            for command in [
+                "dcg --agent='dcg --robot uninstall' doctor",
+                "dcg --agent 'dcg --robot uninstall' doctor",
+                "dcg --a'gent'='two words' doctor",
+                "dcg --agent='$profile' doctor",
+                "dcg --agent '/tmp/profile' doctor",
+                "dcg --agent 'codex; rm -rf /' doctor",
+                "dcg --agent 'co`dex' doctor",
+                "dcg test --a'gent'=codex",
+                "dcg --unknown-option --a'gent'=codex uninstall",
+                "dcg -- --a'gent'=codex uninstall",
+                "other --a'gent'=codex --robot uninstall",
+                "printf '%s' \"dcg --a'gent'=codex --robot uninstall\"",
+            ] {
+                assert_eq!(
+                    normalize_command_in_dialect(command, dialect),
+                    command,
+                    "opaque arguments retain their structure: {dialect:?}: {command}"
+                );
+            }
+        }
+        assert_eq!(
+            normalize_command_in_dialect(
+                "dcg --a`gent=codex --robot uninstall",
+                ShellDialect::PowerShell,
+            ),
+            "dcg --agent=codex --robot uninstall"
+        );
+        for dialect in [ShellDialect::Cmd, ShellDialect::Unknown] {
+            let command = "dcg --a'gent'=codex --robot uninstall";
+            assert_eq!(normalize_command_in_dialect(command, dialect), command);
+        }
+        let stopped = "dcg --% --a'gent'=codex --robot uninstall";
+        assert_eq!(
+            normalize_command_in_dialect(stopped, ShellDialect::PowerShell),
+            stopped
         );
     }
 

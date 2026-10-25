@@ -10,8 +10,16 @@ use std::process::{Command, Stdio};
 
 /// `(decision, rule id)` from an isolated invocation of the real hook.
 fn hook(command: &str) -> (String, String) {
+    hook_with_environment(command, None, None)
+}
+
+fn hook_with_environment(
+    command: &str,
+    tmpdir: Option<&std::path::Path>,
+    home_override: Option<&std::path::Path>,
+) -> (String, String) {
     let temp = tempfile::tempdir().expect("temp dir");
-    let home = temp.path().join("home");
+    let home = home_override.map_or_else(|| temp.path().join("home"), std::path::Path::to_path_buf);
     std::fs::create_dir_all(&home).expect("home");
     let config = temp.path().join("config.toml");
     std::fs::write(&config, "[history]\nenabled = false\n").expect("config");
@@ -33,6 +41,7 @@ fn hook(command: &str) -> (String, String) {
         .env("LOCALAPPDATA", home.join("localappdata"))
         .env("TEMP", temp.path())
         .env("TMP", temp.path())
+        .env("TMPDIR", tmpdir.unwrap_or(temp.path()))
         .env("DCG_CONFIG", &config)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .env(
@@ -80,6 +89,118 @@ fn assert_denied(command: &str) {
     let (decision, rule) = hook(command);
     assert_eq!(decision, "deny", "must deny {command:?}: {rule}");
     assert!(!rule.is_empty(), "denial needs a rule id: {command:?}");
+}
+
+/// Three leading slashes are a POSIX spelling of the same absolute path, but
+/// are outside the literal `/tmp/` prefix. This gives each Unix test a real,
+/// writable alternate root without requiring a privileged `/data/tmp` fixture.
+#[cfg(unix)]
+fn alternate_tmpdir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempfile::tempdir_in("/tmp").expect("alternate temp root");
+    let spelling = std::path::PathBuf::from(format!("//{}", directory.path().display()));
+    (directory, spelling)
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_tmpdir_extends_only_proven_local_redirect_paths_590() {
+    let (_directory, root) = alternate_tmpdir();
+    let root_text = root.to_str().expect("UTF-8 test path");
+    for command in [
+        format!("S={root_text}/scratchpad; echo hi > $S/a.txt"),
+        format!("S={root_text}/scratchpad && echo hi > $S/a.txt"),
+        format!("for n in 1 2; do echo hi > {root_text}/scratchpad/l$n.txt; done"),
+        format!("S={root_text}/scratchpad; T=\"$S/sub\"; echo hi > \"$T/a.txt\""),
+        format!("echo hi > {root_text}/scratchpad/run-$$.txt"),
+        format!("bash -c 'S={root_text}/scratchpad; echo hi > \"$S/a.txt\"'"),
+        format!("TMPDIR=/etc; S={root_text}/scratchpad; echo hi > \"$S/a.txt\""),
+    ] {
+        let (decision, rule) = hook_with_environment(&command, Some(&root), None);
+        assert_eq!(
+            decision, "allow",
+            "startup root should prove {command:?}: {rule}"
+        );
+        let (decision, rule) = hook(&command);
+        assert_eq!(
+            decision, "deny",
+            "an unconfigured root remains unproven: {command:?}: {rule}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_tmpdir_keeps_unknown_protected_and_nonlocal_targets_denied_590() {
+    let (_directory, root) = alternate_tmpdir();
+    let root_text = root.to_str().expect("UTF-8 test path");
+    for command in [
+        // Startup context supplies a root, never a shell variable value.
+        "echo hi > $TMPDIR/a.txt".to_string(),
+        "TMPDIR=/etc; echo hi > $TMPDIR/passwd".to_string(),
+        format!("S={root_text}/scratchpad; read S; echo hi > $S/a.txt"),
+        format!("false && S={root_text}/scratchpad; echo hi > $S/a.txt"),
+        format!("S={root_text}/scratchpad; echo hi > $S/$UNKNOWN"),
+        format!("S={root_text}; echo hi > $S/../outside.txt"),
+        format!("S={root_text}; echo hi > $S/.git/config"),
+        format!("S={root_text}; echo hi > $S/.ssh/id_rsa"),
+        format!("S={root_text}; echo hi > $S/a.txt > $OTHER"),
+        format!("S={root_text}; echo hi > $S/a.txt; git reset --hard"),
+        format!("S={root_text}-outside; echo hi > $S/a.txt"),
+        format!("S={root_text}; echo hi > $S"),
+        // Recursive removal and mktemp producer rules are not widened.
+        format!("S={root_text}/scratchpad; rm -rf $S"),
+        format!("D=$(mktemp -d -p {root_text}); echo hi > $D/a.txt"),
+        // Local startup context is not evidence about an SSH/container host.
+        format!("ssh host 'S={root_text}/scratchpad; echo hi > \"$S/a.txt\"'"),
+        format!("ssh host 'for n in 1 2; do echo hi > {root_text}/l$n.txt; done'"),
+        format!("ssh host <<'SH'\nS={root_text}/scratchpad; echo hi > \"$S/a.txt\"\nSH"),
+        format!("ssh host <<'SH'\nbash -c 'S={root_text}; echo hi > \"$S/a.txt\"'\nSH"),
+        format!("docker exec container sh -c 'S={root_text}; echo hi > \"$S/a.txt\"'"),
+        format!("chroot /sandbox sh -c 'S={root_text}; echo hi > \"$S/a.txt\"'"),
+        format!("nsenter -t 1 -m sh -c 'S={root_text}; echo hi > \"$S/a.txt\"'"),
+    ] {
+        let (decision, rule) = hook_with_environment(&command, Some(&root), None);
+        assert_eq!(
+            decision, "deny",
+            "must retain review for {command:?}: {rule}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_tmpdir_cannot_reclassify_home_system_or_symlink_roots_590() {
+    let (directory, root) = alternate_tmpdir();
+    let home = directory.path().join("home");
+    std::fs::create_dir(&home).expect("test home");
+    let home_link = directory.path().join("home-link");
+    let system_link = directory.path().join("system-link");
+    std::os::unix::fs::symlink(&home, &home_link).expect("home alias");
+    std::os::unix::fs::symlink("/etc", &system_link).expect("system alias");
+    let home_link_spelling = root.join("home-link");
+    let system_link_spelling = root.join("system-link");
+    let home_spelling = root.join("home");
+    let missing_root = root.join("missing");
+    let regular_file = directory.path().join("regular-file");
+    std::fs::write(&regular_file, "not a directory").expect("file root control");
+    let file_spelling = root.join("regular-file");
+    for tmpdir in [
+        std::path::Path::new("/"),
+        std::path::Path::new("/etc"),
+        &home_spelling,
+        &root,
+        &home_link_spelling,
+        &system_link_spelling,
+        &missing_root,
+        &file_spelling,
+    ] {
+        let command = format!("S={}/scratchpad; echo hi > $S/a.txt", tmpdir.display());
+        let (decision, rule) = hook_with_environment(&command, Some(tmpdir), Some(&home));
+        assert_eq!(
+            decision, "deny",
+            "invalid scratch root {tmpdir:?}: {command:?}: {rule}"
+        );
+    }
 }
 
 #[test]

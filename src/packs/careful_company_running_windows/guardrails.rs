@@ -47,7 +47,23 @@
 
 use crate::destructive_pattern;
 use crate::packs::careful_company_running_windows::shared_safe_patterns;
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
+
+// Match the global options declared by `cli::Cli`, including between an
+// `allowlist` command and its subcommand. Only --agent consumes a value: a
+// subcommand-looking agent name is data, while --robot never consumes the
+// following word. Help/version and arbitrary positional words are not skipped.
+// This grammar adds destructive evidence; it grants no exemption.
+macro_rules! dcg_global_options {
+    () => {
+        concat!(
+            r"(?:(?:--(?:verbose|quiet|legacy-output|no-color|no-suggestions|robot)|-v+|-q)[ \t]+",
+            r#"|--agent=(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'|&;<>]*)[ \t]+"#,
+            r#"|--agent[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'|&;<>]+)[ \t]+)*"#
+        )
+    };
+}
 
 const CONTROL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
@@ -315,12 +331,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             CONTROL_SUGGESTIONS
         ),
         // === dcg and agent configuration ===
-        destructive_pattern!(
-            "dcg-bypass-or-uninstall",
-            r"(?i)\bDCG_BYPASS\b\s*[=:]\s*[\x22']?(?:1|true|yes|y|on)\b|\bsetx?\s+DCG_BYPASS\s+[\x22']?(?:1|true|yes|y|on)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_BYPASS\b[^|&;\r\n]*(?:-value\s+)?[\x22']?(?:1|true|yes|y|on)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_BYPASS[\x22']\s*,\s*[\x22']?(?:1|true|yes|y|on)\b|\bdcg(?:\.exe)?\s+uninstall\b|\buninstall\.ps1\b",
-            "Bypassing or uninstalling dcg removes the guard that is supervising this session.",
-            Critical,
-            "`DCG_BYPASS=1` disables every rule for an invocation and `dcg uninstall` removes the \
+        DestructivePattern {
+            name: Some("dcg-bypass-or-uninstall"),
+            regex: LazyCompiledRegex::new(concat!(
+                r"(?i)\bDCG_BYPASS\b\s*[=:]\s*[\x22']?(?:1|true|yes|y|on)\b|\bsetx?\s+DCG_BYPASS\s+[\x22']?(?:1|true|yes|y|on)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_BYPASS\b[^|&;\r\n]*(?:-value\s+)?[\x22']?(?:1|true|yes|y|on)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_BYPASS[\x22']\s*,\s*[\x22']?(?:1|true|yes|y|on)\b|\bdcg(?:\.exe)?[ \t]+",
+                dcg_global_options!(),
+                r"uninstall\b|\buninstall\.ps1\b"
+            )),
+            reason: "Bypassing or uninstalling dcg removes the guard that is supervising this session.",
+            severity: crate::packs::Severity::Critical,
+            explanation: Some(
+                "`DCG_BYPASS=1` disables every rule for an invocation and `dcg uninstall` removes the \
              hook entirely. The escape hatch exists for a person at a terminal who has decided to \
              accept the risk — an agent reaching for it has removed the only thing checking its \
              work. A *truthy assignment* is required, so reading the variable, setting it to a false \
@@ -329,14 +350,23 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - `dcg explain \"<command>\"` to find out precisely which rule is in the way\n\
              - `dcg allowlist add <ruleId> -r \"<reason>\"` to permit one rule, with the reason recorded\n\
              - Ask the operator to run the command manually if it is genuinely needed",
-            DCG_SUGGESTIONS
-        ),
-        destructive_pattern!(
-            "dcg-policy-self-weakening",
-            r"(?i)\bdcg(?:\.exe)?\s+(?:allowlist\s+(?:add|add-command|import)|allow-once|allow)\b|\bDCG_(?:DISABLE|PACKS|CONFIG)\b\s*[=:]|\bsetx?\s+DCG_(?:DISABLE|PACKS|CONFIG)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_(?:DISABLE|PACKS|CONFIG)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_(?:DISABLE|PACKS|CONFIG)[\x22']\s*,|\bDCG_POLICY_DEFAULT_MODE\b\s*[=:]\s*[\x22']?(?:log|warn)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_POLICY_DEFAULT_MODE\b[^|&;\r\n]*[\x22']?(?:log|warn)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_POLICY_DEFAULT_MODE[\x22']\s*,\s*[\x22'](?:log|warn)\b|\bDCG_POLICY_OBSERVE_UNTIL\b\s*[=:]\s*\S|\bset-item\b[^|&;\r\n]*\benv:DCG_POLICY_OBSERVE_UNTIL\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_POLICY_OBSERVE_UNTIL[\x22']\s*,|\bDCG_HEREDOC_ENABLED\b\s*[=:]\s*[\x22']?(?:false|0|off|no)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_HEREDOC_ENABLED\b[^|&;\r\n]*[\x22']?(?:false|0|off|no)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_HEREDOC_ENABLED[\x22']\s*,\s*[\x22']?(?:false|0|off|no)\b",
-            "Granting an allowlist exception or overriding pack/policy config lets the agent clear its own path.",
-            Critical,
-            "`dcg allowlist add` and `dcg allow-once` grant permission for a rule or command, and the \
+            ),
+            suggestions: DCG_SUGGESTIONS,
+            executables: None,
+        },
+        DestructivePattern {
+            name: Some("dcg-policy-self-weakening"),
+            regex: LazyCompiledRegex::new(concat!(
+                r"(?i)\bdcg(?:\.exe)?[ \t]+",
+                dcg_global_options!(),
+                r"(?:allowlist[ \t]+",
+                dcg_global_options!(),
+                r"(?:add|add-command|import)|allow-once|allow)\b|\bDCG_(?:DISABLE|PACKS|CONFIG)\b\s*[=:]|\bsetx?\s+DCG_(?:DISABLE|PACKS|CONFIG)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_(?:DISABLE|PACKS|CONFIG)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_(?:DISABLE|PACKS|CONFIG)[\x22']\s*,|\bDCG_POLICY_DEFAULT_MODE\b\s*[=:]\s*[\x22']?(?:log|warn)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_POLICY_DEFAULT_MODE\b[^|&;\r\n]*[\x22']?(?:log|warn)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_POLICY_DEFAULT_MODE[\x22']\s*,\s*[\x22'](?:log|warn)\b|\bDCG_POLICY_OBSERVE_UNTIL\b\s*[=:]\s*\S|\bset-item\b[^|&;\r\n]*\benv:DCG_POLICY_OBSERVE_UNTIL\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_POLICY_OBSERVE_UNTIL[\x22']\s*,|\bDCG_HEREDOC_ENABLED\b\s*[=:]\s*[\x22']?(?:false|0|off|no)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_HEREDOC_ENABLED\b[^|&;\r\n]*[\x22']?(?:false|0|off|no)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_HEREDOC_ENABLED[\x22']\s*,\s*[\x22']?(?:false|0|off|no)\b"
+            )),
+            reason: "Granting an allowlist exception or overriding pack/policy config lets the agent clear its own path.",
+            severity: crate::packs::Severity::Critical,
+            explanation: Some(
+                "`dcg allowlist add` and `dcg allow-once` grant permission for a rule or command, and the \
              runtime environment overrides weaken enforcement wholesale: `DCG_PACKS` *replaces* the \
              enabled list (so it silently drops this preset), `DCG_DISABLE` removes packs, \
              `DCG_CONFIG` swaps the config file, `DCG_POLICY_DEFAULT_MODE=warn|log` and \
@@ -350,8 +380,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - `dcg explain \"<command>\"` and `dcg allowlist list` remain available for diagnosis\n\
              - Report which rule is in the way and let the operator run `dcg allowlist add` with a \
              recorded reason",
-            DCG_SUGGESTIONS
-        ),
+            ),
+            suggestions: DCG_SUGGESTIONS,
+            executables: None,
+        },
         // Delete/rewrite/move verbs tamper no matter where the config path
         // appears (moving or renaming the live file away removes the hook
         // just as surely as deleting it). The COPY family is deliberately
@@ -639,6 +671,67 @@ mod tests {
         ];
         for (command, expected) in checks {
             assert_blocks_reachably(&pack, command, expected);
+        }
+    }
+
+    #[test]
+    fn global_options_do_not_hide_dcg_self_weakening() {
+        use clap::Parser;
+
+        let pack = create_pack();
+        for (command, expected) in [
+            ("dcg --robot uninstall", "dcg-bypass-or-uninstall"),
+            ("dcg -vv --no-color uninstall", "dcg-bypass-or-uninstall"),
+            (
+                "dcg -q --legacy-output uninstall",
+                "dcg-bypass-or-uninstall",
+            ),
+            ("dcg --agent codex uninstall", "dcg-bypass-or-uninstall"),
+            ("dcg --agent= --robot uninstall", "dcg-bypass-or-uninstall"),
+            (
+                "dcg --agent=codex --robot allow-once abc123 --yes",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg --agent test allow-once abc123 --yes",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg --no-suggestions --verbose allow core.git:reset-hard --reason reviewed",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg --robot allowlist --agent codex add core.git:reset-hard --reason reviewed",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg allowlist --quiet add-command 'rm -rf dist' --reason reviewed",
+                "dcg-policy-self-weakening",
+            ),
+        ] {
+            // Parse only: never run an uninstall or grant an exception. This
+            // ties the option positions to the real CLI, not a regex fixture.
+            let parsed = crate::cli::Cli::try_parse_from(shell_words::split(command).unwrap());
+            assert!(parsed.is_ok(), "valid CLI input {command:?}: {parsed:?}");
+            assert_blocks_reachably(&pack, command, expected);
+        }
+    }
+
+    #[test]
+    fn agent_option_values_are_not_dcg_subcommands() {
+        use clap::Parser;
+
+        let pack = create_pack();
+        for command in [
+            "dcg --agent uninstall doctor",
+            "dcg --agent allow-once --robot allowlist list",
+            "dcg --agent='allowlist add' doctor",
+            "dcg allowlist --agent add list",
+            "dcg --robot allowlist --quiet remove core.git:reset-hard",
+        ] {
+            let parsed = crate::cli::Cli::try_parse_from(shell_words::split(command).unwrap());
+            assert!(parsed.is_ok(), "valid CLI input {command:?}: {parsed:?}");
+            assert!(pack.check(command).is_none(), "inspection: {command}");
         }
     }
 

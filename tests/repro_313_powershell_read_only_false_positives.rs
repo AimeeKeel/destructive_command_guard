@@ -62,7 +62,16 @@ fn assert_blocked(command: &str, rule: &str) {
         result.starts_with("Result: BLOCKED") || result.starts_with("Result: REVIEW REQUIRED"),
         "command: {command}\n{full}"
     );
-    assert!(full.contains(rule), "expected {rule} for {command}\n{full}");
+    let separate_fields = rule.split_once(':').is_some_and(|(pack, pattern)| {
+        full.lines().any(|line| line == format!("Pack: {pack}"))
+            && full
+                .lines()
+                .any(|line| line == format!("Pattern: {pattern}"))
+    });
+    assert!(
+        full.contains(rule) || separate_fields,
+        "expected {rule} for {command}\n{full}"
+    );
 }
 
 #[test]
@@ -175,4 +184,217 @@ fn items1_and_2_planted_negatives_recursive_delete_still_denies() {
         "function Clean { Remove-Item -Recurse -Force ./build }",
         "windows.filesystem",
     );
+}
+
+#[test]
+fn global_options_cannot_hide_guardrail_changes() {
+    for command in [
+        "dcg --robot allow-once abc123 --yes",
+        "dcg --agent codex --no-color allow-once abc123 --yes",
+        "dcg --agent test allow-once abc123 --yes",
+        "dcg --agent classify allowlist add core.git:reset-hard --reason reviewed",
+        "dcg --robot allowlist add core.git:reset-hard --reason reviewed",
+        "dcg allowlist --robot add core.git:reset-hard --reason reviewed",
+        "dcg allowlist --agent=codex add-command 'rm -rf dist' --reason reviewed",
+        "dcg --legacy-output -vv allow core.git:reset-hard --reason reviewed",
+        "env dcg --robot allow-once abc123 --yes",
+    ] {
+        assert_blocked(
+            command,
+            "careful_company_running_windows.guardrails:dcg-policy-self-weakening",
+        );
+    }
+    for command in [
+        "dcg --robot uninstall",
+        "dcg -q --no-suggestions uninstall",
+        "dcg --agent 'codex' --no-color uninstall",
+        "dcg --agent= --robot uninstall",
+        "dcg --agent explain uninstall",
+        "dcg --agent='dcg --robot uninstall' --robot uninstall",
+        "dcg --agent='dcg --robot uninstall' doctor; dcg --robot uninstall",
+        "bash -c 'dcg --robot uninstall'",
+        r"C:\tools\dcg.exe --robot uninstall",
+        "git status && dcg --robot uninstall",
+    ] {
+        assert_blocked(
+            command,
+            "careful_company_running_windows.guardrails:dcg-bypass-or-uninstall",
+        );
+    }
+}
+
+#[test]
+fn global_options_preserve_inspection_and_argument_data() {
+    for command in [
+        "dcg --robot allowlist list",
+        "dcg allowlist --agent add list",
+        "dcg --agent uninstall doctor",
+        "dcg --agent='allowlist add' doctor",
+        "dcg --agent='dcg --robot uninstall' doctor",
+        "dcg --agent='dcg --robot allow-once abc --yes' allowlist list",
+        "dcg --robot allowlist remove core.git:reset-hard",
+        "dcg --robot test 'dcg --robot uninstall'",
+        "dcg --no-color explain 'dcg --robot allow-once abc123 --yes'",
+        "dcg --agent codex --robot test 'dcg --robot uninstall'",
+        "printf '%s\\n' 'dcg --robot uninstall'",
+        "echo 'dcg --robot allowlist add core.git:reset-hard --reason reviewed'",
+    ] {
+        assert_allowed(command);
+    }
+}
+
+#[test]
+fn hook_protocol_keeps_guardrails_active_with_global_options() {
+    use std::io::Write;
+
+    // The strings are hook input only; no uninstall or exception grant runs.
+    let temp = tempfile::tempdir().expect("isolated hook test");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("isolated home");
+    let config = temp.path().join("config.toml");
+    std::fs::write(&config, "[history]\nenabled = false\n").expect("hook config");
+    for tool_name in ["Bash", "PowerShell", "cmd"] {
+        let cases: &[(&str, Option<&str>)] = if tool_name == "cmd" {
+            &[
+                (
+                    "echo 'data & dcg --robot uninstall & data'",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                ("echo \"data & dcg --robot uninstall & data\"", None),
+            ]
+        } else {
+            &[
+                (
+                    "dcg --robot allow-once abc123 --yes",
+                    Some("dcg-policy-self-weakening"),
+                ),
+                (
+                    "dcg --agent test allow-once abc123 --yes",
+                    Some("dcg-policy-self-weakening"),
+                ),
+                (
+                    "dcg --agent 'test' --robot allow-once abc123 --yes",
+                    Some("dcg-policy-self-weakening"),
+                ),
+                (
+                    "dcg --agent explain uninstall",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --agent co'dex' --robot uninstall",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --a'gent'=codex --robot uninstall",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --agent= --robot uninstall",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --agent='dcg --robot uninstall' --robot uninstall",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --agent='dcg --robot uninstall' doctor; dcg --robot uninstall",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "bash -c 'dcg --robot uninstall'",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                ("dcg --agent uninstall doctor", None),
+                ("dcg --agent='allowlist add' doctor", None),
+                ("dcg --agent='dcg --robot uninstall' doctor", None),
+                (
+                    "dcg --agent='dcg --robot allow-once abc --yes' allowlist list",
+                    None,
+                ),
+                ("dcg --robot test 'dcg --robot uninstall'", None),
+                (
+                    "dcg --agent codex --no-color explain 'dcg --robot allow-once abc123 --yes'",
+                    None,
+                ),
+            ]
+        };
+        for &(command, expected_rule) in cases {
+            let mut child = Command::new(dcg_binary())
+                .env_clear()
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("APPDATA", home.join("appdata"))
+                .env("LOCALAPPDATA", home.join("localappdata"))
+                .env("TEMP", temp.path())
+                .env("TMP", temp.path())
+                .env("TMPDIR", temp.path())
+                .env("DCG_CONFIG", &config)
+                .env("DCG_PACKS", PACKS)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env(
+                    "DCG_PENDING_EXCEPTIONS_PATH",
+                    temp.path().join("pending.jsonl"),
+                )
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                .env("DCG_AST_TIMEOUT_MS", "5000")
+                .current_dir(temp.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start dcg hook");
+            let payload = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_name,
+                "tool_input": {"command": command},
+            });
+            child
+                .stdin
+                .take()
+                .expect("hook stdin")
+                .write_all(payload.to_string().as_bytes())
+                .expect("write hook input");
+            let output = child.wait_with_output().expect("hook result");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{tool_name} {command:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if let Some(rule) = expected_rule {
+                let result: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("structured hook denial");
+                let decision = &result["hookSpecificOutput"];
+                assert_eq!(decision["hookEventName"], "PreToolUse");
+                assert_eq!(
+                    decision["permissionDecision"], "deny",
+                    "{tool_name}: {command}"
+                );
+                // The Bash adapter provides ruleId; the PowerShell adapter
+                // currently carries the same rule in its decision reason.
+                let reported_rule = decision["ruleId"].as_str().or_else(|| {
+                    decision["permissionDecisionReason"]
+                        .as_str()?
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Rule: "))
+                });
+                let expected_rule = format!("careful_company_running_windows.guardrails:{rule}");
+                assert_eq!(
+                    reported_rule,
+                    Some(expected_rule.as_str()),
+                    "{tool_name}: {command}"
+                );
+            } else {
+                assert!(
+                    output.stdout.is_empty(),
+                    "{tool_name} {command:?}: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+        }
+    }
 }

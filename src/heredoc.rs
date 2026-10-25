@@ -1529,6 +1529,20 @@ pub struct ExtractedContent {
     /// The command that receives this heredoc (e.g., "cat", "bash").
     /// Used to determine if content should be evaluated as executable.
     pub target_command: Option<String>,
+    /// An additional, proven interpreter that executes a written file with
+    /// script arguments. Language-aware safety checks use this receiver;
+    /// raw-shell quote classification keeps `target_command`'s original
+    /// provenance. This evidence cannot grant a literal-data exemption.
+    pub additional_execution_target: Option<String>,
+}
+
+impl ExtractedContent {
+    /// The receiving program for additive language-aware safety checks.
+    pub(crate) fn execution_target(&self) -> Option<&str> {
+        self.additional_execution_target
+            .as_deref()
+            .or(self.target_command.as_deref())
+    }
 }
 
 /// Reason why extraction was skipped (for observability/logging).
@@ -2759,6 +2773,7 @@ fn extract_inline_scripts(
                 quoted: true, // -c/-e content is always in quotes
                 heredoc_type: None,
                 target_command: Some(cmd_name.to_string()), // -c/-e content is executed by the interpreter
+                additional_execution_target: None,
             });
         }
     };
@@ -3116,6 +3131,7 @@ fn push_windows_inner(
         quoted: true,
         heredoc_type: None,
         target_command: Some(target.to_string()),
+        additional_execution_target: None,
     });
     true
 }
@@ -4222,6 +4238,7 @@ fn extract_deno_eval_inline_scripts(
             quoted: true,
             heredoc_type: None,
             target_command: Some("deno".to_string()),
+            additional_execution_target: None,
         });
     }
 }
@@ -7637,6 +7654,7 @@ fn extract_herestrings(
                 quoted: is_quoted,
                 heredoc_type: Some(HeredocType::HereString),
                 target_command: target_cmd,
+                additional_execution_target: None,
             });
         }
     };
@@ -7811,7 +7829,14 @@ fn extract_heredocs(
 
     let mut hit_limit = false;
     let mut foreign_body_ranges = None;
-    let written_source = written_heredoc_interpreter(command);
+    // A script's argv does not stop the file from being executable source.
+    // This wider identity is for additive language analysis only; proofs
+    // that exempt literal data still require the isolated invocation below.
+    let written_source = written_heredoc_interpreter(command)
+        .map(|source| (source, false))
+        .or_else(|| {
+            written_heredoc_interpreter_with_argv(command, true).map(|source| (source, true))
+        });
     for cap in HEREDOC_EXTRACTOR.captures_iter(command) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
@@ -7923,16 +7948,23 @@ fn extract_heredocs(
                 // executable source, not a data-only cat body (#519). Bind
                 // the language to this exact operator and body, so the AST
                 // and synchronous sink backstops inspect the written bytes.
-                let target_cmd = if let Some(source) = written_source.as_ref().filter(|source| {
+                let mut target_cmd = extract_heredoc_target_command(command, full_match.start());
+                let mut additional_execution_target = None;
+                if let Some((source, additional)) = written_source.as_ref().filter(|(source, _)| {
                     quoted
                         && source.operator_start == full_match.start()
                         && source.body == (body_start_abs..body_end_abs)
                 }) {
                     language = source.language;
-                    Some(source.interpreter.clone())
-                } else {
-                    extract_heredoc_target_command(command, full_match.start())
-                };
+                    if *additional {
+                        // An additive source identity must not turn a print
+                        // literal into raw shell code merely by changing its
+                        // receiver from tee/cat to node/python.
+                        additional_execution_target = Some(source.interpreter.clone());
+                    } else {
+                        target_cmd = Some(source.interpreter.clone());
+                    }
+                }
                 extracted.push(ExtractedContent {
                     content,
                     language,
@@ -7943,6 +7975,7 @@ fn extract_heredocs(
                     quoted,
                     heredoc_type: Some(heredoc_type),
                     target_command: target_cmd,
+                    additional_execution_target,
                 });
             }
             Err(reason) => {
@@ -9739,6 +9772,16 @@ pub(crate) fn written_javascript_arrow_offsets(command: &str) -> Vec<usize> {
 /// proof. In particular a later `bash file` must not borrow an earlier
 /// `node file` classification merely because the filename matches.
 fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterpreter> {
+    written_heredoc_interpreter_with_argv(command, false)
+}
+
+/// Additional argv is useful evidence that a written file executes, but it
+/// must not broaden the literal-data exemptions that rely on an isolated
+/// interpreter invocation. Only extraction requests this wider proof.
+fn written_heredoc_interpreter_with_argv(
+    command: &str,
+    allow_script_arguments: bool,
+) -> Option<WrittenHeredocInterpreter> {
     if !command.contains("<<") || command.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
         return None;
     }
@@ -9812,8 +9855,13 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
     if !chained && chained_consumer.is_some() {
         return None;
     }
-    if consumer.kind().as_ref() != "command"
-        || consumer
+    if consumer.kind().as_ref() != "command" {
+        return None;
+    }
+    let words = if allow_script_arguments {
+        literal_script_consumer_prefix(&consumer)?
+    } else {
+        if consumer
             .children()
             .filter(ast_grep_core::Node::is_named)
             .any(|child| {
@@ -9822,12 +9870,18 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
                     "command_name" | "word" | "raw_string" | "string"
                 )
             })
-    {
-        return None;
-    }
-    let words = literal_script_words(&consumer)?;
-    let [program, path] = words.as_slice() else {
-        return None;
+        {
+            return None;
+        }
+        literal_script_words(&consumer)?
+    };
+    let (program, path) = if allow_script_arguments {
+        literal_interpreter_script_operand(&words)?
+    } else {
+        let [program, path] = words.as_slice() else {
+            return None;
+        };
+        (program.as_str(), path.as_str())
     };
     let interpreter = program.rsplit('/').next()?;
     let language = ScriptLanguage::from_command(interpreter);
@@ -9837,7 +9891,7 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
     if chained && supported_shell {
         return None;
     }
-    if !destinations.contains(path)
+    if !destinations.iter().any(|destination| destination == path)
         // Every output must leave the interpreter's normal contract intact,
         // including tee outputs that the consumer does not read. Comparing
         // basenames also covers an absolute output followed by a PATH lookup.
@@ -9866,6 +9920,111 @@ fn written_heredoc_interpreter(command: &str) -> Option<WrittenHeredocInterprete
         interpreter: interpreter.to_string(),
         language,
     })
+}
+
+/// Recover only the literal interpreter/options/file prefix for additive
+/// checks. Once Python or Node reaches a file operand, `$1`, `"$@"`, globs
+/// and other script arguments cannot become interpreter options. They remain
+/// visible to the outer shell checks, including any substitutions that may
+/// mutate the file, and never earn the strict literal-data exemption.
+fn literal_script_consumer_prefix<D: ast_grep_core::Doc>(
+    consumer: &ast_grep_core::Node<'_, D>,
+) -> Option<Vec<String>> {
+    if consumer.children().any(|child| {
+        matches!(
+            child.kind().as_ref(),
+            "variable_assignment" | "file_redirect" | "heredoc_redirect" | "herestring_redirect"
+        )
+    }) {
+        return None;
+    }
+    let program = consumer.field("name")?;
+    if program.kind().as_ref() != "command_name" {
+        return None;
+    }
+    let mut words = literal_script_words(&program)?;
+    let [name] = words.as_slice() else {
+        return None;
+    };
+    if !matches!(
+        ScriptLanguage::from_command(name.rsplit('/').next()?),
+        ScriptLanguage::Python | ScriptLanguage::JavaScript
+    ) {
+        // Only these two interpreters opt into additional identities.
+        // Other languages retain the original strict consumer proof.
+        return None;
+    }
+    for argument in consumer
+        .children()
+        .filter(ast_grep_core::Node::is_named)
+        .filter(|child| child.node_id() != program.node_id())
+    {
+        if !matches!(
+            argument.kind().as_ref(),
+            "word" | "raw_string" | "string" | "concatenation"
+        ) {
+            return None;
+        }
+        let decoded = literal_script_words(&argument)?;
+        let [word] = decoded.as_slice() else {
+            return None;
+        };
+        let file_candidate = !word.starts_with('-');
+        words.push(word.clone());
+        if file_candidate {
+            // The option parser still rejects code/module modes and consumed
+            // option values. It runs once, so a long flag prefix stays linear.
+            return Some(words);
+        }
+    }
+    None
+}
+
+/// Locate a real file operand without confusing an option's value, inline
+/// code, a module, stdin, or a REPL with that file. Python and Node stop
+/// parsing interpreter options at their script operand, so later
+/// arguments (including option-looking ones) belong to the script.
+///
+/// Keep the option set explicit: preload hooks and source-transforming flags
+/// do not preserve the written bytes or the interpreter's usual contract.
+/// Unknown options and wrappers retain the existing conservative analysis.
+/// The containing source proof already bounds the complete command's size.
+fn literal_interpreter_script_operand(words: &[String]) -> Option<(&str, &str)> {
+    let (program, arguments) = words.split_first()?;
+    let language = ScriptLanguage::from_command(program.rsplit('/').next()?);
+    if !matches!(
+        language,
+        ScriptLanguage::Python | ScriptLanguage::JavaScript
+    ) {
+        let [path] = arguments else {
+            return None;
+        };
+        return Some((program, path));
+    }
+
+    for (index, argument) in arguments.iter().enumerate() {
+        if argument == "--" {
+            let path = arguments.get(index + 1)?;
+            return is_plain_file_path(path).then_some((program.as_str(), path.as_str()));
+        }
+        if !argument.starts_with('-') {
+            return is_plain_file_path(argument).then_some((program.as_str(), argument.as_str()));
+        }
+        let preserves_source = match language {
+            ScriptLanguage::Python => argument.strip_prefix('-').is_some_and(|flags| {
+                !flags.is_empty() && flags.bytes().all(|flag| b"bBdEIOPqRsSuv".contains(&flag))
+            }),
+            ScriptLanguage::JavaScript => matches!(
+                argument.as_str(),
+                "--no-warnings" | "--trace-warnings" | "--no-deprecation" | "--trace-deprecation"
+            ),
+            _ => false,
+        };
+        if !preserves_source {
+            return None;
+        }
+    }
+    None
 }
 
 fn literal_file_write<'a, D: ast_grep_core::Doc>(
@@ -20232,6 +20391,7 @@ fi"#;
                 content.target_command.as_deref(),
                 Some(proof.interpreter.as_str())
             );
+            assert!(content.additional_execution_target.is_none());
             assert_eq!(
                 content.content,
                 body.strip_suffix('\n').expect("body newline"),
@@ -20389,6 +20549,128 @@ fi"#;
         ] {
             assert!(written_heredoc_interpreter(command).is_none(), "{command}");
             assert!(written_javascript_arrow_offsets(command).is_empty());
+        }
+    }
+
+    #[test]
+    fn written_script_arguments_add_language_checks_without_literal_exemptions() {
+        for (consumer, language) in [
+            ("python3 /tmp/program argument", ScriptLanguage::Python),
+            ("python3 -I /tmp/program", ScriptLanguage::Python),
+            (
+                "python3 -IuB /tmp/program --argument",
+                ScriptLanguage::Python,
+            ),
+            ("python3 -E -s -- /tmp/program -c", ScriptLanguage::Python),
+            ("python3 /tmp/program \"$USER\"", ScriptLanguage::Python),
+            ("python3 -I /tmp/program \"$@\"", ScriptLanguage::Python),
+            ("python3 /tmp/program $1", ScriptLanguage::Python),
+            (
+                "python3 /tmp/program $(printf argument)",
+                ScriptLanguage::Python,
+            ),
+            ("node /tmp/program argument", ScriptLanguage::JavaScript),
+            ("node -- /tmp/program --eval", ScriptLanguage::JavaScript),
+            ("node /tmp/program \"${USER}\"", ScriptLanguage::JavaScript),
+            ("node -- /tmp/program *.txt", ScriptLanguage::JavaScript),
+            (
+                "node --no-warnings /tmp/program",
+                ScriptLanguage::JavaScript,
+            ),
+            (
+                "node --trace-warnings -- /tmp/program argument",
+                ScriptLanguage::JavaScript,
+            ),
+        ] {
+            let body = match language {
+                ScriptLanguage::Python => "import shutil\nshutil.rmtree('/home/user')",
+                ScriptLanguage::JavaScript => {
+                    "require('fs').rmSync('/home/user', {recursive: true});"
+                }
+                _ => unreachable!(),
+            };
+            let command = format!("tee /tmp/program <<'EOF' >/dev/null\n{body}\nEOF\n{consumer}");
+            let proof = written_heredoc_interpreter_with_argv(&command, true)
+                .expect("the literal script operand still executes");
+            assert_eq!(proof.language, language, "{command}");
+            assert_eq!(&command[proof.body.clone()], body);
+            assert!(
+                written_heredoc_interpreter(&command).is_none(),
+                "additional argv cannot establish the isolated-source exemption"
+            );
+            assert!(!range_is_quoted_interpreter_source(
+                &command,
+                &proof.body,
+                language
+            ));
+            let ExtractionResult::Extracted(contents) =
+                extract_content(&command, &ExtractionLimits::structural_scan())
+            else {
+                panic!("complete extraction required: {command}");
+            };
+            let content = contents
+                .iter()
+                .find(|source| source.byte_range.start == proof.operator_start)
+                .expect("the written body reaches typed analysis");
+            assert_eq!(content.language, language, "{command}");
+            assert_eq!(content.content, body, "{command}");
+            assert_eq!(content.target_command.as_deref(), Some("tee"));
+            assert_eq!(
+                content.additional_execution_target.as_deref(),
+                Some(proof.interpreter.as_str())
+            );
+            assert_eq!(content.execution_target(), Some(proof.interpreter.as_str()));
+            assert!(
+                mask_non_executing_heredocs(&command).contains(body),
+                "additional identity cannot mask the original safety evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn written_script_argument_proof_keeps_option_values_and_other_sources_separate() {
+        for consumer in [
+            "python3 -c /tmp/program",
+            "python3 -m /tmp/program",
+            "python3 -W /tmp/program /tmp/program",
+            "python3 -Wignore /tmp/program",
+            "python3 -X /tmp/program /tmp/program",
+            "python3 -Xpresite=example /tmp/program",
+            "python3 -i /tmp/program",
+            "python3 -x /tmp/program",
+            "python3 - /tmp/program",
+            "python3 -- - /tmp/program",
+            "python3 --check-hash-based-pycs /tmp/program",
+            "python3 --unknown /tmp/program",
+            "node -e /tmp/program",
+            "node -p /tmp/program",
+            "node --eval=/tmp/program",
+            "node --print /tmp/program",
+            "node -r /tmp/program /tmp/program",
+            "node --import /tmp/program /tmp/program",
+            "node --interactive /tmp/program",
+            "node --check /tmp/program",
+            "node - /tmp/program",
+            "node -- --eval /tmp/program",
+            "node --unknown /tmp/program",
+            "env python3 /tmp/program argument",
+            "PYTHONPATH=/tmp python3 /tmp/program argument",
+            "$PYTHON /tmp/program \"$USER\"",
+            "python3 $OPTIONS /tmp/program",
+            "python3 -I \"$SCRIPT\" /tmp/program",
+            "python3 /tmp/\"$SCRIPT\" argument",
+            "node \"${OPTIONS}\" /tmp/program",
+            "node -r \"$MODULE\" /tmp/program",
+            "python3 /tmp/other /tmp/program",
+            "node /tmp/other /tmp/program",
+            "node /tmp/program > /tmp/output",
+        ] {
+            let command =
+                format!("tee /tmp/program <<'EOF' >/dev/null\nprint('source')\nEOF\n{consumer}");
+            assert!(
+                written_heredoc_interpreter_with_argv(&command, true).is_none(),
+                "do not borrow source identity from an option value or an ambiguous handoff: {command}"
+            );
         }
     }
 
