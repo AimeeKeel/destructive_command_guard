@@ -1076,9 +1076,12 @@ fn time_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Optio
             index += 2;
             continue;
         }
+        // `-fFORMAT` / `-oFILE` carry their value. Only an option does: a
+        // program word whose second byte is `f` or `o` (`/opt/...`, `sort`)
+        // is the command, and skipping it handed the next word that role.
         if word.starts_with("--format=")
             || word.starts_with("--output=")
-            || word.len() > 2 && matches!(word.as_bytes()[1], b'f' | b'o')
+            || word.len() > 2 && word.starts_with('-') && matches!(word.as_bytes()[1], b'f' | b'o')
             || word.strip_prefix('-').is_some_and(|flags| {
                 !flags.is_empty()
                     && flags
@@ -5403,6 +5406,31 @@ mod tests {
         ] {
             assert!(
                 !strip_wrapper_prefixes(command).was_normalized(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_reads_attached_option_values_only_from_options() {
+        // `-fFORMAT` and `-oFILE` carry their value. A wrapped program whose
+        // second byte is `f` or `o` is still the program: it used to be skipped
+        // as an option, so the word after it became the command. Synthetic
+        // program names.
+        let cases = [
+            ("time zofftool shatter", "zofftool shatter"),
+            ("time -p zofftool shatter", "zofftool shatter"),
+            ("time /opt/bin/frobtool zap", "/opt/bin/frobtool zap"),
+            ("time /fs/frobtool zap", "/fs/frobtool zap"),
+            ("time -o t.txt zofftool shatter", "zofftool shatter"),
+            ("time -ot.txt zofftool shatter", "zofftool shatter"),
+            ("time -f%E zofftool shatter", "zofftool shatter"),
+            ("time --output=t.txt zofftool shatter", "zofftool shatter"),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                strip_wrapper_prefixes(command).normalized,
+                expected,
                 "{command}"
             );
         }

@@ -227,6 +227,11 @@ fn programs_behind_wrappers_and_launchers_select_the_external_pack() {
         ("wrapper left in place", "sudo -p prompt $F zap"),
         ("wrapper left in place", "builtin command $F zap"),
         ("option where the program goes", "time --unmodeled $F zap"),
+        // A program word whose second byte is an option letter of `time`
+        // (`-fFORMAT`, `-oFILE`) is still the program.
+        ("stripped wrapper", "time /opt/bin/frobtool zap"),
+        ("stripped wrapper", "time -o t.txt /fs/frobtool zap"),
+        ("stripped wrapper", "time -f%E /opt/frob''tool zap"),
         ("launcher", "xargs $F zap"),
         ("launcher", "xargs frob''tool zap"),
         ("launcher", "xargs fr\\obtool zap"),
