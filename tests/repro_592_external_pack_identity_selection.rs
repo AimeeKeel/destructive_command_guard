@@ -232,6 +232,12 @@ fn programs_behind_wrappers_and_launchers_select_the_external_pack() {
         ("stripped wrapper", "time /opt/bin/frobtool zap"),
         ("stripped wrapper", "time -o t.txt /fs/frobtool zap"),
         ("stripped wrapper", "time -f%E /opt/frob''tool zap"),
+        // A `timeout` flag cluster ending in `-k`/`-s` is not the duration,
+        // and an option word is not the program behind `chrt`.
+        ("stripped wrapper", "timeout -vk 5 10 $F zap"),
+        ("stripped wrapper", "timeout -fsKILL 10 frob''tool zap"),
+        ("wrapper left in place", "timeout --sig KILL 10 $F zap"),
+        ("wrapper left in place", "chrt -o --fi 0 $F zap"),
         ("launcher", "xargs $F zap"),
         ("launcher", "xargs frob''tool zap"),
         ("launcher", "xargs fr\\obtool zap"),

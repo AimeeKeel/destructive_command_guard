@@ -1249,18 +1249,41 @@ fn timeout_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Op
             index += 1;
             continue;
         }
-        if word.strip_prefix('-').is_some_and(|flags| {
-            !flags.is_empty() && flags.bytes().all(|flag| matches!(flag, b'f' | b'p' | b'v'))
-        }) {
-            index += 1;
+        if let Some(consume_next) = timeout_flag_cluster(&word) {
+            if consume_next {
+                wrapper_word(command, tokens, index + 1)?;
+            }
+            index += 1 + usize::from(consume_next);
             continue;
         }
         break;
     }
-    wrapper_word(command, tokens, index)?;
+    // DURATION is a number with an optional unit, never an option word. Taking
+    // an option this parser does not model (a long-option abbreviation such as
+    // `--sig`, an unknown letter) for the duration made the real duration the
+    // program.
+    if wrapper_word(command, tokens, index)?.starts_with('-') {
+        return None;
+    }
     let command_index = index.checked_add(1)?;
     wrapper_word(command, tokens, command_index)?;
     Some(command_index)
+}
+
+/// A getopt cluster of `timeout` flags: `-f`/`-p`/`-v`, optionally ending in
+/// `-k` or `-s`, whose value is the rest of the word or, when the letter ends
+/// the word, the next word (returned as `Some(true)`). `None` when the word is
+/// not such a cluster.
+fn timeout_flag_cluster(word: &str) -> Option<bool> {
+    let flags = word.strip_prefix('-').filter(|flags| !flags.is_empty())?;
+    for (position, flag) in flags.bytes().enumerate() {
+        match flag {
+            b'f' | b'p' | b'v' => {}
+            b'k' | b's' => return Some(position + 1 == flags.len()),
+            _ => return None,
+        }
+    }
+    Some(false)
 }
 
 fn stdbuf_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
@@ -1387,7 +1410,9 @@ fn chrt_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Optio
         let command_index = index.checked_add(1)?;
         wrapper_word(command, tokens, command_index)?;
         Some(command_index)
-    } else if priority_optional {
+    } else if priority_optional && !first.starts_with('-') {
+        // An option word here is one the loop does not model (such as the
+        // `--fi` abbreviation of `--fifo`), not the program.
         Some(index)
     } else {
         None
@@ -5493,6 +5518,45 @@ mod tests {
                 strip_wrapper_prefixes(command).normalized,
                 expected,
                 "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_and_chrt_never_take_an_option_word_as_the_duration_or_program() {
+        // `timeout` clusters its flags getopt style, and the last letter of a
+        // cluster may be `-k`/`-s`, whose value is the rest of the word or the
+        // next word. Read as the DURATION, such a cluster made the real
+        // duration the program. Synthetic program names.
+        let stripped = [
+            ("timeout -vk 5 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -vk5 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -fs KILL 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -pvsKILL 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -k 5 -v 10 zofftool shatter", "zofftool shatter"),
+            ("timeout -- 10 zofftool shatter", "zofftool shatter"),
+        ];
+        for (command, expected) in stripped {
+            assert_eq!(
+                strip_wrapper_prefixes(command).normalized,
+                expected,
+                "{command}"
+            );
+        }
+        // An option the parser does not model (a long-option abbreviation, an
+        // unknown letter) is never the duration, and a word the priority slot
+        // of `chrt` does not hold is never the program: the wrapper stays.
+        for command in [
+            "timeout --sig KILL 10 zofftool shatter",
+            "timeout -x 10 zofftool shatter",
+            "timeout -vx 10 zofftool shatter",
+            "chrt -o --fi 0 zofftool shatter",
+            "chrt --other -x zofftool shatter",
+        ] {
+            assert!(
+                !strip_wrapper_prefixes(command).was_normalized(),
+                "an option word was read as the duration or program: {command} -> {}",
+                strip_wrapper_prefixes(command).normalized
             );
         }
     }
