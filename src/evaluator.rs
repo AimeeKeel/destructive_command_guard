@@ -5655,11 +5655,16 @@ fn evaluate_windows_launcher_envelopes(
     // A quoted POSIX heredoc that feeds a proven data sink suppresses outer
     // shell expansion. Mask those literal bodies before launcher discovery so
     // text such as `$(rm ...)` cannot be mistaken for dynamic construction of
-    // a Windows shell launcher. Expanding heredocs and executing targets stay
-    // visible, preserving the fail-closed path for real substitutions.
+    // a Windows shell launcher. A quoted body that is a proven non-shell
+    // interpreter's program (`python3 - <<'PY'`) is not shell syntax either:
+    // its own language's analysis and the raw rescan judge it (#560).
+    // Expanding heredocs and executing targets stay visible, preserving the
+    // fail-closed path for real substitutions.
+    let data_view;
     let launcher_source = match outer_dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
-            crate::heredoc::mask_non_expanding_data_heredocs(command)
+            data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref())
         }
         ShellDialect::PowerShell | ShellDialect::Cmd => std::borrow::Cow::Borrowed(command),
     };
@@ -33938,35 +33943,49 @@ fn exec_sink_pack_verdict(
             .min((remaining / 2).max(crate::ast_matcher::protected_scan_budget()))
             .min(remaining);
     }
-    let recovered = match crate::ast_matcher::interpreter_literal_shell_commands(
-        &content.content,
-        content.language,
-        move || {
-            let Some((source, range, decoded_program, language)) = source_identity else {
-                return (!inline).then_some(false);
-            };
-            if let Some(program) = decoded_program {
-                // The complete word, decoded by the extractor's own lexer.
-                // An unresolved (partial or dynamic) word carries no
-                // `word_range` and never reaches this proof.
-                crate::heredoc::decoded_inline_interpreter_source_proof(
-                    &source, &range, &program, language,
-                )
-            } else if inline {
-                // The existing inline extractor can return a partial raw
-                // fragment when shell quotes are escaped. Only extend it
-                // when the extracted bytes are exactly the complete program.
-                // Other consumers revoke the documentation exemption without
-                // suppressing additive checks of that complete source.
-                crate::heredoc::inline_interpreter_source_proof(&source, &range, language)
-            } else {
-                Some(crate::heredoc::range_is_quoted_interpreter_source(
-                    &source, &range, language,
-                ))
-            }
-        },
-        budget,
-    ) {
+    let proof = move || {
+        let Some((source, range, decoded_program, language)) = source_identity else {
+            return (!inline).then_some(false);
+        };
+        if let Some(program) = decoded_program {
+            // The complete word, decoded by the extractor's own lexer.
+            // An unresolved (partial or dynamic) word carries no
+            // `word_range` and never reaches this proof.
+            crate::heredoc::decoded_inline_interpreter_source_proof(
+                &source, &range, &program, language,
+            )
+        } else if inline {
+            // The existing inline extractor can return a partial raw
+            // fragment when shell quotes are escaped. Only extend it
+            // when the extracted bytes are exactly the complete program.
+            // Other consumers revoke the documentation exemption without
+            // suppressing additive checks of that complete source.
+            crate::heredoc::inline_interpreter_source_proof(&source, &range, language)
+        } else {
+            Some(crate::heredoc::range_is_quoted_interpreter_source(
+                &source, &range, language,
+            ))
+        }
+    };
+    // An unquoted heredoc body is expanded by the outer shell first: its
+    // backquotes run then, so its literals are judged whole (#560 narrows
+    // only what a later shell might run).
+    let recovered = if content.heredoc_type.is_some() && !content.quoted {
+        crate::ast_matcher::expanded_interpreter_literal_shell_commands(
+            &content.content,
+            content.language,
+            proof,
+            budget,
+        )
+    } else {
+        crate::ast_matcher::interpreter_literal_shell_commands(
+            &content.content,
+            content.language,
+            proof,
+            budget,
+        )
+    };
+    let recovered = match recovered {
         Ok(commands) => commands,
         Err(error) => {
             tracing::debug!(%error, "interpreter literal analysis did not complete");

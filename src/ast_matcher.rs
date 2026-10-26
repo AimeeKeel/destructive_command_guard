@@ -225,6 +225,26 @@ pub(crate) fn interpreter_literal_shell_commands(
     )
 }
 
+/// [`interpreter_literal_shell_commands`] for a program the outer shell
+/// expands before the interpreter reads it (an unquoted heredoc body). Its
+/// backquotes run at that expansion whatever the program then does with the
+/// string, so no candidate is screened or cut as text only a later shell
+/// might run: every one is judged whole.
+pub(crate) fn expanded_interpreter_literal_shell_commands(
+    code: &str,
+    language: ScriptLanguage,
+    allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
+    budget: Duration,
+) -> Result<Vec<ReconstructedCommand>, MatchError> {
+    source_analysis::interpreter_literal_shell_commands_with_execution_evidence(
+        code,
+        language,
+        allow_documentation_literals,
+        budget,
+        false,
+    )
+}
+
 // Retain the previous two-parse composition only as a differential oracle.
 #[cfg(test)]
 fn literal_recovery_scope(
@@ -243,7 +263,6 @@ fn literal_recovery_scope(
 
 // Independent bounds on this optional screen. Crossing either withholds the
 // screen, leaving the existing source analyzer's hard bounds and errors intact.
-#[cfg(test)]
 const LITERAL_EVIDENCE_MAX_BYTES: usize = 256 * 1024;
 const LITERAL_EVIDENCE_MAX_NODES: usize = 4096;
 
@@ -271,12 +290,54 @@ fn literal_source_has_execution_evidence(code: &str, language: ScriptLanguage) -
     literal_root_has_execution_evidence(&ast.root(), language)
 }
 
+/// Whether a Python or JavaScript program may start a process or evaluate
+/// code at all: an execution API name under any arguments (a closed
+/// `subprocess.run([...])` included), or any shape the evidence screen cannot
+/// read. Other languages, oversized programs and parse failures answer yes.
+///
+/// Used where a program's capability, not its literals, is the question: an
+/// interpreter that reads its program from its own heredoc cannot run what
+/// another heredoc wrote unless that program can execute something (#591).
+pub(crate) fn program_may_execute_code(code: &str, language: ScriptLanguage) -> bool {
+    use ast_grep_core::AstGrep;
+    use ast_grep_language::SupportLang;
+
+    if code.len() > LITERAL_EVIDENCE_MAX_BYTES {
+        return true;
+    }
+    let grammar = match language {
+        ScriptLanguage::Python => SupportLang::Python,
+        ScriptLanguage::JavaScript => SupportLang::JavaScript,
+        _ => return true,
+    };
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
+    let ast = {
+        let _parse = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+        AstGrep::try_new(code, grammar)
+    };
+    let Ok(ast) = ast else {
+        return true;
+    };
+    root_has_execution_evidence(&ast.root(), language, false)
+}
+
 /// Inspect the recovery worker's tree; do not derive a new source exemption.
 /// A negative answer still requires the caller's independent outer-consumer
 /// proof. All original node, syntax, callee and identifier checks remain here.
 fn literal_root_has_execution_evidence<D: ast_grep_core::Doc>(
     root: &ast_grep_core::Node<'_, D>,
     language: ScriptLanguage,
+) -> bool {
+    root_has_execution_evidence(root, language, true)
+}
+
+/// The evidence scan. `exempt_closed_calls` lets a [`closed_process_call`]
+/// pass, which is right when the question is whether some *other* literal
+/// may run, and wrong when it is whether the program can run anything.
+fn root_has_execution_evidence<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+    exempt_closed_calls: bool,
 ) -> bool {
     for (index, node) in root.dfs().enumerate() {
         if index >= LITERAL_EVIDENCE_MAX_NODES || node.is_error() || node.is_missing() {
@@ -323,13 +384,221 @@ fn literal_root_has_execution_evidence<D: ast_grep_core::Doc>(
             if !name.is_ascii()
                 || name.contains('\\')
                 || name.starts_with("__")
-                || literal_execution_name(name.as_ref())
+                || (literal_execution_name(name.as_ref())
+                    && !(exempt_closed_calls
+                        && closed_process_call(&node, name.as_ref(), language)))
             {
                 return true;
             }
         }
     }
     false
+}
+
+/// Whether `name_node` names the callee of a process call that no string
+/// with shell substitution syntax can reach: `subprocess.run(['git', 'show',
+/// 'origin/main:f'], capture_output=True)`, `re.compile(r'\s+$')` (#560).
+///
+/// The callee is a process API ([`closed_process_call_name`]) under a plain
+/// dotted name, and every argument is a literal (a string, number, boolean
+/// or `None`, or a list, tuple or keyword argument of those) whose value
+/// holds no backquote and no `$(`. No other value of the program can reach
+/// such a call, and the named-sink scanners judge its own arguments, so it
+/// is no evidence that some other literal runs. A reference that is not a
+/// call (`f = os.system`), a computed receiver, a variable or a call among
+/// the arguments, and code evaluation or reflection under any arguments all
+/// remain evidence.
+fn closed_process_call<D: ast_grep_core::Doc>(
+    name_node: &ast_grep_core::Node<'_, D>,
+    name: &str,
+    language: ScriptLanguage,
+) -> bool {
+    let Some(parent) = name_node.parent() else {
+        return false;
+    };
+    let (callee, attribute_form) = match parent.kind().as_ref() {
+        "call" | "call_expression" => (name_node.clone(), false),
+        "attribute" | "member_expression" => {
+            let terminal = match language {
+                ScriptLanguage::Python => parent.field("attribute"),
+                _ => parent.field("property"),
+            };
+            if terminal.is_none_or(|terminal| terminal.range() != name_node.range())
+                || parent
+                    .field("object")
+                    .is_none_or(|object| !plain_dotted_name(&object, 0))
+            {
+                return false;
+            }
+            (parent, true)
+        }
+        _ => return false,
+    };
+    let Some(call) = callee.parent() else {
+        return false;
+    };
+    let Some(arguments) = call.field("arguments") else {
+        return false;
+    };
+    let closed = closed_process_call_name(name, attribute_form)
+        && matches!(call.kind().as_ref(), "call" | "call_expression")
+        && call
+            .field("function")
+            .is_some_and(|function| function.range() == callee.range())
+        && matches!(arguments.kind().as_ref(), "argument_list" | "arguments")
+        && arguments
+            .children()
+            .filter(|argument| argument.is_named() && argument.kind().as_ref() != "comment")
+            .all(|argument| closed_literal_argument(&argument, language, 0));
+    if !closed {
+        return false;
+    }
+    // `re.compile(…)` builds a pattern and `fork()` copies this program; any
+    // other call runs a command line, which must not be one that can run a
+    // file this program may have written (`['sh', 'm.sh']`, `'./gen'`).
+    (attribute_form && name == "compile")
+        || matches!(name, "fork" | "forkpty")
+        || closed_call_command_line(&arguments, language)
+            .is_some_and(|line| !crate::heredoc::shell_text_may_run_generated_code(&line))
+}
+
+/// The command line a [`closed_process_call`] runs, as shell text: string
+/// arguments as written (a command string), list items as quoted words
+/// (`['git', 'show', 'x']`), in argument order, from the positional arguments
+/// and Python's `args=`. Under a `shell=` keyword a list's items are joined
+/// as written, since its first item is a command string. `None` when there
+/// is none, or when an `executable=` keyword names the program separately.
+fn closed_call_command_line<D: ast_grep_core::Doc>(
+    arguments: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> Option<String> {
+    fn word<D: ast_grep_core::Doc>(
+        node: &ast_grep_core::Node<'_, D>,
+        language: ScriptLanguage,
+    ) -> Option<String> {
+        match node.kind().as_ref() {
+            "string" | "template_string" | "concatenated_string" => {
+                source_analysis::static_interpreter_literal(node, language, 0)
+            }
+            "integer" | "float" | "number" => Some(node.text().to_string()),
+            _ => None,
+        }
+    }
+    let through_shell = arguments.children().any(|argument| {
+        argument.kind().as_ref() == "keyword_argument"
+            && argument
+                .field("name")
+                .is_some_and(|keyword| keyword.text().as_ref() == "shell")
+    });
+    let mut parts: Vec<String> = Vec::new();
+    for argument in arguments
+        .children()
+        .filter(|argument| argument.is_named() && argument.kind().as_ref() != "comment")
+    {
+        let value = match argument.kind().as_ref() {
+            "keyword_argument" => {
+                let keyword = argument.field("name")?;
+                match keyword.text().as_ref() {
+                    "executable" => return None,
+                    "args" => argument.field("value")?,
+                    _ => continue,
+                }
+            }
+            _ => argument,
+        };
+        match value.kind().as_ref() {
+            "list" | "tuple" | "array" => {
+                let words: Option<Vec<String>> = value
+                    .children()
+                    .filter(|item| item.is_named() && item.kind().as_ref() != "comment")
+                    .map(|item| word(&item, language))
+                    .collect();
+                let words = words?;
+                parts.push(if through_shell {
+                    words.join(" ")
+                } else {
+                    shell_words::join(words)
+                });
+            }
+            _ => parts.push(word(&value, language)?),
+        }
+    }
+    let line = parts.join(" ");
+    (!line.trim().is_empty()).then_some(line)
+}
+
+/// The [`literal_execution_name`]s that start a process rather than evaluate
+/// code or look a callable up: `system`, `run`, `Popen`, `spawn*`, `exec*`
+/// other than `exec` itself, and `compile` when it is a method (`re.compile`;
+/// the builtin `compile` makes code for `exec`).
+fn closed_process_call_name(name: &str, attribute_form: bool) -> bool {
+    (name.starts_with("exec") && !matches!(name, "exec" | "execfile"))
+        || name.starts_with("spawn")
+        || name.starts_with("popen")
+        || matches!(
+            name,
+            "system"
+                | "Popen"
+                | "run"
+                | "call"
+                | "check_call"
+                | "check_output"
+                | "getoutput"
+                | "getstatusoutput"
+                | "create_subprocess_shell"
+                | "create_subprocess_exec"
+                | "posix_spawn"
+                | "posix_spawnp"
+                | "fork"
+                | "forkpty"
+                | "startfile"
+        )
+        || (attribute_form && name == "compile")
+}
+
+/// `os`, `subprocess`, `asyncio.subprocess`: identifiers joined by member
+/// access, with no call, subscript or other expression a value could hide in.
+fn plain_dotted_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    depth: usize,
+) -> bool {
+    if depth >= 16 {
+        return false;
+    }
+    match node.kind().as_ref() {
+        "identifier" => true,
+        "attribute" | "member_expression" => node
+            .field("object")
+            .is_some_and(|object| plain_dotted_name(&object, depth + 1)),
+        _ => false,
+    }
+}
+
+/// An argument of a [`closed_process_call`]: a literal whose decoded value has
+/// no shell substitution syntax, or a list, tuple or keyword argument of them.
+fn closed_literal_argument<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+    depth: usize,
+) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    match node.kind().as_ref() {
+        "integer" | "float" | "number" | "true" | "false" | "none" | "null" => true,
+        "string" | "template_string" | "concatenated_string" => {
+            source_analysis::static_interpreter_literal(node, language, 0)
+                .is_some_and(|value| !value.contains('`') && !value.contains("$("))
+        }
+        "list" | "tuple" | "array" | "parenthesized_expression" => node
+            .children()
+            .filter(|item| item.is_named() && item.kind().as_ref() != "comment")
+            .all(|item| closed_literal_argument(&item, language, depth + 1)),
+        "keyword_argument" => node
+            .field("value")
+            .is_some_and(|value| closed_literal_argument(&value, language, depth + 1)),
+        _ => false,
+    }
 }
 
 fn literal_execution_name(name: &str) -> bool {
@@ -935,5 +1204,103 @@ mod literal_execution_evidence_tests {
             &with_sink,
             ScriptLanguage::Python
         ));
+    }
+
+    /// A process call whose every argument is a literal without substitution
+    /// syntax runs a fixed command line. That is no evidence that another
+    /// literal runs, unless the command line can run a file the program
+    /// wrote (#560).
+    #[test]
+    fn closed_process_calls_count_only_when_they_can_run_generated_code_560() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nc = subprocess.run(['git', 'show', 'origin/main:F.md'], capture_output=True, text=True, check=True).stdout\nb = \"it's `x`\"",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.check_output(['git', 'diff', '--stat'], cwd='/w')\nb = '`x`'",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import re\np = re.compile(r'Some\\(x\\)')\nt = 'Option<(A, B)> `x`'",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.execSync('git status'); const t = 'it is `x`';",
+            ),
+        ] {
+            assert!(
+                !literal_source_has_execution_evidence(source, language),
+                "a closed call became evidence: {source}"
+            );
+            // The capability question keeps every execution name.
+            assert!(
+                program_may_execute_code(source, language),
+                "a process call must still count as a capability: {source}"
+            );
+        }
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['sh', 'm.sh'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['./m.sh'])",
+            ),
+            (ScriptLanguage::Python, "import os\nos.system('bash m.sh')"),
+            (
+                ScriptLanguage::Python,
+                "import os\nos.system('git status; ./m.sh')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['git', '-c', 'core.pager=sh', 'log'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['env', 'PATH=.', 'ls'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run('make', shell=True)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['git status; sh m.sh'], shell=True)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['ls'], executable='/bin/sh')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['echo', '$(date)'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(args)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nrun = subprocess.run",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\nos.execv('/bin/git', ['git', 'log'])",
+            ),
+            (ScriptLanguage::Python, "code = compile('x', 'f', 'exec')"),
+            (ScriptLanguage::JavaScript, "cp.execSync('sh m.sh');"),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.spawnSync('git', ['-c', 'alias.x=!sh', 'x']);",
+            ),
+        ] {
+            assert!(
+                literal_source_has_execution_evidence(source, language),
+                "this call can run what the program wrote: {source}"
+            );
+        }
     }
 }

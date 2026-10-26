@@ -7943,7 +7943,17 @@ fn extract_heredocs(
             timeout,
         ) {
             Ok((content, end_pos, body_start_abs, body_end_abs)) => {
-                let (mut language, _confidence) = ScriptLanguage::detect(command, &content);
+                // The body is the stdin of the program that owns this
+                // operator. `ScriptLanguage::detect` reads the program at the
+                // head of the whole command, which is `cd` in `cd dir &&
+                // python3 - <<'EOF'` and `S=…;` in `S=…; python3 - <<'EOF'`;
+                // a Python body without an import line then fell to the shell
+                // analysis and its strings were judged as commands (#560).
+                let (mut language, _confidence) =
+                    heredoc_receiver_language(command, full_match.start()).map_or_else(
+                        || ScriptLanguage::detect(command, &content),
+                        |language| (language, DetectionConfidence::CommandPrefix),
+                    );
                 // A literal cat write immediately consumed as a script is
                 // executable source, not a data-only cat body (#519). Bind
                 // the language to this exact operator and body, so the AST
@@ -8102,6 +8112,45 @@ fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option
     })
 }
 
+/// The language of the program that receives the heredoc at `heredoc_start`,
+/// read from that program's own command word.
+///
+/// Only a word that starts its simple command (after environment assignments)
+/// counts: the backward walk of [`extract_heredoc_target_resolution`] skips
+/// path-like operands, and one of those is not the receiver. A shell keeps
+/// its answer whatever its name may be rebound to, since judging the body as
+/// shell is the strict reading. A non-shell interpreter counts only when no
+/// wrapper, function, alias or untrusted path can stand in for it
+/// ([`stdin_data_sink_may_be_overridden`]). `None` leaves the caller's
+/// whole-command detection in place.
+fn heredoc_receiver_language(command: &str, heredoc_start: usize) -> Option<ScriptLanguage> {
+    let (token, wrapped) = extract_heredoc_target_resolution(command, heredoc_start)?;
+    if wrapped {
+        return None;
+    }
+    let line_start = command
+        .get(..heredoc_start)?
+        .rfind(['\n', '\r'])
+        .map_or(0, |at| at + 1);
+    let words = tokenize_backwards(command.get(line_start..heredoc_start)?.trim_end());
+    if words
+        .iter()
+        .rev()
+        .find(|word| !is_shell_env_assignment(word))
+        != Some(&token)
+    {
+        return None;
+    }
+    let name = token.rsplit(['/', '\\']).next().unwrap_or(token.as_str());
+    match ScriptLanguage::from_command(name) {
+        ScriptLanguage::Unknown => None,
+        ScriptLanguage::Bash => Some(ScriptLanguage::Bash),
+        language => {
+            (!stdin_data_sink_may_be_overridden(command, heredoc_start, name)).then_some(language)
+        }
+    }
+}
+
 /// The command that receives the first heredoc in `command`, by basename.
 ///
 /// Exposed for pack ordering (#428): the dialect that will actually execute a
@@ -8187,11 +8236,15 @@ fn extract_heredoc_target_resolution(
 
             // Check if this looks like a command path (/bin/cat, /usr/bin/bash)
             // vs a file argument (/tmp/file, /path/to/data)
+            // A package manager's interpreter (`/opt/homebrew/bin/python3.14`)
+            // is a program too; one in a virtualenv or a project directory
+            // stays unresolved, as before.
             let is_known_command = NON_EXECUTING_HEREDOC_COMMANDS.contains(&basename)
                 || [
                     "bash", "sh", "zsh", "fish", "ksh", "dash", "python", "perl", "ruby", "node",
                 ]
-                .contains(&basename);
+                .contains(&basename)
+                || is_trusted_interpreter_path(token, basename);
 
             // Command paths are typically in standard locations
             let looks_like_command_path = token.starts_with("/bin/")
@@ -8435,7 +8488,8 @@ pub(crate) fn stdin_data_sink_may_be_overridden(
         // executable: `./cat` and `/tmp/cat` may run their stdin as shell. Only
         // the two normalized OS utility paths retain the documented data-sink
         // contract; every other path-qualified token fails closed.
-        return !is_trusted_os_data_sink_path(&lexical_target, target);
+        return !(is_trusted_os_data_sink_path(&lexical_target, target)
+            || is_trusted_interpreter_path(&lexical_target, target));
     }
     if std::env::var_os(format!("BASH_FUNC_{target}%%")).is_some() {
         return true;
@@ -8635,6 +8689,29 @@ fn is_trusted_os_data_sink_path(lexical_target: &str, basename: &str) -> bool {
         || lexical_target
             .strip_prefix("/usr/bin/")
             .is_some_and(|name| name == basename)
+}
+
+/// A non-shell interpreter named by its path in a system or package-manager
+/// `bin` directory: `/usr/local/bin/python3`, `/opt/homebrew/bin/python3.14`.
+/// That is where a bare `python3` resolves through `PATH` anyway, so naming
+/// it is no weaker than the bare name the proofs already accept. Shells and
+/// every other directory (`./python3`, `/tmp/node`, a virtualenv's `bin`)
+/// keep failing closed.
+fn is_trusted_interpreter_path(lexical_target: &str, basename: &str) -> bool {
+    const INTERPRETER_DIRS: [&str; 6] = [
+        "/bin/",
+        "/usr/bin/",
+        "/usr/local/bin/",
+        "/opt/homebrew/bin/",
+        "/opt/local/bin/",
+        "/home/linuxbrew/.linuxbrew/bin/",
+    ];
+    is_non_shell_interpreter_stdin_command(basename)
+        && INTERPRETER_DIRS.iter().any(|dir| {
+            lexical_target
+                .strip_prefix(dir)
+                .is_some_and(|name| name == basename)
+        })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -9191,7 +9268,7 @@ fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool 
         let words = shell_words::split(header).ok()?;
         let (program, arguments) = words.split_first()?;
         if !is_non_shell_interpreter_stdin_command(program)
-            || !(arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
+            || !interpreter_arguments_read_program_from_stdin(program, arguments)
         {
             return None;
         }
@@ -9210,9 +9287,11 @@ fn direct_interpreter_stdin_owner(command: &str, operator_start: usize) -> bool 
     // (#357: python/node/deno/bun/ruby/perl/php/go); this proof adds only
     // the operand rule. Keeping a narrower private language list here
     // silently withdrew the #357 exemption from deno/bun/go when #560 made
-    // every exemption consumer require this proof.
+    // every exemption consumer require this proof. The operand rule admits
+    // Python's run-mode options (`python3 -I -`) and the program's own
+    // arguments after `-`, which leave stdin the program (#560).
     is_non_shell_interpreter_stdin_command(program)
-        && (arguments.is_empty() || matches!(arguments, [arg] if arg == "-"))
+        && interpreter_arguments_read_program_from_stdin(program, arguments)
 }
 /// A quoted cat or tee body written verbatim and immediately read by a concrete
 /// interpreter. This proof supplies a language, never an allow:
@@ -9257,41 +9336,18 @@ pub(crate) fn range_is_quoted_interpreter_source(
     {
         return true;
     }
-    // A direct source proof belongs to the complete invocation, not merely
-    // one receiver inside a larger workflow. A later shell could execute a
-    // file the interpreter writes, and a preceding environment assignment
-    // could preload code that changes its builtins. Neither supplies the
-    // isolated program assumed by the language-specific literal analysis.
+    // A direct source proof needs the interpreter's whole effect on the rest
+    // of the command to be accounted for, not merely one receiver. Its output
+    // must reach no other process, and nothing else in the command may run a
+    // file it writes or preload code that changes its builtins. Other
+    // statements that do neither (`cd dir && python3 - <<'PY'`, a `grep` or
+    // `cargo check` afterwards) leave the program isolated (#560); see
+    // [`heredoc_program_is_isolated`].
     let Ok(ast) = try_parse_shell_ast(command) else {
         return false;
     };
     let root = ast.root();
-    if root.get_inner_node().has_error()
-        || root.children().any(|child| child.kind().as_ref() == "&")
-    {
-        return false;
-    }
-    let mut statements = root
-        .children()
-        .filter(|child| child.is_named() && child.kind().as_ref() != "comment");
-    let Some(statement) = statements.next() else {
-        return false;
-    };
-    if statements.next().is_some()
-        || statement.kind().as_ref() != "redirected_statement"
-        || statement
-            .field("body")
-            .is_none_or(|body| body.kind().as_ref() != "command")
-        || statement
-            .children()
-            .filter(ast_grep_core::Node::is_named)
-            .any(|child| !matches!(child.kind().as_ref(), "command" | "heredoc_redirect"))
-        || statement
-            .children()
-            .filter(|child| child.kind().as_ref() == "heredoc_redirect")
-            .count()
-            != 1
-    {
+    if root.get_inner_node().has_error() {
         return false;
     }
     let Some(heredocs) = active_heredocs(command) else {
@@ -9301,9 +9357,15 @@ pub(crate) fn range_is_quoted_interpreter_source(
         return false;
     }
     heredocs.iter().any(|heredoc| {
-        let Some(mut body) = inert_interpreter_stdin_body(command, heredoc) else {
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            delimiter_quoted: true,
+        } = heredoc.body
+        else {
             return false;
         };
+        let mut body = body_start..body_end;
         // `<<-` strips leading tabs from every body line and from the
         // terminator line. tree-sitter's body span starts after the first
         // line's tabs and keeps the terminator line's tabs after the final
@@ -9341,18 +9403,610 @@ pub(crate) fn range_is_quoted_interpreter_source(
         if body != *range {
             return false;
         }
-        let Some(owner) = plain_heredoc_command_at(command, heredoc.operator_start) else {
+        let Some(target) = extract_heredoc_target_command(command, heredoc.operator_start) else {
             return false;
         };
-        let Ok(words) = shell_words::split(&owner) else {
-            return false;
-        };
-        let Some((program, arguments)) = words.split_first() else {
-            return false;
-        };
-        ScriptLanguage::from_command(program.rsplit('/').next().unwrap_or(program)) == language
-            && (arguments.is_empty() || matches!(arguments, [argument] if argument == "-"))
+        is_non_shell_interpreter_stdin_command(&target)
+            && !stdin_data_sink_may_be_overridden(command, heredoc.operator_start, &target)
+            && heredoc_program_is_isolated(command, &root, heredoc.operator_start, language)
     })
+}
+
+/// Python options that change how a program runs but not which source it
+/// runs or how it reads it: `-b`, `-B`, `-d`, `-E`, `-I`, `-O`, `-P`, `-q`,
+/// `-R`, `-s`, `-S`, `-u`, `-v`, alone or combined (`-IuB`). None takes a
+/// value.
+const PYTHON_RUN_MODE_FLAGS: &[u8] = b"bBdEIOPqRsSuv";
+
+/// Whether an interpreter invoked with these arguments reads its program
+/// from standard input, leaving every later word as data for the program.
+///
+/// Python's [`PYTHON_RUN_MODE_FLAGS`] may come first. After a `-` operand, Python
+/// and Node hand the remaining words to the program as `sys.argv` /
+/// `process.argv`: they can no longer become options, a script file or a code
+/// string. Anything else (a script operand, `-c`, `-m`, `-r`, an unknown
+/// option) does not prove that stdin is the program.
+fn interpreter_arguments_read_program_from_stdin(program: &str, arguments: &[String]) -> bool {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    let python = ScriptLanguage::from_command(name) == ScriptLanguage::Python;
+    let mut rest = arguments;
+    if python {
+        while let Some((option, tail)) = rest.split_first() {
+            let Some(letters) = option.strip_prefix('-') else {
+                break;
+            };
+            if letters.is_empty()
+                || !letters
+                    .bytes()
+                    .all(|byte| PYTHON_RUN_MODE_FLAGS.contains(&byte))
+            {
+                break;
+            }
+            rest = tail;
+        }
+    }
+    match rest {
+        [] => true,
+        [stdin] => stdin == "-",
+        [stdin, ..] => stdin == "-" && (python || matches!(name, "node" | "nodejs")),
+    }
+}
+
+/// Programs that may run a file or text another statement produced, judged
+/// by name wherever they appear in a command: shells, interpreters, remote
+/// shells and stdin runners ([`is_code_runner_name`]), recipe and package
+/// script runners whose recipes are shell, launchers that open a file with
+/// whatever handles it, and wrappers that run a command string. A Python
+/// program writing `m.sh` followed by `sh m.sh` must keep its literal
+/// recovery (#544).
+fn may_run_generated_code(name: &str) -> bool {
+    is_code_runner_name(name)
+        || matches!(
+            name,
+            "exec"
+                | "trap"
+                | "alias"
+                | "enable"
+                | "hash"
+                | "coproc"
+                | "make"
+                | "gmake"
+                | "just"
+                | "npm"
+                | "npx"
+                | "pnpm"
+                | "pnpx"
+                | "yarn"
+                | "bunx"
+                | "watch"
+                | "tmux"
+                | "screen"
+                | "script"
+                | "busybox"
+                | "toybox"
+                | "docker"
+                | "podman"
+                | "kubectl"
+                | "oc"
+                | "lxc"
+                | "incus"
+                | "nsenter"
+                | "chroot"
+                | "systemd-run"
+                | "machinectl"
+                | "unbuffer"
+                | "open"
+                | "xdg-open"
+        )
+}
+
+/// The [`may_run_generated_code`] names that are shell builtins with no
+/// executable of their own: only the shell runs them, as a command word.
+fn is_shell_builtin_runner(name: &str) -> bool {
+    matches!(
+        name,
+        "." | "source" | "eval" | "exec" | "trap" | "alias" | "enable" | "hash" | "coproc"
+    )
+}
+
+/// Programs that run another program named among their operands, beyond the
+/// shell wrappers of [`COMMAND_WRAPPERS`]: tracers, benchmark and file-watch
+/// runners, and the package managers' `run`/`exec` front ends. Their operands
+/// are judged as possible programs by [`wrapper_operand_may_be_generated`].
+fn runs_operand_program(name: &str) -> bool {
+    COMMAND_WRAPPERS.contains(&name)
+        || matches!(
+            name,
+            "gtimeout"
+                | "gnutimeout"
+                | "uv"
+                | "uvx"
+                | "pipx"
+                | "pipenv"
+                | "poetry"
+                | "pdm"
+                | "hatch"
+                | "rye"
+                | "conda"
+                | "mamba"
+                | "bundle"
+                | "mise"
+                | "direnv"
+                | "nix-shell"
+                | "strace"
+                | "ltrace"
+                | "valgrind"
+                | "perf"
+                | "hyperfine"
+                | "entr"
+                | "faketime"
+                | "rlwrap"
+                | "xvfb-run"
+                | "dbus-run-session"
+                | "firejail"
+                | "bwrap"
+                | "numactl"
+                | "prlimit"
+                | "runuser"
+                | "pkexec"
+        )
+}
+
+/// Whether a wrapper's operand may name a program another statement wrote:
+/// a relative path (`./gen.sh`, `../bin/run`), an absolute or home path to a
+/// script or to a file without an extension (`/tmp/run`), or a bare script
+/// name (`uv run gen.py`). A path with a data extension (`a/Cargo.toml`,
+/// `src/x.py` handed to a formatter) and a plain word are not judged here.
+fn wrapper_operand_may_be_generated(word: &str) -> bool {
+    const SCRIPT_EXTENSIONS: [&str; 14] = [
+        "sh", "bash", "zsh", "ksh", "py", "js", "mjs", "cjs", "ts", "rb", "pl", "php", "lua",
+        "command",
+    ];
+    if word.starts_with("./") || word.starts_with("../") {
+        return true;
+    }
+    let basename = word.rsplit('/').next().unwrap_or(word);
+    let extension = basename
+        .rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .map(|(_, extension)| extension);
+    let anchored = word.starts_with('/') || word.starts_with('~');
+    match extension {
+        Some(extension) => {
+            SCRIPT_EXTENSIONS.contains(&extension) && (anchored || !word.contains('/'))
+        }
+        None => anchored && basename != word,
+    }
+}
+
+/// `git` invocations that run a command or program they are given rather
+/// than only the repository's hooks: `-c`/`--config-env` (a pager, an alias,
+/// a diff driver), `--exec-path`, and `bisect run`, `rebase --exec`,
+/// `submodule foreach`, `filter-branch`, `difftool`/`mergetool`. Hooks a
+/// program writes are `.git/` writes, which the protected-path rules judge.
+fn git_may_run_given_program(arguments: &[String]) -> bool {
+    let mut skip_value = false;
+    for argument in arguments {
+        let word = unquoted_word(argument);
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        if word == "-c" || word.starts_with("--config-env") || word.starts_with("--exec-path") {
+            return true;
+        }
+        if word.starts_with('-') {
+            skip_value = matches!(
+                word,
+                "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+            );
+            continue;
+        }
+        // The subcommand: a computed one may be any of them, or an alias.
+        return is_computed_word(argument)
+            || matches!(
+                word,
+                "bisect"
+                    | "rebase"
+                    | "submodule"
+                    | "filter-branch"
+                    | "filter-repo"
+                    | "difftool"
+                    | "mergetool"
+            );
+    }
+    false
+}
+
+/// Whether a shell's options, before its first operand, include noexec
+/// (`bash -n x.sh`, `sh -nc '…'`, `bash -o noexec x.sh`): the shell then
+/// parses its script, file or `-c` string without running any of it. A
+/// computed word anywhere may be another option, so it never counts.
+fn shell_options_set_noexec(arguments: &[String]) -> bool {
+    if arguments.iter().any(|argument| is_computed_word(argument)) {
+        return false;
+    }
+    let mut noexec = false;
+    let mut words = arguments.iter().map(|argument| unquoted_word(argument));
+    while let Some(word) = words.next() {
+        if word == "--noexec" {
+            noexec = true;
+        } else if word == "--" || !word.starts_with(['-', '+']) {
+            break;
+        } else if word.starts_with("--") {
+            if matches!(word, "--rcfile" | "--init-file") {
+                words.next();
+            }
+        } else if let Some(letters) = word.strip_prefix('-') {
+            noexec |= letters.contains('n');
+            if letters.ends_with('o') && words.next() == Some("noexec") {
+                noexec = true;
+            }
+        } else if word.ends_with('o') {
+            // `+o name` unsets an option; its name is not an operand.
+            words.next();
+        }
+    }
+    noexec
+}
+
+/// Environment names that load code into, or change the program run by, an
+/// interpreter started later in the same shell.
+fn assignment_changes_interpreter(name: &str) -> bool {
+    name.starts_with("PYTHON")
+        || name.starts_with("NODE_")
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || matches!(name, "PATH" | "BASH_ENV" | "ENV" | "PERL5OPT" | "RUBYOPT")
+}
+
+/// Whether the quoted heredoc at `operator_start` is the whole program of an
+/// interpreter whose effects no other part of `command` can turn into shell
+/// execution (#544, #560).
+///
+/// The literal analysis that consumes this proof assumes the interpreter's
+/// strings stay inside it: printed to the terminal, or written to files that
+/// nothing in this command runs. So the owning statement must be a plain
+/// interpreter run (an optional `cd dir &&`-style list ahead of it), reading
+/// its program from this heredoc ([`interpreter_arguments_read_program_from_stdin`]),
+/// with no environment prefix, no other redirect, pipe or chained command on
+/// the heredoc line, and only `&&`/`||` lists between it and the top level:
+/// its standard output then reaches only the terminal. Every other command in
+/// the tree must be one that cannot run what the interpreter produced
+/// ([`command_may_run_generated_code`]): a literal program name, not a path,
+/// that neither is nor names (as an argument) a shell, interpreter or other
+/// runner ([`may_run_generated_code`]); a wrapper whose operands name no
+/// script or computed program; no `find -exec`, `git -c` or `awk -f`; and no
+/// `set -a`. A shell run with noexec (`bash -n x.sh`) runs nothing. A
+/// function definition, a background job, or an `export`/`declare` of a name
+/// that changes interpreters ([`assignment_changes_interpreter`]) anywhere
+/// also revokes the proof. Anything unrecognised fails closed.
+///
+/// Programs that build and run project code (`cargo test`, `pytest`, a
+/// repository's git hooks) are not runners here: the literal analysis judges
+/// strings as shell commands, which says nothing about Rust or Python a
+/// program wrote, and writes under `.git/` meet the protected-path rules.
+fn heredoc_program_is_isolated<D: ast_grep_core::Doc>(
+    command: &str,
+    root: &ast_grep_core::Node<'_, D>,
+    operator_start: usize,
+    language: ScriptLanguage,
+) -> bool {
+    const MAX_ISOLATION_NODES: usize = 1 << 16;
+    let Some(redirect) = root.dfs().take(MAX_ISOLATION_NODES).find(|node| {
+        node.kind().as_ref() == "heredoc_redirect"
+            && node
+                .text()
+                .find("<<")
+                .map(|offset| node.range().start + offset)
+                == Some(operator_start)
+    }) else {
+        return false;
+    };
+    // tree-sitter-bash hangs the rest of the heredoc's line on the redirect:
+    // `<<'PY' | sh`, `<<'PY' > x.sh`, `<<'PY' && sh x.sh`.
+    if redirect
+        .children()
+        .filter(ast_grep_core::Node::is_named)
+        .any(|child| {
+            !matches!(
+                child.kind().as_ref(),
+                "heredoc_start" | "heredoc_body" | "heredoc_end"
+            )
+        })
+    {
+        return false;
+    }
+    let Some(statement) = redirect.parent() else {
+        return false;
+    };
+    let named: Vec<_> = statement
+        .children()
+        .filter(ast_grep_core::Node::is_named)
+        .collect();
+    let [body, only_redirect] = named.as_slice() else {
+        return false;
+    };
+    if statement.kind().as_ref() != "redirected_statement"
+        || only_redirect.range() != redirect.range()
+    {
+        return false;
+    }
+    // A heredoc after `cd dir && python3 -` hangs on the whole list; the
+    // shell hands it to the list's last command.
+    let owner = match body.kind().as_ref() {
+        "command" => body.clone(),
+        "list" => {
+            if body
+                .children()
+                .any(|child| !child.is_named() && !matches!(child.kind().as_ref(), "&&" | "||"))
+            {
+                return false;
+            }
+            let Some(last) = body.children().filter(ast_grep_core::Node::is_named).last() else {
+                return false;
+            };
+            last
+        }
+        _ => return false,
+    };
+    if owner.kind().as_ref() != "command"
+        || owner.children().any(|child| {
+            matches!(
+                child.kind().as_ref(),
+                "variable_assignment" | "file_redirect" | "herestring_redirect"
+            )
+        })
+        || owner.dfs().any(|node| {
+            matches!(
+                node.kind().as_ref(),
+                "command_substitution" | "process_substitution"
+            )
+        })
+    {
+        return false;
+    }
+    // tree-sitter drops a bare `-` written just before the operator
+    // (`python3 - <<'PY'`) from the command node. Read the owner from its
+    // first byte to the operator, admitting only that dropped operand.
+    let owner_start = owner.range().start;
+    let Some(gap) = command.get(owner.range().end..operator_start) else {
+        return false;
+    };
+    if !gap.bytes().all(|byte| matches!(byte, b' ' | b'\t' | b'-')) {
+        return false;
+    }
+    let Some(owner_text) = command.get(owner_start..operator_start) else {
+        return false;
+    };
+    let Ok(words) = shell_words::split(owner_text) else {
+        return false;
+    };
+    let Some((program, arguments)) = words.split_first() else {
+        return false;
+    };
+    if ScriptLanguage::from_command(program.rsplit('/').next().unwrap_or(program)) != language
+        || !interpreter_arguments_read_program_from_stdin(program, arguments)
+    {
+        return false;
+    }
+    // Only `&&`/`||` lists separate the statement from the top level, so its
+    // standard output is the terminal: no pipeline, subshell, substitution,
+    // loop, or redirected group can capture it.
+    let mut node = statement;
+    loop {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        match parent.kind().as_ref() {
+            "program" => break,
+            "list"
+                if parent.children().all(|child| {
+                    child.is_named() || matches!(child.kind().as_ref(), "&&" | "||")
+                }) => {}
+            _ => return false,
+        }
+        node = parent;
+    }
+    let owner_range = owner.range();
+    for (index, node) in root.dfs().enumerate() {
+        if index >= MAX_ISOLATION_NODES {
+            return false;
+        }
+        match node.kind().as_ref() {
+            "&" | "function_definition" => return false,
+            "declaration_command" => {
+                // `export NODE_OPTIONS=…`, `export -f`, `declare -x PATH`.
+                let changes_interpreter = node
+                    .children()
+                    .filter(ast_grep_core::Node::is_named)
+                    .any(|child| match child.kind().as_ref() {
+                        "variable_assignment" => shell_assignment_name(child.text().as_ref())
+                            .is_none_or(assignment_changes_interpreter),
+                        "variable_name" => assignment_changes_interpreter(child.text().as_ref()),
+                        _ => true,
+                    });
+                if changes_interpreter {
+                    return false;
+                }
+            }
+            "variable_assignment"
+                if node
+                    .parent()
+                    .is_none_or(|parent| parent.kind().as_ref() != "command") =>
+            {
+                if shell_assignment_name(node.text().as_ref())
+                    .is_none_or(assignment_changes_interpreter)
+                {
+                    return false;
+                }
+            }
+            "command" if node.range() != owner_range && command_may_run_generated_code(&node) => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether the command line `text` (an interpreter's closed process call,
+/// rendered as shell words) may run code another statement wrote: any of its
+/// commands that [`command_may_run_generated_code`] flags, a definition or
+/// background job, or text the grammar cannot read in full.
+pub(crate) fn shell_text_may_run_generated_code(text: &str) -> bool {
+    const MAX_TEXT_BYTES: usize = 16 * 1024;
+    const MAX_NODES: usize = 1 << 12;
+    if text.len() > MAX_TEXT_BYTES {
+        return true;
+    }
+    let Ok(ast) = try_parse_shell_ast(text) else {
+        return true;
+    };
+    let root = ast.root();
+    if root.get_inner_node().has_error() {
+        return true;
+    }
+    let mut commands = 0usize;
+    for (index, node) in root.dfs().enumerate() {
+        if index >= MAX_NODES {
+            return true;
+        }
+        match node.kind().as_ref() {
+            "&" | "function_definition" | "declaration_command" => return true,
+            "command" => {
+                commands += 1;
+                if command_may_run_generated_code(&node) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    commands == 0
+}
+
+/// [`heredoc_program_is_isolated`]'s test for one other simple command.
+fn command_may_run_generated_code<D: ast_grep_core::Doc>(
+    command: &ast_grep_core::Node<'_, D>,
+) -> bool {
+    let Some(name_node) = command.field("name") else {
+        return true;
+    };
+    // `PATH=. ls` may run a file named `ls` another statement wrote.
+    if command.children().any(|child| {
+        child.kind().as_ref() == "variable_assignment"
+            && shell_assignment_name(child.text().as_ref())
+                .is_none_or(assignment_changes_interpreter)
+    }) {
+        return true;
+    }
+    let name_text = name_node.text();
+    let name = name_text.as_ref();
+    if matches!(name, "[" | ":") {
+        return false;
+    }
+    // A computed or path-qualified program may be a file another statement
+    // wrote (`./gen.sh`, `$S/run`); only a plain PATH name is judged by name.
+    let Some(program) = literal_program_name(name) else {
+        return true;
+    };
+    if name.contains('/') {
+        return true;
+    }
+    let arguments: Vec<String> = command
+        .children()
+        .filter(|argument| {
+            argument.is_named()
+                && !matches!(
+                    argument.kind().as_ref(),
+                    "command_name"
+                        | "variable_assignment"
+                        | "file_redirect"
+                        | "herestring_redirect"
+                        | "comment"
+                )
+        })
+        .map(|argument| argument.text().to_string())
+        .collect();
+    if SHELL_PROGRAMS.contains(&program) && shell_options_set_noexec(&arguments) {
+        return false;
+    }
+    if may_run_generated_code(program) {
+        return true;
+    }
+    let wrapper = runs_operand_program(program);
+    let reads_program_file = matches!(program, "awk" | "gawk" | "mawk" | "nawk" | "sed" | "gsed");
+    match program {
+        "git" => return git_may_run_given_program(&arguments),
+        // `find … -exec ./gen.sh {} +`, `fd -x ./gen.sh`.
+        "find" | "gfind"
+            if arguments.iter().any(|argument| {
+                matches!(
+                    unquoted_word(argument),
+                    "-exec" | "-execdir" | "-ok" | "-okdir"
+                )
+            }) =>
+        {
+            return true;
+        }
+        "fd" | "fdfind"
+            if arguments.iter().any(|argument| {
+                let word = unquoted_word(argument);
+                matches!(word, "-x" | "-X") || word.starts_with("--exec")
+            }) =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    // A shell builtin (`.`, `source`, `eval`, `exec`, …) runs only as the
+    // shell's own command word, which an external program cannot start: a
+    // lone `.` operand is the current directory (`rg x .`, `git add .`) and
+    // `devtool exec -- cargo test` runs cargo. `command` and `builtin` are
+    // builtins themselves and hand their operands to the shell.
+    let operands_reach_the_shell = matches!(program, "command" | "builtin");
+    for argument in &arguments {
+        let word = unquoted_word(argument);
+        // `timeout 60 bash x.sh`, `find . -exec sh {} +`, `env python3 x.py`.
+        if literal_program_name(word).is_some_and(|name| {
+            may_run_generated_code(name)
+                && (operands_reach_the_shell || !is_shell_builtin_runner(name))
+        }) {
+            return true;
+        }
+        // `rg --pre ./filter`, `sort --compress-program=sh` hand files to a
+        // program they name.
+        if word.starts_with("--pre") || word.starts_with("--compress-program") {
+            return true;
+        }
+        // `awk -f gen.awk`, `sed -f gen.sed`, and awk's own `system(…)`,
+        // `print | "sh"` or `"cmd" | getline` run what another statement may
+        // have written.
+        if reads_program_file
+            && (matches!(word, "-f" | "--file")
+                || word.starts_with("--file=")
+                || (!program.ends_with("sed")
+                    && ["system(", "|\"", "| \"", "|&", "getline"]
+                        .iter()
+                        .any(|needle| word.contains(needle))))
+        {
+            return true;
+        }
+        if wrapper
+            && (is_computed_word(argument)
+                || wrapper_operand_may_be_generated(word)
+                || shell_assignment_name(word).is_some_and(assignment_changes_interpreter))
+        {
+            return true;
+        }
+    }
+    // `set -a` exports every later assignment, `PATH` and `PYTHON*` included.
+    program == "set"
+        && arguments.iter().any(|argument| {
+            let word = unquoted_word(argument);
+            word == "allexport"
+                || (word.starts_with('-') && !word.starts_with("--") && word.contains('a'))
+        })
 }
 
 /// Whether an isolated inline invocation passes these exact bytes as its
@@ -10012,7 +10666,10 @@ fn literal_interpreter_script_operand(words: &[String]) -> Option<(&str, &str)> 
         }
         let preserves_source = match language {
             ScriptLanguage::Python => argument.strip_prefix('-').is_some_and(|flags| {
-                !flags.is_empty() && flags.bytes().all(|flag| b"bBdEIOPqRsSuv".contains(&flag))
+                !flags.is_empty()
+                    && flags
+                        .bytes()
+                        .all(|flag| PYTHON_RUN_MODE_FLAGS.contains(&flag))
             }),
             ScriptLanguage::JavaScript => matches!(
                 argument.as_str(),
@@ -10963,10 +11620,13 @@ fn mask_non_executing_heredocs_with_policy(
     // Where each command's output goes, when the parse tree did not prove
     // it: decided once, from the text outside every body.
     let mut unproven_output: Option<HeredocOutput> = None;
+    let quoted = quoted_bodies_by_operator(&active_heredocs);
     let mut output_of = |heredoc: &ActiveHeredoc| -> HeredocOutput {
         heredoc.output.unwrap_or_else(|| {
             *unproven_output.get_or_insert_with(|| {
-                if command_may_run_heredoc_output(&blank_ranges(command, &bodies)) {
+                if command_may_run_heredoc_output(&blank_ranges(command, &bodies), &|operator| {
+                    quoted_body_for_operator(command, &quoted, operator)
+                }) {
                     HeredocOutput::Executes
                 } else {
                     HeredocOutput::Escapes
@@ -11164,6 +11824,7 @@ pub(crate) fn data_heredoc_bodies_whose_output_may_run(command: &str) -> Vec<Ran
             ActiveHeredocBody::HereString => None,
         })
         .collect();
+    let quoted = quoted_bodies_by_operator(&heredocs);
     let mut unproven_runs: Option<bool> = None;
     let mut found = Vec::new();
     for heredoc in &heredocs {
@@ -11185,7 +11846,9 @@ pub(crate) fn data_heredoc_bodies_whose_output_may_run(command: &str) -> Vec<Ran
         let runs = match heredoc.output {
             Some(output) => output == HeredocOutput::Executes,
             None => *unproven_runs.get_or_insert_with(|| {
-                command_may_run_heredoc_output(&blank_ranges(command, &bodies))
+                command_may_run_heredoc_output(&blank_ranges(command, &bodies), &|operator| {
+                    quoted_body_for_operator(command, &quoted, operator)
+                })
             }),
         };
         if runs {
@@ -11234,6 +11897,34 @@ pub(crate) fn quoted_heredoc_body_at(command: &str, operator_start: usize) -> Op
             } if heredoc.operator_start == operator_start => Some(body_start..body_end),
             ActiveHeredocBody::HereString | ActiveHeredocBody::Heredoc { .. } => None,
         })
+}
+
+/// The quoted-delimiter bodies among `heredocs`, with their operator
+/// positions, for [`command_may_run_heredoc_output`].
+fn quoted_bodies_by_operator(heredocs: &[ActiveHeredoc]) -> Vec<(usize, Range<usize>)> {
+    heredocs
+        .iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                delimiter_quoted: true,
+            } => Some((heredoc.operator_start, body_start..body_end)),
+            ActiveHeredocBody::HereString | ActiveHeredocBody::Heredoc { .. } => None,
+        })
+        .collect()
+}
+
+/// The text of the body in `quoted` whose operator lies in `operator`.
+fn quoted_body_for_operator<'a>(
+    command: &'a str,
+    quoted: &[(usize, Range<usize>)],
+    operator: Range<usize>,
+) -> Option<&'a str> {
+    quoted
+        .iter()
+        .find(|(start, _)| operator.contains(start))
+        .and_then(|(_, body)| command.get(body.clone()))
 }
 
 /// `command` with every byte inside `ranges` (other than newlines) blanked.
@@ -13672,7 +14363,15 @@ fn redirect_line_end<D: ast_grep_core::Doc>(node: &ast_grep_core::Node<'_, D>) -
 /// that ends in a pipe (the pipeline continues past the body), a process
 /// substitution, `eval`/`source`/`.`/`exec`/`xargs`/…, or such a program fed
 /// a computed operand (`sh -c "$x"`, `bash "$(cat <<EOF …)"`) or a redirect.
-fn command_may_run_heredoc_output(outside: &str) -> bool {
+///
+/// `quoted_body` returns the original text of the quoted-delimiter body whose
+/// operator lies in the given byte range of `outside`, if there is one; the
+/// answer for an interpreter fed its program by a heredoc depends on what that
+/// program can do.
+fn command_may_run_heredoc_output<'a>(
+    outside: &str,
+    quoted_body: &dyn Fn(Range<usize>) -> Option<&'a str>,
+) -> bool {
     use crate::normalize::NormalizeTokenKind;
     if outside.contains(">(") || outside.contains("<(") {
         return true;
@@ -13680,8 +14379,11 @@ fn command_may_run_heredoc_output(outside: &str) -> bool {
     let tokens = crate::normalize::tokenize_for_normalization(outside);
     let mut trailing_pipe = false;
     let mut previous_separator: Option<&str> = None;
-    let mut words: Vec<&str> = Vec::new();
-    let segment_runs = |separator: Option<&str>, words: &[&str], trailing_pipe: bool| -> bool {
+    let mut words: Vec<(Range<usize>, &str)> = Vec::new();
+    let segment_runs = |separator: Option<&str>,
+                        words: &[(Range<usize>, &str)],
+                        trailing_pipe: bool|
+     -> bool {
         // Redirect words are neither the program nor operands (`sh < x` reads
         // `x`, and a stdin redirect on a runner is input it may run); a group
         // brace, an assignment or a reserved word before the program is not
@@ -13689,15 +14391,31 @@ fn command_may_run_heredoc_output(outside: &str) -> bool {
         let mut program = None;
         let mut operands: Vec<String> = Vec::new();
         let mut redirected_input = false;
+        // Input from the stage's own here-document, as opposed to a file,
+        // descriptor or here-string.
+        let mut heredoc_input = false;
+        // The operator word of that here-document; with two, neither is
+        // known to be the program, so neither counts.
+        let mut heredoc_operator: Option<Range<usize>> = None;
+        let mut heredoc_operators = 0usize;
+        let mut other_input = false;
         let mut redirect_target = false;
-        for word in words.iter().copied() {
+        for (range, word) in words.iter().cloned() {
             if std::mem::take(&mut redirect_target) {
                 continue;
             }
             let operator = word.trim_start_matches(|c: char| c.is_ascii_digit());
             if operator.starts_with(['<', '>']) || operator.starts_with("&>") {
                 redirected_input |= operator.starts_with('<');
-                redirect_target = operator.trim_start_matches(['<', '>', '&', '|']).is_empty();
+                let heredoc = operator.starts_with("<<") && !operator.starts_with("<<<");
+                heredoc_input |= heredoc;
+                if heredoc {
+                    heredoc_operators += 1;
+                    heredoc_operator = Some(range);
+                }
+                other_input |= operator.starts_with('<') && !heredoc;
+                redirect_target = operator.trim_start_matches(['<', '>', '&', '|']).is_empty()
+                    || matches!(operator, "<<" | "<<-");
                 continue;
             }
             if program.is_some() {
@@ -13730,6 +14448,38 @@ fn command_may_run_heredoc_output(outside: &str) -> bool {
         }
         let name = literal_program_name(&program).unwrap_or("");
         let piped = matches!(separator, Some("|" | "|&")) || trailing_pipe;
+        // A non-shell interpreter reading its program from its own quoted
+        // heredoc (`python3 - <<'PY'`) runs that body, which its language's
+        // analysis judges. Its standard input is that body, not another
+        // heredoc's output, and its operands are the program's data. It can
+        // still run a file another heredoc wrote, so this holds only for a
+        // program that can start no process and evaluate no code (#591). A
+        // shell fed a heredoc keeps the conservative answer: its body is
+        // blanked here and may source a file another heredoc wrote. So does a
+        // name that a function, alias or `PATH` change may have turned into
+        // one.
+        if heredoc_input
+            && heredoc_operators == 1
+            && !other_input
+            && !piped
+            && !name.is_empty()
+            && (trusted_literal_script_program(&program)
+                || is_trusted_interpreter_path(&program, name))
+            && is_non_shell_interpreter_stdin_command(&program)
+            && interpreter_arguments_read_program_from_stdin(&program, &operands)
+            && (program.contains('/') || !shell_name_may_be_rebound(outside, name))
+            && heredoc_operator
+                .clone()
+                .and_then(quoted_body)
+                .is_some_and(|body| {
+                    !crate::ast_matcher::program_may_execute_code(
+                        body,
+                        ScriptLanguage::from_command(name),
+                    )
+                })
+        {
+            return false;
+        }
         piped
             || matches!(
                 name,
@@ -13744,7 +14494,7 @@ fn command_may_run_heredoc_output(outside: &str) -> bool {
             continue;
         };
         if token.kind == NormalizeTokenKind::Word {
-            words.push(text);
+            words.push((token.byte_range.clone(), text));
             continue;
         }
         if segment_runs(previous_separator, &words, trailing_pipe) {
@@ -13760,6 +14510,18 @@ fn command_may_run_heredoc_output(outside: &str) -> bool {
         previous_separator = Some(text);
     }
     segment_runs(previous_separator, &words, trailing_pipe)
+}
+
+/// Whether anything in `command` may rebind the bare program `name`: a
+/// function or alias of that name, a `PATH` assignment, or an `eval`/`source`
+/// that could install one ([`find_visible_shell_name_override`]). A command
+/// the parser cannot read fails closed.
+fn shell_name_may_be_rebound(command: &str, name: &str) -> bool {
+    let ast = parse_shell_ast(command);
+    let mut overridden = false;
+    let mut parse_error = false;
+    find_visible_shell_name_override(ast.root(), name, &mut overridden, &mut parse_error);
+    overridden || parse_error
 }
 
 /// Whether an expanding (unquoted-delimiter) heredoc body holds syntax the
@@ -14366,6 +15128,416 @@ pub(crate) fn longest_pipeline_stages(command: &str) -> usize {
         previous_pipe_end = None;
     }
     longest
+}
+
+/// The part of `text` a POSIX shell would run if handed it as a script: the
+/// whole lines before the line where [`shell_syntax_stop`] finds the shell
+/// stopping, which may be empty, or all of `text` when it finds no stop.
+/// `None` when that cannot be bounded: a form the shells read differently, a
+/// substitution left open, text over the parse limits, a stop the bash
+/// grammar does not also fail on, or no stop-free text within a few cuts. A
+/// caller must then judge all of `text`.
+///
+/// A shell reads a script one complete command at a time, and a
+/// non-interactive one exits at a syntax error, so nothing from the failing
+/// line on runs: an unterminated quote in Markdown prose, a `(` after a
+/// command word in a Rust signature. The earlier lines do run, and stay
+/// judged. Used to tell a string that only might reach a shell from one that
+/// is shell (#560).
+///
+/// That holds for one shell reading the whole string as its script (`sh f`,
+/// `sh -c`, a pipe into `sh`, `eval`, `.`). A consumer that runs each line
+/// on its own (Makefile recipes, a crontab) or types the text into an
+/// interactive shell goes on past the failing line. Text built to exploit
+/// that is no wider a gap than a string the program concatenates, whose
+/// pieces the literal analysis already judges one at a time.
+pub(crate) fn posix_text_runnable_prefix(text: &str) -> Option<&str> {
+    const MAX_CUTS: usize = 8;
+    const MAX_ERROR_SCAN_NODES: usize = 1 << 16;
+    let mut runnable = text;
+    for _ in 0..=MAX_CUTS {
+        if runnable.trim().is_empty() {
+            return Some(&runnable[..0]);
+        }
+        // Where a shell stops comes from a reader that follows the shell's
+        // own quoting. tree-sitter-bash also fails on text a shell runs (an
+        // empty backquote pair, as in a Markdown fence around a command), so
+        // its errors never place a cut.
+        let stop = match shell_syntax_stop(runnable) {
+            ShellSyntaxStop::Clean => return Some(runnable),
+            ShellSyntaxStop::At(stop) => stop,
+            ShellSyntaxStop::OpenSubstitution | ShellSyntaxStop::Unknown => return None,
+        };
+        // The text may be one piece of a string the program assembles, whose
+        // stray quote or parenthesis closes one an earlier piece opened and
+        // leaves what follows it live (`'echo \'x' + '\' $(git re' + …`).
+        // A substitution left open after any stop keeps the piece whole.
+        let mut after = stop;
+        while let Some(rest) = runnable.get(after + 1..) {
+            match shell_syntax_stop(rest) {
+                ShellSyntaxStop::Clean => break,
+                ShellSyntaxStop::At(next) => after += 1 + next,
+                ShellSyntaxStop::OpenSubstitution | ShellSyntaxStop::Unknown => return None,
+            }
+        }
+        // A second reading must also fail before anything is dropped.
+        if runnable.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+            || longest_pipeline_stages(runnable) > MAX_PARSED_PIPELINE_STAGES
+        {
+            return None;
+        }
+        let ast = try_parse_shell_ast(runnable).ok()?;
+        let mut grammar_fails = false;
+        for (index, node) in ast.root().dfs().enumerate() {
+            if index >= MAX_ERROR_SCAN_NODES {
+                return None;
+            }
+            // tree-sitter-bash accepts `( … )` after a command word
+            // (`` `x` (see `y`) ``), which a shell rejects: a subshell
+            // starts a command and is never one's argument.
+            if node.is_error()
+                || node.is_missing()
+                || (node.kind().as_ref() == "subshell"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind().as_ref() == "command"))
+            {
+                grammar_fails = true;
+                break;
+            }
+        }
+        if !grammar_fails {
+            return None;
+        }
+        let line_start = runnable
+            .get(..stop)?
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        runnable = &runnable[..line_start];
+    }
+    None
+}
+
+/// Where a POSIX shell reading `text` as a script first meets a syntax error
+/// of a kind it cannot run past and this reader follows exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellSyntaxStop {
+    /// No such error: every quote, backquote, `$(`, `${` and subshell
+    /// closes, and no `(` or `)` stands where a shell refuses one.
+    Clean,
+    /// The shell refuses the command holding this byte offset: a quote or
+    /// subshell opened here never closes, or a `(` or `)` stands here where
+    /// no command takes one.
+    At(usize),
+    /// A backquote, `$(` or `${` (or a quote inside one) never closes. A
+    /// shell stops there too, but such text is likely one piece of a string
+    /// the program assembles (`'echo $(git re' + 'set --hard)'`), which
+    /// another piece completes, so it is not cut.
+    OpenSubstitution,
+    /// The text holds a form whose reading differs between shells or that
+    /// this reader does not follow (a heredoc or here-string, arithmetic,
+    /// `$'…'`, a comment or `case` inside `$(`, a brace inside `${`), so
+    /// where a shell stops is not known.
+    Unknown,
+}
+
+/// Reads `text` the way a POSIX shell lexes a script, far enough to find
+/// the errors [`ShellSyntaxStop`] names: single and double quotes,
+/// backquotes (closed by the next unescaped backquote, whatever they hold),
+/// `$(`, `${`, `<(`, comments, and the words of each top-level command, so
+/// a `(` after a command word (`` `x` (see `y`) ``, `fn f() -> T`) or a
+/// stray `)` is seen where bash and dash reject it. Arrays, extglob groups
+/// and function definitions take their parentheses; after `case`, `[[`,
+/// `for`, `select`, `function`, `time` or `coproc` no parenthesis counts as
+/// an error, since those forms take them too. The parenthesis rules are
+/// POSIX sh's, like the rest of the judgement of recovered shell text: zsh
+/// reads a `(…)` after a word as a glob instead.
+fn shell_syntax_stop(text: &str) -> ShellSyntaxStop {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Open {
+        Double,
+        Backtick,
+        Brace,
+        /// `$(`, `<(`, `>(`, an array or an extglob group, with its depth.
+        Paren(usize),
+    }
+    // Where a shell stops when the text ends, or a single quote never
+    // closes, inside the constructs still open.
+    fn open_stop(stack: &[(Open, usize)]) -> ShellSyntaxStop {
+        if stack.iter().any(|(open, _)| *open != Open::Double) {
+            ShellSyntaxStop::OpenSubstitution
+        } else {
+            stack.first().map_or(ShellSyntaxStop::Clean, |&(_, start)| {
+                ShellSyntaxStop::At(start)
+            })
+        }
+    }
+    let bytes = text.as_bytes();
+    let at = |index: usize| bytes.get(index).copied();
+    let next_non_blank = |mut index: usize| {
+        while matches!(at(index), Some(b' ' | b'\t')) {
+            index += 1;
+        }
+        index
+    };
+    let may_name_function = |word: &[u8]| {
+        !word.is_empty()
+            && !word
+                .iter()
+                .any(|byte| matches!(byte, b'\'' | b'"' | b'`' | b'$' | b'\\' | b'='))
+    };
+    let mut stack: Vec<(Open, usize)> = Vec::new();
+    // Top-level state: the word being read, the words of the current simple
+    // command, open subshells, and whether a parenthesis can still be judged.
+    let mut word_start: Option<usize> = None;
+    let mut words = 0usize;
+    let mut first_word_may_name_function = false;
+    let mut subshells: Vec<usize> = Vec::new();
+    let mut parentheses_judged = true;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(&(open, _)) = stack.last() {
+            match (open, byte) {
+                (_, b'\\') => index += 2,
+                (Open::Backtick, b'`') | (Open::Double, b'"') | (Open::Brace, b'}') => {
+                    stack.pop();
+                    index += 1;
+                }
+                (Open::Backtick, _) => index += 1,
+                (_, b'`') => {
+                    stack.push((Open::Backtick, index));
+                    index += 1;
+                }
+                (_, b'$') if at(index + 1) == Some(b'(') => {
+                    if at(index + 2) == Some(b'(') {
+                        return ShellSyntaxStop::Unknown;
+                    }
+                    stack.push((Open::Paren(1), index));
+                    index += 2;
+                }
+                (_, b'$') if at(index + 1) == Some(b'{') => {
+                    stack.push((Open::Brace, index));
+                    index += 2;
+                }
+                (Open::Double, _) => index += 1,
+                // Unquoted inside `$(` or `${`.
+                (_, b'"') => {
+                    stack.push((Open::Double, index));
+                    index += 1;
+                }
+                (_, b'$') if at(index + 1) == Some(b'"') => {
+                    stack.push((Open::Double, index));
+                    index += 2;
+                }
+                // dash reads `$'` as `$` and a plain quote, bash as an ANSI-C
+                // quote; how a quote inside `${…}` within double quotes
+                // reads varies by shell too.
+                (_, b'$') if at(index + 1) == Some(b'\'') => return ShellSyntaxStop::Unknown,
+                (_, b'\'') => {
+                    if open == Open::Brace && stack.iter().any(|(outer, _)| *outer == Open::Double)
+                    {
+                        return ShellSyntaxStop::Unknown;
+                    }
+                    let Some(end) = quote_end(bytes, index) else {
+                        return open_stop(&stack);
+                    };
+                    index = end;
+                }
+                (Open::Brace, b'{') => return ShellSyntaxStop::Unknown,
+                (Open::Brace, _) => index += 1,
+                (Open::Paren(depth), b'(') => {
+                    if at(index + 1) == Some(b'(') {
+                        return ShellSyntaxStop::Unknown;
+                    }
+                    if let Some(last) = stack.last_mut() {
+                        last.0 = Open::Paren(depth + 1);
+                    }
+                    index += 1;
+                }
+                (Open::Paren(depth), b')') => {
+                    if depth == 1 {
+                        stack.pop();
+                    } else if let Some(last) = stack.last_mut() {
+                        last.0 = Open::Paren(depth - 1);
+                    }
+                    index += 1;
+                }
+                // A heredoc body is not shell syntax; dash reads `<<<` as one.
+                (Open::Paren(_), b'<') if at(index + 1) == Some(b'<') => {
+                    return ShellSyntaxStop::Unknown;
+                }
+                (Open::Paren(_), b'#' | b'c') => {
+                    let word_boundary = index == 0
+                        || matches!(
+                            bytes[index - 1],
+                            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+                        );
+                    let case_word = byte == b'c'
+                        && bytes[index..].starts_with(b"case")
+                        && at(index + 4)
+                            .is_none_or(|after| matches!(after, b' ' | b'\t' | b'\n' | b';'));
+                    if word_boundary && (byte == b'#' || case_word) {
+                        return ShellSyntaxStop::Unknown;
+                    }
+                    index += 1;
+                }
+                (Open::Paren(_), _) => index += 1,
+            }
+            continue;
+        }
+        // Top level. `(` is a metacharacter and ends the word before it,
+        // except where the word makes it an array (`a=(`) or an extglob
+        // group (`@(`).
+        if byte == b'('
+            && word_start.is_some_and(|start| {
+                matches!(
+                    bytes[start..index].last(),
+                    Some(b'=' | b'@' | b'!' | b'*' | b'+' | b'?')
+                )
+            })
+        {
+            stack.push((Open::Paren(1), index));
+            index += 1;
+            continue;
+        }
+        if matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')'
+        ) && let Some(start) = word_start.take()
+        {
+            let word = &bytes[start..index];
+            if words == 0 {
+                match word {
+                    b"!" | b"{" | b"}" | b"if" | b"then" | b"else" | b"elif" | b"fi" | b"do"
+                    | b"done" | b"while" | b"until" => {}
+                    b"case" | b"esac" | b"for" | b"select" | b"in" | b"function" | b"time"
+                    | b"coproc" | b"[[" | b"]]" => parentheses_judged = false,
+                    _ => {
+                        first_word_may_name_function = may_name_function(word);
+                        words = 1;
+                    }
+                }
+            } else {
+                words += 1;
+            }
+        }
+        match byte {
+            b' ' | b'\t' => index += 1,
+            b'\n' | b';' | b'&' | b'|' => {
+                words = 0;
+                index += 1;
+            }
+            b'<' | b'>' => {
+                if at(index + 1) == Some(b'(') {
+                    word_start = Some(index);
+                    stack.push((Open::Paren(1), index));
+                    index += 2;
+                    continue;
+                }
+                if byte == b'<' && at(index + 1) == Some(b'<') {
+                    return ShellSyntaxStop::Unknown;
+                }
+                if words == 0 {
+                    first_word_may_name_function = false;
+                }
+                words += 1;
+                index += 1;
+            }
+            b'(' => {
+                if at(index + 1) == Some(b'(') {
+                    return ShellSyntaxStop::Unknown;
+                }
+                if words == 0 {
+                    subshells.push(index);
+                    index += 1;
+                    continue;
+                }
+                let close = next_non_blank(index + 1);
+                if words == 1 && first_word_may_name_function && at(close) == Some(b')') {
+                    words = 0;
+                    index = close + 1;
+                    continue;
+                }
+                if parentheses_judged {
+                    return ShellSyntaxStop::At(index);
+                }
+                index += 1;
+            }
+            b')' => {
+                if subshells.pop().is_some() {
+                    words = 1;
+                    first_word_may_name_function = false;
+                } else if parentheses_judged {
+                    return ShellSyntaxStop::At(index);
+                }
+                index += 1;
+            }
+            b'#' if word_start.is_none() => {
+                index = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(bytes.len(), |offset| index + offset);
+            }
+            _ => {
+                word_start.get_or_insert(index);
+                match byte {
+                    b'\\' => index += 2,
+                    b'\'' => {
+                        let Some(end) = quote_end(bytes, index) else {
+                            return ShellSyntaxStop::At(index);
+                        };
+                        index = end;
+                    }
+                    b'"' => {
+                        stack.push((Open::Double, index));
+                        index += 1;
+                    }
+                    b'`' => {
+                        stack.push((Open::Backtick, index));
+                        index += 1;
+                    }
+                    b'$' => match at(index + 1) {
+                        Some(b'\'') => return ShellSyntaxStop::Unknown,
+                        Some(b'"') => {
+                            stack.push((Open::Double, index));
+                            index += 2;
+                        }
+                        Some(b'(') => {
+                            if at(index + 2) == Some(b'(') {
+                                return ShellSyntaxStop::Unknown;
+                            }
+                            stack.push((Open::Paren(1), index));
+                            index += 2;
+                        }
+                        Some(b'{') => {
+                            stack.push((Open::Brace, index));
+                            index += 2;
+                        }
+                        _ => index += 1,
+                    },
+                    _ => index += 1,
+                }
+            }
+        }
+    }
+    if !stack.is_empty() {
+        return open_stop(&stack);
+    }
+    match subshells.first() {
+        Some(&start) if parentheses_judged => ShellSyntaxStop::At(start),
+        _ => ShellSyntaxStop::Clean,
+    }
+}
+
+/// The offset just past the single-quoted string opened at `start`, which
+/// no escape ends early. `None` when it never closes.
+fn quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    bytes
+        .get(start + 1..)?
+        .iter()
+        .position(|byte| *byte == b'\'')
+        .map(|offset| start + 1 + offset + 1)
 }
 
 pub fn extract_posix_command_substitutions(
@@ -15226,7 +16398,10 @@ mod tests {
             "exec 3> >(sh)\ncat <<EOF >&3\n\nEOF",
             "cat <<EOF > x\n\nEOF\nexec sh < x",
         ] {
-            assert!(command_may_run_heredoc_output(command), "{command:?}");
+            assert!(
+                command_may_run_heredoc_output(command, &|_| None),
+                "{command:?}"
+            );
         }
         for command in [
             "cat <<EOF >&2\n\nEOF\nexit 1",
@@ -15238,7 +16413,218 @@ mod tests {
             "{ cat <<EOF; } > n\n\nEOF",
             "if true; then cat <<EOF > n\n\nEOF\nfi",
         ] {
-            assert!(!command_may_run_heredoc_output(command), "{command:?}");
+            assert!(
+                !command_may_run_heredoc_output(command, &|_| None),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// An interpreter fed its program by its own quoted heredoc runs another
+    /// heredoc's output only if that program can execute something (#591).
+    #[test]
+    fn interpreter_reading_its_own_program_runs_other_output_only_with_execution() {
+        let may_run = |command: &str| -> bool {
+            let heredocs = active_heredocs(command).expect("parsable command");
+            let bodies: Vec<Range<usize>> = heredocs
+                .iter()
+                .filter_map(|heredoc| match heredoc.body {
+                    ActiveHeredocBody::Heredoc {
+                        body_start,
+                        body_end,
+                        ..
+                    } => Some(body_start..body_end),
+                    ActiveHeredocBody::HereString => None,
+                })
+                .collect();
+            let quoted = quoted_bodies_by_operator(&heredocs);
+            command_may_run_heredoc_output(&blank_ranges(command, &bodies), &|operator| {
+                quoted_body_for_operator(command, &quoted, operator)
+            })
+        };
+        let note = "cat > ~/n/x.md <<'EOF'\na `b\nEOF\n";
+        for program in [
+            "python3 - <<'EOF'\nprint(1)\nEOF",
+            "python3 -I - <<'EOF'\nfrom pathlib import Path\nprint(Path('x.md').read_text())\nEOF",
+            "/usr/bin/python3 - a b <<'EOF'\nimport sys\nprint(sys.argv)\nEOF",
+            "node - <<'EOF'\nconsole.log(1);\nEOF",
+        ] {
+            let command = format!("{note}{program}");
+            assert!(!may_run(&command), "{command:?}");
+        }
+        for program in [
+            // The program can run the file the first heredoc wrote.
+            "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['sh', 'x.md'])\nEOF",
+            "python3 - <<'EOF'\nimport os\nos.system('sh x.md')\nEOF",
+            "python3 - <<'EOF'\nexec(open('x.md').read())\nEOF",
+            "python3 - <<'EOF'\nimport runpy\nrunpy.run_path('x.md')\nEOF",
+            "node - <<'EOF'\nrequire('child_process').execSync('sh x.md');\nEOF",
+            // A program the screen cannot read.
+            "python3 - <<'EOF'\nprint(\nEOF",
+            "ruby - <<'EOF'\nputs 1\nEOF",
+            // The shell expands an unquoted body before the interpreter reads it.
+            "python3 - <<EOF\nprint(1)\nEOF",
+            // A shell, a pipe, a second input, a rebindable name.
+            "bash <<'EOF'\necho hi\nEOF",
+            "python3 - <<'EOF' | sh\nprint(1)\nEOF",
+            "python3 - <<'EOF' < x.md\nprint(1)\nEOF",
+            "python3(){ sh \"$@\"; }; python3 - <<'EOF'\nprint(1)\nEOF",
+        ] {
+            let command = format!("{note}{program}");
+            assert!(may_run(&command), "{command:?}");
+        }
+    }
+
+    /// A shell runs a script up to the line of its first syntax error (#560).
+    #[test]
+    fn runnable_prefix_stops_at_the_first_syntax_error_line() {
+        for (text, expected) in [
+            ("echo hi; git status", Some("echo hi; git status")),
+            ("a `b", None),
+            ("echo it's `x`", Some("")),
+            ("fn f() -> Option<(u8, u8)> {", Some("")),
+            ("`span_ref` (token; `origin` r2 \\| checked)", Some("")),
+            (
+                "git reset --hard\n`x` (see `y`)",
+                Some("git reset --hard\n"),
+            ),
+            (
+                "(cd x && make); f() ( true )",
+                Some("(cd x && make); f() ( true )"),
+            ),
+            (
+                "git reset --hard\necho it's `x`",
+                Some("git reset --hard\n"),
+            ),
+            (
+                "## Flags\n- The caller's `RunConfig` budget.\n",
+                Some("## Flags\n"),
+            ),
+            (
+                "if true; then\ngit reset --hard\nfi\necho ) x",
+                Some("if true; then\ngit reset --hard\nfi\n"),
+            ),
+            // tree-sitter-bash fails on an empty backquote pair, which a
+            // shell runs: nothing is cut there, so all of it is judged.
+            ("```bash\nls\n```", Some("```bash\nls\n```")),
+            ("```rm -rf ~```", Some("```rm -rf ~```")),
+            ("``\ngit reset --hard", Some("``\ngit reset --hard")),
+            (
+                "``git reset --hard``\necho it's",
+                Some("``git reset --hard``\n"),
+            ),
+            (
+                "echo ok `` ; git reset --hard\necho it's",
+                Some("echo ok `` ; git reset --hard\n"),
+            ),
+            (
+                "# don't\ngit reset --hard ``",
+                Some("# don't\ngit reset --hard ``"),
+            ),
+            (
+                "echo `echo it's`\ngit reset --hard ``",
+                Some("echo `echo it's`\ngit reset --hard ``"),
+            ),
+            // Only the failing line and what follows it are dropped.
+            (
+                "git reset --hard &&\necho it's",
+                Some("git reset --hard &&\n"),
+            ),
+            (
+                "| a | b |\ngit reset --hard",
+                Some("| a | b |\ngit reset --hard"),
+            ),
+            // Forms the shells read differently cut nothing.
+            ("echo $'it\\'s'\ngit reset --hard\necho it's", None),
+            ("cat <<< x\ngit reset --hard\necho it's", None),
+            ("echo \"${x:-'a'}\"\ngit reset --hard\necho it's", None),
+            // Quotes, comments and parentheses read as a shell reads them.
+            ("echo a#b it's\ngit reset --hard", Some("")),
+            ("echo \"$(echo it's)\"\ngit reset --hard", None),
+            // A piece of an assembled string is judged whole.
+            ("echo $(git re", None),
+            ("set --hard)", Some("")),
+            ("' $(git re", None),
+            ("x) `git re", None),
+            ("Don't use `foo", None),
+            ("Don't run `make` here (see `docs/`).", Some("")),
+            (
+                "echo it\\'s \"it's\"\necho it's",
+                Some("echo it\\'s \"it's\"\n"),
+            ),
+            (
+                "if(true); then git status; fi\necho it's",
+                Some("if(true); then git status; fi\n"),
+            ),
+            (
+                "a=(1 2)\ngit status\necho it's",
+                Some("a=(1 2)\ngit status\n"),
+            ),
+            (
+                "case x in x) git status;; esac\necho it's",
+                Some("case x in x) git status;; esac\n"),
+            ),
+            (
+                "f () { git status; }\nf\necho it's",
+                Some("f () { git status; }\nf\n"),
+            ),
+            (
+                "git status\n(git reset --hard\necho ok",
+                Some("git status\n"),
+            ),
+            ("git status\nf (x)\ngit reset --hard", Some("git status\n")),
+            ("git status; `x` (y)\ngit reset --hard", Some("")),
+        ] {
+            assert_eq!(posix_text_runnable_prefix(text), expected, "{text:?}");
+        }
+        // Past the parse limits nothing is cut: the caller judges it all.
+        let long_pipeline = format!(
+            "{}echo `x",
+            "true | ".repeat(MAX_PARSED_PIPELINE_STAGES + 1)
+        );
+        assert_eq!(posix_text_runnable_prefix(&long_pipeline), None);
+    }
+
+    /// Where a shell stops reading is decided by its own quoting, never by
+    /// the grammar's error recovery.
+    #[test]
+    fn shell_syntax_stop_follows_shell_quoting() {
+        use ShellSyntaxStop::{At, Clean, OpenSubstitution, Unknown};
+        for (text, expected) in [
+            ("echo ok", Clean),
+            ("```bash\nls\n```", Clean),
+            ("echo `echo it's`", Clean),
+            ("echo \"`echo \"a\"`\" '(' \\( a=(1 2) @(x) <(y)", Clean),
+            ("# it's\necho ok", Clean),
+            ("echo ok # it's", Clean),
+            ("(x)# it's", Clean),
+            ("f() ( true ); g () { :; }; if(true); then :; fi", Clean),
+            ("case x in (a) :;; b) :;; esac", Clean),
+            ("time (x); [[ a =~ (b) ]]", Clean),
+            ("echo it's", At(7)),
+            ("echo a#b it's", At(11)),
+            ("echo \"it's", At(5)),
+            ("a `b", OpenSubstitution),
+            ("echo \"$(echo it's)\"", OpenSubstitution),
+            ("echo ${x:-'a}", OpenSubstitution),
+            ("echo $(git re", OpenSubstitution),
+            ("(x", At(0)),
+            ("echo ) x", At(5)),
+            ("`x` (see `y`)", At(4)),
+            ("fn f() -> T", At(4)),
+            ("x=1 (y)", At(4)),
+            ("(a) (b)", At(4)),
+            ("echo $'it\\'s'", Unknown),
+            ("cat <<EOF\nit's\nEOF", Unknown),
+            ("cat <<< it", Unknown),
+            ("echo $((1 + 2)) it's", Unknown),
+            ("((i++)); echo it's", Unknown),
+            ("echo $(a # it's\n)", Unknown),
+            ("echo $(case x in a) :;; esac)", Unknown),
+            ("echo ${x:-{a}}", Unknown),
+            ("echo \"${x:-'a'}\"", Unknown),
+        ] {
+            assert_eq!(shell_syntax_stop(text), expected, "{text:?}");
         }
     }
 
@@ -22459,9 +23845,24 @@ mod issue_560_masking_tests {
             "env python3 - <<'PY'\nprint('x')\nPY",
             "X=1 python3 - <<'PY'\nprint('x')\nPY",
             "python3 script.py <<'PY'\nprint('x')\nPY",
-            "python3 - arg <<'PY'\nprint('x')\nPY",
+            "python3 -m tool - <<'PY'\nprint('x')\nPY",
+            "python3 -X dev - <<'PY'\nprint('x')\nPY",
+            "python3 arg - <<'PY'\nprint('x')\nPY",
         ] {
             assert_eq!(mask_inert_interpreter_stdin(command).as_ref(), command);
+        }
+    }
+
+    /// Words after `-` are the program's arguments (`sys.argv[1:]`); the
+    /// program is still the heredoc (#560: `python3 - "$F" <<'EOF'`).
+    #[test]
+    fn program_arguments_after_stdin_dash_keep_the_body_inert() {
+        for command in [
+            "python3 - arg <<'PY'\nprint('it`s')\nPY",
+            "python3 -I - a \"$F\" <<'PY'\nprint('it`s')\nPY",
+        ] {
+            let masked = mask_inert_interpreter_stdin(command);
+            assert!(!masked.contains("it`s"), "{command}");
         }
     }
 }

@@ -1187,13 +1187,20 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
     // The evidence screen already requires a complete bounded tree before
     // answering false. Running it here preserves the data-only fast path and
     // all predicates, but avoids a second parse when recovery is required.
-    // An unproved outer consumer always retains the unscreened recovery.
-    if screen_execution_evidence
-        && allow_documentation_literals
-        && !super::literal_root_has_execution_evidence(&root, language)
-    {
+    let without_execution_evidence =
+        screen_execution_evidence && !super::literal_root_has_execution_evidence(&root, language);
+    if without_execution_evidence && allow_documentation_literals {
         return Ok(Vec::new());
     }
+    // An unproved outer consumer retains the recovery: a program that runs
+    // nothing itself can still print or write a string that a later shell
+    // runs. A shell given that string runs only the part before its first
+    // syntax error, though. From the line holding an unterminated quote in
+    // Markdown prose, or a `(` after a command word in a Rust signature, the
+    // text is the program's data, not a hidden command, so only the lines
+    // before it are judged (#560; [`crate::heredoc::posix_text_runnable_prefix`]).
+    // With execution evidence every candidate is judged whole.
+    let only_shell_text = without_execution_evidence;
     let node_limit = interpreter_literal_node_limit(code.len());
     for (index, node) in root.dfs().enumerate() {
         if index >= node_limit {
@@ -1272,13 +1279,24 @@ pub(super) fn interpreter_literal_shell_commands_inner_with_execution_evidence(
                     "literal count limit",
                 ));
             }
-            if let Some(command) = command {
+            if let Some(mut command) = command {
                 payload_bytes = payload_bytes.saturating_add(command.len());
                 if payload_bytes > MAX_INTERPRETER_LITERAL_PAYLOAD_BYTES {
                     return Err(interpreter_literal_parse_error(
                         language,
                         "aggregate literal byte limit",
                     ));
+                }
+                // Counted against both limits above, so narrowing or
+                // skipping it adds no unbounded work.
+                if only_shell_text {
+                    match crate::heredoc::posix_text_runnable_prefix(&command) {
+                        Some(runnable) if runnable.trim().is_empty() => continue,
+                        Some(runnable) if runnable.len() < command.len() => {
+                            command = runnable.to_string();
+                        }
+                        Some(_) | None => {}
+                    }
                 }
                 let range = node.range();
                 commands.push(ReconstructedCommand {
@@ -1371,7 +1389,7 @@ fn interpreter_literal_has_owned_sink<D: ast_grep_core::Doc>(
 /// Decode complete AST string values, retaining unknown expressions as unknown.
 /// Python's raw/bytes/triple strings and JavaScript's static templates have
 /// different escape contracts; shell quoting cannot decode either language.
-fn static_interpreter_literal<D: ast_grep_core::Doc>(
+pub(super) fn static_interpreter_literal<D: ast_grep_core::Doc>(
     node: &ast_grep_core::Node<'_, D>,
     language: ScriptLanguage,
     depth: usize,

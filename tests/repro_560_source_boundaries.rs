@@ -5,10 +5,19 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn assert_decision(source: &str, expected: &str) {
+    assert_decision_with_home_dirs(source, expected, &[]);
+}
+
+/// `home_dirs` are created under the isolated home first: whether a write
+/// under `~` lands in an existing directory is part of the verdict.
+fn assert_decision_with_home_dirs(source: &str, expected: &str, home_dirs: &[&str]) {
     for hook in [false, true] {
         let temp = tempfile::tempdir().expect("isolated working directory");
         let home = temp.path().join("home");
         std::fs::create_dir(&home).expect("isolated home");
+        for dir in home_dirs {
+            std::fs::create_dir_all(home.join(dir)).expect("directory under the isolated home");
+        }
         let mut command = Command::new(env!("CARGO_BIN_EXE_dcg"));
         let input = if hook {
             command.args(["hook", "--batch"]);
@@ -282,5 +291,87 @@ fn many_inert_shell_looking_literals_do_not_exhaust_recovery_budget() {
         }
         source.push_str("LITERAL_DATA");
         assert_decision(&source, "allow");
+    }
+}
+
+/// Shapes of quoted `python3 -` edit heredocs that agents run and 0.15.3
+/// allows (#560 reopened): Markdown and Rust doc text with apostrophes,
+/// backquotes and generics inside Python strings, shell text kept as data,
+/// closed `subprocess.run` argument lists, and an ordinary command after the
+/// heredoc. None of these bodies reaches a shell.
+#[test]
+fn quoted_python_edit_heredocs_followed_by_commands_are_allowed() {
+    for source in [
+        "python3 - <<'EOF'\ns = s.replace(a, '\\n// `model` is loaded through `#[path]`\\n')\nEOF\ncargo check",
+        "python3 -I - <<'EOF'\nimport subprocess\nfrom pathlib import Path\nc = subprocess.run(['git', 'show', 'origin/main:DESIGN.md'], capture_output=True, text=True, check=True).stdout\nb = \"\"\"## Feature flags\n- The fallback path retries with the caller's `RunConfig` budget.\n\"\"\"\nPath('DESIGN.md').write_text(c.replace('## Feature flags\\n', b))\nEOF\ngit diff --stat origin/main -- DESIGN.md",
+        "python3 -I - <<'PY'\nedits = [\n(\"\"\"    exit 3\n    echo \"COPY FAILED: $1 -> $DEST/$2\"\n\"\"\"),\n(\"\"\"esac\n\"\"\"),\n]\nPY",
+        "cd tools && python3 -I - <<'PY'\nedits = [\n(\"\"\"    exit 3\n    echo \"COPY FAILED: $1 -> $DEST/$2\"\n\"\"\"),\n]\nPY\nbash -n copy.sh && shellcheck -S warning copy.sh; echo \"check rc=$?\"",
+        "python3 -I - <<'EOF'\nimport re\nt = open('f.rs').read()\nt = t[:10] + '''/// `f_k(s)` on the reduced form, refused below the cutoff.\nfn scale_factor(mode: Mode) -> impl Fn(f64) -> Option<(f64, f64)> {\n''' + t[20:]\npattern = re.compile(r\"Some\\(Limits \\{\\s*mode: &mode_fn,\\s*\\}\\),\")\nt, n = pattern.subn(\"\"\"vec![\n        ],\"\"\", t)\nopen('f.rs', 'w').write(t)\nEOF",
+        // A wrapper that runs a build tool, and a runner that starts Python
+        // for pytest, are not programs that run what the heredoc printed.
+        "cd crates/net && python3 -I - <<'EOF'\np = 'src/lib.rs'\ns = open(p).read()\ndef rep(old, new):\n    global s\n    assert s.count(old) == 1, old[:80]\n    s = s.replace(old, new)\nrep('''use x::LIMIT;\n''', '''use x::LIMIT;\n\n/// A pending item's wakeup can be missed under load: `poll_next`\n/// retries `recv()` on every poll.\n''')\nopen(p, 'w').write(s)\nprint('ok')\nEOF\ndevtool exec -- cargo test -p net --no-run > ../build.log 2>&1; echo build=$?; grep -E '^(error|warning)' -A6 ../build.log | head -24",
+        "cat >> tests/test_spans.py <<'PYEOF'\n\ndef test_x():\n    assert True\nPYEOF\npython3 - <<'PYEOF'\nnew = \"`span_ref` (token → line spans; `origin` r2 \\\\| checked; owned by A2)\"\nprint(new)\nPYEOF\nuv run --no-project --with pytest python -m pytest -q tests/test_spans.py 2>&1 | tail -2",
+        // Prose whose shell reading stops at its first line, then a later
+        // script run.
+        "python3 - <<'PY'\nopen('README.md', 'w').write(\"Don't run `make` here (see `docs/`).\\n\")\nPY\nsh scripts/check.sh",
+    ] {
+        assert_decision(source, "allow");
+    }
+}
+
+/// The isolation proof is about where the body goes. Printed shell text that
+/// a shell reads, a written script that a later command runs, and a program
+/// that executes its own literal all stay denied.
+#[test]
+fn python_edit_heredocs_keep_shell_consumers_and_sinks_denied() {
+    for source in [
+        "python3 - <<'PY' | sh\ns = 'echo $(git reset --hard)'\nprint(s)\nPY\ncargo check",
+        "python3 - <<'PY' | sh\nprint(\"git reset --hard it's\")\nPY",
+        "python3 - <<'PY'\nopen('m.sh', 'w').write('echo $(git reset --hard)')\nPY\ncargo check && sh m.sh",
+        "python3 -I - <<'PY'\nopen('m.sh', 'w').write('echo $(git reset --hard)')\nPY\ndevtool exec -- bash m.sh",
+        "python3 -I - <<'PY'\nopen('m.sh', 'w').write('echo `git reset --hard`')\nPY\n. ./m.sh",
+        "python3 - <<'PY'\nimport os\ns = \"it's `git reset --hard`\"\nos.system(s)\nPY\ncargo check",
+        "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['sh', '-c', 'echo $(git reset --hard)'])\nPY",
+        "python3 - <<'PY'\nimport subprocess\nrun = subprocess.run\ns = 'echo $(git reset --hard)'\nrun(s, shell=True)\nPY\ncargo check",
+        // A fixed process call, or a later command, that runs the file the
+        // program wrote.
+        "python3 - <<'PY'\nimport subprocess\nopen('m.sh', 'w').write('echo $(git re' + 'set --hard)')\nsubprocess.run(['sh', 'm.sh'])\nPY",
+        "python3 - <<'PY'\nimport subprocess\nopen('m.sh', 'w').write('echo $(git re' + 'set --hard)')\nsubprocess.run(['bash', 'm.sh'], check=True)\nPY\ncargo check",
+        "python3 - <<'PY'\nimport os\nopen('m.sh', 'w').write('echo $(git re' + 'set --hard)')\nos.system('./m.sh')\nPY",
+        "python3 - <<'PY'\nopen('ls', 'w').write('echo $(git re' + 'set --hard)')\nPY\nPATH=.:$PATH ls",
+        // A shell runs the lines before a syntax error in the script.
+        "python3 - <<'PY'\nopen('m.sh', 'w').write(\"git reset --hard\\necho it's `x`\")\nPY\nsh m.sh",
+        // An empty backquote pair is no syntax error to a shell: a Markdown
+        // fence around a command runs it.
+        "python3 - <<'PY'\nopen('m.sh', 'w').write(\"```\\ngit re\\x73et --hard\\n```\")\nPY\nsh m.sh",
+        "python3 - <<'PY'\nopen('m.sh', 'w').write('``git re\\x73et --hard``')\nPY\nsh m.sh",
+        // A piece whose stray quote closes the previous piece's quote.
+        "python3 - <<'PY'\nopen('m.sh', 'w').write('echo \\'x' + '\\' $(git re' + 'set --hard)')\nPY\nsh m.sh",
+    ] {
+        assert_decision(source, "deny");
+    }
+}
+
+/// Issue #591: a quoted `cat` body written under `~` is data. A later
+/// `python3 -` heredoc reads its own program, not that file, unless the
+/// program can run something.
+#[test]
+fn quoted_note_body_followed_by_python_heredoc_is_allowed() {
+    for source in [
+        "cat > ~/notes/x.md <<'EOF'\na `b\nEOF\npython3 - <<'EOF'\nprint(1)\nEOF",
+        "cat > ~/notes/x.md <<'EOF'\n# Note\nThe error was `Failed to fetch dynamically imported\nmodule` in the browser.\nEOF\npython3 - <<'EOF'\nfrom pathlib import Path\np = Path.home() / 'notes' / 'index.md'\nprint(p)\nEOF",
+    ] {
+        assert_decision_with_home_dirs(source, "allow", &["notes"]);
+    }
+}
+
+#[test]
+fn written_note_run_by_a_later_program_stays_denied() {
+    for source in [
+        "cat > ~/notes/x.sh <<'EOF'\ngit reset --hard\nEOF\npython3 - <<'EOF'\nimport subprocess\nsubprocess.run(['sh', 'x.sh'], cwd='/h/notes')\nEOF",
+        "cat > ~/notes/x.sh <<'EOF'\ngit reset --hard `\nEOF\npython3 - <<'EOF'\nimport subprocess, os\nsubprocess.run(['sh', os.path.expanduser('~/notes/x.sh')])\nEOF",
+        "cat > ~/notes/x.sh <<'EOF'\ngit reset --hard `\nEOF\npython3 - <<'EOF'\nprint(1)\nEOF\nsh ~/notes/x.sh",
+    ] {
+        assert_decision_with_home_dirs(source, "deny", &["notes"]);
     }
 }
