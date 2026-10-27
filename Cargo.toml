@@ -68,7 +68,8 @@ rayon = { version = "1.11", optional = true }
 # SupportLang crosses this crate's Language/LanguageExt trait boundary. Keep
 # the core compatible with the vendored language adapter below; two semver
 # incompatible core versions produce distinct traits and cannot interoperate.
-ast-grep-core = "0.51.0"
+# Dependabot ignores this crate for that reason (.github/dependabot.yml).
+ast-grep-core = "0.45.3"
 # The Bash grammar carries dcg's #442/#461 fixes (scanner memory safety on glibc;
 # explicit stdin descriptors and mixed file/here-string redirections). It used to
 # arrive through `[patch.crates-io]`, which `cargo publish` drops, so a crates.io

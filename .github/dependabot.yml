@@ -19,6 +19,12 @@ updates:
     labels:
       - "dependencies"
       - "rust"
+    ignore:
+      # Must match the core version the vendored ast-grep-language-dcg adapter
+      # is built against (see Cargo.toml). A standalone bump creates a second,
+      # incompatible core and main stops compiling (cdf17b49, and again with
+      # the 0.51.0 bump).
+      - dependency-name: "ast-grep-core"
     groups:
       # Group minor/patch updates together
       rust-minor-patch:
