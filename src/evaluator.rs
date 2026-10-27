@@ -347,7 +347,15 @@ fn byte_span_to_char_span(command: &str, span: &MatchSpan) -> Option<WindowedSpa
 thread_local! {
     /// Recursive evaluation is synchronous. Keep authorization source separate
     /// from detection views, including case-folded and redirection-free replays.
+    /// Whole-command allowlists and overrides share this provenance with safe
+    /// patterns: extracting a child cannot create a new authorization scope.
     static SAFE_PATTERN_SOURCE: std::cell::RefCell<Option<Rc<SafePatternSource>>> = const {
+        std::cell::RefCell::new(None)
+    };
+    /// Adapter policy replays enter through the public depth-zero API. Keep
+    /// their initial request authoritative when confidence analysis blanks a
+    /// finding before asking the evaluator to inspect the remaining text.
+    static AUTHORIZATION_REPLAY_SOURCE: std::cell::RefCell<Option<Rc<str>>> = const {
         std::cell::RefCell::new(None)
     };
 }
@@ -400,10 +408,13 @@ struct SafePatternScope {
 
 impl SafePatternScope {
     fn enter(command: &str, dialect: ShellDialect, depth: usize) -> Self {
+        let replay_source = (depth == 0)
+            .then(|| AUTHORIZATION_REPLAY_SOURCE.with(|slot| slot.borrow().clone()))
+            .flatten();
         let previous = SAFE_PATTERN_SOURCE.with(|slot| {
             let previous = slot.borrow_mut().take();
             *slot.borrow_mut() = Some(Rc::new(SafePatternSource {
-                command: command.to_string(),
+                command: replay_source.as_deref().unwrap_or(command).to_string(),
                 dialect,
                 parent: (depth > 0).then(|| previous.clone()).flatten(),
             }));
@@ -413,10 +424,61 @@ impl SafePatternScope {
     }
 }
 
+/// Preserve one authorization request across policy replays, including nested
+/// confidence rounds. Only the detection view changes; every new depth-zero
+/// evaluation still establishes its source using the first request's bytes.
+struct CommandReplayScope {
+    previous: Option<Rc<str>>,
+}
+
+impl CommandReplayScope {
+    fn enter(command: &str) -> Self {
+        let previous = AUTHORIZATION_REPLAY_SOURCE.with(|slot| {
+            let previous = slot.borrow_mut().take();
+            *slot.borrow_mut() = Some(previous.clone().unwrap_or_else(|| Rc::from(command)));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for CommandReplayScope {
+    fn drop(&mut self) {
+        AUTHORIZATION_REPLAY_SOURCE.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
 impl Drop for SafePatternScope {
     fn drop(&mut self) {
         SAFE_PATTERN_SOURCE.with(|slot| *slot.borrow_mut() = self.previous.take());
     }
+}
+
+/// A whole-command grant authorizes the original outer request. Detection
+/// replays may change case, remove syntax, or extract executable children;
+/// none of those derived strings is a new request the operator authorized.
+/// An explicitly approved outer envelope is checked before its children run.
+fn original_command_grant<T>(command: &str, grant: impl FnOnce(&str) -> Option<T>) -> Option<T> {
+    let source = SAFE_PATTERN_SOURCE.with(|slot| slot.borrow().clone());
+    match source {
+        Some(source) if source.parent.is_none() => grant(&source.command),
+        Some(_) => None,
+        None => grant(command),
+    }
+}
+
+fn original_command_matches_grant(command: &str, matches: impl FnOnce(&str) -> bool) -> bool {
+    original_command_grant(command, |original| matches(original).then_some(())).is_some()
+}
+
+fn command_allowed_by_override_as_written(
+    command: &str,
+    compiled_overrides: &crate::config::CompiledOverrides,
+) -> bool {
+    !compiled_overrides.allow.is_empty()
+        && original_command_matches_grant(command, |original| {
+            compiled_overrides.check_allow(original)
+        })
 }
 
 /// Regex exemptions read the original segment, including assignments,
@@ -13923,12 +13985,17 @@ fn allow_once_match(
     command: &str,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
-    let cwd = std::env::current_dir().ok()?;
-    let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
-    match store.match_command(command, &cwd, Utc::now(), allow_once_audit) {
-        Ok(Some(entry)) => Some(entry),
-        _ => None,
-    }
+    // A policy replay is a different detection view of the same request.
+    // Resolve its identity before consulting the store: matching the derived
+    // text would both authorize another command and consume its one-use grant.
+    original_command_grant(command, |original| {
+        let cwd = std::env::current_dir().ok()?;
+        let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
+        store
+            .match_command(original, &cwd, Utc::now(), allow_once_audit)
+            .ok()
+            .flatten()
+    })
 }
 
 #[allow(dead_code)]
@@ -13936,12 +14003,14 @@ fn allow_once_match_force_config(
     command: &str,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
-    let cwd = std::env::current_dir().ok()?;
-    let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
-    match store.match_command_force_config(command, &cwd, Utc::now(), allow_once_audit) {
-        Ok(Some(entry)) => Some(entry),
-        _ => None,
-    }
+    original_command_grant(command, |original| {
+        let cwd = std::env::current_dir().ok()?;
+        let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
+        store
+            .match_command_force_config(original, &cwd, Utc::now(), allow_once_audit)
+            .ok()
+            .flatten()
+    })
 }
 
 /// Return whether evaluation may recurse into an executable payload before the
@@ -13981,7 +14050,7 @@ fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn outer_command_allowlisted_before_nested_evaluation(
+fn command_allowlisted_as_written(
     command: &str,
     allowlists: &LayeredAllowlist,
     project_path: Option<&Path>,
@@ -13990,34 +14059,22 @@ fn outer_command_allowlisted_before_nested_evaluation(
         return false;
     }
 
-    // Match exactly the same sanitized/normalized representation used by the
-    // ordinary allowlist phase below. Only whole-command selectors are checked
-    // here: rule selectors must never authorize an unrelated nested rule.
-    let matches_full_command = |normalized: &str| {
+    // These selectors authorize command text, not a detection representation.
+    // Normalization may remove environment assignments, wrappers, paths or
+    // quoting; sanitization may erase argument data. Matching either derived
+    // form would broaden an exact, prefix or regex grant beyond its author.
+    // Rule selectors remain independently scoped to their own findings.
+    original_command_matches_grant(command, |original| {
         allowlists
-            .match_exact_command_at_path(normalized, project_path)
+            .match_exact_command_at_path(original, project_path)
             .is_some()
             || allowlists
-                .match_command_prefix_at_path(normalized, project_path)
+                .match_command_prefix_at_path(original, project_path)
                 .is_some()
             || allowlists
-                .match_pattern_at_path(normalized, project_path)
+                .match_pattern_at_path(original, project_path)
                 .is_some()
-    };
-
-    // First honor the literal outer envelope after ordinary command-word
-    // normalization. Sanitization can intentionally remove inert data spans,
-    // but an exact outer-command grant must still match what the user granted.
-    let raw_normalized = crate::normalize::normalize_command(command);
-    if matches_full_command(raw_normalized.as_ref()) {
-        return true;
-    }
-
-    // Retain the established sanitized matching representation as a fallback
-    // for existing allowlist entries created by earlier releases.
-    let sanitized = sanitize_for_pattern_matching(command);
-    let normalized = crate::normalize::normalize_command(sanitized.as_ref());
-    matches_full_command(normalized.as_ref())
+    })
 }
 
 /// Evaluate a command against all patterns and packs using a deadline.
@@ -14471,11 +14528,31 @@ fn dialect_view_may_expose_hidden_execution(
     command: &str,
     view: ShellDialect,
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    ordered_packs: &[String],
 ) -> bool {
     if view_exposes_extra_command_segments(command, view) {
         return true;
     }
     if view_decode_exposes_pack_keyword(command, view, keyword_index) {
+        return true;
+    }
+    // An escaped DCG option or subcommand can expose a control change without
+    // exposing a new pack keyword: both views already contain `dcg`. Ask the
+    // native argv proof, which distinguishes syntax from agent-name/data
+    // arguments, only when the relevant protection is enabled.
+    if matches!(view, ShellDialect::PowerShell | ShellDialect::Cmd)
+        && ordered_packs
+            .iter()
+            .any(|pack| pack == "careful_company_running_windows.guardrails")
+        && ["dcg-bypass-or-uninstall", "dcg-policy-self-weakening"]
+            .iter()
+            .any(|rule| {
+                crate::packs::careful_company_running_windows::guardrails::dcg_control_action_span(
+                    command, view, rule,
+                )
+                .is_some()
+            })
+    {
         return true;
     }
     view == ShellDialect::PowerShell
@@ -14564,13 +14641,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     if result.decision == EvaluationDecision::Allow
         && result.bypass_method != Some(BypassMethod::AllowOnce)
         && let Some(folded) = crate::normalize::fold_program_name_case(command, enabled_keywords)
-        && !explicitly_allowed_as_written(
-            command,
-            compiled_overrides,
-            allowlists,
-            project_path,
-            shell_dialect,
-        )
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
     {
         let alternate = if deadline_exceeded(deadline) {
             EvaluationResult::indeterminate_due_to_budget()
@@ -14634,21 +14705,9 @@ fn explicitly_allowed_as_written(
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &LayeredAllowlist,
     project_path: Option<&Path>,
-    dialect: ShellDialect,
 ) -> bool {
-    if compiled_overrides.check_allow(command) {
-        return true;
-    }
-    let normalized = crate::normalize::normalize_command_in_dialect(command, dialect);
-    allowlists
-        .match_exact_command_at_path(&normalized, project_path)
-        .is_some()
-        || allowlists
-            .match_command_prefix_at_path(&normalized, project_path)
-            .is_some()
-        || allowlists
-            .match_pattern_at_path(&normalized, project_path)
-            .is_some()
+    command_allowed_by_override_as_written(command, compiled_overrides)
+        || command_allowlisted_as_written(command, allowlists, project_path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14701,7 +14760,7 @@ fn evaluate_command_in_dialect_union(
     }
 
     for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
-        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index) {
+        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs) {
             continue;
         }
         // An exhausted budget is never proof that the un-run views are clean.
@@ -14793,7 +14852,7 @@ fn evaluate_command_in_single_dialect_view(
     }
 
     // Step 1.5: Check precompiled allow overrides after blocks.
-    if compiled_overrides.check_allow(command) {
+    if command_allowed_by_override_as_written(command, compiled_overrides) {
         return EvaluationResult::allowed();
     }
 
@@ -14878,22 +14937,23 @@ fn evaluate_command_in_single_dialect_view(
 
     let posix_executable_model = model_literal_posix_executable_assignments(command, shell_dialect);
 
-    // Launcher and substitution evaluation recurses before the ordinary
-    // full-command allowlist phase. Honor an authorization for the exact outer
-    // command first, after explicit block overrides have already won above.
-    // This does not consult rule selectors, so authorizing one outer envelope
-    // cannot accidentally authorize arbitrary nested commands.
+    // Launcher and substitution evaluation may recurse before pack matching.
+    // Honor an authorization for the original outer command first, after
+    // explicit block overrides have already won above. Rule selectors remain
+    // scoped to their own findings, and extracted children cannot acquire a
+    // new whole-command grant. Only the allow-once filesystem lookup needs the
+    // performance predicate: aliases and other modeled execution also need an
+    // explicit outer allowlist grant checked before their children are read.
     let checked_allow_once_before_nested = may_evaluate_nested_payload_before_allowlists(command)
         || !posix_executable_model.invocations.is_empty();
-    if checked_allow_once_before_nested {
-        if nested_command_depth == 0
-            && allow_once_match(allow_once_command, allow_once_audit).is_some()
-        {
-            return EvaluationResult::allowed_by_allow_once();
-        }
-        if outer_command_allowlisted_before_nested_evaluation(command, allowlists, project_path) {
-            return EvaluationResult::allowed();
-        }
+    if checked_allow_once_before_nested
+        && nested_command_depth == 0
+        && allow_once_match(allow_once_command, allow_once_audit).is_some()
+    {
+        return EvaluationResult::allowed_by_allow_once();
+    }
+    if command_allowlisted_as_written(command, allowlists, project_path) {
+        return EvaluationResult::allowed();
     }
 
     // A straight-line `d=docker; $d system prune -af` carries enough static
@@ -15569,23 +15629,6 @@ fn evaluate_command_in_single_dialect_view(
     // wrapper sneaks in via a path-stripped binary name.
     if crate::allowlist::is_builtin_inspection_wrapper_call(command)
         || crate::allowlist::is_builtin_inspection_wrapper_call(&normalized)
-    {
-        return EvaluationResult::allowed();
-    }
-
-    // Check exact command, prefix, and pattern allowlists (reusing normalized
-    // from quick-reject). Use path-aware matching for context-aware
-    // allowlisting (Epic 5). Pattern entries must additionally have
-    // `risk_acknowledged = true` (enforced inside the matcher's validity check).
-    if allowlists
-        .match_exact_command_at_path(&normalized, project_path)
-        .is_some()
-        || allowlists
-            .match_command_prefix_at_path(&normalized, project_path)
-            .is_some()
-        || allowlists
-            .match_pattern_at_path(&normalized, project_path)
-            .is_some()
     {
         return EvaluationResult::allowed();
     }
@@ -25636,6 +25679,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                 &pattern.regex,
                 command_for_packs,
                 normalized_offset.map(|offset| (original_command, offset)),
+                shell_dialect,
             );
 
             if deadline_exceeded(deadline) {
@@ -31526,7 +31570,41 @@ fn find_actionable_command_pattern_span(
     regex: &crate::packs::regex_engine::LazyCompiledRegex,
     command: &str,
     source_context: Option<(&str, usize)>,
+    shell_dialect: ShellDialect,
 ) -> Option<MatchSpan> {
+    // The guardrails regex also covers environment/control mutations. Add a
+    // native argv proof for its DCG-command branches so an escaped space in
+    // one --agent value cannot hide the following real subcommand. Keep the
+    // existing rule identity, source-data checks and regex fallback.
+    if pack_id == "careful_company_running_windows.guardrails"
+        && let Some(rule @ ("dcg-bypass-or-uninstall" | "dcg-policy-self-weakening")) = pattern_name
+        && let Some(range) =
+            crate::packs::careful_company_running_windows::guardrails::dcg_control_action_span(
+                command,
+                shell_dialect,
+                rule,
+            )
+    {
+        let span = MatchSpan {
+            start: range.start,
+            end: range.end,
+        };
+        if !command_pattern_match_is_inert_quoted_data(
+            pack_id,
+            pattern_name,
+            command,
+            span,
+            source_context,
+        ) && !command_match_is_literal_safe_inline_script(
+            pack_id,
+            pattern_name,
+            command,
+            span,
+            source_context,
+        ) {
+            return Some(span);
+        }
+    }
     let (source, source_base) = source_context.unwrap_or((command, 0));
     let written_arrows = if is_core_filesystem_redirect_rule(pack_id, pattern_name) {
         crate::heredoc::written_javascript_arrow_offsets(source)
@@ -32769,6 +32847,7 @@ fn evaluate_pack_destructive_patterns(
                     pattern_command,
                     normalized_offset
                         .map(|offset| (original_command, offset.saturating_add(slice_offset))),
+                    shell_dialect,
                 )
                 .map(|span| MatchSpan {
                     start: span.start + slice_offset,
@@ -33116,7 +33195,7 @@ where
         return EvaluationResult::denied_by_config(reason.to_string());
     }
 
-    if compiled_overrides.check_allow(command) {
+    if command_allowed_by_override_as_written(command, compiled_overrides) {
         return EvaluationResult::allowed();
     }
 
@@ -35443,6 +35522,13 @@ where
     if first_mode == crate::packs::DecisionMode::Deny {
         return result;
     }
+
+    // Re-evaluation uses the public API after the first evaluator scope has
+    // ended. A later confidence round may blank a span, but that must not
+    // turn the resulting text into a newly authorized command or safe-pattern
+    // source. Nested rounds retain this original request until all callbacks
+    // finish; ordinary allow/deny decisions allocate no replay source.
+    let _authorization_replay = CommandReplayScope::enter(command);
 
     // Matches that confidence scoring, not policy, lets run. Granting one
     // looks past it by suppressing its rule for the whole line, which also
@@ -50369,6 +50455,380 @@ mod tests {
     }
 
     #[test]
+    fn command_allowlists_keep_original_request_bytes() {
+        let approved = "git reset --hard";
+        assert!(evaluate_with_pack_ids(approved, &["core.git"]).is_denied());
+
+        for selector in [
+            AllowSelector::ExactCommand(approved.to_string()),
+            AllowSelector::CommandPrefix(approved.to_string()),
+            AllowSelector::RegexPattern(r"^git reset --hard$".to_string()),
+        ] {
+            let allowlists = project_allowlists_for_command_selector(
+                selector.clone(),
+                matches!(selector, AllowSelector::RegexPattern(_)),
+            );
+            let evaluate = |command: &str| {
+                evaluate_with_pack_ids_and_allowlists_at_path(
+                    command,
+                    &["core.git"],
+                    &allowlists,
+                    None,
+                )
+            };
+            assert!(evaluate(approved).is_allowed(), "{selector:?}");
+            for changed in [
+                "PATH=/tmp/replacement git reset --hard",
+                "LD_PRELOAD=/tmp/replacement.so git reset --hard",
+                "env PATH=/tmp/replacement git reset --hard",
+                "env -i git reset --hard",
+                "sudo git reset --hard",
+                "/usr/bin/git reset --hard",
+                "g\"it\" reset --hard",
+                "GIT reset --hard",
+                "git reset --hard; echo done",
+            ] {
+                let result = evaluate(changed);
+                assert!(
+                    result.is_denied(),
+                    "{selector:?} must not authorize a different request: {changed}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_allowlists_cannot_be_reacquired_after_command_extraction() {
+        for selector in [
+            AllowSelector::ExactCommand("git reset --hard".to_string()),
+            AllowSelector::CommandPrefix("git reset --hard".to_string()),
+            AllowSelector::RegexPattern(r"^git reset --hard$".to_string()),
+        ] {
+            let allowlists = project_allowlists_for_command_selector(
+                selector.clone(),
+                matches!(selector, AllowSelector::RegexPattern(_)),
+            );
+            // Each spelling reconstructs the approved text internally. The
+            // reconstructed command is detection evidence, not a new request.
+            for command in [
+                "d=git; $d reset --hard",
+                "git${IFS}reset${IFS}--hard",
+                "alias wipe='git reset --hard'; wipe",
+                "eval 'git reset --hard'",
+            ] {
+                let result = evaluate_with_pack_ids_and_allowlists_at_path(
+                    command,
+                    &["core.git"],
+                    &allowlists,
+                    None,
+                );
+                assert!(
+                    result.is_denied(),
+                    "{selector:?} must not independently authorize an extracted child: {command}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_allowlists_preserve_explicit_original_envelopes() {
+        // Literal executable identity, assignments, quoting and redirects
+        // remain authorizable when they are actually present in the grant.
+        for approved in [
+            "PATH=/usr/bin:/bin /usr/bin/git reset --hard",
+            "env LD_PRELOAD=/opt/reviewed.so /usr/bin/git reset --hard",
+            "g\"it\" reset --hard",
+            "GIT reset --hard",
+            "git reset --hard >/tmp/reviewed-output",
+            "PATH=/usr/bin:/bin bash -c 'git reset --hard'",
+            "d=git; $d reset --hard",
+            "alias wipe='git reset --hard'; wipe",
+        ] {
+            for selector in [
+                AllowSelector::ExactCommand(approved.to_string()),
+                AllowSelector::RegexPattern(format!("^{}$", regex::escape(approved))),
+            ] {
+                let allowlists = project_allowlists_for_command_selector(
+                    selector.clone(),
+                    matches!(selector, AllowSelector::RegexPattern(_)),
+                );
+                let evaluate = |command: &str| {
+                    evaluate_with_pack_ids_and_allowlists_at_path(
+                        command,
+                        &["core.git"],
+                        &allowlists,
+                        None,
+                    )
+                };
+                let allowed = evaluate(approved);
+                assert!(allowed.is_allowed(), "{selector:?}: {allowed:?}");
+                // Keep the executable assignment inside its proven shell
+                // body; multiple assignments in one statement are a separate
+                // modeling boundary, not evidence about grant matching.
+                let changed_envelope = if approved == "d=git; $d reset --hard" {
+                    format!("env UNREVIEWED=1 bash -c '{approved}'")
+                } else {
+                    format!("UNREVIEWED=1 {approved}")
+                };
+                for changed in ["git reset --hard".to_string(), changed_envelope] {
+                    assert!(
+                        evaluate_with_pack_ids(&changed, &["core.git"]).is_denied(),
+                        "the altered-envelope control must deny independently of a grant: {changed}"
+                    );
+                    let result = evaluate(&changed);
+                    assert!(
+                        result.is_denied(),
+                        "an explicit envelope grant must retain its exact scope: {selector:?}: {changed}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_allowlists_cannot_authorize_a_confidence_replay_view() {
+        let config = confidence_config();
+        let command = "watch rm -rf ./build; rm -r''f ./build";
+        let approved = "watch        ./build; rm -r''f ./build";
+        let control = evaluate_detailed(command, &config);
+        assert_eq!(
+            control.result.effective_mode,
+            Some(crate::packs::DecisionMode::Deny)
+        );
+
+        // Confidence analysis blanks the first low-confidence match before
+        // looking for a second, obfuscated occurrence. That intermediate
+        // string must not borrow a grant for a different reviewed request.
+        for selector in [
+            AllowSelector::ExactCommand(approved.to_string()),
+            AllowSelector::RegexPattern(
+                r"^watch\s+\./build;\s*rm -r(?:\x27\x27)?f \./build$".to_string(),
+            ),
+        ] {
+            let allowlists = project_allowlists_for_command_selector(
+                selector.clone(),
+                matches!(selector, AllowSelector::RegexPattern(_)),
+            );
+            let result = evaluate_detailed_with_allowlists(command, &config, &allowlists);
+            assert_eq!(
+                result.result.effective_mode,
+                Some(crate::packs::DecisionMode::Deny),
+                "a replay is not an authorized request: {selector:?}: {result:?}"
+            );
+            // A subsequent independent request gets its own source again;
+            // the replay scope must not leak across evaluations on a thread.
+            let explicit = evaluate_detailed_with_allowlists(approved, &config, &allowlists);
+            assert!(explicit.result.is_allowed(), "{selector:?}: {explicit:?}");
+        }
+
+        // Override patterns compose across segments, but must still evaluate
+        // the original segments rather than the confidence-masked replay.
+        let mut overrides_config = config;
+        overrides_config.overrides.allow = vec![
+            crate::config::AllowOverride::Simple(r"^watch\s+\./build$".to_string()),
+            crate::config::AllowOverride::Simple(r"^rm -r(?:\x27\x27)?f \./build$".to_string()),
+        ];
+        let result = evaluate_detailed(command, &overrides_config);
+        assert_eq!(
+            result.result.effective_mode,
+            Some(crate::packs::DecisionMode::Deny),
+            "overrides must not authorize a replay view: {result:?}"
+        );
+        assert!(
+            evaluate_detailed(approved, &overrides_config)
+                .result
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn allow_once_grants_cannot_be_consumed_by_confidence_replays() {
+        use crate::pending_exceptions::{
+            AllowOnceEntry, AllowOnceScopeKind, ENV_ALLOW_ONCE_PATH, PendingExceptionRecord,
+        };
+
+        const CHILD_MARKER: &str = "DCG_TEST_ALLOW_ONCE_REPLAY_CHILD";
+        const CHILD_COMPLETION: &str = "dcg-allow-once-replay-child-complete";
+
+        // Store selection is process-wide. Isolate its environment override
+        // instead of mutating the environment alongside parallel test readers.
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let fixtures = tempfile::tempdir().expect("allow-once fixture directory");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "evaluator::tests::allow_once_grants_cannot_be_consumed_by_confidence_replays",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(
+                ENV_ALLOW_ONCE_PATH,
+                fixtures.path().join("allow_once.jsonl"),
+            )
+            .output()
+            .expect("run isolated allow-once test");
+            assert!(
+                output.status.success(),
+                "isolated allow-once test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETION),
+                "the exact child test must run its assertions"
+            );
+            return;
+        }
+
+        let cwd = std::env::current_dir().expect("fixture working directory");
+        let cwd_text = cwd.to_string_lossy();
+        let store = AllowOnceStore::new(PathBuf::from(
+            std::env::var_os(ENV_ALLOW_ONCE_PATH).expect("isolated allow-once store"),
+        ));
+        let command = "watch rm -rf ./build; rm -r''f ./build";
+        let approved = "watch        ./build; rm -r''f ./build";
+        let redaction = crate::logging::RedactionConfig::default();
+
+        for (explicit_block, force_allow_config) in [(false, false), (true, false), (true, true)] {
+            let mut config = confidence_config();
+            if explicit_block {
+                config.overrides.block.push(crate::config::BlockOverride {
+                    pattern: format!("^{}$", regex::escape(approved)),
+                    reason: "explicit residual command block".to_string(),
+                });
+            }
+            let now = Utc::now();
+            let pending = PendingExceptionRecord::new(
+                now,
+                &cwd_text,
+                approved,
+                "reviewed residual request",
+                &redaction,
+                true,
+                None,
+            );
+            let entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                &cwd_text,
+                true,
+                force_allow_config,
+                &redaction,
+            );
+            store.add_entry(&entry, now).expect("seed one-use grant");
+
+            // The legacy entrypoint shares the same replay provenance and
+            // must not consume a grant even when its block override wins.
+            {
+                let _replay = CommandReplayScope::enter(command);
+                let no_safe: [crate::packs::SafePattern; 0] = [];
+                let destructive = [crate::destructive_pattern!(
+                    "replay-rm",
+                    r"\brm\b",
+                    "decision-only replay control"
+                )];
+                let result = evaluate_command_with_legacy(
+                    approved,
+                    &config,
+                    &["rm"],
+                    &config.overrides.compile(),
+                    &default_allowlists(),
+                    &no_safe,
+                    &destructive,
+                );
+                assert!(result.is_denied(), "legacy replay: {result:?}");
+            }
+
+            let replay = evaluate_detailed(command, &config);
+            assert_eq!(
+                replay.result.effective_mode,
+                Some(crate::packs::DecisionMode::Deny),
+                "another request must not borrow the residual's grant: {replay:?}"
+            );
+            let (active, _) = store.preview_active(Utc::now()).expect("inspect grant");
+            assert_eq!(active.len(), 1, "replays must leave the grant unconsumed");
+            assert_eq!(active[0].command_raw, approved);
+            assert!(!active[0].is_consumed());
+
+            if explicit_block && !force_allow_config {
+                assert!(evaluate_detailed(approved, &config).result.is_denied());
+                assert_eq!(
+                    store
+                        .preview_active(Utc::now())
+                        .expect("inspect grant")
+                        .0
+                        .len(),
+                    1,
+                    "a non-force grant cannot override or be consumed by a config block"
+                );
+                config.overrides.block.clear();
+            }
+            let explicit = evaluate_detailed(approved, &config);
+            assert!(
+                explicit.result.is_allowed(),
+                "reviewed request: {explicit:?}"
+            );
+            assert!(matches!(
+                explicit.result.bypass_method,
+                Some(BypassMethod::AllowOnce)
+            ));
+            assert!(
+                store
+                    .preview_active(Utc::now())
+                    .expect("inspect consumed grant")
+                    .0
+                    .is_empty()
+            );
+            assert!(
+                evaluate_detailed(approved, &config).result.is_denied(),
+                "the reviewed grant remains single-use"
+            );
+        }
+        println!("{CHILD_COMPLETION}");
+    }
+
+    #[test]
+    fn allow_overrides_cannot_be_reacquired_after_command_extraction() {
+        let config = default_config();
+        let allowlists = default_allowlists();
+        let compile = |pattern: String| {
+            crate::config::OverridesConfig {
+                allow: vec![crate::config::AllowOverride::Simple(pattern)],
+                ..Default::default()
+            }
+            .compile()
+        };
+        let approved = "git reset --hard";
+        let compiled = compile(format!("^{}$", regex::escape(approved)));
+        assert!(evaluate_command(approved, &config, &["git"], &compiled, &allowlists).is_allowed());
+        for command in [
+            "d=git; $d reset --hard",
+            "git${IFS}reset${IFS}--hard",
+            "alias wipe='git reset --hard'; wipe",
+            "eval 'git reset --hard'",
+            "GIT reset --hard",
+        ] {
+            let result = evaluate_command(command, &config, &["git"], &compiled, &allowlists);
+            assert!(
+                result.is_denied(),
+                "an extracted or folded spelling must not acquire a new override grant: {command}: {result:?}"
+            );
+        }
+
+        // A grant for the complete enclosing request remains intentional.
+        let outer = "PATH=/usr/bin:/bin eval 'git reset --hard'";
+        let outer_grant = compile(format!("^{}$", regex::escape(outer)));
+        assert!(evaluate_command(outer, &config, &["git"], &outer_grant, &allowlists).is_allowed());
+        assert!(
+            evaluate_command(approved, &config, &["git"], &outer_grant, &allowlists).is_denied()
+        );
+    }
+
+    #[test]
     fn full_command_allowlists_authorize_outer_envelopes_before_nested_evaluation() {
         use crate::normalize::ShellDialect;
 
@@ -56187,7 +56647,7 @@ mod tests {
             "echo ok \\& docker system prune -af",
         ] {
             assert!(
-                dialect_view_may_expose_hidden_execution(command, ShellDialect::Cmd, None),
+                dialect_view_may_expose_hidden_execution(command, ShellDialect::Cmd, None, &[]),
                 "{command:?} runs a second command under cmd.exe only"
             );
         }
@@ -56196,7 +56656,12 @@ mod tests {
             "\"git reset --hard\" | Invoke-Expression",
         ] {
             assert!(
-                dialect_view_may_expose_hidden_execution(command, ShellDialect::PowerShell, None),
+                dialect_view_may_expose_hidden_execution(
+                    command,
+                    ShellDialect::PowerShell,
+                    None,
+                    &[]
+                ),
                 "{command:?} executes its string argument under PowerShell only"
             );
         }
@@ -56218,7 +56683,7 @@ mod tests {
             ("echo hello", ShellDialect::Cmd),
         ] {
             assert!(
-                !dialect_view_may_expose_hidden_execution(command, view, None),
+                !dialect_view_may_expose_hidden_execution(command, view, None, &[]),
                 "{command:?} exposes no hidden execution under {view:?}"
             );
         }
@@ -56238,7 +56703,8 @@ mod tests {
             dialect_view_may_expose_hidden_execution(
                 "doc^ker system prune -af",
                 ShellDialect::Cmd,
-                Some(&index)
+                Some(&index),
+                &ordered
             ),
             "cmd.exe removes the caret before it resolves the command name"
         );
@@ -56246,7 +56712,8 @@ mod tests {
             dialect_view_may_expose_hidden_execution(
                 "doc`k`er system prune -af",
                 ShellDialect::PowerShell,
-                Some(&index)
+                Some(&index),
+                &ordered
             ),
             "PowerShell removes the backtick before it resolves the command name"
         );
@@ -56257,12 +56724,14 @@ mod tests {
         assert!(!dialect_view_may_expose_hidden_execution(
             "doc^ker system prune -af",
             ShellDialect::PowerShell,
-            Some(&index)
+            Some(&index),
+            &ordered
         ));
         assert!(!dialect_view_may_expose_hidden_execution(
             "doc`k`er system prune -af",
             ShellDialect::Cmd,
-            Some(&index)
+            Some(&index),
+            &ordered
         ));
 
         // Benign decodes stay out of the replay entirely.
@@ -56271,7 +56740,7 @@ mod tests {
             ("echo he`l`lo", ShellDialect::PowerShell),
         ] {
             assert!(
-                !dialect_view_may_expose_hidden_execution(command, view, Some(&index)),
+                !dialect_view_may_expose_hidden_execution(command, view, Some(&index), &ordered),
                 "{command:?} decodes to a benign command under {view:?}"
             );
         }
@@ -56281,7 +56750,8 @@ mod tests {
         assert!(dialect_view_may_expose_hidden_execution(
             "doc^ker system prune -af",
             ShellDialect::Cmd,
-            None
+            None,
+            &ordered
         ));
     }
 
@@ -56308,7 +56778,12 @@ mod tests {
             "wipe^fs /dev/sda",
         ] {
             assert!(
-                dialect_view_may_expose_hidden_execution(command, ShellDialect::Cmd, Some(&index)),
+                dialect_view_may_expose_hidden_execution(
+                    command,
+                    ShellDialect::Cmd,
+                    Some(&index),
+                    &ordered
+                ),
                 "{command:?} hides its command word behind a caret; the `/dev/` \
                  operand belongs to a different rule and cannot stand in for it"
             );
@@ -56318,7 +56793,12 @@ mod tests {
         // that exposes no keyword the POSIX view lacked does not replay.
         for command in ["echo he^llo", "git log --oneline -5"] {
             assert!(
-                !dialect_view_may_expose_hidden_execution(command, ShellDialect::Cmd, Some(&index)),
+                !dialect_view_may_expose_hidden_execution(
+                    command,
+                    ShellDialect::Cmd,
+                    Some(&index),
+                    &ordered
+                ),
                 "{command:?} exposes no keyword its POSIX view did not already have"
             );
         }

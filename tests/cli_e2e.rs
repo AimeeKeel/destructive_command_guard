@@ -10073,6 +10073,7 @@ safe_patterns:
     struct SafePatternFixture {
         root: tempfile::TempDir,
         config: std::path::PathBuf,
+        allowlist: Option<std::path::PathBuf>,
     }
 
     impl SafePatternFixture {
@@ -10120,7 +10121,40 @@ safe_patterns:
                 ),
             )
             .expect("write config");
-            Self { root, config }
+            Self {
+                root,
+                config,
+                allowlist: None,
+            }
+        }
+
+        fn with_allowlist(mut self, selector: &str, value: &str) -> Self {
+            let path = self.root.path().join("allowlist.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[[allow]]\n{selector} = {}\nreason = \"Reviewed command form\"\n\
+                     risk_acknowledged = true\n",
+                    serde_json::to_string(value).expect("serialize allowlist selector")
+                ),
+            )
+            .expect("write isolated allowlist");
+            self.allowlist = Some(path);
+            self
+        }
+
+        fn with_allow_override(self, pattern: &str) -> Self {
+            let mut config = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.config)
+                .expect("open isolated config");
+            writeln!(
+                config,
+                "\n[overrides]\nallow = [{}]",
+                serde_json::to_string(pattern).expect("serialize allow override")
+            )
+            .expect("append allow override");
+            self
         }
 
         fn command(&self) -> Command {
@@ -10144,6 +10178,9 @@ safe_patterns:
                 .stderr(Stdio::piped());
             if let Some(path) = std::env::var_os("PATH") {
                 command.env("PATH", path);
+            }
+            if let Some(path) = &self.allowlist {
+                command.env("DCG_ALLOWLIST_SYSTEM_PATH", path);
             }
             command
         }
@@ -10242,6 +10279,204 @@ safe_patterns:
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn command_allowlist_selectors_preserve_original_execution_context() {
+        let exact_pattern = format!("^{}$", regex::escape(REVIEWED_COMMAND));
+        let control = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN);
+        control.assert_explain(REVIEWED_COMMAND, "deny", Some(REVIEW_RULE));
+
+        for (selector, grant) in [
+            ("exact_command", REVIEWED_COMMAND),
+            ("command_prefix", REVIEWED_COMMAND),
+            ("pattern", exact_pattern.as_str()),
+        ] {
+            let fixture = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN)
+                .with_allowlist(selector, grant);
+            fixture.assert_explain(REVIEWED_COMMAND, "allow", None);
+            fixture.assert_hooks(REVIEWED_COMMAND, true);
+            for variable in [
+                "PATH",
+                "PYTHONPATH",
+                "NODE_OPTIONS",
+                "BASH_ENV",
+                "LD_PRELOAD",
+                "DYLD_INSERT_LIBRARIES",
+                "GIT_CONFIG_COUNT",
+                "APPLICATION_SPECIFIC_SETTING",
+            ] {
+                fixture.assert_explain(
+                    &format!("{variable}=/unreviewed {REVIEWED_COMMAND}"),
+                    "deny",
+                    Some(REVIEW_RULE),
+                );
+            }
+            for candidate in [
+                format!("env PATH=/unreviewed {REVIEWED_COMMAND}"),
+                format!("env -i {REVIEWED_COMMAND}"),
+                format!("command {REVIEWED_COMMAND}"),
+                format!("exec {REVIEWED_COMMAND}"),
+                format!("sudo {REVIEWED_COMMAND}"),
+                format!("timeout 5s {REVIEWED_COMMAND}"),
+                format!("sh -c '{REVIEWED_COMMAND}'"),
+                format!("env PATH=/unreviewed sh -c '{REVIEWED_COMMAND}'"),
+                format!("bash -c \"sh -c '{REVIEWED_COMMAND}'\""),
+                format!("true; {REVIEWED_COMMAND}"),
+                format!("{REVIEWED_COMMAND}; {REVIEWED_COMMAND}"),
+                REVIEWED_COMMAND.replace("/usr/bin/python3", "/unreviewed/python3"),
+                REVIEWED_COMMAND.replace("/usr/bin/python3", "python3"),
+            ] {
+                fixture.assert_explain(&candidate, "deny", Some(REVIEW_RULE));
+            }
+            fixture.assert_hooks(&format!("PATH=/unreviewed {REVIEWED_COMMAND}"), false);
+            fixture.assert_hooks(
+                &format!("env PATH=/unreviewed sh -c '{REVIEWED_COMMAND}'"),
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn exact_command_grants_keep_explicit_environment_and_complete_wrapper_scope() {
+        for grant in [
+            format!("PATH=/reviewed {REVIEWED_COMMAND}"),
+            format!("env -i PATH=/reviewed {REVIEWED_COMMAND}"),
+            format!("env PATH=/reviewed sh -c '{REVIEWED_COMMAND}'"),
+            format!("bash -c '{REVIEWED_COMMAND}'"),
+            format!("{REVIEWED_COMMAND}; {REVIEWED_COMMAND}"),
+        ] {
+            let fixture = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN)
+                .with_allowlist("exact_command", &grant);
+            fixture.assert_explain(&grant, "allow", None);
+            fixture.assert_hooks(&grant, true);
+            fixture.assert_explain(REVIEWED_COMMAND, "deny", Some(REVIEW_RULE));
+            fixture.assert_explain(
+                &format!("LD_PRELOAD=/unreviewed.so {grant}"),
+                "deny",
+                Some(REVIEW_RULE),
+            );
+            if grant.contains("/reviewed") {
+                fixture.assert_explain(
+                    &grant.replace("/reviewed", "/unreviewed"),
+                    "deny",
+                    Some(REVIEW_RULE),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_allowlist_retains_authored_regex_scope_and_rule_grants() {
+        let exact_pattern = format!("^PATH=/reviewed {}$", regex::escape(REVIEWED_COMMAND));
+        let fixture = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN)
+            .with_allowlist("pattern", &exact_pattern);
+        fixture.assert_explain(&format!("PATH=/reviewed {REVIEWED_COMMAND}"), "allow", None);
+        fixture.assert_explain(
+            &format!("PATH=/unreviewed {REVIEWED_COMMAND}"),
+            "deny",
+            Some(REVIEW_RULE),
+        );
+
+        // A deliberately unanchored, risk-acknowledged expression authorizes
+        // the complete request when its original text matches. Rule grants
+        // separately authorize that rule, irrespective of command spelling.
+        for (selector, grant) in [
+            ("pattern", regex::escape(REVIEWED_COMMAND)),
+            ("rule", REVIEW_RULE.to_string()),
+        ] {
+            let fixture = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN)
+                .with_allowlist(selector, &grant);
+            fixture.assert_explain(REVIEWED_COMMAND, "allow", None);
+            fixture.assert_explain(&format!("PATH=/reviewed {REVIEWED_COMMAND}"), "allow", None);
+        }
+    }
+
+    #[test]
+    fn exact_command_grants_do_not_reappear_after_detection_rewrites() {
+        let fixture = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN)
+            .with_allowlist("exact_command", "git reset --hard");
+        fixture.assert_explain("git reset --hard", "allow", None);
+        for candidate in [
+            "git reset --hard 2>/tmp/dcg-reviewed.log",
+            "git reset --hard # unreviewed suffix",
+            "/usr/bin/git reset --hard",
+            "env GIT_CONFIG_COUNT=1 git reset --hard",
+        ] {
+            fixture.assert_explain(candidate, "deny", Some("core.git:reset-hard"));
+        }
+        fixture.assert_explain_in_dialects(
+            "GIT RESET --HARD",
+            "deny",
+            Some("core.git:reset-hard"),
+            &["powershell", "unknown"],
+        );
+        fixture.assert_explain("git status", "allow", None);
+    }
+
+    #[test]
+    fn allow_override_requires_the_original_complete_request() {
+        let pattern = format!("^{}$", regex::escape(REVIEWED_COMMAND));
+        let fixture = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN)
+            .with_allow_override(&pattern);
+        fixture.assert_explain(REVIEWED_COMMAND, "allow", None);
+        fixture.assert_hooks(REVIEWED_COMMAND, true);
+        for candidate in [
+            format!("PATH=/unreviewed {REVIEWED_COMMAND}"),
+            format!("sh -c '{REVIEWED_COMMAND}'"),
+            format!("env PATH=/unreviewed sh -c '{REVIEWED_COMMAND}'"),
+            format!("true; {REVIEWED_COMMAND}"),
+        ] {
+            fixture.assert_explain(&candidate, "deny", Some(REVIEW_RULE));
+        }
+
+        let grant = format!("env PATH=/reviewed sh -c '{REVIEWED_COMMAND}'");
+        let fixture = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN)
+            .with_allow_override(&format!("^{}$", regex::escape(&grant)));
+        fixture.assert_explain(&grant, "allow", None);
+        fixture.assert_explain(
+            &grant.replace("/reviewed", "/unreviewed"),
+            "deny",
+            Some(REVIEW_RULE),
+        );
+    }
+
+    #[test]
+    fn command_grants_cannot_be_acquired_from_a_confidence_replay() {
+        let original = "watch rm -rf ./build; rm -r''f ./build";
+        let residual = "watch        ./build; rm -r''f ./build";
+        let residual_pattern = r"^watch\s+\./build;\s*rm -r(?:\x27\x27)?f \./build$";
+        for grant in [None, Some(residual_pattern)] {
+            let fixture = SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN);
+            let fixture = if let Some(pattern) = grant {
+                fixture.with_allowlist("pattern", pattern)
+            } else {
+                fixture
+            };
+            let mut config = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&fixture.config)
+                .expect("open confidence fixture");
+            writeln!(
+                config,
+                "\n[confidence]\nenabled = true\nwarn_threshold = 0.7"
+            )
+            .expect("configure confidence scoring");
+
+            // The first low-confidence match must not hide the later actual
+            // rm, even when blanking it creates text matched by a grant.
+            fixture.assert_explain(original, "deny", Some("core.filesystem:rm-rf-general"));
+            fixture.assert_hooks(original, false);
+            fixture.assert_explain(
+                residual,
+                if grant.is_some() { "allow" } else { "deny" },
+                if grant.is_some() {
+                    None
+                } else {
+                    Some("core.filesystem:rm-rf-general")
+                },
+            );
         }
     }
 

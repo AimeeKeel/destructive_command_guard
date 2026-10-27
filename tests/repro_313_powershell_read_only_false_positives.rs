@@ -23,11 +23,15 @@ const PACKS: &str =
 /// `dcg test <command>` under a hermetic config; returns the `Result:` line
 /// plus the full output for diagnostics.
 fn dcg_test(command: &str) -> (String, String) {
+    dcg_test_in_dialect(command, "unknown")
+}
+
+fn dcg_test_in_dialect(command: &str, dialect: &str) -> (String, String) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(temp.path().join("home")).unwrap();
     std::fs::create_dir_all(temp.path().join("xdg")).unwrap();
     let output = Command::new(dcg_binary())
-        .args(["test", "--with-packs", PACKS, command])
+        .args(["test", "--with-packs", PACKS, "--dialect", dialect, command])
         .env_clear()
         .env("HOME", temp.path().join("home"))
         .env("USERPROFILE", temp.path().join("home"))
@@ -244,6 +248,159 @@ fn global_options_preserve_inspection_and_argument_data() {
 }
 
 #[test]
+fn escaped_dcg_syntax_cannot_hide_guardrail_changes() {
+    // Ordinary PowerShell backtick escapes are syntax; these strings are
+    // passed to dcg test as data and never execute exception grants/uninstall.
+    for dialect in ["powershell", "unknown"] {
+        for (command, rule) in [
+            (
+                "dcg --a`gent=codex --robot uninstall",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --a`gent codex --r`obot un`install",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --a`gent='two words' --robot un`install",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --a`gent='two 'words --robot un`install",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --a`gent 'two 'words --robot un`install",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --a`gent=codex doctor; dcg un`install",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --a`gent=codex doctor\ndcg un`install",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --a`gent=codex doctor && dcg un`install",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --a'gent'='dcg --robot uninstall' --robot un'install'",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --r`obot al`low-once abc123 --yes",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg --a`gent=codex al`low core.git:reset-hard --reason reviewed",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg allowl`ist --a`gent='dcg uninstall' a`dd core.git:reset-hard --reason reviewed",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg allowl`ist add-c`ommand 'git reset --hard' --reason reviewed",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg allowl`ist imp`ort /tmp/reviewed-allowlist.toml",
+                "dcg-policy-self-weakening",
+            ),
+        ] {
+            let (result, full) = dcg_test_in_dialect(command, dialect);
+            assert!(
+                result.starts_with("Result: BLOCKED"),
+                "[{dialect}] {command:?}: {full}"
+            );
+            assert!(
+                full.contains(&format!("Pattern: {rule}")),
+                "[{dialect}] expected {rule} for {command:?}: {full}"
+            );
+        }
+    }
+}
+
+#[test]
+fn escaped_dcg_options_keep_agent_values_and_inspection_arguments_as_data() {
+    for dialect in ["powershell", "unknown"] {
+        for command in [
+            "dcg --a`gent=uninstall do`ctor",
+            "dcg --a`gent='allowlist add' allowlist list",
+            "dcg --a`gent='dcg --robot uninstall' doctor",
+            "dcg --a'gent'='dcg --robot uninstall' doctor",
+            "dcg --a`gent='two words' doctor",
+            "dcg --a`gent='two 'words doctor",
+            "dcg --a`gent 'two 'words doctor",
+            "dcg --a`gent='co`dex; dcg uninstall' doctor",
+            "dcg --r`obot al`lowlist li`st",
+            "dcg al`lowlist --a`gent=add li`st",
+            "dcg --r`obot test 'dcg --robot uninstall'",
+            "dcg --agent='--robot uninstall' explain 'dcg allow-once abc123 --yes'",
+        ] {
+            let (result, full) = dcg_test_in_dialect(command, dialect);
+            assert_eq!(result, "Result: ALLOWED", "[{dialect}] {command:?}: {full}");
+        }
+    }
+}
+
+#[test]
+fn native_agent_argument_boundaries_are_dialect_specific() {
+    for (dialect, escaped_space) in [("powershell", "two` words"), ("posix", r"two\ words")] {
+        for separator in ["=", " "] {
+            let dangerous = format!("dcg --agent{separator}{escaped_space} uninstall");
+            for view in [dialect, "unknown"] {
+                let (result, full) = dcg_test_in_dialect(&dangerous, view);
+                assert!(
+                    result.starts_with("Result: BLOCKED"),
+                    "[{view}] {dangerous:?}: {full}"
+                );
+                assert!(
+                    full.contains("Pattern: dcg-bypass-or-uninstall"),
+                    "[{view}] {dangerous:?}: {full}"
+                );
+            }
+            let inspection = format!("dcg --agent{separator}{escaped_space} doctor");
+            let (result, full) = dcg_test_in_dialect(&inspection, dialect);
+            assert_eq!(result, "Result: ALLOWED", "{inspection:?}: {full}");
+        }
+        let with_literal_braces = format!("dcg --agent={escaped_space}'{{literal}}' uninstall");
+        let (result, full) = dcg_test_in_dialect(&with_literal_braces, dialect);
+        assert!(
+            result.starts_with("Result: BLOCKED")
+                && full.contains("Pattern: dcg-bypass-or-uninstall"),
+            "[{dialect}] literal braces remain agent data: {with_literal_braces:?}: {full}"
+        );
+    }
+
+    // A backslash does not escape PowerShell whitespace. The intervening
+    // positional word cannot be skipped to invent an uninstall subcommand.
+    for command in [
+        r"dcg --agent=two\ words uninstall",
+        r"dcg --agent two\ words uninstall",
+    ] {
+        let (result, full) = dcg_test_in_dialect(command, "powershell");
+        assert_eq!(result, "Result: ALLOWED", "{command:?}: {full}");
+    }
+    for view in ["cmd", "unknown"] {
+        let command = "dcg --a^gent=\"two words\" un^install";
+        let (result, full) = dcg_test_in_dialect(command, view);
+        assert!(
+            result.starts_with("Result: BLOCKED")
+                && full.contains("Pattern: dcg-bypass-or-uninstall"),
+            "[{view}] {command:?}: {full}"
+        );
+        // Cmd removes the caret; it does not quote the resulting space for
+        // the native executable's argv parser. The extra word is still data.
+        let command = "dcg --agent=two^ words uninstall";
+        let (result, full) = dcg_test_in_dialect(command, view);
+        assert_eq!(result, "Result: ALLOWED", "[{view}] {command:?}: {full}");
+    }
+}
+
+#[test]
 fn hook_protocol_keeps_guardrails_active_with_global_options() {
     use std::io::Write;
 
@@ -318,7 +475,56 @@ fn hook_protocol_keeps_guardrails_active_with_global_options() {
                 ),
             ]
         };
-        for &(command, expected_rule) in cases {
+        let escaped_cases: &[(&str, Option<&str>)] = if tool_name == "PowerShell" {
+            &[
+                (
+                    "dcg --a`gent=codex --r`obot un`install",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --a`gent='two words' --robot un`install",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --a`gent='two 'words --robot un`install",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --a`gent=codex doctor; dcg un`install",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --agent=two` words uninstall",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --agent two` words uninstall",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --a'gent'='dcg --robot uninstall' --robot un'install'",
+                    Some("dcg-bypass-or-uninstall"),
+                ),
+                (
+                    "dcg --r`obot al`low-once abc123 --yes",
+                    Some("dcg-policy-self-weakening"),
+                ),
+                (
+                    "dcg allowl`ist --a`gent='dcg uninstall' a`dd core.git:reset-hard --reason reviewed",
+                    Some("dcg-policy-self-weakening"),
+                ),
+                ("dcg --a`gent='dcg --robot uninstall' doctor", None),
+                ("dcg --a`gent='two 'words doctor", None),
+                ("dcg --a`gent='co`dex; dcg uninstall' doctor", None),
+                ("dcg --agent two` words doctor", None),
+                (r"dcg --agent=two\ words uninstall", None),
+                ("dcg --r`obot al`lowlist li`st", None),
+                ("dcg --r`obot test 'dcg --robot uninstall'", None),
+            ]
+        } else {
+            &[]
+        };
+        for &(command, expected_rule) in cases.iter().chain(escaped_cases) {
             let mut child = Command::new(dcg_binary())
                 .env_clear()
                 .env("HOME", &home)

@@ -3196,6 +3196,23 @@ risk_acknowledged = true  # Required for pattern-based entries
 added_at = "2026-01-08T12:00:00Z"
 ```
 
+**Command grants bind to the original request.** `exact_command` compares the
+complete command text, including environment assignments, executable paths,
+quoting, wrappers, and redirections. `command_prefix` and risk-acknowledged
+`pattern` entries also match that original text. For example, an exact grant
+for `git reset --hard` does not authorize `PATH=/other/bin git reset --hard`
+or `sh -c 'git reset --hard'`. An explicit grant for either complete form can
+authorize that form; extracting its child command during analysis never
+creates a new grant. `[overrides] allow` follows the same original-request
+boundary, and an applicable explicit block override still takes precedence.
+Confidence and policy re-evaluation keep that same boundary, including for
+temporary allow-once grants.
+
+Rule entries remain scoped to the named rule. An intentionally unanchored
+allowlist regex retains the scope its author wrote, so use anchors when the
+approval is for one complete command. Destructive detection continues to use
+normalization to recognize dangerous commands behind assignments and wrappers.
+
 ### Per-Rule Target-Path Exemptions
 
 Agent runtimes hand each job a scratch directory under `$HOME` — Claude Code

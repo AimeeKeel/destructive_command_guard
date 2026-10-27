@@ -46,6 +46,11 @@
 //! persistent `Set-ExecutionPolicy` is.
 
 use crate::destructive_pattern;
+use crate::normalize::{
+    NormalizeToken, NormalizeTokenKind, ShellDialect, dcg_global_option_has_no_value,
+    dcg_literal_word_is_static, decode_dcg_literal_word, is_dcg_literal_agent_assignment,
+    tokenize_for_shell_dialect,
+};
 use crate::packs::careful_company_running_windows::shared_safe_patterns;
 use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
@@ -54,15 +59,237 @@ use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 // `allowlist` command and its subcommand. Only --agent consumes a value: a
 // subcommand-looking agent name is data, while --robot never consumes the
 // following word. Help/version and arbitrary positional words are not skipped.
+// One argv value may concatenate quoted and unquoted fragments. The unquoted
+// alternative consumes one character so the outer repetition has no ambiguous
+// nested quantifier; whitespace or a shell boundary still ends the whole word.
 // This grammar adds destructive evidence; it grants no exemption.
 macro_rules! dcg_global_options {
     () => {
         concat!(
             r"(?:(?:--(?:verbose|quiet|legacy-output|no-color|no-suggestions|robot)|-v+|-q)[ \t]+",
-            r#"|--agent=(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'|&;<>]*)[ \t]+"#,
-            r#"|--agent[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'|&;<>]+)[ \t]+)*"#
+            r#"|--agent=(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'|&;<>])*[ \t]+"#,
+            r#"|--agent[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'|&;<>])+[ \t]+)*"#
         )
     };
+}
+
+/// Prove a dcg control action from native argv boundaries without rewriting
+/// opaque agent values. This supplements the regex view, whose whitespace
+/// boundaries cannot represent unquoted escaped spaces in one argv word.
+///
+/// Only top-level commands in a proven dialect participate. Nested execution
+/// is evaluated separately by the evaluator; expression/scriptblock ownership
+/// and unknown shells are not guessed here. Returned spans refer to `command`.
+pub(crate) fn dcg_control_action_span(
+    command: &str,
+    dialect: ShellDialect,
+    expected_rule: &str,
+) -> Option<std::ops::Range<usize>> {
+    if !matches!(
+        expected_rule,
+        "dcg-bypass-or-uninstall" | "dcg-policy-self-weakening"
+    ) {
+        return None;
+    }
+    let dialect = if dialect == ShellDialect::Unknown {
+        ShellDialect::Posix
+    } else {
+        dialect
+    };
+    let tokens = tokenize_for_shell_dialect(command, dialect);
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut grouped = false;
+    let mut comment = false;
+    for (index, token) in tokens.iter().enumerate() {
+        let raw = token.text(command)?;
+        let newline = matches!(raw, "\n" | "\r" | "\r\n");
+        if comment {
+            if newline {
+                comment = false;
+                start = index + 1;
+                grouped = depth != 0;
+            }
+            continue;
+        }
+        if token.kind == NormalizeTokenKind::Word {
+            if dialect != ShellDialect::Cmd && raw.starts_with('#') {
+                if depth == 0
+                    && !grouped
+                    && let Some(span) = dcg_segment_action_span(
+                        command,
+                        &tokens[start..index],
+                        dialect,
+                        expected_rule,
+                    )
+                {
+                    return Some(span);
+                }
+                comment = true;
+            } else if dcg_word_updates_group_depth(raw, dialect, &mut depth) {
+                grouped = true;
+            }
+            continue;
+        }
+        match raw {
+            "(" => {
+                depth = depth.saturating_add(1);
+                grouped = true;
+            }
+            ")" => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            "&" if dialect == ShellDialect::PowerShell && index == start => {}
+            _ => {
+                if !grouped
+                    && let Some(span) = dcg_segment_action_span(
+                        command,
+                        &tokens[start..index],
+                        dialect,
+                        expected_rule,
+                    )
+                {
+                    return Some(span);
+                }
+                // A leading PowerShell & invokes the next command. Retain
+                // it so a quoted executable is distinguished from a string
+                // expression; POSIX & is only a sequence boundary here.
+                start = if raw == "&" && dialect == ShellDialect::PowerShell {
+                    index
+                } else {
+                    index + 1
+                };
+                grouped = false;
+            }
+        }
+    }
+    if comment || grouped || depth != 0 {
+        None
+    } else {
+        dcg_segment_action_span(command, &tokens[start..], dialect, expected_rule)
+    }
+}
+
+/// Only unquoted, unescaped braces establish a script/function body. Braces
+/// in an agent name or another literal argument cannot suppress the proof.
+fn dcg_word_updates_group_depth(raw: &str, dialect: ShellDialect, depth: &mut usize) -> bool {
+    if dialect == ShellDialect::Cmd || !raw.contains(['{', '}']) {
+        return false;
+    }
+    if dialect == ShellDialect::Posix && !matches!(raw, "{" | "}") {
+        return false; // POSIX brace-group reserved words stand alone.
+    }
+    if dialect == ShellDialect::PowerShell && (raw.starts_with("@'") || raw.starts_with("@\"")) {
+        return false; // The native tokenizer already owns the here-string body.
+    }
+    let mut quote = None;
+    let mut changed = false;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quote == Some('\'') {
+            if ch == '\'' {
+                if dialect == ShellDialect::PowerShell && chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        if (dialect == ShellDialect::PowerShell && ch == '`')
+            || (dialect == ShellDialect::Posix && ch == '\\')
+        {
+            chars.next();
+            continue;
+        }
+        if ch == '"' {
+            quote = if quote.is_some() { None } else { Some('"') };
+        } else if quote.is_none() {
+            match ch {
+                '\'' => quote = Some('\''),
+                '{' => {
+                    *depth = depth.saturating_add(1);
+                    changed = true;
+                }
+                '}' => {
+                    *depth = depth.saturating_sub(1);
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    changed
+}
+
+fn dcg_segment_action_span(
+    command: &str,
+    tokens: &[NormalizeToken],
+    dialect: ShellDialect,
+    expected_rule: &str,
+) -> Option<std::ops::Range<usize>> {
+    let mut words = tokens.iter();
+    let first = words.next()?;
+    let called = dialect == ShellDialect::PowerShell && first.text(command) == Some("&");
+    let executable = if called { words.next()? } else { first };
+    if executable.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+    let raw_executable = executable.text(command)?;
+    if dialect == ShellDialect::PowerShell && !called && raw_executable.starts_with(['\'', '"']) {
+        return None; // A quoted PowerShell string does not execute itself.
+    }
+    let program = decode_dcg_literal_word(raw_executable, dialect)?;
+    let name = if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Cmd) {
+        program.rsplit(['/', '\\']).next()?
+    } else {
+        program.rsplit('/').next()?
+    };
+    if !name.eq_ignore_ascii_case("dcg") && !name.eq_ignore_ascii_case("dcg.exe") {
+        return None;
+    }
+
+    let mut after_allowlist = false;
+    let mut agent_value = false;
+    for token in words {
+        if token.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        // The literal proof establishes one actual argv word; its value is
+        // never scanned for subcommands, split on decoded spaces, or copied
+        // into a new matching view. Runtime field splitting stays unproven.
+        let raw = token.text(command)?;
+        if std::mem::take(&mut agent_value) {
+            if !dcg_literal_word_is_static(raw, dialect) {
+                return None;
+            }
+            continue;
+        }
+        if is_dcg_literal_agent_assignment(raw, dialect) {
+            continue;
+        }
+        let word = decode_dcg_literal_word(raw, dialect)?;
+        if word == "--agent" {
+            agent_value = true;
+            continue;
+        }
+        if word.starts_with("--agent=") || dcg_global_option_has_no_value(&word) {
+            continue;
+        }
+        if word == "allowlist" && !after_allowlist {
+            after_allowlist = true;
+            continue;
+        }
+        let rule = match (after_allowlist, word.as_ref()) {
+            (false, "uninstall") => "dcg-bypass-or-uninstall",
+            (false, "allow" | "allow-once") | (true, "add" | "add-command" | "import") => {
+                "dcg-policy-self-weakening"
+            }
+            _ => return None, // Includes help/version, unknown options and data.
+        };
+        return (rule == expected_rule)
+            .then_some(executable.byte_range.start..token.byte_range.end);
+    }
+    None
 }
 
 const CONTROL_SUGGESTIONS: &[PatternSuggestion] = &[
@@ -687,6 +914,18 @@ mod tests {
                 "dcg-bypass-or-uninstall",
             ),
             ("dcg --agent codex uninstall", "dcg-bypass-or-uninstall"),
+            (
+                "dcg --agent='two 'words --robot uninstall",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --agent 'two 'words uninstall",
+                "dcg-bypass-or-uninstall",
+            ),
+            (
+                "dcg --agent=\"two \"'other 'words uninstall",
+                "dcg-bypass-or-uninstall",
+            ),
             ("dcg --agent= --robot uninstall", "dcg-bypass-or-uninstall"),
             (
                 "dcg --agent=codex --robot allow-once abc123 --yes",
@@ -702,6 +941,10 @@ mod tests {
             ),
             (
                 "dcg --robot allowlist --agent codex add core.git:reset-hard --reason reviewed",
+                "dcg-policy-self-weakening",
+            ),
+            (
+                "dcg allowlist --agent 'two 'words --robot add core.git:reset-hard --reason reviewed",
                 "dcg-policy-self-weakening",
             ),
             (
@@ -726,12 +969,161 @@ mod tests {
             "dcg --agent uninstall doctor",
             "dcg --agent allow-once --robot allowlist list",
             "dcg --agent='allowlist add' doctor",
+            "dcg --agent='un'install doctor",
+            "dcg --agent 'allowl'ist doctor",
+            "dcg --agent='allowl'ist' add' doctor",
             "dcg allowlist --agent add list",
+            "dcg allowlist --agent ad'd' list",
             "dcg --robot allowlist --quiet remove core.git:reset-hard",
         ] {
             let parsed = crate::cli::Cli::try_parse_from(shell_words::split(command).unwrap());
             assert!(parsed.is_ok(), "valid CLI input {command:?}: {parsed:?}");
             assert!(pack.check(command).is_none(), "inspection: {command}");
+        }
+    }
+
+    #[test]
+    fn native_dcg_action_proof_owns_escaped_space_values_and_source_spans() {
+        let uninstall = "dcg-bypass-or-uninstall";
+        let grant = "dcg-policy-self-weakening";
+        for (dialect, command, rule, matched) in [
+            (
+                ShellDialect::PowerShell,
+                "dcg --a`gent=two` words un`install",
+                uninstall,
+                "dcg --a`gent=two` words un`install",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "dcg --agent two` words allowl`ist a`dd rule",
+                grant,
+                "dcg --agent two` words allowl`ist a`dd",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "dcg --a`gent='[team] {} ($profile)' un`install",
+                uninstall,
+                "dcg --a`gent='[team] {} ($profile)' un`install",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output '{}'; dcg --agent=two` words un`install",
+                uninstall,
+                "dcg --agent=two` words un`install",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "dcg --a`gent=codex doctor; dcg un`install",
+                uninstall,
+                "dcg un`install",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output ready #{\ndcg --a`gent=two` words un`install",
+                uninstall,
+                "dcg --a`gent=two` words un`install",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& 'C:\\tools\\dcg.exe' --agent two` words uninstall",
+                uninstall,
+                "'C:\\tools\\dcg.exe' --agent two` words uninstall",
+            ),
+            (
+                ShellDialect::Posix,
+                "dcg --a'gent'=two\\ words un'install'",
+                uninstall,
+                "dcg --a'gent'=two\\ words un'install'",
+            ),
+            (
+                ShellDialect::Unknown,
+                "dcg --agent two\\ words uninstall",
+                uninstall,
+                "dcg --agent two\\ words uninstall",
+            ),
+            (
+                ShellDialect::Cmd,
+                "dcg --a^gent=\"two words\" un^install",
+                uninstall,
+                "dcg --a^gent=\"two words\" un^install",
+            ),
+            (
+                ShellDialect::Cmd,
+                "dcg --agent \"two words\" allowlist add rule",
+                grant,
+                "dcg --agent \"two words\" allowlist add",
+            ),
+        ] {
+            let span = dcg_control_action_span(command, dialect, rule)
+                .unwrap_or_else(|| panic!("native action: {dialect:?}: {command}"));
+            assert_eq!(&command[span], matched, "{dialect:?}: {command}");
+        }
+    }
+
+    #[test]
+    fn native_dcg_action_proof_retains_dialect_data_and_group_boundaries() {
+        for (dialect, command) in [
+            (
+                ShellDialect::PowerShell,
+                "dcg --agent=two\\ words uninstall",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "dcg --agent=two` uninstall doctor",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "dcg --agent='dcg un`install' doctor",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "echo 'dcg --a`gent=codex un`install'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output $(\"dcg --a`gent=codex un`install\")",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "{ Write-Output ready; dcg un`install }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "{ Write-Output ready #}\ndcg un`install\n}",
+            ),
+            (ShellDialect::PowerShell, "# data; dcg un`install"),
+            (
+                ShellDialect::PowerShell,
+                "dcg --% --agent=two` words uninstall",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "dcg --help --agent=two` words uninstall",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "dcg --unknown --agent=two` words uninstall",
+            ),
+            (ShellDialect::PowerShell, "dcg --agent=$profile un`install"),
+            (
+                ShellDialect::PowerShell,
+                "'dcg' --agent=two` words uninstall",
+            ),
+            (ShellDialect::PowerShell, "dcg --ro`bot uninstall"),
+            (ShellDialect::Posix, "dcg --agent=two^ words uninstall"),
+            (ShellDialect::Cmd, "dcg --agent=two\\ words uninstall"),
+            (ShellDialect::Cmd, "dcg --agent=two^ words uninstall"),
+            (ShellDialect::Cmd, "dcg --agent=^\"words uninstall"),
+            (ShellDialect::Cmd, "dcg --agent=two^ uninstall doctor"),
+            (ShellDialect::Cmd, "dcg --agent=%PROFILE% uninstall"),
+            (ShellDialect::Unknown, "dcg --agent=two` words uninstall"),
+        ] {
+            for rule in ["dcg-bypass-or-uninstall", "dcg-policy-self-weakening"] {
+                assert!(
+                    dcg_control_action_span(command, dialect, rule).is_none(),
+                    "unproven action: {dialect:?}: {command} ({rule})"
+                );
+            }
         }
     }
 

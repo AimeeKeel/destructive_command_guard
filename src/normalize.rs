@@ -2656,19 +2656,34 @@ fn decode_powershell_pattern_view(command: &str) -> Cow<'_, str> {
 
     let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
     let mut segment_has_command = false;
+    let mut quoted_invocation_target = false;
     for token in &tokens {
+        let Some(raw) = token.text(command) else {
+            return Cow::Borrowed(command);
+        };
         if token.kind == NormalizeTokenKind::Separator {
-            segment_has_command = false;
+            // A leading call operator invokes its next word. An ampersand
+            // after an existing command is the background operator instead;
+            // it does not turn the following string expression into a call.
+            quoted_invocation_target = !segment_has_command && raw == "&";
+            // A closing parenthesis completes an expression; a following
+            // ampersand is still backgrounding that completed command.
+            segment_has_command = raw == ")";
             continue;
         }
         if segment_has_command {
             continue;
         }
-        let Some(raw) = token.text(command) else {
-            return Cow::Borrowed(command);
-        };
+        if raw == "." {
+            // Dot sourcing, like the call operator, owns an executable
+            // operand rather than evaluating a standalone string expression.
+            quoted_invocation_target = true;
+            continue;
+        }
         segment_has_command = true;
-        if !raw.contains('`') {
+        let string_expression =
+            raw.starts_with(['\'', '"']) || raw.starts_with("@'") || raw.starts_with("@\"");
+        if (!quoted_invocation_target && string_expression) || !raw.contains('`') {
             continue;
         }
         let decoded = decode_powershell_executable_backticks(raw);
@@ -3878,6 +3893,282 @@ fn normalize_subcommand_token(token: &str, posix_quoting: bool) -> Option<String
     if changed { Some(out) } else { None }
 }
 
+/// Quote state at a source boundary in a literal dcg syntax token.
+///
+/// PowerShell control/Unicode escapes are not ordinary escaped letters. The
+/// shared syntax decoder intentionally retains its established matching view;
+/// this narrower CLI proof must not turn `--ro`bot` into `--robot`, for example.
+/// Returning `None` leaves those bytes opaque instead of inventing an option.
+fn dcg_syntax_quote_state(token: &str, dialect: ShellDialect) -> Option<(PosixQuote, bool)> {
+    let mut quote = PosixQuote::Unquoted;
+    let mut ansi_c_quote = false;
+    let mut chars = token.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quote == PosixQuote::Single && !ansi_c_quote {
+            if ch == '\'' {
+                if dialect == ShellDialect::PowerShell && chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    quote = PosixQuote::Unquoted;
+                }
+            }
+            continue;
+        }
+        if dialect == ShellDialect::PowerShell && ch == '`' {
+            let escaped = chars.next()?;
+            if matches!(
+                escaped,
+                '0' | 'a' | 'b' | 'e' | 'f' | 'n' | 'r' | 't' | 'u' | 'v'
+            ) {
+                return None;
+            }
+            continue;
+        }
+        if dialect == ShellDialect::Posix && ch == '\\' {
+            chars.next()?;
+            continue;
+        }
+        match (quote, ch) {
+            (PosixQuote::Unquoted, '$')
+                if dialect == ShellDialect::Posix && chars.peek() == Some(&'\'') =>
+            {
+                chars.next();
+                quote = PosixQuote::Single;
+                ansi_c_quote = true;
+            }
+            (PosixQuote::Unquoted, '\'') => quote = PosixQuote::Single,
+            (PosixQuote::Unquoted, '"') => quote = PosixQuote::Double,
+            (PosixQuote::Double, '"') => quote = PosixQuote::Unquoted,
+            (PosixQuote::Single, '\'') => {
+                quote = PosixQuote::Unquoted;
+                ansi_c_quote = false;
+            }
+            _ => {}
+        }
+    }
+    Some((quote, ansi_c_quote))
+}
+
+/// Canonicalize an inline --agent option without rewriting its opaque value.
+fn normalize_dcg_agent_assignment(raw: &str, dialect: ShellDialect) -> Option<String> {
+    let value_start = raw.find('=')? + 1;
+    let prefix = &raw[..value_start];
+    let (quote, ansi_c_quote) = dcg_syntax_quote_state(prefix, dialect)?;
+    let (closing_quote, value_quote) = match quote {
+        PosixQuote::Unquoted => ("", ""),
+        PosixQuote::Single if ansi_c_quote => ("'", "$'"),
+        PosixQuote::Single => ("'", "'"),
+        PosixQuote::Double => ("\"", "\""),
+    };
+    // A quote spanning the option/value boundary can be closed just for the
+    // syntax proof, then reopened in front of the unchanged value. Thus
+    // "--a`gent=two words" becomes --agent="two words", not two argv words.
+    let syntax = format!("{prefix}{closing_quote}");
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    if decoder.decode(&syntax, ShellTokenRole::Syntax).as_deref() != Some("--agent=") {
+        return None;
+    }
+    Some(format!("--agent={value_quote}{}", &raw[value_start..]))
+}
+
+pub(crate) fn dcg_global_option_has_no_value(word: &str) -> bool {
+    matches!(
+        word,
+        "--robot"
+            | "--verbose"
+            | "--quiet"
+            | "--legacy-output"
+            | "--no-color"
+            | "--no-suggestions"
+            | "-q"
+    ) || word
+        .strip_prefix('-')
+        .is_some_and(|flags| !flags.is_empty() && flags.bytes().all(|b| b == b'v'))
+}
+
+pub(crate) fn is_dcg_literal_agent_assignment(raw: &str, dialect: ShellDialect) -> bool {
+    dcg_literal_word_is_static(raw, dialect)
+        && normalize_dcg_agent_assignment(raw, dialect).is_some()
+}
+
+/// Recover one static CLI argv word without evaluating its source. The
+/// PowerShell proof is intentionally narrower than the generic syntax view:
+/// expressions, splats, control escapes and incomplete quoting remain opaque.
+pub(crate) fn decode_dcg_literal_word(raw: &str, dialect: ShellDialect) -> Option<Cow<'_, str>> {
+    match dialect {
+        ShellDialect::Posix => decode_posix_literal_word(raw),
+        ShellDialect::PowerShell => {
+            if !dcg_literal_word_is_static(raw, dialect)
+                || dcg_syntax_quote_state(raw, dialect)?.0 != PosixQuote::Unquoted
+            {
+                return None;
+            }
+            ShellTokenDecoder::new(dialect).decode(raw, ShellTokenRole::Syntax)
+        }
+        ShellDialect::Cmd if dcg_literal_word_is_static(raw, dialect) => {
+            ShellTokenDecoder::new(dialect).decode(raw, ShellTokenRole::Syntax)
+        }
+        ShellDialect::Cmd | ShellDialect::Unknown => None,
+    }
+}
+
+/// Whether a caller-tokenized CLI word has a fixed single-argument value.
+/// No value is evaluated or rewritten. Quoted/escaped punctuation remains
+/// data, while runtime expansion, splatting and expression syntax do not
+/// establish argv ownership for a destructive-action proof.
+pub(crate) fn dcg_literal_word_is_static(raw: &str, dialect: ShellDialect) -> bool {
+    if dialect == ShellDialect::Posix {
+        return decode_posix_literal_word(raw).is_some();
+    }
+    if dialect == ShellDialect::Cmd {
+        // Environment/delayed expansion and the native Windows argv parser's
+        // backslash-before-quote rules require a separate proof.
+        if raw.contains(['%', '!']) || raw.contains("\\\"") {
+            return false;
+        }
+        let mut quoted = false;
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '"' {
+                quoted = !quoted;
+            } else if ch == '^' && !quoted {
+                let Some(escaped) = chars.next() else {
+                    return false;
+                };
+                // Cmd removes this caret, but the native executable parses
+                // the resulting command line again. An unquoted space/tab
+                // still splits argv, and a quote can absorb later words.
+                if matches!(escaped, ' ' | '\t' | '"') {
+                    return false;
+                }
+            }
+        }
+        return !quoted;
+    }
+    if dialect != ShellDialect::PowerShell {
+        return false;
+    }
+    let mut quote = PosixQuote::Unquoted;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quote == PosixQuote::Single {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    quote = PosixQuote::Unquoted;
+                }
+            }
+            continue;
+        }
+        if ch == '`' {
+            if chars.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        match (quote, ch) {
+            (PosixQuote::Unquoted, '\'') => quote = PosixQuote::Single,
+            (PosixQuote::Unquoted, '"') => quote = PosixQuote::Double,
+            (PosixQuote::Double, '"') => quote = PosixQuote::Unquoted,
+            (_, '$') | (PosixQuote::Unquoted, '@' | '(' | ')' | '{' | '}' | '[' | ']' | ',') => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    quote == PosixQuote::Unquoted
+}
+
+/// Decode only dcg's CLI syntax following an already identified executable.
+///
+/// The general dequoting pass deliberately keeps the generic token stream for
+/// PowerShell, so subexpressions and here-string data are not promoted into
+/// command words. That stream cannot delimit PowerShell options containing a
+/// backtick: it treats the escape as POSIX command substitution and may absorb
+/// the rest of the command. Use the proven dialect for this bounded argv
+/// prefix instead, without changing how the executable itself was identified.
+/// Return the last consumed source offset so the general pass does not also
+/// rewrite these option values or create overlapping replacements.
+fn normalize_dcg_syntax_prefix(
+    command: &str,
+    start: usize,
+    dialect: ShellDialect,
+    replacements: &mut Vec<(Range<usize>, String)>,
+) -> usize {
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let mut after_allowlist = false;
+    let mut agent_value = false;
+    let mut end = start;
+
+    for token in tokenize_for_shell_dialect(&command[start..], dialect) {
+        if token.kind == NormalizeTokenKind::Separator {
+            break;
+        }
+        let range = start + token.byte_range.start..start + token.byte_range.end;
+        let Some(raw) = command.get(range.clone()) else {
+            break;
+        };
+        end = range.end;
+        let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+            // Do not normalize native argv after PowerShell's stop-parsing
+            // token, including when the token itself was quoted or escaped.
+            break;
+        };
+        let word = decoded.as_ref();
+        let literal_syntax = dcg_syntax_quote_state(raw, dialect).is_some();
+        let (may_replace, is_subcommand) = if std::mem::take(&mut agent_value) {
+            // --agent consumes one argv word, even if it resembles an option
+            // or a subcommand. Keep spaces, paths and runtime syntax opaque.
+            (literal_syntax && looks_like_subcommand_word(word), false)
+        } else if word == "--agent" {
+            agent_value = true;
+            (true, false)
+        } else if let Some(replacement) = normalize_dcg_agent_assignment(raw, dialect) {
+            if literal_syntax
+                && word
+                    .strip_prefix("--agent=")
+                    .is_some_and(|value| value.is_empty() || looks_like_subcommand_word(value))
+            {
+                (true, false)
+            } else {
+                if replacement != raw {
+                    replacements.push((range, replacement));
+                }
+                continue;
+            }
+        } else if let Some(value) = word.strip_prefix("--agent=") {
+            // An ANSI-C encoded equals sign may have no literal source '='.
+            // Keep the established whole-token proof for plain literal values.
+            (
+                literal_syntax && (value.is_empty() || looks_like_subcommand_word(value)),
+                false,
+            )
+        } else if dcg_global_option_has_no_value(word) {
+            (true, false)
+        } else if word == "allowlist" && !after_allowlist {
+            after_allowlist = true;
+            (true, false)
+        } else {
+            // The first non-option is the actual subcommand, not data. Decode
+            // its literal spelling too (`un`install`, `allowl`ist a`dd`), then
+            // stop before any arguments that subcommand owns. Unknown options
+            // and shell syntax terminate the prefix without being rewritten.
+            (
+                !word.starts_with('-') && looks_like_subcommand_word(word),
+                true,
+            )
+        };
+        if may_replace && literal_syntax && word != raw {
+            replacements.push((range, decoded.into_owned()));
+        }
+        if is_subcommand {
+            break;
+        }
+    }
+    end
+}
+
 /// Normalize wrapper/segment command words for matching.
 ///
 /// This removes harmless quoting around *executed* command tokens:
@@ -3926,21 +4217,23 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
     let mut segment_has_cmd = false;
     let mut current_cmd_word: Option<String> = None;
     let mut wrapper: NormalizeWrapper = NormalizeWrapper::None;
-    // Some(false): dcg's global prefix; Some(true): the same prefix after
-    // `allowlist`. Stop at a real subcommand, unknown option or shell stop-
-    // parsing marker, so argument data cannot become command syntax.
-    let mut dcg_global_prefix: Option<bool> = None;
-    let mut dcg_agent_value = false;
-    let mut dcg_decoder = ShellTokenDecoder::new(dialect);
+    let mut dcg_syntax_end = None;
+    let mut dcg_native_tokens = None;
 
     for tok in &tokens {
+        // The generic tokenizer may mistake a backtick in a PowerShell
+        // option for command substitution and expose separators inside the
+        // option's quoted value. The native prefix already owns those bytes,
+        // including any such apparent separators; skip them before resetting
+        // the command state.
+        if dcg_syntax_end.is_some_and(|end| tok.byte_range.start < end) {
+            continue;
+        }
         if tok.kind == NormalizeTokenKind::Separator {
             segment_has_cmd = false;
             current_cmd_word = None;
             wrapper = NormalizeWrapper::None;
-            dcg_global_prefix = None;
-            dcg_agent_value = false;
-            dcg_decoder = ShellTokenDecoder::new(dialect);
+            dcg_syntax_end = None;
             continue;
         }
 
@@ -3950,49 +4243,6 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
         };
 
         if segment_has_cmd {
-            if let Some(after_allowlist) = dcg_global_prefix {
-                if let Some(decoded) = dcg_decoder.decode(token_text, ShellTokenRole::Syntax) {
-                    let word = decoded.as_ref();
-                    let may_replace = if std::mem::take(&mut dcg_agent_value) {
-                        // --agent consumes exactly one argv word. Decode an
-                        // ordinary name, but preserve spaces, paths, runtime
-                        // expansions and metacharacters as opaque data.
-                        Some(looks_like_subcommand_word(word))
-                    } else if word == "--agent" {
-                        dcg_agent_value = true;
-                        Some(true)
-                    } else if let Some(value) = word.strip_prefix("--agent=") {
-                        Some(value.is_empty() || looks_like_subcommand_word(value))
-                    } else if matches!(
-                        word,
-                        "--robot"
-                            | "--verbose"
-                            | "--quiet"
-                            | "--legacy-output"
-                            | "--no-color"
-                            | "--no-suggestions"
-                            | "-q"
-                    ) || word
-                        .strip_prefix('-')
-                        .is_some_and(|flags| !flags.is_empty() && flags.bytes().all(|b| b == b'v'))
-                    {
-                        Some(true)
-                    } else if word == "allowlist" && !after_allowlist {
-                        dcg_global_prefix = Some(true);
-                        Some(true)
-                    } else {
-                        None
-                    };
-                    if let Some(may_replace) = may_replace {
-                        if may_replace && word != token_text {
-                            replacements.push((tok.byte_range.clone(), decoded.into_owned()));
-                        }
-                        continue;
-                    }
-                }
-                dcg_global_prefix = None;
-            }
-
             // Check if we should skip dequoting for this command
             if let Some(cmd) = &current_cmd_word {
                 if crate::context::SAFE_STRING_REGISTRY.is_all_args_data(cmd) {
@@ -4058,8 +4308,29 @@ fn dequote_segment_command_words_in_dialect(command: &str, dialect: ShellDialect
                 let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
                 name.eq_ignore_ascii_case("dcg") || name.eq_ignore_ascii_case("dcg.exe")
             })
+            && (dialect != ShellDialect::PowerShell || {
+                // A generic token inside a quoted PowerShell subexpression
+                // can look like an executable after its opening quote was
+                // split off. Require an exact native source token before
+                // interpreting the following bytes as dcg's CLI syntax.
+                let native_tokens = dcg_native_tokens
+                    .get_or_insert_with(|| tokenize_for_shell_dialect(command, dialect));
+                native_tokens
+                    .binary_search_by_key(&tok.byte_range.start, |native| native.byte_range.start)
+                    .ok()
+                    .and_then(|index| native_tokens.get(index))
+                    .is_some_and(|native| {
+                        native.kind == NormalizeTokenKind::Word
+                            && native.byte_range == tok.byte_range
+                    })
+            })
         {
-            dcg_global_prefix = Some(false);
+            dcg_syntax_end = Some(normalize_dcg_syntax_prefix(
+                command,
+                tok.byte_range.end,
+                dialect,
+                &mut replacements,
+            ));
         }
 
         if let Some(repl) = replacement {
@@ -6004,6 +6275,10 @@ mod tests {
                     "dcg '--agent=codex' --robot uninstall",
                     "dcg --agent=codex --robot uninstall",
                 ),
+                (
+                    "dcg --a'gent'='two words' doctor",
+                    "dcg --agent='two words' doctor",
+                ),
             ] {
                 assert_eq!(
                     normalize_command_in_dialect(command, dialect),
@@ -6014,7 +6289,6 @@ mod tests {
             for command in [
                 "dcg --agent='dcg --robot uninstall' doctor",
                 "dcg --agent 'dcg --robot uninstall' doctor",
-                "dcg --a'gent'='two words' doctor",
                 "dcg --agent='$profile' doctor",
                 "dcg --agent '/tmp/profile' doctor",
                 "dcg --agent 'codex; rm -rf /' doctor",
@@ -6048,6 +6322,192 @@ mod tests {
             normalize_command_in_dialect(stopped, ShellDialect::PowerShell),
             stopped
         );
+    }
+
+    #[test]
+    fn powershell_dcg_prefix_uses_native_words_and_preserves_opaque_values() {
+        for (command, expected) in [
+            (
+                "dcg --a`gent=codex --r`obot un`install",
+                "dcg --agent=codex --robot uninstall",
+            ),
+            (
+                "d`cg --a`gent co`dex --r`obot un`install",
+                "dcg --agent codex --robot uninstall",
+            ),
+            (
+                "dcg allowl`ist --a`gent=codex --no-c`olor a`dd rule",
+                "dcg allowlist --agent=codex --no-color add rule",
+            ),
+            (
+                "dcg --a`gent='two words' un`install",
+                "dcg --agent='two words' uninstall",
+            ),
+            (
+                "dcg --a`gent='two 'words un`install",
+                "dcg --agent='two 'words uninstall",
+            ),
+            (
+                "dcg \"--a`gent=two words\" un`install",
+                "dcg --agent=\"two words\" uninstall",
+            ),
+            (
+                "dcg --a`gent`='two words' un`install",
+                "dcg --agent='two words' uninstall",
+            ),
+            (
+                "dcg --a`gent=co`ndex un`install",
+                "dcg --agent=co`ndex uninstall",
+            ),
+            (
+                "dcg --a`gent='co`dex; dcg un`install' doctor",
+                "dcg --agent='co`dex; dcg un`install' doctor",
+            ),
+            (
+                "dcg --a`gent=$profile un`install",
+                "dcg --agent=$profile uninstall",
+            ),
+            (
+                "dcg --a`gent=/tmp/profile un`install",
+                "dcg --agent=/tmp/profile uninstall",
+            ),
+            (
+                "dcg --a`gent=`\r\ncodex un`install",
+                "dcg --agent=codex uninstall",
+            ),
+        ] {
+            assert_eq!(
+                normalize_command_in_dialect(command, ShellDialect::PowerShell),
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_executable_decoding_preserves_string_expression_ownership() {
+        for command in [
+            "\"dcg --a`gent=codex un`install\"",
+            "Write-Output $(\"dcg --a`gent=codex un`install\")",
+            "Write-Output $(\"d`cg --a`gent=codex un`install\")",
+            "Write-Output ready & \"dcg --a`gent=codex un`install\"",
+            "Write-Output $(Get-Date) & \"dcg --a`gent=codex un`install\"",
+            "Write-Output $(@\"\ndcg --a`gent=codex un`install\n\"@)",
+        ] {
+            assert_eq!(
+                decode_powershell_pattern_view(command),
+                command,
+                "a string expression is not an executable argv word: {command}"
+            );
+        }
+
+        for (command, expected) in [
+            ("d`cg uninstall", "dcg uninstall"),
+            (
+                "Write-Output $(d`cg un`install)",
+                "Write-Output $(dcg un`install)",
+            ),
+            ("& \"d`cg\" uninstall", "& \"dcg\" uninstall"),
+            (". \"d`cg\" uninstall", ". \"dcg\" uninstall"),
+            (
+                "Write-Output $(& \"d`cg\" uninstall)",
+                "Write-Output $(& \"dcg\" uninstall)",
+            ),
+            (
+                "Write-Output $(Get-Date); & \"d`cg\" uninstall",
+                "Write-Output $(Get-Date); & \"dcg\" uninstall",
+            ),
+        ] {
+            assert_eq!(
+                decode_powershell_pattern_view(command),
+                expected,
+                "executed command words still expose their literal spelling: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn dcg_prefix_does_not_promote_data_or_guess_shell_escape_semantics() {
+        for command in [
+            "dcg --agent 'uninstall' doctor",
+            "dcg --agent 'dcg --robot uninstall' doctor",
+            "dcg --a`gent='co`dex; dcg un`install' doctor",
+            "dcg --agent=$(Write-Output 'dcg un`install') doctor",
+            "dcg --% --a`gent=codex un`install",
+            "dcg '--%' --a`gent=codex un`install",
+            "dcg --unknown --a`gent=codex un`install",
+            "dcg doctor --a`gent=codex un`install",
+            "dcg --ro`bot uninstall",
+            "dcg \"--ro`bot\" uninstall",
+            "dcg --ag`ent=codex uninstall",
+            "other --a`gent=codex un`install",
+            "Write-Output 'dcg --a`gent=codex un`install'",
+            "Write-Output $(\"dcg --a`gent=codex un`install\")",
+            "Write-Output $(\"d`cg --a`gent=codex un`install\")",
+        ] {
+            let expected = match command {
+                "dcg --agent 'uninstall' doctor" => "dcg --agent uninstall doctor",
+                "dcg --a`gent='co`dex; dcg un`install' doctor" => {
+                    "dcg --agent='co`dex; dcg un`install' doctor"
+                }
+                _ => command,
+            };
+            assert_eq!(
+                normalize_command_in_dialect(command, ShellDialect::PowerShell),
+                expected,
+                "{command}"
+            );
+        }
+
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::Unknown,
+            ShellDialect::Cmd,
+        ] {
+            for command in [
+                "dcg --a`gent=codex --robot uninstall",
+                "dcg --agent=`printf '%s' codex` doctor",
+                "dcg --agent='co`dex' doctor",
+            ] {
+                assert_eq!(normalize_command_in_dialect(command, dialect), command);
+            }
+        }
+    }
+
+    #[test]
+    fn dcg_agent_assignment_keeps_the_original_value_quote_mode() {
+        for (command, expected) in [
+            (
+                "dcg --a'gent'=\"$profile\" uninstall",
+                "dcg --agent=\"$profile\" uninstall",
+            ),
+            (
+                "dcg '--a'gent='two 'words uninstall",
+                "dcg --agent='two 'words uninstall",
+            ),
+            (
+                "dcg \"--a'gent'=two words\" uninstall",
+                "dcg \"--a'gent'=two words\" uninstall",
+            ),
+            (
+                "dcg '--agent=two words' uninstall",
+                "dcg --agent='two words' uninstall",
+            ),
+            (
+                "dcg $'--agent=two\\nwords' uninstall",
+                "dcg --agent=$'two\\nwords' uninstall",
+            ),
+            (
+                "dcg --a'gent'='dcg --robot uninstall' doctor",
+                "dcg --agent='dcg --robot uninstall' doctor",
+            ),
+        ] {
+            assert_eq!(
+                normalize_command_in_dialect(command, ShellDialect::Posix),
+                expected,
+                "{command}"
+            );
+        }
     }
 
     #[test]
