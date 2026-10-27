@@ -197,3 +197,24 @@ description = "a literal branch deletion in a quoted interpreter body still deni
 command = "python3 - <<'PY'\ngit branch -D main\nPY"
 expected = "deny"
 rule_id = "core.git:branch-force-delete"
+
+# #597 controls: a visible read-only subcommand after an unquoted `-C` path is
+# allowed, but branch argv after it, or no visible subcommand, still denies.
+[[case]]
+description = "unquoted -C path before a branch creation with a dynamic name (#597)"
+command = "git -C $r branch $b"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "unquoted -C path that could split into the branch subcommand before -D (#597)"
+command = "git -C $r -D main"
+expected = "deny"
+rule_id = "core.git:branch-dynamic-token"
+
+[[case]]
+description = "unquoted -C path before a dynamic subcommand (#597)"
+command = "git -C $r $sub main $b"
+expected = "deny"
+# The dynamic subcommand is reported first, as a possible alias.
+rule_id = "core.git:git-alias-semantic-unverified"

@@ -196,3 +196,41 @@ expected = "allow"
 description = "a second wildcard word cannot stand in for the branch subcommand (#360)"
 command = "/* b*"
 expected = "allow"
+
+# #597: an unquoted `-C` path followed by a read-only subcommand and a bare
+# dynamic operand. Reaching a branch deletion needs the path to split into
+# `branch` and the operand to be a flag: two unknowns.
+[[case]]
+description = "unquoted -C path, log with a dynamic revision (#597)"
+command = "git -C $r log main $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, log with only a dynamic revision (#597)"
+command = "git -C $r log $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, log with a quoted dynamic revision (#597)"
+command = "git -C $r log main \"$b\""
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, diff against a dynamic revision (#597)"
+command = "git -C $r diff main $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, rev-list with a dynamic revision (#597)"
+command = "git -C $r rev-list main $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, merge-base with a dynamic revision (#597)"
+command = "git -C $r merge-base main $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, cherry with a dynamic revision (#597)"
+command = "git -C $r cherry main $b"
+expected = "allow"

@@ -4059,7 +4059,17 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
             let Some(value) = words.get(index + 1) else {
                 return false;
             };
-            if value.dynamic && value.may_split {
+            // A field-splitting value could supply the subcommand itself
+            // (`$r` = `dir branch`), so the words after it may be branch
+            // argv. When a literal Git subcommand follows the value, that
+            // reading needs a second unknown to reach a deletion flag
+            // (`git -C $r log main $b`), and two unknowns are not evidence
+            // (#281): let the visible subcommand decide, as #405 does for
+            // aliases (#597).
+            let visible_subcommand = words
+                .get(index + 2)
+                .is_some_and(|next| !next.dynamic && is_known_git_command(&next.decoded));
+            if value.dynamic && value.may_split && !visible_subcommand {
                 return semantic_branch_argv_may_mutate(&words[index + 2..], dialect);
             }
             index += 2;
@@ -6669,6 +6679,47 @@ mod tests {
                 InvokedGitAliasDecision::Unverified,
                 "{command} must stay unverifiable"
             );
+        }
+    }
+
+    #[test]
+    fn dynamic_path_value_before_a_visible_subcommand_is_not_branch_argv() {
+        // #597: with an unquoted `-C $r`, a bare dynamic operand after a
+        // read-only subcommand was judged as `git branch` argv.
+        for command in [
+            "git -C $r log main $b",
+            "git -C $r log $b",
+            "git -C $r log main \"$b\"",
+            "git -C $r diff main $b",
+            "git -C $r rev-list main $b",
+            "git -C $r merge-base main $b",
+            "git -C $r cherry main $b",
+            "git --work-tree $w --git-dir $d diff $b",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !decision.is_destructive(),
+                    "{command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+        // Branch argv after the dynamic path, and a dynamic path with no
+        // visible subcommand after it, still fail closed.
+        for command in [
+            "git -C $r branch $b",
+            "git -C $r branch -D $b",
+            "git -C $r -D main",
+            "git -C $r $sub main $b",
+            "git -C $r -f main $b",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    decision.is_destructive(),
+                    "{command} ({dialect:?}) -> {decision:?}"
+                );
+            }
         }
     }
 
