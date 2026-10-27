@@ -2197,9 +2197,9 @@ This is logged and visible in git history. For permanent exceptions, use allowli
 Your AI agent invokes dcg as a PreToolUse hook before executing each shell command. The hook receives the command as JSON on stdin and runs through a four-stage pipeline:
 
 1. **JSON Parsing** -- Validates the hook payload (Claude/Gemini/Copilot variants), extracts the command string. Non-shell tools are immediately allowed.
-2. **Normalization** -- Strips absolute paths (`/usr/bin/git` becomes `git`) while preserving arguments.
-3. **Quick Reject** -- O(n) substring search for keywords like "git" or "rm". Commands without these substrings skip regex matching entirely (handles 99%+ of non-destructive commands).
-4. **Pattern Matching** -- Safe patterns checked first (match = allow). Destructive patterns checked second (match = deny with explanation). No match on either = allow.
+2. **Normalization** -- Builds a detection view by stripping recognized wrappers, environment assignments, and executable paths (`/usr/bin/git` becomes `git`), while retaining the original command and execution context for safe exemptions.
+3. **Quick Reject** -- Searches command text and resolved executable names for pack keywords such as "git" or "rm". Original text remains available to custom policies, including keywords in environment assignments removed from the detection view.
+4. **Pattern Matching** -- Checks safe exemptions in their original execution context before the relevant pack's destructive rules. Destructive matching retains the normalized view so wrappers cannot hide dangerous commands. An exemption is scoped to its pack and command segment; other packs and segments still undergo evaluation. Commands without a destructive match are allowed.
 
 If blocked under a Claude-compatible JSON hook protocol, dcg outputs a JSON
 denial on stdout and a colorful human-readable warning on stderr. If blocked
@@ -2806,17 +2806,25 @@ fn quick_reject(cmd: &str) -> bool {
 
 For commands like `ls -la`, `cargo build`, or `npm install`, this check short-circuits the entire matching pipeline. The `memmem::Finder` is pre-compiled once and reused, avoiding repeated setup costs.
 
-### 3. Early Exit on Safe Match
+### 3. Early Exit Within a Pack
 
-Safe patterns are checked first. On match, the function returns immediately without checking destructive patterns:
+A safe exemption skips the corresponding pack's destructive rules for the
+authorized command segment. Evaluation continues for other packs and shell
+segments, so one safe command cannot exempt a dangerous sibling.
 
-```rust
-for pattern in SAFE_PATTERNS.iter() {
-    if pattern.regex.is_match(&normalized).unwrap_or(false) {
-        return;  // Allow immediately
-    }
-}
-```
+Regex exemptions retain the original command's environment assignments,
+wrappers, executable paths, and redirections. For example, an exact custom
+safe pattern for `/usr/bin/python3 -I /opt/tools/run_check.py --check` does not
+also authorize that invocation with `PATH=/somewhere` prepended. Destructive
+patterns still inspect normalized commands, and custom destructive patterns
+also inspect the original command after data sanitization.
+
+Nested commands retain their carrier's context. A custom safe grant can
+transfer to a nested command only when a safe pattern explicitly covers the
+complete original carrier as one shell segment. Earlier shell statements
+also prevent a later custom exemption unless they are provably neutral.
+See [command text and safe exemptions](docs/custom-packs.md#command-text-and-safe-exemptions)
+for exact matching, unanchored patterns, and compound-command behavior.
 
 ### 4. Compile-Time Pattern Validation
 

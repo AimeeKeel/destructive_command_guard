@@ -69,6 +69,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::LazyLock;
 
 /// Convert `ast_matcher::Severity` to `packs::Severity`.
@@ -341,6 +342,272 @@ fn byte_span_to_char_span(command: &str, span: &MatchSpan) -> Option<WindowedSpa
         start: char_start,
         end: char_end,
     })
+}
+
+thread_local! {
+    /// Recursive evaluation is synchronous. Keep authorization source separate
+    /// from detection views, including case-folded and redirection-free replays.
+    static SAFE_PATTERN_SOURCE: std::cell::RefCell<Option<Rc<SafePatternSource>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+struct SafePatternSource {
+    command: String,
+    dialect: ShellDialect,
+    parent: Option<Rc<Self>>,
+}
+
+impl SafePatternSource {
+    /// An outer full-command grant covers only its own pack. Otherwise a
+    /// custom exemption cannot be acquired by extracting an apparently bare
+    /// child command from a different invocation (#598). This is a provenance
+    /// rule, independent of variable names or the set of recognized wrappers.
+    fn inherited_grant(
+        &self,
+        pack: &crate::packs::Pack,
+        deadline: Option<&Deadline>,
+    ) -> Option<bool> {
+        let parent = self.parent.as_ref()?;
+        if let Some(grant) = parent.inherited_grant(pack, deadline) {
+            return Some(grant);
+        }
+        if REGISTRY.get_entry(&pack.id).is_some() {
+            // A built-in operation-level exception must still recognize the
+            // original carrier. It never grants safety to a child on its own:
+            // the child also needs its own existing safe proof below.
+            return (!pack.matches_safe_with_deadline(&parent.command, deadline)).then_some(false);
+        }
+        let segments =
+            crate::packs::split_command_segments_in_dialect(&parent.command, parent.dialect);
+        // Built-in safe regexes describe operation-level exceptions (such as
+        // Redis INFO), not reviewed envelopes. Propagating those would let an
+        // outer read-only word hide a destructive command substitution.
+        Some(
+            segments.len() == 1
+                && pack.matches_safe_with_deadline(&parent.command, deadline)
+                && pack.safe_patterns.iter().any(|pattern| {
+                    !deadline_exceeded(deadline)
+                        && pattern.regex.find(&parent.command) == Some((0, parent.command.len()))
+                }),
+        )
+    }
+}
+
+struct SafePatternScope {
+    previous: Option<Rc<SafePatternSource>>,
+}
+
+impl SafePatternScope {
+    fn enter(command: &str, dialect: ShellDialect, depth: usize) -> Self {
+        let previous = SAFE_PATTERN_SOURCE.with(|slot| {
+            let previous = slot.borrow_mut().take();
+            *slot.borrow_mut() = Some(Rc::new(SafePatternSource {
+                command: command.to_string(),
+                dialect,
+                parent: (depth > 0).then(|| previous.clone()).flatten(),
+            }));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for SafePatternScope {
+    fn drop(&mut self) {
+        SAFE_PATTERN_SOURCE.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Regex exemptions read the original segment, including assignments,
+/// executable paths, wrappers, and redirects. Normalized/sanitized strings are
+/// detection inputs only. Segment correspondence is positional, never a search
+/// for equal normalized text: two siblings may normalize to the same command.
+struct SafePatternInputs<'a> {
+    source: Rc<SafePatternSource>,
+    view: &'a str,
+    dialect: ShellDialect,
+    ranges: std::cell::OnceCell<Vec<(usize, usize)>>,
+    source_ranges: std::cell::OnceCell<Vec<(usize, usize)>>,
+}
+
+impl<'a> SafePatternInputs<'a> {
+    fn new(view: &'a str, original: &str, dialect: ShellDialect) -> Self {
+        let source = SAFE_PATTERN_SOURCE
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(|| {
+                Rc::new(SafePatternSource {
+                    command: original.to_string(),
+                    dialect,
+                    parent: None,
+                })
+            });
+        Self {
+            source,
+            view,
+            dialect,
+            ranges: std::cell::OnceCell::new(),
+            source_ranges: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn segment(&self, range: Option<(usize, usize)>) -> Option<&str> {
+        let Some(range) = range else {
+            return Some(&self.source.command);
+        };
+        if self.view == self.source.command {
+            return self.source.command.get(range.0..range.1);
+        }
+        let ranges = self
+            .ranges
+            .get_or_init(|| command_segment_ranges_in_dialect(self.view, self.dialect));
+        let source_ranges = self
+            .source_ranges
+            .get_or_init(|| command_segment_ranges_in_dialect(&self.source.command, self.dialect));
+        if ranges.len() != source_ranges.len() {
+            // A transformation changed execution structure. There is no proof
+            // that this segment is the one the safe pattern author authorized.
+            return None;
+        }
+        let index = ranges.iter().position(|candidate| *candidate == range)?;
+        let source_range = source_ranges[index];
+        if ranges.iter().zip(source_ranges).any(|(other, source)| {
+            let contains = other.0 <= range.0 && range.1 <= other.1;
+            let source_contains = source.0 <= source_range.0 && source_range.1 <= source.1;
+            contains != source_contains
+        }) {
+            return None;
+        }
+        self.source.command.get(source_range.0..source_range.1)
+    }
+
+    fn preceding_shell_context_is_unproven(&self, segment: &str) -> bool {
+        let start = segment.as_ptr() as usize - self.source.command.as_ptr() as usize;
+        if start == 0 {
+            return false;
+        }
+        let ranges = self
+            .source_ranges
+            .get_or_init(|| command_segment_ranges_in_dialect(&self.source.command, self.dialect));
+        ranges.iter().any(|&(before_start, before_end)| {
+            if before_end > start || segment_range_is_nested(ranges, before_start, before_end) {
+                return false;
+            }
+            let before = &self.source.command[before_start..before_end];
+            // Prove a predecessor cannot change this shell's environment,
+            // rather than enumerate mutating builtins. Quoting, expansions,
+            // function definitions, dispatchers and unknown commands all
+            // withhold the later exemption. In proven POSIX syntax a literal
+            // executable path runs in a child; Windows shell scripts can
+            // change the current process's environment. Simple no-argument
+            // no-ops are also neutral, except assignments before the POSIX
+            // special builtin `:` persist in the parent shell.
+            // Invocation-local literal assignments are permitted, whereas
+            // an assignment-only statement has no proven neutral command.
+            let words: Vec<_> = before.split_ascii_whitespace().collect();
+            let literal = words.iter().all(|word| {
+                word.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(
+                            byte,
+                            b'_' | b'.' | b'/' | b':' | b'=' | b',' | b'+' | b'-' | b'@' | b'%'
+                        )
+                })
+            });
+            let mut argv = words
+                .iter()
+                .enumerate()
+                .skip_while(|(_, word)| crate::normalize::is_env_assignment(word));
+            let neutral = argv.next().is_some_and(|(index, word)| {
+                (self.dialect == ShellDialect::Posix && word.contains('/'))
+                    || ((matches!(*word, "true" | "false") || (*word == ":" && index == 0))
+                        && argv.next().is_none())
+            });
+            !(literal && neutral)
+        })
+    }
+
+    fn matches(
+        &self,
+        pack: &crate::packs::Pack,
+        detection_input: &str,
+        range: Option<(usize, usize)>,
+        deadline: Option<&Deadline>,
+    ) -> bool {
+        if deadline_exceeded(deadline) {
+            return false;
+        }
+        let builtin = REGISTRY.get_entry(&pack.id).is_some();
+        if builtin && let Some(decision) = pack.semantic_safe_decision(detection_input) {
+            // Structural argv proofs (for example kubectl's effective dry-run
+            // flag) are independent of authorizing an arbitrary regex spelling.
+            return decision;
+        }
+        if pack.safe_patterns.is_empty() {
+            return false;
+        }
+        // The established detection view also proves ownership of built-in
+        // exceptions: raw quoted data or a child substitution must not lend
+        // a read-only keyword to its destructive parent (e.g. AWS describe
+        // inside terminate-instances). Raw matching may narrow that proof,
+        // never replace it with a broader exemption.
+        let nested_ranges: Vec<_> = if builtin
+            && (detection_input.contains(['$', '`'])
+                || detection_input.contains("<(")
+                || detection_input.contains(">("))
+        {
+            let ranges = command_segment_ranges_in_dialect(detection_input, self.dialect);
+            ranges
+                .iter()
+                .copied()
+                .filter(|&(start, end)| segment_range_is_nested(&ranges, start, end))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let owned_detection = mask_nested_segment_ranges(detection_input, 0, &nested_ranges);
+        let detection_safe = pack.matches_safe_with_deadline(owned_detection.as_ref(), deadline)
+            && (pack.id != "cloud.aws"
+                || pack.safe_patterns.iter().any(|pattern| {
+                    !deadline_exceeded(deadline)
+                        && pattern
+                            .regex
+                            .find(owned_detection.as_ref())
+                            .is_some_and(|(start, _)| {
+                                !crate::context::offset_is_quoted_data(
+                                    owned_detection.as_ref(),
+                                    start,
+                                )
+                            })
+                }));
+        if builtin && !detection_safe {
+            return false;
+        }
+        if let Some(grant) = self.source.inherited_grant(pack, deadline) {
+            return grant;
+        }
+        self.segment(range).is_some_and(|source| {
+            let source_safe = if source == owned_detection.as_ref() {
+                detection_safe
+            } else {
+                pack.matches_safe_with_deadline(source, deadline)
+            };
+            // A prior shell-state change must not disappear merely because
+            // this pack evaluates the next shell segment independently.
+            (builtin || !self.preceding_shell_context_is_unproven(source))
+                && source_safe
+                // Restoring raw text must not let an unanchored safe phrase
+                // borrow inert argument/substitution text that the previous
+                // matching view excluded. An explicit full-segment custom
+                // grant can authorize its original spelling, including a
+                // wrapper or quoted argv that normalization changes.
+                && (detection_safe
+                    || pack.safe_patterns.iter().any(|pattern| {
+                        !deadline_exceeded(deadline)
+                            && pattern.regex.find(source) == Some((0, source.len()))
+                    }))
+        })
+    }
 }
 
 fn compute_normalized_offset(command_for_match: &str, normalized: &str) -> Option<usize> {
@@ -14268,6 +14535,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         return EvaluationResult::denied_by_config(reason.to_string());
     }
 
+    let _safe_pattern_scope = SafePatternScope::enter(command, shell_dialect, nested_command_depth);
     let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
     let mut result = evaluate_command_in_dialect_union(
         command,
@@ -15242,7 +15510,7 @@ fn evaluate_command_in_single_dialect_view(
             ordered_packs,
         )
         && !external_pack_needs_identity_selection(
-            inert_redirection_gating_view(normalized.as_ref(), shell_dialect).as_ref(),
+            inert_redirection_gating_view(command_for_match, shell_dialect).as_ref(),
             shell_dialect,
             ordered_packs,
         )
@@ -24306,6 +24574,8 @@ fn evaluate_packs_with_allowlists_at_depth(
     // Inert redirections select no pack (#571); rules still match the text.
     let gating_command = inert_redirection_gating_view(command_for_packs, shell_dialect);
     let gating_command = gating_command.as_ref();
+    let original_gating_command = inert_redirection_gating_view(command_for_match, shell_dialect);
+    let original_gating_command = original_gating_command.as_ref();
     let core_filesystem_keyword_candidate =
         crate::packs::core::filesystem::filesystem_keyword_candidate(gating_command);
     // External packs the keyword gate skips may still be owed their rules
@@ -24349,6 +24619,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                         .and_then(|store| store.get(pack_id))
                         .is_some_and(|pack| {
                             pack.might_match(gating_command)
+                                || pack.might_match(original_gating_command)
                                 || should_check_original_control_plane_payload(
                                     pack_id,
                                     command_for_packs,
@@ -24391,7 +24662,9 @@ fn evaluate_packs_with_allowlists_at_depth(
                         let external_selected = external_store
                             .and_then(|store| store.get(pack_id))
                             .is_some_and(|pack| {
-                                pack.might_match(gating_command) || external_identity_selects(pack)
+                                pack.might_match(gating_command)
+                                    || pack.might_match(original_gating_command)
+                                    || external_identity_selects(pack)
                             });
                         if !external_selected {
                             return None;
@@ -24418,6 +24691,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     let normalized_offset = compute_normalized_offset(command_for_match, normalized);
     let original_len = original_command.len();
     let segment_ranges = command_segment_ranges_in_dialect(command_for_packs, shell_dialect);
+    let safe_inputs = SafePatternInputs::new(command_for_packs, input_command, shell_dialect);
     let has_cmd_grouping_or_separator = shell_dialect == ShellDialect::Cmd
         && tokenize_for_shell_dialect(command_for_packs, ShellDialect::Cmd)
             .iter()
@@ -24611,6 +24885,52 @@ fn evaluate_packs_with_allowlists_at_depth(
             return result;
         }
 
+        // Custom policies may deliberately require an assignment or wrapper
+        // in their destructive regex (#598). Keep that detection input in
+        // addition to the normalized one; sanitization still masks inert data.
+        if REGISTRY.get_entry(pack_id).is_none() && command_for_match != command_for_packs {
+            let raw_ranges = command_segment_ranges_in_dialect(command_for_match, shell_dialect);
+            let raw_safe_inputs =
+                SafePatternInputs::new(command_for_match, input_command, shell_dialect);
+            for &(start, end) in &raw_ranges {
+                if raw_safe_inputs.matches(
+                    pack,
+                    &command_for_match[start..end],
+                    Some((start, end)),
+                    deadline,
+                ) {
+                    continue;
+                }
+                let nested_ranges: Vec<_> = raw_ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(child_start, child_end)| {
+                        start <= child_start
+                            && child_end <= end
+                            && (start != child_start || end != child_end)
+                    })
+                    .collect();
+                if let Some(result) = evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    &command_for_match[start..end],
+                    shell_dialect,
+                    start,
+                    original_command,
+                    Some(0),
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut first_allowlist_hit,
+                    deadline,
+                    &nested_ranges,
+                    None,
+                ) {
+                    return result;
+                }
+            }
+        }
+
         if has_compound_segments
             && pack_id == "careful_company_running_windows.upload"
             && let Some(result) = evaluate_pack_destructive_patterns(
@@ -24789,6 +25109,8 @@ fn evaluate_packs_with_allowlists_at_depth(
             && let Some(posix_ranges) = posix_segment_ranges_for_scoped_packs.as_ref()
             && !posix_ranges.is_empty()
         {
+            let safe_inputs =
+                SafePatternInputs::new(command_for_packs, input_command, ShellDialect::Posix);
             for &(segment_start, segment_end) in posix_ranges {
                 if deadline_exceeded(deadline)
                     || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
@@ -24800,7 +25122,12 @@ fn evaluate_packs_with_allowlists_at_depth(
                 };
                 let sanitized_segment = sanitize_for_pattern_matching(segment);
                 let segment_for_match = sanitized_segment.as_ref();
-                if pack.matches_safe_with_deadline(segment_for_match, deadline) {
+                if safe_inputs.matches(
+                    pack,
+                    segment_for_match,
+                    Some((segment_start, segment_end)),
+                    deadline,
+                ) {
                     continue;
                 }
                 if let Some(result) = evaluate_pack_destructive_patterns(
@@ -24880,6 +25207,8 @@ fn evaluate_packs_with_allowlists_at_depth(
             let permissions_command = scp_semantic_masked.as_ref();
             let permissions_ranges =
                 command_segment_ranges_in_dialect(permissions_command, shell_dialect);
+            let safe_inputs =
+                SafePatternInputs::new(permissions_command, input_command, shell_dialect);
             for &(start, end) in &permissions_ranges {
                 if deadline_exceeded(deadline)
                     || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
@@ -24917,7 +25246,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                 }
                 // Never prove a complete chmod argv from a view that may have
                 // masked an unresolved later target or shell expansion.
-                if pack.matches_safe_with_deadline(segment, deadline) {
+                if safe_inputs.matches(pack, segment, Some((start, end)), deadline) {
                     continue;
                 }
                 let nested_ranges: Vec<_> = permissions_ranges
@@ -25047,10 +25376,14 @@ fn evaluate_packs_with_allowlists_at_depth(
                     }
                     let safe_view =
                         crate::packs::core::git::syntax_view_in_dialect(segment, shell_dialect);
-                    if pack.matches_safe_with_deadline(
-                        safe_view.as_deref().unwrap_or(segment),
-                        deadline,
-                    ) {
+                    if SafePatternInputs::new(core_git_command, input_command, shell_dialect)
+                        .matches(
+                            pack,
+                            safe_view.as_deref().unwrap_or(segment),
+                            Some((segment_start - command_prefix_len, segment_end)),
+                            deadline,
+                        )
+                    {
                         continue;
                     }
 
@@ -25112,8 +25445,10 @@ fn evaluate_packs_with_allowlists_at_depth(
                     core_git_segment,
                     shell_dialect,
                 );
-                if pack.matches_safe_with_deadline(
+                if SafePatternInputs::new(core_git_command, input_command, shell_dialect).matches(
+                    pack,
                     safe_view.as_deref().unwrap_or(core_git_segment),
+                    None,
                     deadline,
                 ) {
                     continue;
@@ -25219,7 +25554,12 @@ fn evaluate_packs_with_allowlists_at_depth(
                 }
                 let sanitized_segment = sanitize_for_pattern_matching(segment);
                 let segment_for_match = sanitized_segment.as_ref();
-                if pack.matches_safe_with_deadline(segment_for_match, deadline) {
+                if safe_inputs.matches(
+                    pack,
+                    segment_for_match,
+                    Some((segment_start, segment_end)),
+                    deadline,
+                ) {
                     continue;
                 }
 
@@ -25252,7 +25592,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     return result;
                 }
             }
-        } else if pack.matches_safe_with_deadline(command_for_packs, deadline) {
+        } else if safe_inputs.matches(pack, command_for_packs, None, deadline) {
             continue; // Safe pattern match - skip this pack's destructive patterns
         }
 
@@ -25412,7 +25752,36 @@ fn evaluate_packs_with_allowlists_at_depth(
             // segment loop; keep its full-command regex fallback visible.
             if has_compound_segments
                 && pack_id != "core.filesystem"
-                && span_is_inside_any_segment(span, &segment_ranges)
+                && (span_is_inside_any_segment(span, &segment_ranges)
+                    || command_for_packs
+                        .get(span.start..span.end)
+                        .is_some_and(|matched| {
+                            // A boundary regex may consume the whitespace
+                            // just before an already-exempt segment. Only
+                            // suppress that duplicate after proving this
+                            // exact segment's exemption again; a destructive
+                            // regex that requires leading whitespace must
+                            // still fire when no safe pattern authorizes it.
+                            let trimmed = matched.trim();
+                            if trimmed.is_empty() {
+                                return false;
+                            }
+                            let start = span.start + matched.len() - matched.trim_start().len();
+                            let end = start + trimmed.len();
+                            segment_ranges.iter().any(|&(segment_start, segment_end)| {
+                                start >= segment_start
+                                    && end <= segment_end
+                                    && safe_inputs.matches(
+                                        pack,
+                                        sanitize_for_pattern_matching(
+                                            &command_for_packs[segment_start..segment_end],
+                                        )
+                                        .as_ref(),
+                                        Some((segment_start, segment_end)),
+                                        deadline,
+                                    )
+                            })
+                        }))
             {
                 continue;
             }
@@ -26087,6 +26456,7 @@ fn evaluate_cloudflare_workers_pack(
     embedded_shell_depth: usize,
     nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
 ) -> Option<EvaluationResult> {
+    let safe_inputs = SafePatternInputs::new(command_for_packs, original_command, shell_dialect);
     for &(segment_start, segment_end) in segment_ranges {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -26208,7 +26578,12 @@ fn evaluate_cloudflare_workers_pack(
 
         let sanitized_segment = sanitize_for_pattern_matching(segment);
         let segment_for_match = sanitized_segment.as_ref();
-        if pack.matches_safe_with_deadline(segment_for_match, deadline) {
+        if safe_inputs.matches(
+            pack,
+            segment_for_match,
+            Some((segment_start, segment_end)),
+            deadline,
+        ) {
             continue;
         }
         let nested_segment_ranges: Vec<(usize, usize)> = segment_ranges
@@ -29915,6 +30290,7 @@ fn evaluate_core_filesystem_pack(
     inherited_automated_stdin: bool,
     heredoc_settings: Option<&crate::config::HeredocSettings>,
 ) -> Option<EvaluationResult> {
+    let safe_inputs = SafePatternInputs::new(command_for_packs, original_command, shell_dialect);
     // The quoted and escaped `;`, `|`, `&` of this command, in its own
     // coordinates, for the add-only masked pass every destructive pass below
     // gets (see `evaluate_view_then_separator_masked`). Only POSIX grammar
@@ -30517,7 +30893,12 @@ fn evaluate_core_filesystem_pack(
         if rm_was_semantically_handled {
             continue;
         }
-        if pack.matches_safe_with_deadline(segment_for_match, deadline) {
+        if safe_inputs.matches(
+            pack,
+            segment_for_match,
+            Some((segment_start, segment_end)),
+            deadline,
+        ) {
             continue;
         }
 
@@ -31040,9 +31421,8 @@ fn is_core_filesystem_recursive_rm_rule(pack_id: &str, name: Option<&str>) -> bo
         )
 }
 
-/// Whether a recursive-`rm` regex hit lies inside a verified literal shell
-/// script that is, as a whole, one literal cleanup of `/tmp` or `/var/tmp`
-/// descendants (#576).
+/// Whether an operation-specific regex hit repeats a verified safe literal
+/// shell payload: a temporary cleanup (#576) or a proven preview (#598).
 ///
 /// The outer command's view still contains the script's bytes, so
 /// `sh -c 'rm -rf /tmp/probe'` matched `rm-rf-root-home` on `rm -rf /`: the
@@ -31062,14 +31442,26 @@ fn is_core_filesystem_recursive_rm_rule(pack_id: &str, name: Option<&str>) -> bo
 ///
 /// Roots, traversal, other operands, expansions, globs, separators, redirects,
 /// interactive flags and every other rule keep the outer denial.
-fn recursive_rm_match_is_literal_temp_inline_script(
+///
+/// Preview proofs have the same ownership requirement. The carrier's closing
+/// quote is not an argv byte, so it must not revoke a proven preview at the
+/// end of the literal payload. Only the owning pack's rules stand down, and
+/// only when the whole literal payload passes its existing argv proof.
+fn command_match_is_literal_safe_inline_script(
     pack_id: &str,
     pattern_name: Option<&str>,
     command: &str,
     span: MatchSpan,
     source_context: Option<(&str, usize)>,
 ) -> bool {
-    if !is_core_filesystem_recursive_rm_rule(pack_id, pattern_name) {
+    let temp_cleanup = is_core_filesystem_recursive_rm_rule(pack_id, pattern_name);
+    let ec2_preview = pack_id == "cloud.aws"
+        && matches!(
+            pattern_name,
+            Some("ec2-terminate" | "removes AWS resources")
+        );
+    let kubectl_preview = pack_id == "kubernetes.kubectl";
+    if !temp_cleanup && !ec2_preview && !kubectl_preview {
         return false;
     }
     let Some((source, source_base)) = source_context else {
@@ -31114,7 +31506,16 @@ fn recursive_rm_match_is_literal_temp_inline_script(
         literal_bash_source_range(source, content).is_some_and(|range| {
             range.start <= start
                 && end <= range.end
-                && crate::ast_matcher::literal_temp_rm(&content.content)
+                && if temp_cleanup {
+                    crate::ast_matcher::literal_temp_rm(&content.content)
+                } else if ec2_preview {
+                    crate::packs::cloud::aws::ec2_dry_run_decision(&content.content) == Some(true)
+                } else {
+                    crate::packs::split_command_segments(&content.content).len() == 1
+                        && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(
+                            &content.content,
+                        )
+                }
         })
     })
 }
@@ -31158,7 +31559,7 @@ fn find_actionable_command_pattern_span(
             command,
             span,
             source_context,
-        ) && !recursive_rm_match_is_literal_temp_inline_script(
+        ) && !command_match_is_literal_safe_inline_script(
             pack_id,
             pattern_name,
             command,
@@ -32121,6 +32522,15 @@ fn external_pack_needs_identity_selection(
     if enabled_external.peek().is_none() {
         return false;
     }
+    // Normalization can remove the only keyword a policy uses, for example
+    // `PATH` in a rule about a leading assignment. Such a rule still gets its
+    // original-source pass even when executable identity alone would skip it.
+    if enabled_external
+        .clone()
+        .any(|pack| pack.might_match(command))
+    {
+        return true;
+    }
     let identities = command_executable_identities(command, dialect);
     identities.unresolved || enabled_external.any(|pack| identities.selects(pack))
 }
@@ -32684,6 +33094,7 @@ where
         return EvaluationResult::denied_by_config(reason.to_string());
     }
 
+    let _safe_pattern_scope = SafePatternScope::enter(command, ShellDialect::Unknown, 0);
     // Empty commands are allowed (no-op)
     if command.is_empty() {
         return EvaluationResult::allowed();
@@ -32805,9 +33216,12 @@ where
         return EvaluationResult::allowed();
     }
 
-    // Step 7: Check legacy safe patterns (whitelist, reusing normalized from quick-reject)
+    // Step 7: Exemptions must authorize the original spelling. Retain the
+    // established sanitized detection check as well: the legacy trait cannot
+    // prove a full-source grant, and raw inert data must not lend a safe phrase
+    // to a destructive command that previously had no exemption.
     for pattern in safe_patterns {
-        if pattern.is_match(&normalized) {
+        if pattern.is_match(command) && pattern.is_match(&normalized) {
             return EvaluationResult::allowed();
         }
     }
@@ -35407,6 +35821,234 @@ pub fn apply_branch_strictness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_598_legacy_safe_patterns_keep_the_original_command_spelling() {
+        let config = default_config();
+        let overrides = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let safe = [crate::safe_pattern!("reviewed-status", r"^git status$")];
+        let destructive = [crate::destructive_pattern!(
+            "reviewed-status",
+            r"\bgit\s+status\b",
+            "This legacy policy requires the reviewed status invocation"
+        )];
+        let evaluate = |command: &str| {
+            evaluate_command_with_legacy(
+                command,
+                &config,
+                &["git"],
+                &overrides,
+                &allowlists,
+                &safe,
+                &destructive,
+            )
+        };
+        assert!(evaluate("git status").is_allowed());
+        let no_safe: [crate::packs::SafePattern; 0] = [];
+        assert!(
+            evaluate_command_with_legacy(
+                "git status",
+                &config,
+                &["git"],
+                &overrides,
+                &allowlists,
+                &no_safe,
+                &destructive,
+            )
+            .is_denied()
+        );
+        for command in [
+            "PATH=/tmp/replacement git status",
+            "PYTHONPATH=/tmp/modules git status",
+            "env PATH=/tmp/replacement git status",
+            "env -i git status",
+            "sudo env LABEL=reviewed git status",
+            "command -p git status",
+            "/usr/bin/git status",
+        ] {
+            let result = evaluate(command);
+            assert!(result.is_denied(), "{command}: {result:?}");
+            assert_eq!(
+                result.pattern_info.as_ref().map(|info| info.source),
+                Some(MatchSource::LegacyPattern),
+                "the legacy destructive rule must remain visible: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_598_legacy_safe_patterns_cannot_borrow_inert_argument_text() {
+        let safe = [crate::safe_pattern!("status", r"\bgit\s+status\b")];
+        let destructive = [crate::destructive_pattern!(
+            "reset-hard",
+            r"\bgit\s+reset\s+--hard\b",
+            "A safe phrase in a commit message cannot authorize a reset"
+        )];
+        let command = "git commit -m 'git status'; git reset --hard";
+        let result = evaluate_command_with_legacy(
+            command,
+            &default_config(),
+            &["git"],
+            &default_compiled_overrides(),
+            &default_allowlists(),
+            &safe,
+            &destructive,
+        );
+        assert!(result.is_denied(), "{command}: {result:?}");
+        assert_eq!(
+            result.pattern_info.as_ref().map(|info| info.source),
+            Some(MatchSource::LegacyPattern)
+        );
+    }
+
+    #[test]
+    fn issue_598_builtin_safe_patterns_cannot_borrow_raw_argument_text() {
+        for command in [
+            "aws ec2 terminate-instances --instance-ids $(aws ec2 describe-instances)",
+            "aws ec2 terminate-instances --instance-ids 'aws ec2 describe-instances'",
+            "aws iam delete-user --user-name $(aws iam list-users)",
+            "aws iam delete-user --user-name 'aws iam list-users'",
+            "docker stop $(docker ps -q)",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    command,
+                    &["cloud.aws", "containers.docker"],
+                    dialect,
+                );
+                assert!(result.is_denied(), "{dialect:?}: {command}: {result:?}");
+                let info = result.pattern_info.as_ref().expect("destructive rule");
+                let (pack, rule) = if command.starts_with("aws ec2") {
+                    ("cloud.aws", "ec2-terminate")
+                } else if command.starts_with("aws iam") {
+                    ("cloud.aws", "iam-delete")
+                } else {
+                    ("containers.docker", "stop-all")
+                };
+                assert_eq!(info.pack_id.as_deref(), Some(pack), "{command}");
+                assert_eq!(info.pattern_name.as_deref(), Some(rule), "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_598_builtin_parent_safe_regex_cannot_exempt_an_obfuscated_child() {
+        // The parent's raw text ends in INFO and conceals FLUSHALL from the
+        // safe regex's negative lookahead. That incidental full-span safe
+        // match must not exempt the child command revealed by shell decoding.
+        for command in [
+            r#"bash -c "redis-cli FLUSH'ALL'" INFO"#,
+            r#"bash -c "redis-cli CONFIG RE'SETSTAT'" INFO"#,
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["database.redis"], dialect);
+                assert!(result.is_denied(), "{dialect:?}: {command}: {result:?}");
+                let info = result
+                    .pattern_info
+                    .as_ref()
+                    .expect("destructive Redis rule");
+                assert_eq!(info.pack_id.as_deref(), Some("database.redis"), "{command}");
+                assert_eq!(
+                    info.pattern_name.as_deref(),
+                    Some(if command.contains("FLUSH") {
+                        "flushall"
+                    } else {
+                        "config-resetstat"
+                    }),
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_598_existing_builtin_safe_proofs_remain_available_in_shells() {
+        for command in [
+            "git clean -n",
+            "bash -c 'git clean -n'",
+            "env LABEL=reviewed bash -c 'git clean -n'",
+            "sh -c 'rm -rf /tmp/dcg-598-reviewed-artifacts'",
+            "aws ec2 describe-instances",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --dry-run",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --force --dry-run",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --dry-run --skip-os-shutdown",
+            "bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run'",
+            "bash -c 'aws --profile reviewed ec2 delete-snapshot --snapshot-id snap-reviewed --dry-run'",
+            "redis-cli INFO",
+            "bash -c 'redis-cli INFO'",
+            "kubectl delete deployment reviewed --dry-run=client",
+            "bash -c 'kubectl delete deployment reviewed --dry-run=client'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &[
+                    "core.git",
+                    "core.filesystem",
+                    "cloud.aws",
+                    "database.redis",
+                    "kubernetes.kubectl",
+                ],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_allowed(), "{command}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn issue_598_aws_preview_requires_a_real_static_flag() {
+        for command in [
+            "env LABEL=reviewed bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run'",
+            "BASH_ENV=/unreviewed bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run'",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --no-dry-run",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --dry-run=false",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --dry-run --no-dry-run",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --no-dry-run --dry-run",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --dry-run $EXTRA_FLAGS",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --query '--dry-run'",
+            "aws ec2 terminate-instances --instance-ids i-reviewed --query 'text --dry-run text'",
+            "aws ec2 terminate-instances --instance-ids $(aws ec2 describe-instances --dry-run)",
+            "bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run=false'",
+            "bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run --no-dry-run'",
+            "bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run $EXTRA_FLAGS'",
+            "bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run; aws ec2 terminate-instances --instance-ids i-unreviewed'",
+            "bash -c 'aws ec2 terminate-instances --instance-ids i-reviewed --dry-run'; aws ec2 terminate-instances --instance-ids i-unreviewed",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["cloud.aws"], ShellDialect::Posix);
+            assert!(result.is_denied(), "{command}: {result:?}");
+            let info = result.pattern_info.as_ref().expect("destructive AWS rule");
+            assert_eq!(info.pack_id.as_deref(), Some("cloud.aws"));
+            assert_eq!(info.pattern_name.as_deref(), Some("ec2-terminate"));
+        }
+    }
+
+    #[test]
+    fn issue_598_nested_kubectl_semantics_do_not_exempt_real_deletions() {
+        for command in [
+            "kubectl delete namespace reviewed",
+            "bash -c 'kubectl delete namespace reviewed'",
+            "env LABEL=reviewed bash -c 'kubectl delete namespace reviewed'",
+            "bash -c 'kubectl delete namespace reviewed --dry-run=false'",
+            "env LABEL=reviewed bash -c 'kubectl delete namespace reviewed --dry-run=client --dry-run=false'",
+            "env LABEL=reviewed bash -c 'kubectl delete namespace reviewed --dry-run=client'",
+            "BASH_ENV=/unreviewed/startup bash -c 'kubectl delete namespace reviewed --dry-run=client'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["kubernetes.kubectl"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_denied(), "{command}: {result:?}");
+            let info = result
+                .pattern_info
+                .as_ref()
+                .expect("destructive kubectl rule");
+            assert_eq!(info.pack_id.as_deref(), Some("kubernetes.kubectl"));
+            assert_eq!(info.pattern_name.as_deref(), Some("delete-namespace"));
+        }
+    }
 
     #[test]
     fn documentation_mask_timeout_keeps_live_worker_permit() {

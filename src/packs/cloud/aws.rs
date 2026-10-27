@@ -51,6 +51,124 @@ pub fn create_pack() -> Pack {
     }
 }
 
+/// Prove EC2's existing preview exemption from literal argv, including when
+/// the invocation was extracted from a shell carrier. A dry-run-looking word
+/// in an option value or command substitution is not an execution flag.
+/// `Some(false)` owns a recognized EC2 deletion so a read-only phrase in its
+/// arguments cannot override a failed preview proof.
+pub(crate) fn ec2_dry_run_decision(command: &str) -> Option<bool> {
+    let stripped = crate::normalize::strip_wrapper_prefixes(command);
+    if stripped.wrapper_limit_reached {
+        return None;
+    }
+    let source = stripped.normalized.as_ref();
+    let words = shell_words::split(source).ok()?;
+    let executable = words.first()?.rsplit(['/', '\\']).next()?;
+    if !matches!(executable, "aws" | "aws.exe") {
+        return None;
+    }
+    let mut index = 1;
+    while let Some(option) = words.get(index).filter(|word| word.starts_with('-')) {
+        let name = option
+            .split_once('=')
+            .map_or(option.as_str(), |(name, _)| name);
+        if aws_global_value_option(name) {
+            index += if option.contains('=') { 1 } else { 2 };
+        } else if aws_global_flag(name) && !option.contains('=') {
+            index += 1;
+        } else {
+            return None;
+        }
+    }
+    if words.get(index).map(String::as_str) != Some("ec2")
+        || !words.get(index + 1).is_some_and(|operation| {
+            operation == "terminate-instances" || operation.starts_with("delete-")
+        })
+    {
+        return None;
+    }
+    let terminate = words[index + 1] == "terminate-instances";
+    let operation_end = index + 2;
+    let tokens = crate::normalize::tokenize_for_normalization(source);
+    let literal_words: Option<Vec<_>> = tokens
+        .iter()
+        .map(|token| {
+            (token.kind == crate::normalize::NormalizeTokenKind::Word)
+                .then(|| token.text(source))
+                .flatten()
+                .and_then(crate::normalize::decode_posix_literal_word)
+        })
+        .collect();
+    let Some(words) = literal_words else {
+        return Some(false);
+    };
+    // These are expansion/escape syntax in the other supported shells. The
+    // pack-level helper has no caller-proven dialect, so it cannot grant a
+    // preview from their POSIX-looking literal spelling.
+    if source.contains(['%', '!', '^']) {
+        return Some(false);
+    }
+    let mut preview = false;
+    index = operation_end;
+    while let Some(argument) = words.get(index) {
+        match argument.as_ref() {
+            "--dry-run" => preview = true,
+            "--" | "--no-dry-run" => return Some(false),
+            word if word.starts_with("--dry-run=") || word.starts_with("--no-dry-run=") => {
+                return Some(false);
+            }
+            "--force" | "--no-force" | "--skip-os-shutdown" | "--no-skip-os-shutdown"
+                if terminate => {}
+            word if word.starts_with('-') && !word.contains('=') && !aws_global_flag(word) => {
+                // This narrow proof does not guess an unknown boolean
+                // option's arity. Consume only a literal value, and never
+                // let that value provide the preview flag itself.
+                let Some(value) = words.get(index + 1) else {
+                    return Some(false);
+                };
+                if value.starts_with('-') {
+                    return Some(false);
+                }
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Some(preview)
+}
+
+fn aws_global_value_option(option: &str) -> bool {
+    matches!(
+        option,
+        "--profile"
+            | "--region"
+            | "--endpoint-url"
+            | "--output"
+            | "--query"
+            | "--color"
+            | "--ca-bundle"
+            | "--cli-read-timeout"
+            | "--cli-connect-timeout"
+            | "--cli-binary-format"
+            | "--cli-error-format"
+    )
+}
+
+fn aws_global_flag(option: &str) -> bool {
+    matches!(
+        option,
+        "--debug"
+            | "--no-verify-ssl"
+            | "--no-paginate"
+            | "--no-sign-request"
+            | "--no-cli-pager"
+            | "--cli-auto-prompt"
+            | "--no-cli-auto-prompt"
+            | "--version"
+    )
+}
+
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // describe/list/get operations are safe (read-only).

@@ -200,6 +200,68 @@ silently become broader or turn into a dead rule.
 | `pattern` | string | yes | fancy-regex pattern to match |
 | `description` | string | no | Why this command is allowed |
 
+### Command text and safe exemptions
+
+Safe patterns match the **original command segment**, including leading
+environment assignments, execution wrappers, executable paths, and
+redirections. Detection still uses normalized command text so a wrapper such
+as `env NAME=value` cannot hide a destructive operation. Custom destructive
+patterns also see the original, data-sanitized command, allowing a policy to
+require an assignment or wrapper in its match.
+
+For an exemption that authorizes one reviewed invocation, anchor both ends:
+
+```yaml
+safe_patterns:
+  - name: reviewed-check
+    pattern: '^/usr/bin/python3 -I /opt/tools/run_check\.py --check$'
+```
+
+This exemption does not cover `PATH=/somewhere` before the command, an `env`
+or `sudo` wrapper, or another executable with the same basename. An absolute
+interpreter path and Python's `-I` option do not pin the environment used by
+child processes. Any variable can matter to an application; dcg does not
+maintain a list of supposedly harmless variable names for exemptions.
+
+When a particular environment is intentional, include its exact spelling in
+the safe pattern:
+
+```yaml
+safe_patterns:
+  - name: reviewed-check-with-path
+    pattern: '^env PATH=/usr/bin:/bin /usr/bin/python3 -I /opt/tools/run_check\.py --check$'
+```
+
+Nested shell evaluation retains the enclosing execution context. Extracting
+the command from an environment-changing wrapper or shell does not give it a
+new bare-command exemption. A custom safe regex that matches the **complete
+original carrier as one shell segment** can authorize that carrier's nested
+commands for its own pack; it cannot exempt another pack or a sibling shell
+segment. Even a plain `bash -c 'reviewed-command'` needs an exemption for the
+complete carrier to transfer a custom safe grant to its extracted command.
+
+Earlier shell segments can change the context of a later command. dcg
+conservatively withholds a later segment's custom exemption unless every
+preceding top-level segment is provably neutral with respect to the parent
+shell's state. Examples include no-argument `true` and `false`, bare `:`,
+and literal executable paths with literal arguments when the shell dialect
+is known to be POSIX. The path proof does not apply to unknown dialects,
+PowerShell, or Cmd, where a script can change the current process's
+environment. For example, `FOO=1 true; reviewed-command` can retain the
+later command's exemption; `export PATH=/somewhere; reviewed-command` and
+`PATH=/somewhere :; reviewed-command` cannot. Standalone assignments,
+`unset`, unknown command names, and expansions do not establish a neutral
+context. Exempting an earlier command does not by itself prove that later
+commands retain their reviewed shell state.
+
+Unanchored patterns can intentionally permit additional prefixes or
+suffixes when the safe match also holds in the detection view. When a safe
+match exists only in the original text, it must cover the complete original
+segment; a substring in quoted data or removed wrapper text cannot supply a
+new exemption. Use anchors to constrain the command forms you authorize.
+Losing a safe match means destructive evaluation continues; it does not by
+itself deny a command that no destructive rule covers.
+
 ## Severity Levels
 
 Severity determines the default decision mode when a command matches, and how

@@ -697,6 +697,38 @@ impl Pack {
         false
     }
 
+    /// Apply operation-specific safety proofs independently of regex grants.
+    ///
+    /// `Some(false)` is an authoritative refusal: a permissive safe regex must
+    /// not override it. `None` leaves the command to ordinary pattern matching.
+    /// These proofs inspect command semantics, so the evaluator can preserve
+    /// them while binding regex exemptions to their original source spelling.
+    #[must_use]
+    pub(crate) fn semantic_safe_decision(&self, cmd: &str) -> Option<bool> {
+        match self.id.as_str() {
+            "core.filesystem" => {
+                // This proof owns unlink's exemptions, including rejected
+                // literal-path boundaries that a legacy temp regex may match.
+                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+                .map(|command| command.safe)
+            }
+            "system.permissions" => {
+                crate::packs::system::permissions::posix_chmod_is_safe(cmd).then_some(true)
+            }
+            "kubernetes.kubectl" => {
+                crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd).then_some(true)
+            }
+            "cloud.aws" => crate::packs::cloud::aws::ec2_dry_run_decision(cmd),
+            "careful_company_running_windows.transfer" => {
+                crate::packs::careful_company_running_windows::transfer::direct_safe_decision(cmd)
+            }
+            _ => None,
+        }
+    }
+
     /// Check if a command matches any safe pattern.
     ///
     /// Uses `RegexSet` for O(n) matching when available (fast path).
@@ -706,31 +738,7 @@ impl Pack {
         if self.destructive_match_vetoes_safe(cmd) {
             return false;
         }
-        if self.id == "core.filesystem"
-            && let Some(command) =
-                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
-                    cmd,
-                    crate::normalize::ShellDialect::Unknown,
-                )
-        {
-            // This proof owns unlink's exemptions. A permissive legacy temp
-            // regex must not override a rejected literal-path boundary.
-            return command.safe;
-        }
-        if self.id == "system.permissions"
-            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
-        {
-            return true;
-        }
-        if self.id == "kubernetes.kubectl"
-            && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
-        {
-            return true;
-        }
-        if self.id == "careful_company_running_windows.transfer"
-            && let Some(decision) =
-                crate::packs::careful_company_running_windows::transfer::direct_safe_decision(cmd)
-        {
+        if let Some(decision) = self.semantic_safe_decision(cmd) {
             return decision;
         }
         // Fast path: use RegexSet if available
@@ -779,29 +787,7 @@ impl Pack {
         if self.destructive_match_vetoes_safe_with_deadline(cmd, deadline) {
             return false;
         }
-        if self.id == "core.filesystem"
-            && let Some(command) =
-                crate::packs::core::filesystem::unlink_command_for_pattern_matching(
-                    cmd,
-                    crate::normalize::ShellDialect::Unknown,
-                )
-        {
-            return command.safe;
-        }
-        if self.id == "system.permissions"
-            && crate::packs::system::permissions::posix_chmod_is_safe(cmd)
-        {
-            return true;
-        }
-        if self.id == "kubernetes.kubectl"
-            && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
-        {
-            return true;
-        }
-        if self.id == "careful_company_running_windows.transfer"
-            && let Some(decision) =
-                crate::packs::careful_company_running_windows::transfer::direct_safe_decision(cmd)
-        {
+        if let Some(decision) = self.semantic_safe_decision(cmd) {
             return decision;
         }
         let linear_set_missed = if let Some(ref set) = self.safe_regex_set {

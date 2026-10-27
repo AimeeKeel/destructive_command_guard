@@ -41,7 +41,7 @@ fn hook_with_environment(
         .env("LOCALAPPDATA", home.join("localappdata"))
         .env("TEMP", temp.path())
         .env("TMP", temp.path())
-        .env("TMPDIR", tmpdir.unwrap_or(temp.path()))
+        .env("TMPDIR", tmpdir.unwrap_or_else(|| temp.path()))
         .env("DCG_CONFIG", &config)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .env(

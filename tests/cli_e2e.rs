@@ -9798,6 +9798,7 @@ destructive_patterns:
 
 mod custom_pack_loading_tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::io::Write;
 
     /// Create a temp directory with a custom pack and config
@@ -10058,6 +10059,553 @@ safe_patterns:
             json["hookSpecificOutput"]["permissionDecision"], "deny",
             "the pack's destructive pattern must still block prod\nstdout:\n{stdout}"
         );
+    }
+
+    // Issue #598: these strings are inputs to dcg's decision APIs only. The
+    // reviewed script, replacement executables, and injected libraries need
+    // not exist and are never run by this fixture.
+    const REVIEWED_COMMAND: &str = "/usr/bin/python3 -I /opt/tools/run_check.py --check";
+    const REVIEWED_SAFE_PATTERN: &str =
+        r"^\s*/usr/bin/python3[ \t]+-I[ \t]+/opt/tools/run_check\.py[ \t]+--check[ \t]*$";
+    const REVIEWED_DESTRUCTIVE_PATTERN: &str = r"(?:^|\s)(?:[^\s]*/)?python3[ \t]+-I[ \t]+/opt/tools/run_check\.py[ \t]+--check(?:[ \t]|$)";
+    const REVIEW_RULE: &str = "synthetic.environment:requires-review";
+
+    struct SafePatternFixture {
+        root: tempfile::TempDir,
+        config: std::path::PathBuf,
+    }
+
+    impl SafePatternFixture {
+        fn new(safe_patterns: &[&str], destructive_pattern: &str) -> Self {
+            Self::new_with_keywords(safe_patterns, destructive_pattern, &["python3", "git"])
+        }
+
+        fn new_with_keywords(
+            safe_patterns: &[&str],
+            destructive_pattern: &str,
+            keywords: &[&str],
+        ) -> Self {
+            let root = tempfile::tempdir().expect("isolated safe-pattern fixture");
+            for directory in ["home", "tmp", "cwd", "xdg"] {
+                std::fs::create_dir_all(root.path().join(directory)).expect("fixture directory");
+            }
+            let pack_path = root.path().join("pack.yaml");
+            let mut pack = format!(
+                "schema_version: 1\nid: synthetic.environment\nname: Environment exemption regression\n\
+                 version: 1.0.0\nkeywords: {}\ndestructive_patterns:\n  - name: requires-review\n    pattern: {}\n    severity: critical\n    description: This command requires explicit review\nsafe_patterns:\n",
+                serde_json::to_string(keywords).expect("serialize pack keywords"),
+                serde_json::to_string(destructive_pattern).expect("serialize destructive pattern")
+            );
+            if safe_patterns.is_empty() {
+                pack.push_str("  []\n");
+            } else {
+                for (index, pattern) in safe_patterns.iter().enumerate() {
+                    writeln!(
+                        pack,
+                        "  - name: reviewed-{index}\n    pattern: {}",
+                        serde_json::to_string(pattern).expect("serialize safe pattern")
+                    )
+                    .expect("append safe pattern");
+                }
+            }
+            std::fs::write(&pack_path, pack).expect("write custom pack");
+            let config = root.path().join("config.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    "[general]\nself_heal_hook = false\n[packs]\n\
+                     enabled = [\"core.git\", \"core.filesystem\", \"containers.docker\"]\n\
+                     custom_paths = [{}]\n",
+                    serde_json::to_string(&pack_path).expect("serialize pack path")
+                ),
+            )
+            .expect("write config");
+            Self { root, config }
+        }
+
+        fn command(&self) -> Command {
+            let mut command = Command::new(dcg_binary());
+            command
+                .env_clear()
+                .env("HOME", self.root.path().join("home"))
+                .env("USERPROFILE", self.root.path().join("home"))
+                .env("XDG_CONFIG_HOME", self.root.path().join("xdg"))
+                .env("TMPDIR", self.root.path().join("tmp"))
+                .env("TEMP", self.root.path().join("tmp"))
+                .env("TMP", self.root.path().join("tmp"))
+                .env("DCG_CONFIG", &self.config)
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("DCG_HISTORY_DISABLED", "1")
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                .env("NO_COLOR", "1")
+                .current_dir(self.root.path().join("cwd"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(path) = std::env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+            command
+        }
+
+        fn assert_explain(&self, candidate: &str, expected: &str, rule: Option<&str>) {
+            self.assert_explain_in_dialects(candidate, expected, rule, &["posix", "unknown"]);
+        }
+
+        fn assert_explain_in_dialects(
+            &self,
+            candidate: &str,
+            expected: &str,
+            rule: Option<&str>,
+            dialects: &[&str],
+        ) {
+            for &dialect in dialects {
+                let output = self
+                    .command()
+                    .args([
+                        "explain",
+                        "--format",
+                        "json",
+                        "--dialect",
+                        dialect,
+                        "--",
+                        candidate,
+                    ])
+                    .output()
+                    .expect("run decision-only explain");
+                assert!(output.status.success(), "explain failed: {output:?}");
+                let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .unwrap_or_else(|error| panic!("explain JSON: {error}; {output:?}"));
+                assert_eq!(
+                    json["decision"], expected,
+                    "[{dialect}] {candidate:?}: {json}"
+                );
+                assert_eq!(
+                    json["outcome"], expected,
+                    "[{dialect}] {candidate:?}: {json}"
+                );
+                if let Some(rule) = rule {
+                    assert_eq!(
+                        json["match"]["rule_id"], rule,
+                        "[{dialect}] {candidate:?}: {json}"
+                    );
+                }
+            }
+        }
+
+        fn assert_hooks(&self, candidate: &str, allow: bool) {
+            let payloads = [
+                (
+                    "claude",
+                    serde_json::json!({"tool_name":"Bash","tool_input":{"command":candidate}}),
+                    "/hookSpecificOutput/permissionDecision",
+                ),
+                (
+                    "codex",
+                    serde_json::json!({"tool_name":"Bash","tool_input":{"command":candidate},"turn_id":"598"}),
+                    "/hookSpecificOutput/permissionDecision",
+                ),
+                (
+                    "grok",
+                    serde_json::json!({"hookEventName":"pre_tool_use","toolName":"run_terminal_cmd","toolInput":{"command":candidate}}),
+                    "/decision",
+                ),
+            ];
+            for (agent, payload, decision_pointer) in payloads {
+                let mut child = self.command().spawn().expect("spawn decision-only hook");
+                child
+                    .stdin
+                    .take()
+                    .expect("hook stdin")
+                    .write_all(payload.to_string().as_bytes())
+                    .expect("write candidate as JSON data");
+                let output = child.wait_with_output().expect("hook output");
+                assert!(
+                    output.status.success(),
+                    "[{agent}] {candidate:?}: {output:?}"
+                );
+                if allow {
+                    assert!(
+                        output.stdout.is_empty(),
+                        "[{agent}] {candidate:?}: {output:?}"
+                    );
+                } else {
+                    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+                        .unwrap_or_else(|error| {
+                            panic!("[{agent}] {candidate:?}: {error}; {output:?}")
+                        });
+                    assert_eq!(
+                        json.pointer(decision_pointer)
+                            .and_then(serde_json::Value::as_str),
+                        Some("deny"),
+                        "[{agent}] {candidate:?}: {json}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue_598_exact_safe_patterns_do_not_authorize_environment_prefixes() {
+        let fixture =
+            SafePatternFixture::new(&[REVIEWED_SAFE_PATTERN], REVIEWED_DESTRUCTIVE_PATTERN);
+        fixture.assert_explain(REVIEWED_COMMAND, "allow", None);
+        fixture.assert_explain(
+            "  /usr/bin/python3\t-I /opt/tools/run_check.py\t--check  ",
+            "allow",
+            None,
+        );
+        fixture.assert_hooks(REVIEWED_COMMAND, true);
+        // Without the exemption, the same command really does hit the rule.
+        SafePatternFixture::new(&[], REVIEWED_DESTRUCTIVE_PATTERN).assert_explain(
+            REVIEWED_COMMAND,
+            "deny",
+            Some(REVIEW_RULE),
+        );
+
+        for assignment in [
+            "PATH=/tmp/replacement:/usr/bin",
+            "PATH='/tmp/replacement directory:/usr/bin'",
+            "PATH+=:/tmp/replacement",
+            "PYTHONPATH=/tmp/modules",
+            "PYTHONWARNINGS=all",
+            "NODE_OPTIONS=--require=/tmp/hook.js",
+            "BASH_ENV=/tmp/startup.sh",
+            "ENV=/tmp/startup.sh",
+            "LD_PRELOAD=/tmp/hook.so",
+            "LD_LIBRARY_PATH=/tmp/libraries",
+            "DYLD_INSERT_LIBRARIES=/tmp/hook.dylib",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand GIT_CONFIG_VALUE_0=/tmp/ssh",
+            "GIT_EXEC_PATH=/tmp/git-tools",
+            "PERL5OPT=-MInjected",
+            "RUBYOPT=-rinjected",
+            "DCG_TEST_ARBITRARY=changed",
+            "DCG_TEST_EMPTY=",
+            "A=1 B='two words'",
+        ] {
+            let candidate = format!("{assignment} {REVIEWED_COMMAND}");
+            fixture.assert_explain(&candidate, "deny", Some(REVIEW_RULE));
+        }
+        fixture.assert_hooks(
+            &format!("PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}"),
+            false,
+        );
+    }
+
+    #[test]
+    fn issue_598_backtracking_safe_patterns_keep_the_original_match_target() {
+        let fixture = SafePatternFixture::new(
+            &[
+                r"^(?=/usr/bin/python3[ \t])/usr/bin/python3[ \t]+-I[ \t]+/opt/tools/run_check\.py[ \t]+--check[ \t]*$",
+            ],
+            REVIEWED_DESTRUCTIVE_PATTERN,
+        );
+        fixture.assert_explain(REVIEWED_COMMAND, "allow", None);
+        fixture.assert_explain(
+            &format!("PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}"),
+            "deny",
+            Some(REVIEW_RULE),
+        );
+    }
+
+    #[test]
+    fn issue_598_unanchored_safe_patterns_keep_their_authored_prefix_scope() {
+        // Omitting the start anchor intentionally accepts arbitrary prefixes.
+        // Matching the original text must preserve this regex language, while
+        // the end anchor still excludes additional arguments.
+        let fixture = SafePatternFixture::new(
+            &[r"/usr/bin/python3 -I /opt/tools/run_check\.py --check$"],
+            REVIEWED_DESTRUCTIVE_PATTERN,
+        );
+        for prefix in ["", "PATH=/usr/bin:/bin ", "env PATH=/usr/bin:/bin "] {
+            fixture.assert_explain(&format!("{prefix}{REVIEWED_COMMAND}"), "allow", None);
+        }
+        fixture.assert_explain(
+            &format!("{REVIEWED_COMMAND} --unreviewed"),
+            "deny",
+            Some(REVIEW_RULE),
+        );
+        fixture.assert_explain(
+            &format!("PATH=/tmp/replacement bash -c '{REVIEWED_COMMAND}'"),
+            "deny",
+            Some(REVIEW_RULE),
+        );
+    }
+
+    #[test]
+    fn issue_598_safe_patterns_preserve_wrappers_and_executable_identity() {
+        let fixture =
+            SafePatternFixture::new(&[REVIEWED_SAFE_PATTERN], REVIEWED_DESTRUCTIVE_PATTERN);
+        for prefix in [
+            "env",
+            "env PATH=/tmp/replacement:/usr/bin",
+            "env -i",
+            "env --ignore-environment",
+            "env -u PATH",
+            "env --unset=PYTHONPATH",
+            "env -P /tmp/replacement",
+            "env -C /tmp/elsewhere",
+            "env --chdir=/tmp/elsewhere",
+            "/usr/bin/env PATH=/tmp/replacement:/usr/bin",
+            "sudo -E",
+            "command -p",
+            "nice -n 5",
+            "timeout 10",
+            "exec -c",
+            "sudo env PATH=/tmp/replacement:/usr/bin command --",
+            "env PATH=/tmp/replacement:/usr/bin nice -n 5 timeout 10",
+        ] {
+            fixture.assert_explain(
+                &format!("{prefix} {REVIEWED_COMMAND}"),
+                "deny",
+                Some(REVIEW_RULE),
+            );
+        }
+        for candidate in [
+            format!("env -S 'PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}'"),
+            format!("env --split-string='PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}'"),
+            format!("command env -S 'PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}'"),
+            REVIEWED_COMMAND.replacen("/usr/bin/python3", "/tmp/replacement/python3", 1),
+            REVIEWED_COMMAND.replacen("/usr/bin/python3", "./python3", 1),
+            REVIEWED_COMMAND.replacen("/usr/bin/python3", "python3", 1),
+            REVIEWED_COMMAND.replacen("/usr/bin/python3", "/usr/bin/python3.exe", 1),
+        ] {
+            fixture.assert_explain(&candidate, "deny", Some(REVIEW_RULE));
+        }
+    }
+
+    #[test]
+    fn issue_598_safe_patterns_do_not_equate_different_executable_paths() {
+        let fixture = SafePatternFixture::new(
+            &[r"^git status$"],
+            r"(?:^|\s)(?:[^\s]*/)?git\s+status(?:\s|$)",
+        );
+        fixture.assert_explain("git status", "allow", None);
+        for candidate in [
+            "/usr/bin/git status",
+            "/tmp/replacement/bin/git status",
+            "\"/usr/bin/git\" status",
+            "git.exe status",
+            "GIT status",
+            "PATH=/tmp/replacement git status",
+            "command -p git status",
+            ">/tmp/dcg-598-output git status",
+            "git status >/tmp/dcg-598-output",
+        ] {
+            fixture.assert_explain(candidate, "deny", Some(REVIEW_RULE));
+        }
+    }
+
+    #[test]
+    fn issue_598_nested_and_compound_commands_cannot_borrow_safe_exemptions() {
+        let fixture =
+            SafePatternFixture::new(&[REVIEWED_SAFE_PATTERN], REVIEWED_DESTRUCTIVE_PATTERN);
+        for candidate in [
+            format!("true; PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}"),
+            format!("{REVIEWED_COMMAND}; PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}"),
+            format!("PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}; {REVIEWED_COMMAND}"),
+            format!("bash -c '{REVIEWED_COMMAND}'"),
+            format!("PATH=/tmp/replacement:/usr/bin bash -c '{REVIEWED_COMMAND}'"),
+            format!("env PYTHONPATH=/tmp/modules bash -c '{REVIEWED_COMMAND}'"),
+            format!("env -P /tmp/replacement bash -c '{REVIEWED_COMMAND}'"),
+            format!("'/usr/bin/env' PATH=/tmp/replacement bash -c '{REVIEWED_COMMAND}'"),
+            format!("env --default-signal PATH=/tmp/replacement bash -c '{REVIEWED_COMMAND}'"),
+            format!("sudo env PATH=/tmp/replacement:/usr/bin bash -c '{REVIEWED_COMMAND}'"),
+            format!("bash -c 'env PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}'"),
+            format!("bash -c 'export PATH=/tmp/replacement; {REVIEWED_COMMAND}'"),
+            format!("env PATH=/tmp/replacement:/usr/bin sh -c \"bash -c '{REVIEWED_COMMAND}'\""),
+        ] {
+            fixture.assert_explain(&candidate, "deny", Some(REVIEW_RULE));
+        }
+        fixture.assert_hooks(
+            &format!("PATH=/tmp/replacement:/usr/bin bash -c '{REVIEWED_COMMAND}'"),
+            false,
+        );
+    }
+
+    #[test]
+    fn issue_598_preceding_shell_state_cannot_change_a_later_safe_command() {
+        let fixture =
+            SafePatternFixture::new(&[REVIEWED_SAFE_PATTERN], REVIEWED_DESTRUCTIVE_PATTERN);
+        for prefix in [
+            "export PATH=/tmp/replacement;",
+            "PATH=/tmp/replacement;",
+            "unset PYTHONPATH;",
+            "export DCG_APP_CONFIG=/tmp/unreviewed;",
+            "command export PATH=/tmp/replacement;",
+            "builtin export PATH=/tmp/replacement;",
+            "printf '-v' PATH /tmp/replacement;",
+            "let 'PATH=1';",
+            "getopts a PATH -a;",
+            ": ${PATH:=/tmp/replacement};",
+            "PATH=/tmp/replacement :;",
+        ] {
+            fixture.assert_explain(
+                &format!("{prefix} {REVIEWED_COMMAND}"),
+                "deny",
+                Some(REVIEW_RULE),
+            );
+        }
+        // Only provably neutral predecessors preserve a later segment's
+        // independent exemption. A literal command-local assignment to true
+        // does not change the environment of the reviewed command.
+        for prefix in ["true;", "false;", ":;", "FOO=1 true;"] {
+            fixture.assert_explain(&format!("{prefix} {REVIEWED_COMMAND}"), "allow", None);
+        }
+        // A literal executable path launches a child in a proven POSIX
+        // dialect. An unknown dialect does not establish that boundary.
+        fixture.assert_explain_in_dialects(
+            &format!("{REVIEWED_COMMAND}; {REVIEWED_COMMAND}"),
+            "allow",
+            None,
+            &["posix"],
+        );
+        fixture.assert_explain_in_dialects(
+            &format!("{REVIEWED_COMMAND}; {REVIEWED_COMMAND}"),
+            "deny",
+            Some(REVIEW_RULE),
+            &["unknown"],
+        );
+
+        // PowerShell scripts and Cmd batch files can alter the current
+        // process's environment even when invoked through a literal path.
+        let windows_fixture =
+            SafePatternFixture::new(&[r"^git status$"], r"(?:^|\s)git\s+status(?:\s|$)");
+        windows_fixture.assert_explain_in_dialects(
+            "./setenv.ps1; git status",
+            "deny",
+            Some(REVIEW_RULE),
+            &["ps", "unknown"],
+        );
+        windows_fixture.assert_explain_in_dialects(
+            "C:/scripts/setenv & git status",
+            "deny",
+            Some(REVIEW_RULE),
+            &["cmd", "unknown"],
+        );
+    }
+
+    #[test]
+    fn issue_598_whitespace_boundaries_preserve_cross_segment_rules() {
+        let fixture = SafePatternFixture::new(
+            &[REVIEWED_SAFE_PATTERN],
+            r"(?:^|\s)/usr/bin/python3 -I /opt/tools/run_check\.py --check\s*;\s*synthetic_publish\s+production\s*",
+        );
+        // A regex may intentionally govern the combination of two commands.
+        // Trimming whitespace around a whole-command match must not mistake
+        // this for a duplicate of the individually exempt reviewed segment.
+        fixture.assert_explain(
+            &format!("true; {REVIEWED_COMMAND} ; synthetic_publish production  "),
+            "deny",
+            Some(REVIEW_RULE),
+        );
+        fixture.assert_explain(
+            &format!("true; {REVIEWED_COMMAND} ; synthetic_publish staging  "),
+            "allow",
+            None,
+        );
+        // This rule needs the leading whitespace that segmentation trims.
+        // With no safe grant, its full-command match must still be evaluated.
+        SafePatternFixture::new(
+            &[],
+            r"\s+/usr/bin/python3 -I /opt/tools/run_check\.py --check$",
+        )
+        .assert_explain(
+            &format!("true; {REVIEWED_COMMAND}"),
+            "deny",
+            Some(REVIEW_RULE),
+        );
+    }
+
+    #[test]
+    fn issue_598_explicit_environment_safe_patterns_keep_their_exact_scope() {
+        for prefix in ["PATH=/usr/bin:/bin", "env PATH=/usr/bin:/bin"] {
+            let safe = format!(r"^{prefix} /usr/bin/python3 -I /opt/tools/run_check\.py --check$");
+            let fixture = SafePatternFixture::new(&[&safe], REVIEWED_DESTRUCTIVE_PATTERN);
+            let authorized = format!("{prefix} {REVIEWED_COMMAND}");
+            fixture.assert_explain(&authorized, "allow", None);
+            fixture.assert_hooks(&authorized, true);
+            fixture.assert_explain(REVIEWED_COMMAND, "deny", Some(REVIEW_RULE));
+            fixture.assert_explain(
+                &authorized.replacen("/usr/bin:/bin", "/tmp/replacement:/usr/bin", 1),
+                "deny",
+                Some(REVIEW_RULE),
+            );
+            fixture.assert_explain(
+                &format!("PYTHONPATH=/tmp/modules {authorized}"),
+                "deny",
+                Some(REVIEW_RULE),
+            );
+            fixture.assert_explain(&format!("sudo {authorized}"), "deny", Some(REVIEW_RULE));
+        }
+    }
+
+    #[test]
+    fn issue_598_explicit_nested_exemption_is_bound_to_the_complete_carrier() {
+        let safe =
+            r"^PATH=/usr/bin:/bin bash -c '/usr/bin/python3 -I /opt/tools/run_check\.py --check'$";
+        let fixture = SafePatternFixture::new(&[safe], REVIEWED_DESTRUCTIVE_PATTERN);
+        let authorized = format!("PATH=/usr/bin:/bin bash -c '{REVIEWED_COMMAND}'");
+        fixture.assert_explain(&authorized, "allow", None);
+        fixture.assert_hooks(&authorized, true);
+        for candidate in [
+            authorized.replacen("/usr/bin:/bin", "/tmp/replacement:/usr/bin", 1),
+            format!("PYTHONPATH=/tmp/modules {authorized}"),
+            format!("{authorized}; PATH=/tmp/replacement {REVIEWED_COMMAND}"),
+            format!("PATH=/tmp/replacement {REVIEWED_COMMAND}; {authorized}"),
+        ] {
+            fixture.assert_explain(&candidate, "deny", Some(REVIEW_RULE));
+        }
+
+        // A full-carrier exemption belongs only to the custom pack that
+        // authored it. It must not suppress another pack inside that shell.
+        let cross_pack_safe = r"^PATH=/usr/bin:/bin bash -c '/usr/bin/python3 -I /opt/tools/run_check\.py --check; git reset --hard'$";
+        let cross_pack = SafePatternFixture::new(&[cross_pack_safe], REVIEWED_DESTRUCTIVE_PATTERN);
+        cross_pack.assert_explain(
+            &format!("PATH=/usr/bin:/bin bash -c '{REVIEWED_COMMAND}; git reset --hard'"),
+            "deny",
+            Some("core.git:reset-hard"),
+        );
+    }
+
+    #[test]
+    fn issue_598_assignment_sensitive_destructive_patterns_see_the_original_command() {
+        // The only keyword is removed by destructive normalization, so the
+        // original view must survive both global and per-pack selection.
+        let fixture = SafePatternFixture::new_with_keywords(
+            &[],
+            r"^PATH=/tmp/replacement:/usr/bin /usr/bin/python3 -I /opt/tools/run_check\.py --check$",
+            &["PATH"],
+        );
+        fixture.assert_explain(REVIEWED_COMMAND, "allow", None);
+        let candidate = format!("PATH=/tmp/replacement:/usr/bin {REVIEWED_COMMAND}");
+        fixture.assert_explain(&candidate, "deny", Some(REVIEW_RULE));
+        fixture.assert_hooks(&candidate, false);
+    }
+
+    #[test]
+    fn issue_598_existing_builtin_safe_and_destructive_decisions_are_preserved() {
+        let fixture =
+            SafePatternFixture::new(&[REVIEWED_SAFE_PATTERN], REVIEWED_DESTRUCTIVE_PATTERN);
+        for candidate in [
+            "git status",
+            "git clean -n",
+            "git restore --staged file.txt",
+            "rm -rf /tmp/dcg-598-artifacts",
+            "docker ps",
+            "git commit -m 'PATH=/tmp/replacement git reset --hard'",
+        ] {
+            fixture.assert_explain(candidate, "allow", None);
+        }
+        for candidate in [
+            "PATH=/tmp/replacement git reset --hard",
+            "env -i /usr/bin/git reset --hard",
+            "sudo env FOO=1 command git reset --hard",
+            "env -S 'PATH=/tmp/replacement git reset --hard'",
+            "PATH=/tmp/replacement bash -c 'git reset --hard'",
+        ] {
+            fixture.assert_explain(candidate, "deny", Some("core.git:reset-hard"));
+        }
     }
 }
 
