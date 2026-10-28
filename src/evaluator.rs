@@ -14035,6 +14035,24 @@ fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
         return true;
     }
 
+    // A quoted or escaped interpreter path such as `'/usr/bin/python3' -c …`
+    // matches no trigger, yet the launcher verifier refuses or recurses into
+    // it before the deferred lookup (issue #599).
+    if crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix)
+        .into_iter()
+        .any(|segment| {
+            !matches!(
+                parse_obfuscated_posix_inline_launcher_segment(
+                    segment,
+                    MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES
+                ),
+                PosixInlineLauncherParse::NotLauncher
+            )
+        })
+    {
+        return true;
+    }
+
     let lower = command.to_ascii_lowercase();
     [
         "powershell",
@@ -14944,10 +14962,10 @@ fn evaluate_command_in_single_dialect_view(
     // new whole-command grant. Only the allow-once filesystem lookup needs the
     // performance predicate: aliases and other modeled execution also need an
     // explicit outer allowlist grant checked before their children are read.
-    let checked_allow_once_before_nested = may_evaluate_nested_payload_before_allowlists(command)
-        || !posix_executable_model.invocations.is_empty();
+    let checked_allow_once_before_nested = nested_command_depth == 0
+        && (may_evaluate_nested_payload_before_allowlists(command)
+            || !posix_executable_model.invocations.is_empty());
     if checked_allow_once_before_nested
-        && nested_command_depth == 0
         && allow_once_match(allow_once_command, allow_once_audit).is_some()
     {
         return EvaluationResult::allowed_by_allow_once();
@@ -50786,6 +50804,127 @@ mod tests {
             assert!(
                 evaluate_detailed(approved, &config).result.is_denied(),
                 "the reviewed grant remains single-use"
+            );
+        }
+        println!("{CHILD_COMPLETION}");
+    }
+
+    #[test]
+    fn allow_once_grants_reach_quoted_interpreter_launchers_before_their_refusal() {
+        use crate::pending_exceptions::{
+            AllowOnceEntry, AllowOnceScopeKind, ENV_ALLOW_ONCE_PATH, PendingExceptionRecord,
+        };
+
+        const CHILD_MARKER: &str = "DCG_TEST_ALLOW_ONCE_QUOTED_LAUNCHER_CHILD";
+        const CHILD_COMPLETION: &str = "dcg-allow-once-quoted-launcher-child-complete";
+
+        // Store selection is process-wide; see the replay test above.
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let fixtures = tempfile::tempdir().expect("allow-once fixture directory");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "evaluator::tests::allow_once_grants_reach_quoted_interpreter_launchers_before_their_refusal",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(
+                ENV_ALLOW_ONCE_PATH,
+                fixtures.path().join("allow_once.jsonl"),
+            )
+            .output()
+            .expect("run isolated allow-once test");
+            assert!(
+                output.status.success(),
+                "isolated allow-once test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETION),
+                "the exact child test must run its assertions"
+            );
+            return;
+        }
+
+        // Issue #599: a quoted interpreter path matches no heredoc trigger, so
+        // the launcher verifier refused these before the deferred grant lookup
+        // and a reviewed exact grant could never be redeemed.
+        let cwd = std::env::current_dir().expect("fixture working directory");
+        let cwd_text = cwd.to_string_lossy();
+        let store = AllowOnceStore::new(PathBuf::from(
+            std::env::var_os(ENV_ALLOW_ONCE_PATH).expect("isolated allow-once store"),
+        ));
+        let config = default_config();
+        let redaction = crate::logging::RedactionConfig::default();
+        let active_grants = || store.preview_active(Utc::now()).expect("inspect grants").0;
+
+        for (command, altered) in [
+            (
+                "'/usr/bin/python3' -c 'print(1)'",
+                "'/usr/bin/python3' -c 'print(2)'",
+            ),
+            (
+                "\"/opt/py/bin/python3\" -c 'print(2)'",
+                "\"/opt/py/bin/python3\" -c 'print(3)'",
+            ),
+            (
+                "'/usr/bin/python3' -c 'import pathlib; pathlib.Path(\"build.log\").unlink()'",
+                "'/usr/bin/python3' -c 'import pathlib; pathlib.Path(\"build.lock\").unlink()'",
+            ),
+        ] {
+            let refused = evaluate_detailed(command, &config);
+            assert!(refused.result.is_denied(), "{command}: {refused:?}");
+            assert_eq!(
+                refused
+                    .result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("inline-launcher-unverified"),
+                "{command}: {refused:?}"
+            );
+
+            let now = Utc::now();
+            let pending = PendingExceptionRecord::new(
+                now,
+                &cwd_text,
+                command,
+                "reviewed quoted launcher",
+                &redaction,
+                true,
+                None,
+            );
+            let entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                &cwd_text,
+                true,
+                false,
+                &redaction,
+            );
+            store.add_entry(&entry, now).expect("seed one-use grant");
+
+            let borrowed = evaluate_detailed(altered, &config);
+            assert!(
+                borrowed.result.is_denied(),
+                "changed bytes must not borrow the grant: {borrowed:?}"
+            );
+            assert_eq!(active_grants().len(), 1, "{altered}: grant left unconsumed");
+
+            let granted = evaluate_detailed(command, &config);
+            assert!(granted.result.is_allowed(), "{command}: {granted:?}");
+            assert!(matches!(
+                granted.result.bypass_method,
+                Some(BypassMethod::AllowOnce)
+            ));
+            assert!(active_grants().is_empty(), "{command}: grant consumed");
+            assert!(
+                evaluate_detailed(command, &config).result.is_denied(),
+                "{command}: the grant remains single-use"
             );
         }
         println!("{CHILD_COMPLETION}");
