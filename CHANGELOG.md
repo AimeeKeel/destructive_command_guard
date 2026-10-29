@@ -15,6 +15,14 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **Keep executable prose substitutions visible to custom packs (#614).**
+  Custom rules can match active backticks and `$()` inside GitHub CLI body,
+  Git message, Beads Rust description, and other registered data arguments.
+  The custom matching view preserves substitution delimiters and enclosing
+  quotes while keeping inert prose and checked producer output masked.
+  Keyword selection uses the same view; original source spans, safe-pattern
+  authorization, rule allowlists, and built-in inner-command checks remain
+  intact. Single-quoted and escaped literal markers retain their data treatment.
 - **Audit universal allowlist globs as unrestricted (#545).** Doctor now
   recognizes composite patterns such as `**/`, `**/*`, and `**/**` that match
   every working directory, including equivalent normalized root paths.

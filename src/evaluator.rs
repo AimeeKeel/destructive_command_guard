@@ -13240,6 +13240,87 @@ fn evaluate_command_substitutions(
     None
 }
 
+/// The ordinary matching view and the shell syntax custom policies may inspect
+/// after a substitution in a data argument has been checked (#614).
+struct CheckedPosixSubstitutions<'a> {
+    masked: Cow<'a, str>,
+    syntax_offsets: Vec<usize>,
+}
+
+impl CheckedPosixSubstitutions<'_> {
+    fn custom_matching_view<'a>(&self, masked: &'a str, source: &str) -> Cow<'a, str> {
+        if self.syntax_offsets.is_empty()
+            || masked.len() != source.len()
+            || masked.len() != self.masked.len()
+        {
+            return Cow::Borrowed(masked);
+        }
+        let mut bytes = masked.as_bytes().to_vec();
+        for &offset in &self.syntax_offsets {
+            // The argv reading can blank a redirection containing this syntax.
+            // Read that source's byte so its mask remains authoritative too.
+            bytes[offset] = source.as_bytes()[offset];
+        }
+        Cow::Owned(
+            String::from_utf8(bytes)
+                .expect("substitution syntax restores only ASCII bytes at their source offsets"),
+        )
+    }
+}
+
+/// Keep only active substitution delimiters and their enclosing double quotes.
+/// The shadow has no substitutions, so its quoted spans describe the outer
+/// shell's quoting without confusing a child's quotes with its parent's.
+fn checked_substitution_syntax_offsets(
+    sanitized: &str,
+    shadow: &str,
+    shadow_sanitized: &str,
+    substitutions: &[crate::heredoc::PosixCommandSubstitution],
+) -> Vec<usize> {
+    let bytes = sanitized.as_bytes();
+    let masked: Vec<_> = substitutions
+        .iter()
+        .filter(|substitution| {
+            // Do not resurrect syntax removed by an earlier data proof.
+            matches!(bytes[substitution.start], b'$' | b'`')
+                && matches!(bytes[substitution.end - 1], b')' | b'`')
+                && shadow_sanitized.as_bytes()[substitution.start..substitution.end]
+                    .iter()
+                    .all(|byte| *byte == b' ')
+        })
+        .collect();
+    let mut offsets = Vec::new();
+    for substitution in &masked {
+        offsets.push(substitution.start);
+        if bytes[substitution.start] == b'$' {
+            offsets.push(substitution.start + 1);
+        }
+        offsets.push(substitution.end - 1);
+    }
+    if masked.is_empty() {
+        return offsets;
+    }
+
+    let spans = crate::context::classify_command(shadow);
+    let mut next = 0;
+    for span in spans.spans() {
+        while next < masked.len() && masked[next].start < span.byte_range.start {
+            next += 1;
+        }
+        if span.kind == crate::context::SpanKind::Argument
+            && masked
+                .get(next)
+                .is_some_and(|substitution| substitution.end <= span.byte_range.end)
+            && bytes[span.byte_range.start] == b'"'
+            && bytes[span.byte_range.end - 1] == b'"'
+        {
+            offsets.push(span.byte_range.start);
+            offsets.push(span.byte_range.end - 1);
+        }
+    }
+    offsets
+}
+
 /// Mask outer-shell data bytes after every POSIX command substitution body has
 /// already been recursively evaluated.
 ///
@@ -13252,26 +13333,36 @@ fn evaluate_command_substitutions(
 /// real matching view. Executable-position substitutions and piped producers
 /// remain visible because the sanitizer never classifies those positions as
 /// inert data.
+///
+/// When external packs are enabled, retain the offsets of active delimiters and
+/// enclosing quotes for their separate matching view. This lets a custom rule
+/// reject the substitution itself without exposing inert prose or checked
+/// producer output to destructive regexes again.
 fn mask_checked_posix_substitutions<'a>(
     sanitized: &'a str,
     original: &str,
     shell_dialect: ShellDialect,
-) -> Cow<'a, str> {
+    keep_custom_syntax: bool,
+) -> CheckedPosixSubstitutions<'a> {
+    let mut result = CheckedPosixSubstitutions {
+        masked: Cow::Borrowed(sanitized),
+        syntax_offsets: Vec::new(),
+    };
     if !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
         || (!original.contains("$(") && !original.contains('`'))
         || sanitized.len() != original.len()
     {
-        return Cow::Borrowed(sanitized);
+        return result;
     }
 
     let substitution_source = crate::heredoc::mask_non_expanding_data_heredocs(original);
     let Ok(substitutions) =
         crate::heredoc::extract_posix_command_substitutions(substitution_source.as_ref())
     else {
-        return Cow::Borrowed(sanitized);
+        return result;
     };
     if substitutions.is_empty() {
-        return Cow::Borrowed(sanitized);
+        return result;
     }
 
     let mut shadow = original.as_bytes().to_vec();
@@ -13281,16 +13372,16 @@ fn mask_checked_posix_substitutions<'a>(
             || !original.is_char_boundary(substitution.start)
             || !original.is_char_boundary(substitution.end)
         {
-            return Cow::Borrowed(sanitized);
+            return result;
         }
         shadow[substitution.start..substitution.end].fill(b'x');
     }
     let Ok(shadow) = String::from_utf8(shadow) else {
-        return Cow::Borrowed(sanitized);
+        return result;
     };
     let shadow_sanitized = sanitize_for_pattern_matching(&shadow);
     if shadow_sanitized.len() != sanitized.len() {
-        return Cow::Borrowed(sanitized);
+        return result;
     }
 
     let mut output = sanitized.as_bytes().to_vec();
@@ -13302,12 +13393,21 @@ fn mask_checked_posix_substitutions<'a>(
         }
     }
     if !changed {
-        return Cow::Borrowed(sanitized);
+        return result;
     }
-    Cow::Owned(
+    if keep_custom_syntax {
+        result.syntax_offsets = checked_substitution_syntax_offsets(
+            sanitized,
+            &shadow,
+            shadow_sanitized.as_ref(),
+            &substitutions,
+        );
+    }
+    result.masked = Cow::Owned(
         String::from_utf8(output)
             .expect("role-aware masks replace complete UTF-8 token ranges with ASCII spaces"),
-    )
+    );
+    result
 }
 
 fn active_posix_variable_references(
@@ -15505,10 +15605,19 @@ fn evaluate_command_in_single_dialect_view(
     } else {
         precomputed_sanitized.unwrap_or_else(|| sanitize_for_pattern_matching(command))
     };
-    let checked_posix_substitutions =
-        mask_checked_posix_substitutions(sanitized.as_ref(), command, shell_dialect);
+    let keep_custom_syntax = crate::packs::get_external_packs().is_some_and(|store| {
+        ordered_packs
+            .iter()
+            .any(|pack_id| store.get(pack_id).is_some())
+    });
+    let checked_posix_substitutions = mask_checked_posix_substitutions(
+        sanitized.as_ref(),
+        command,
+        shell_dialect,
+        keep_custom_syntax,
+    );
     let inert_posix_assignments = mask_posix_assignments_consumed_as_data(
-        checked_posix_substitutions.as_ref(),
+        checked_posix_substitutions.masked.as_ref(),
         command,
         shell_dialect,
     );
@@ -15541,6 +15650,16 @@ fn evaluate_command_in_single_dialect_view(
     let heredoc_data_mask =
         preserve_source_heredoc_data_mask(cmd_caret_syntax.as_ref(), command, shell_dialect);
     let command_for_match = heredoc_data_mask.as_ref();
+    let custom_substitution_view =
+        checked_posix_substitutions.custom_matching_view(cmd_caret_syntax.as_ref(), command);
+    // The custom view gets the same final source-data proof as the ordinary
+    // view. Restoring syntax must never undo a later heredoc/documentation mask.
+    let custom_heredoc_data_mask = if matches!(custom_substitution_view, Cow::Borrowed(_)) {
+        Cow::Borrowed(command_for_match)
+    } else {
+        preserve_source_heredoc_data_mask(custom_substitution_view.as_ref(), command, shell_dialect)
+    };
+    let custom_command_for_match = custom_heredoc_data_mask.as_ref();
 
     // Decode only caller-proven shell syntax at executable positions before
     // keyword gating. In Bash, `$'\x72\x6d'` is the executable `rm`; leaving
@@ -15588,7 +15707,7 @@ fn evaluate_command_in_single_dialect_view(
             ordered_packs,
         )
         && !external_pack_needs_identity_selection(
-            inert_redirection_gating_view(command_for_match, shell_dialect).as_ref(),
+            inert_redirection_gating_view(custom_command_for_match, shell_dialect).as_ref(),
             shell_dialect,
             ordered_packs,
         )
@@ -15704,6 +15823,7 @@ fn evaluate_command_in_single_dialect_view(
         command_for_packs,
         &normalized,
         command_for_match,
+        custom_command_for_match,
         command,
         command,
         ordered_packs,
@@ -15733,10 +15853,15 @@ fn evaluate_command_in_single_dialect_view(
         if deadline_exceeded(deadline) {
             return EvaluationResult::indeterminate_due_to_budget();
         }
+        let custom_argv_view =
+            checked_posix_substitutions.custom_matching_view(&views.for_match, &views.command);
+        let custom_argv_data_mask =
+            preserve_source_heredoc_data_mask(custom_argv_view.as_ref(), command, shell_dialect);
         let argv_result = evaluate_packs_with_allowlists_at_depth(
             &views.for_packs,
             &views.normalized,
             &views.for_match,
+            custom_argv_data_mask.as_ref(),
             &views.command,
             command,
             ordered_packs,
@@ -24047,6 +24172,7 @@ fn evaluate_indirect_inputs_for_pack(
                             &command,
                             &command,
                             &command,
+                            &command,
                             ordered_packs,
                             allowlists,
                             keyword_index,
@@ -24529,6 +24655,7 @@ fn evaluate_packs_with_allowlists(
         command_for_packs,
         normalized,
         command_for_match,
+        command_for_match,
         original_command,
         original_command,
         ordered_packs,
@@ -24555,6 +24682,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     command_for_packs: &str,
     normalized: &str,
     command_for_match: &str,
+    custom_command_for_match: &str,
     original_command: &str,
     input_command: &str,
     ordered_packs: &[String],
@@ -24644,7 +24772,8 @@ fn evaluate_packs_with_allowlists_at_depth(
     // Inert redirections select no pack (#571); rules still match the text.
     let gating_command = inert_redirection_gating_view(command_for_packs, shell_dialect);
     let gating_command = gating_command.as_ref();
-    let original_gating_command = inert_redirection_gating_view(command_for_match, shell_dialect);
+    let original_gating_command =
+        inert_redirection_gating_view(custom_command_for_match, shell_dialect);
     let original_gating_command = original_gating_command.as_ref();
     let core_filesystem_keyword_candidate =
         crate::packs::core::filesystem::filesystem_keyword_candidate(gating_command);
@@ -24957,18 +25086,24 @@ fn evaluate_packs_with_allowlists_at_depth(
 
         // Custom policies may deliberately require an assignment or wrapper
         // in their destructive regex (#598). Keep that detection input in
-        // addition to the normalized one; sanitization still masks inert data.
-        if REGISTRY.get_entry(pack_id).is_none() && command_for_match != command_for_packs {
-            let raw_ranges = command_segment_ranges_in_dialect(command_for_match, shell_dialect);
+        // addition to the normalized one. It also retains substitution syntax
+        // in data arguments (#614), while the prose and checked bodies stay masked.
+        if REGISTRY.get_entry(pack_id).is_none() && custom_command_for_match != command_for_packs {
+            // Both views preserve source offsets. Split the source: blanking a
+            // checked child body removes its segment from the detection view,
+            // but must not break the correspondence used to authorize a safe
+            // pattern against the complete original parent or a later sibling.
+            let raw_ranges = command_segment_ranges_in_dialect(original_command, shell_dialect);
             let raw_safe_inputs =
-                SafePatternInputs::new(command_for_match, input_command, shell_dialect);
+                SafePatternInputs::new(original_command, input_command, shell_dialect);
             for &(start, end) in &raw_ranges {
-                if raw_safe_inputs.matches(
-                    pack,
-                    &command_for_match[start..end],
-                    Some((start, end)),
-                    deadline,
-                ) {
+                let segment = &custom_command_for_match[start..end];
+                // A checked child's body can be entirely masked. It remains
+                // in the source map, but is not a new empty command to match.
+                if segment.trim().is_empty() {
+                    continue;
+                }
+                if raw_safe_inputs.matches(pack, segment, Some((start, end)), deadline) {
                     continue;
                 }
                 let nested_ranges: Vec<_> = raw_ranges
@@ -24983,7 +25118,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                 if let Some(result) = evaluate_pack_destructive_patterns(
                     pack_id,
                     pack,
-                    &command_for_match[start..end],
+                    segment,
                     shell_dialect,
                     start,
                     original_command,
@@ -50398,6 +50533,73 @@ mod tests {
                 result.is_allowed(),
                 "substitution used only as inert data must remain allowed: {command}: {:?}",
                 result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn issue_614_custom_substitution_view_preserves_syntax_and_byte_offsets() {
+        for (command, expected) in [
+            (
+                r#"gh pr comment 1 --body "see $(id)""#,
+                r#"gh pr comment 1 --body "    $(  )""#,
+            ),
+            (
+                r#"git commit --message="see `id`""#,
+                r#"git commit --message="    `  `""#,
+            ),
+            (
+                r#"br create --description "é $(id) `id`""#,
+                r#"br create --description "   $(  ) `  `""#,
+            ),
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert_eq!(
+                sanitized.as_ref(),
+                command,
+                "live syntax must reach the evaluator"
+            );
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let ordinary =
+                    mask_checked_posix_substitutions(&sanitized, command, dialect, false);
+                let custom = mask_checked_posix_substitutions(&sanitized, command, dialect, true);
+                assert_eq!(
+                    custom.masked, ordinary.masked,
+                    "built-in view must not change"
+                );
+                assert!(ordinary.syntax_offsets.is_empty());
+                let view = custom.custom_matching_view(&custom.masked, command);
+                assert_eq!(view, expected);
+                assert_eq!(
+                    view.len(),
+                    command.len(),
+                    "source offsets must be unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_614_custom_substitution_view_respects_prior_masks_and_shell_dialects() {
+        let command = r#"gh pr comment 1 --body "see $(id)""#;
+        let masked = format!("gh pr comment 1 --body {}", " ".repeat(11));
+        assert_eq!(masked.len(), command.len());
+        let checked = mask_checked_posix_substitutions(&masked, command, ShellDialect::Posix, true);
+        assert!(
+            checked.syntax_offsets.is_empty(),
+            "an earlier proof hid this syntax"
+        );
+        assert_eq!(
+            checked.custom_matching_view(&checked.masked, command),
+            masked
+        );
+
+        for dialect in [ShellDialect::Cmd, ShellDialect::PowerShell] {
+            let checked = mask_checked_posix_substitutions(command, command, dialect, true);
+            assert!(checked.syntax_offsets.is_empty());
+            assert_eq!(
+                checked.masked, command,
+                "POSIX masking cannot interpret {dialect:?}"
             );
         }
     }

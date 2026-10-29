@@ -10280,6 +10280,256 @@ safe_patterns:
                 }
             }
         }
+
+        fn assert_posix_test(
+            &self,
+            candidate: &str,
+            expected: &str,
+            rule: Option<&str>,
+        ) -> serde_json::Value {
+            let output = self
+                .command()
+                .args([
+                    "test",
+                    "--format",
+                    "json",
+                    "--dialect",
+                    "posix",
+                    "--",
+                    candidate,
+                ])
+                .output()
+                .expect("run decision-only test");
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(expected == "deny")),
+                "test exit code for {candidate:?}: {output:?}"
+            );
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|error| panic!("test JSON: {error}; {output:?}"));
+            assert_eq!(json["decision"], expected, "{candidate:?}: {json}");
+            assert_eq!(json["rule_id"].as_str(), rule, "{candidate:?}: {json}");
+            json
+        }
+    }
+
+    // Issue #614: a rule on the substitution syntax needs the surrounding
+    // flag and quotes, even after the inner command has been evaluated.
+    // Inputs are passed directly to dcg; no shell executes these strings.
+    const PROSE_SUBSTITUTION_PATTERN: &str = r#"(?:--(?:body|message|description)(?:=|\s+)|-(?:am|m|b)\s*)"(?:[^"\\`$]|\\.|\$(?!\())*(?:`|\$\()"#;
+    const PROSE_KEYWORDS: &[&str] = &["--body", "--message", "--description", "-m", "-am", "-b"];
+    const PROSE_ARGUMENT_PREFIXES: &[&str] = &[
+        "gh pr comment 1 --body ",
+        "gh pr comment 1 --body=",
+        "gh pr comment 1 -b ",
+        "git commit --message ",
+        "git commit --message=",
+        "git commit -m ",
+        "git commit -m",
+        "git commit -am ",
+        "br create --title t --description ",
+        "br create --title t --description=",
+        "mytool post --body ",
+        "mytool post --body=",
+    ];
+
+    #[test]
+    fn issue_614_custom_rules_see_substitutions_in_prose_arguments() {
+        let fixture =
+            SafePatternFixture::new_with_keywords(&[], PROSE_SUBSTITUTION_PATTERN, PROSE_KEYWORDS);
+        for prefix in PROSE_ARGUMENT_PREFIXES {
+            for substitution in ["`id`", "$(id)"] {
+                let candidate = format!("{prefix}\"see {substitution}\"");
+                fixture.assert_posix_test(&candidate, "deny", Some(REVIEW_RULE));
+            }
+        }
+        for candidate in [
+            r#"gh pr comment 1 --body "see `id`""#,
+            r#"git commit --message "see $(id)""#,
+            r#"br create --title t --description "see `id`""#,
+            r#"mytool post --body "see $(id)""#,
+        ] {
+            fixture.assert_explain_in_dialects(candidate, "deny", Some(REVIEW_RULE), &["posix"]);
+            fixture.assert_hooks(candidate, false);
+        }
+    }
+
+    #[test]
+    fn issue_614_substitution_keywords_select_the_custom_pack() {
+        // The pack's only keyword is inside the argument. Both global and
+        // per-pack quick rejection must consult the same view as its rule.
+        for (keyword, substitution) in [("`", "`id`"), ("$(", "$(id)")] {
+            let fixture =
+                SafePatternFixture::new_with_keywords(&[], PROSE_SUBSTITUTION_PATTERN, &[keyword]);
+            let candidate = format!("gh pr comment 1 --body \"see {substitution}\"");
+            fixture.assert_posix_test(&candidate, "deny", Some(REVIEW_RULE));
+        }
+    }
+
+    #[test]
+    fn issue_614_literal_and_escaped_prose_remains_inert() {
+        let fixture =
+            SafePatternFixture::new_with_keywords(&[], PROSE_SUBSTITUTION_PATTERN, PROSE_KEYWORDS);
+        for prefix in PROSE_ARGUMENT_PREFIXES {
+            for value in [
+                r#""see plain text""#,
+                r"'see `id` and $(id)'",
+                r#""see \`id\` and \$(id)""#,
+            ] {
+                fixture.assert_posix_test(&format!("{prefix}{value}"), "allow", None);
+            }
+        }
+        fixture.assert_hooks(r#"gh pr comment 1 --body "see \`id\` and \$(id)""#, true);
+        fixture.assert_posix_test(
+            "cat <<'EOF'\ngh pr comment 1 --body \"see $(id) and `id`\"\nEOF\n",
+            "allow",
+            None,
+        );
+    }
+
+    #[test]
+    fn issue_614_substitution_context_survives_expansions_and_concatenation() {
+        let fixture =
+            SafePatternFixture::new_with_keywords(&[], PROSE_SUBSTITUTION_PATTERN, PROSE_KEYWORDS);
+        for candidate in [
+            r#"gh pr comment 1 --body "$s $(id)""#,
+            r#"gh pr comment 1 --body "see $(id)"' literal tail'"#,
+            r#"git commit -am "see `id`"' literal tail'"#,
+        ] {
+            fixture.assert_posix_test(candidate, "deny", Some(REVIEW_RULE));
+        }
+        // Require BOTH delimiters so retaining only the first substitution
+        // cannot accidentally satisfy this regression.
+        let both = SafePatternFixture::new_with_keywords(
+            &[],
+            r#"--body\s+"[^"`$]*\$\([^)]*\)[^"`]*`[^`]*`"#,
+            &["--body"],
+        );
+        both.assert_posix_test(
+            r#"gh pr comment 1 --body "one $(id) two `id`""#,
+            "deny",
+            Some(REVIEW_RULE),
+        );
+        both.assert_posix_test(r#"gh pr comment 1 --body "only $(id)""#, "allow", None);
+    }
+
+    #[test]
+    fn issue_614_utf8_and_compound_commands_keep_original_match_offsets() {
+        let fixture =
+            SafePatternFixture::new_with_keywords(&[], PROSE_SUBSTITUTION_PATTERN, PROSE_KEYWORDS);
+        let candidate = r#"printf 'café'; gh pr comment 1 --body "révision $(id)""#;
+        let json = fixture.assert_posix_test(candidate, "deny", Some(REVIEW_RULE));
+        let start = candidate.find("--body").expect("prose flag");
+        let end = candidate.find("$(").expect("substitution opener") + 2;
+        assert_eq!(json["matched_span"], serde_json::json!([start, end]));
+        assert_eq!(&candidate[start..end], "--body \"révision $(");
+    }
+
+    #[test]
+    fn issue_614_rule_grants_do_not_exempt_executed_inner_commands() {
+        let fixture =
+            SafePatternFixture::new_with_keywords(&[], PROSE_SUBSTITUTION_PATTERN, PROSE_KEYWORDS)
+                .with_allowlist("rule", REVIEW_RULE);
+        for substitution in ["$(id)", "`id`"] {
+            fixture.assert_posix_test(
+                &format!("gh pr comment 1 --body \"see {substitution}\""),
+                "allow",
+                None,
+            );
+        }
+        for substitution in ["$(git reset --hard)", "`git reset --hard`"] {
+            fixture.assert_posix_test(
+                &format!("gh pr comment 1 --body \"see {substitution}\""),
+                "deny",
+                Some("core.git:reset-hard"),
+            );
+        }
+    }
+
+    #[test]
+    fn issue_614_safe_patterns_use_original_prose_and_substitution_bodies() {
+        let approved = r#"gh pr comment 1 --body "see $(id)""#;
+        let safe = format!("^{}$", regex::escape(approved));
+        let fixture = SafePatternFixture::new_with_keywords(
+            &[&safe],
+            PROSE_SUBSTITUTION_PATTERN,
+            PROSE_KEYWORDS,
+        );
+        fixture.assert_posix_test(approved, "allow", None);
+        // Each edit preserves the byte length of the masked region, so the
+        // custom matching view alone cannot distinguish these requests.
+        for unapproved in [
+            r#"gh pr comment 1 --body "new $(id)""#,
+            r#"gh pr comment 1 --body "see $(ls)""#,
+        ] {
+            fixture.assert_posix_test(unapproved, "deny", Some(REVIEW_RULE));
+        }
+        fixture.assert_posix_test(
+            r#"gh pr comment 1 --body "see $(git reset --hard)""#,
+            "deny",
+            Some("core.git:reset-hard"),
+        );
+    }
+
+    #[test]
+    fn issue_614_custom_visibility_keeps_data_masked() {
+        let fixture =
+            SafePatternFixture::new_with_keywords(&[], r"\bgit\s+reset\s+--hard\b", &["git"]);
+        // These words are either surrounding prose or the literal output of
+        // a benign substitution. Neither the custom rule nor core.git may
+        // reinterpret them as an executed reset.
+        for prefix in [
+            "gh pr comment 1 --body ",
+            "git commit --message=",
+            "br create --title t --description ",
+        ] {
+            for value in [
+                r#""document git reset --hard""#,
+                r#""document git reset --hard $(id)""#,
+                r#""document git reset --hard `id`""#,
+                r#""see $(printf '%s' 'git reset --hard')""#,
+                r#""see `printf '%s' 'git reset --hard'`""#,
+            ] {
+                fixture.assert_posix_test(&format!("{prefix}{value}"), "allow", None);
+            }
+        }
+        // The same rule must still block a command executed by a substitution.
+        fixture.assert_posix_test(
+            r#"gh pr comment 1 --body "see $(git reset --hard)""#,
+            "deny",
+            Some("core.git:reset-hard"),
+        );
+
+        // Checked child bodies become spaces in the custom view. They must
+        // not be evaluated again as synthetic whitespace-only commands.
+        let blank_rule = SafePatternFixture::new_with_keywords(&[], r"^\s+$", &[]);
+        blank_rule.assert_posix_test(r#"gh pr comment 1 --body "see $(id)""#, "allow", None);
+    }
+
+    #[test]
+    fn issue_614_builtin_substitution_analysis_is_preserved() {
+        // No loaded custom rule matches these inputs; the built-in inner
+        // command analysis must enforce them independently of prose policy.
+        let fixture = SafePatternFixture::new_with_keywords(
+            &[],
+            "synthetic-never-matches-614",
+            &["synthetic-never-matches-614"],
+        );
+        for prefix in [
+            "gh pr comment 1 --body ",
+            "git commit -m ",
+            "br create --title t --description=",
+            "mytool post --body ",
+        ] {
+            for substitution in ["`git reset --hard`", "$(git reset --hard)"] {
+                fixture.assert_posix_test(
+                    &format!("{prefix}\"see {substitution}\""),
+                    "deny",
+                    Some("core.git:reset-hard"),
+                );
+            }
+        }
+        fixture.assert_hooks(r#"git commit -m "see $(git reset --hard)""#, false);
     }
 
     #[test]

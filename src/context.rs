@@ -1450,6 +1450,11 @@ pub(crate) fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
 /// - It never strips any token that appears to contain shell-executed constructs
 ///   like `$(` or backticks (even if the flag/command is otherwise safe).
 ///
+/// After recursively checking substitutions, the evaluator can mask their
+/// data-only argument values in the built-in pack view. Custom packs retain
+/// the active substitution delimiters and enclosing quotes in a separate view,
+/// so a policy can reject executable syntax without matching inert prose.
+///
 /// This is designed to be be used on the hot path, so it returns a borrowed view
 /// when no sanitization is required.
 #[must_use]
@@ -1821,8 +1826,22 @@ fn token_mask_ranges(
             continue;
         }
 
+        // Quoting a complete flag token does not change its argv spelling.
+        // Semantic command views can quote the whole `--message=value` word,
+        // including its flag. Unwrap one literal fragment for flag recognition
+        // while retaining the original value offsets. Leave concatenated or
+        // escaped quote fragments unrecognized rather than guessing their argv.
+        let unquoted_flag = strip_matching_quotes(token_text);
+        let (flag_text, flag_start) = if unquoted_flag.len() < token_text.len()
+            && !unquoted_flag.contains(char::from(token_text.as_bytes()[0]))
+        {
+            (unquoted_flag, token.byte_range.start + 1)
+        } else {
+            (token_text, token.byte_range.start)
+        };
+
         if let Some(pending) = pending_safe_flag {
-            let is_flag_token = token_text.starts_with('-') && token_text != "-";
+            let is_flag_token = flag_text.starts_with('-') && flag_text != "-";
             if pending.multi_value {
                 if token.has_inline_code || is_flag_token {
                     pending_safe_flag = None;
@@ -1850,8 +1869,7 @@ fn token_mask_ranges(
         }
 
         // Handle --flag=value (and similar) forms.
-        if let Some((flag, value_range)) = split_flag_assignment(token_text, token.byte_range.start)
-        {
+        if let Some((flag, value_range)) = split_flag_assignment(flag_text, flag_start) {
             if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag)
                 && !token.has_inline_code
                 && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
@@ -1872,7 +1890,7 @@ fn token_mask_ranges(
         // This also covers combined clusters where the data-flag appears before the value
         // (e.g., `git commit -am"msg"`).
         if let Some((flag, value_range)) =
-            split_short_flag_attached_value(cmd, token_text, token.byte_range.start)
+            split_short_flag_attached_value(cmd, flag_text, flag_start)
         {
             if !token.has_inline_code
                 && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
@@ -1886,14 +1904,14 @@ fn token_mask_ranges(
         }
 
         // Handle separate flag + value forms.
-        if SAFE_STRING_REGISTRY.is_flag_data(cmd, token_text) {
+        if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag_text) {
             pending_safe_flag = Some(PendingSafeFlag {
-                flag: token_text,
-                multi_value: SAFE_STRING_REGISTRY.is_flag_data_multivalue(cmd, token_text),
+                flag: flag_text,
+                multi_value: SAFE_STRING_REGISTRY.is_flag_data_multivalue(cmd, flag_text),
             });
             continue;
         }
-        if let Some(data_flag) = combined_short_data_flag_value(cmd, token_text) {
+        if let Some(data_flag) = combined_short_data_flag_value(cmd, flag_text) {
             pending_safe_flag = Some(PendingSafeFlag {
                 flag: data_flag,
                 multi_value: SAFE_STRING_REGISTRY.is_flag_data_multivalue(cmd, data_flag),
@@ -1908,12 +1926,12 @@ fn token_mask_ranges(
             if is_git_subcommand_token {
                 continue;
             }
-            if token_text == "--" {
+            if flag_text == "--" {
                 options_ended = true;
                 continue;
             }
 
-            let is_option = !options_ended && token_text.starts_with('-') && token_text != "-";
+            let is_option = !options_ended && flag_text.starts_with('-') && flag_text != "-";
             if is_option {
                 continue;
             }
@@ -5931,6 +5949,85 @@ mod tests {
         assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("git commit -am"));
+    }
+
+    #[test]
+    fn sanitize_masks_fully_quoted_attached_message_values_at_source_offsets() {
+        let value = "document git reset --hard — café";
+        for flag in ["--message=", "-m", "-am"] {
+            for quote in ['\'', '"'] {
+                let command = format!("git commit {quote}{flag}{value}{quote} --allow-empty");
+                let sanitized = sanitize_for_pattern_matching(&command);
+                let start = command.find(value).expect("message value");
+                let end = start + value.len();
+                assert_eq!(sanitized.len(), command.len());
+                assert_eq!(&sanitized[..start], &command[..start]);
+                assert!(
+                    sanitized.as_bytes()[start..end]
+                        .iter()
+                        .all(|byte| *byte == b' ')
+                );
+                assert_eq!(&sanitized[end..], &command[end..]);
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_recognizes_fully_quoted_separate_message_flags() {
+        for flag in ["-m", "--message", "-am"] {
+            for quote in ['\'', '"'] {
+                let command =
+                    format!("git commit {quote}{flag}{quote} 'git reset --hard' --allow-empty");
+                let sanitized = sanitize_for_pattern_matching(&command);
+                assert_eq!(sanitized.len(), command.len());
+                assert!(
+                    !sanitized.contains("git reset --hard"),
+                    "{command}: {sanitized}"
+                );
+                assert!(sanitized.contains(&format!("{quote}{flag}{quote}")));
+                assert!(sanitized.ends_with(" --allow-empty"));
+            }
+        }
+        let command = "br create --description 'git reset --hard' '--priority' 2";
+        let sanitized = sanitize_for_pattern_matching(command);
+        assert!(!sanitized.contains("git reset --hard"));
+        assert!(sanitized.ends_with(" '--priority' 2"));
+    }
+
+    #[test]
+    fn sanitize_quoted_flags_preserve_live_substitutions_and_mask_literal_markers() {
+        for flag in ["--message=", "-m", "-am"] {
+            for substitution in ["$(git reset --hard)", "`git reset --hard`"] {
+                let live = format!("git commit \"{flag}see {substitution}\"");
+                assert_eq!(sanitize_for_pattern_matching(&live), live);
+                let literal = format!("git commit '{flag}see {substitution}'");
+                let sanitized = sanitize_for_pattern_matching(&literal);
+                assert_eq!(sanitized.len(), literal.len());
+                assert!(
+                    !sanitized.contains("git reset --hard"),
+                    "{literal}: {sanitized}"
+                );
+            }
+        }
+        for command in [
+            r#"git commit '--message' "see $(git reset --hard)""#,
+            r#"git commit "-m" "see `git reset --hard`""#,
+            r#"git commit '-am' "see $(git reset --hard)""#,
+        ] {
+            assert_eq!(sanitize_for_pattern_matching(command), command);
+        }
+    }
+
+    #[test]
+    fn sanitize_does_not_guess_concatenated_quoted_flags() {
+        for command in [
+            "git commit '--mes''sage=git reset --hard'",
+            r#"git commit "--mes""sage=git reset --hard""#,
+            "git commit '-m''git reset --hard'",
+            "git commit '-a''m' 'git reset --hard'",
+        ] {
+            assert_eq!(sanitize_for_pattern_matching(command), command);
+        }
     }
 
     #[test]

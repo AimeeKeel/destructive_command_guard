@@ -262,6 +262,36 @@ new exemption. Use anchors to constrain the command forms you authorize.
 Losing a safe match means destructive evaluation continues; it does not by
 itself deny a command that no destructive rule covers.
 
+### Substitutions inside prose arguments
+
+Custom destructive rules can recognize active POSIX command substitutions in
+registered data arguments, including `gh --body`, `git -m`/`--message`, and
+`br --description`. After checking each inner command, dcg keeps the active
+backtick or `$()` delimiters and their enclosing double quotes visible to
+custom patterns. The surrounding prose and checked inner body remain masked
+with spaces, preserving original byte offsets and false-positive protection.
+For example, the custom view of `gh pr comment 1 --body "see $(id)"` includes
+`--body "    $(  )"`.
+
+This rule rejects either substitution form in a double-quoted prose argument:
+
+```yaml
+keywords: [--body, --message, --description]
+destructive_patterns:
+  - name: substitution-in-prose
+    pattern: '--(?:body|message|description)(?:=|\s+)"(?:[^"\\`$]|\\.|\$(?!\())*(?:`|\$\()'
+    severity: high
+    description: A command substitution in this text argument would execute
+```
+
+Single-quoted text and escaped substitution markers remain inert. A separate
+rule for a destructive inner command still applies recursively, with its own
+rule ID and allowlist scope. A grant for `substitution-in-prose` does not grant
+permission for a destructive command inside it. Safe patterns continue to
+authorize the original command, including its actual prose and inner body.
+Commands outside the safe-string registry retain their existing matching
+behavior; this view does not add arbitrary flags to that registry.
+
 ## Severity Levels
 
 Severity determines the default decision mode when a command matches, and how
