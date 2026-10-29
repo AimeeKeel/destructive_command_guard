@@ -597,7 +597,14 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         let hit = if inert_string_end.is_some() {
             detect_destructive_in_literal_args(arg_region, language)
         } else {
-            detect_destructive_in_args(arg_region, language)
+            // A name bound to a literal list or tuple is judged as that literal
+            // written in its place (#602).
+            python_bound_argv_calls(language, haystack, arg_region, python_text.as_ref())
+                .iter()
+                .fold(
+                    detect_destructive_in_args(arg_region, language),
+                    |found, call| more_severe(found, detect_destructive_in_args(call, language)),
+                )
         };
         let Some(hit) = hit else {
             continue;
@@ -802,83 +809,94 @@ pub fn exec_sink_reconstructed_commands(
         let inert_string_end = python_text
             .as_ref()
             .and_then(|text| text.inert_string_end(call_start));
-        let region = exec_sink_arg_region(
+        let call_region = exec_sink_arg_region(
             inert_string_end.map_or(haystack, |end| &haystack[..end]),
             call_start,
         );
-        // A call the rm/git backstop owns (any `detect_destructive_in_args`
-        // hit) is left to it, so an allowlisted `rm`/`git` is not re-denied
-        // here under a pack rule id.
-        if detect_destructive_in_args(region, language).is_some() {
-            continue;
-        }
-        // Operands, for the same reason `detect_destructive_in_args` uses them:
-        // reconstructing `dd` from `"d"+"d"` as two argv words would not be the
-        // command the call actually runs (#474).
-        //
-        // #562 resolution is enabled only once this call's program word
-        // (read with resolution off) is an archive tool, never a launcher.
-        let argv = if const_env.is_some() {
-            RESOLVE_ENABLED.with(|cell| cell.set(false));
-            let unresolved = exec_argv_operands(region, language);
-            let archive = unresolved
-                .values
-                .first()
-                .is_some_and(|program| is_archive_program(program));
-            if archive {
-                RESOLVE_ENABLED.with(|cell| cell.set(true));
-                let resolved = exec_argv_operands(region, language);
-                RESOLVE_ENABLED.with(|cell| cell.set(false));
-                resolved
-            } else {
-                unresolved
-            }
+        // A name bound to a literal list or tuple is reconstructed as that
+        // literal written in its place (#602); in a string nothing runs, the
+        // name stays text.
+        let bound = if inert_string_end.is_none() {
+            python_bound_argv_calls(language, haystack, call_region, python_text.as_ref())
         } else {
-            exec_argv_operands(region, language)
+            Vec::new()
         };
-        if argv.unverified {
-            continue;
-        }
-        // In a string nothing runs, a name is text, not a value decided at run
-        // time, so it raises no dynamic-path or alias question (#601). A fully
-        // literal command is still judged, as any destructive literal is.
-        if inert_string_end.is_some()
-            && argv
-                .values
-                .iter()
-                .any(|value| value.contains(RUNTIME_VALUE))
-        {
-            continue;
-        }
-        let operands = argv.values;
-        let command = match operands.as_slice() {
-            [] => continue,
-            // One string handed to a shell (#512): see below.
-            [script] => {
-                if !single_string_sink_runs_shell(language, sink, haystack, call_start, region) {
-                    continue;
+        for region in std::iter::once(call_region).chain(bound.iter().map(String::as_str)) {
+            // A call the rm/git backstop owns (any `detect_destructive_in_args`
+            // hit) is left to it, so an allowlisted `rm`/`git` is not re-denied
+            // here under a pack rule id.
+            if detect_destructive_in_args(region, language).is_some() {
+                continue;
+            }
+            // Operands, for the same reason `detect_destructive_in_args` uses them:
+            // reconstructing `dd` from `"d"+"d"` as two argv words would not be the
+            // command the call actually runs (#474).
+            //
+            // #562 resolution is enabled only once this call's program word
+            // (read with resolution off) is an archive tool, never a launcher.
+            let argv = if const_env.is_some() {
+                RESOLVE_ENABLED.with(|cell| cell.set(false));
+                let unresolved = exec_argv_operands(region, language);
+                let archive = unresolved
+                    .values
+                    .first()
+                    .is_some_and(|program| is_archive_program(program));
+                if archive {
+                    RESOLVE_ENABLED.with(|cell| cell.set(true));
+                    let resolved = exec_argv_operands(region, language);
+                    RESOLVE_ENABLED.with(|cell| cell.set(false));
+                    resolved
+                } else {
+                    unresolved
                 }
-                script.to_string()
+            } else {
+                exec_argv_operands(region, language)
+            };
+            if argv.unverified {
+                continue;
             }
-            _ if matches!(
-                language,
-                ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
-            ) && JS_SHELL_TRUE.is_match(region)
-                || language == ScriptLanguage::Python && PY_SHELL_TRUE.is_match(region) =>
+            // In a string nothing runs, a name is text, not a value decided at run
+            // time, so it raises no dynamic-path or alias question (#601). A fully
+            // literal command is still judged, as any destructive literal is.
+            if inert_string_end.is_some()
+                && argv
+                    .values
+                    .iter()
+                    .any(|value| value.contains(RUNTIME_VALUE))
             {
-                operands.join(" ")
+                continue;
             }
-            _ => operands
-                .iter()
-                .map(|operand| quote_exec_operand(operand))
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
-        out.push(ReconstructedCommand {
-            command,
-            start: call_start,
-            end: m.end(),
-        });
+            let operands = argv.values;
+            let command = match operands.as_slice() {
+                [] => continue,
+                // One string handed to a shell (#512): see below.
+                [script] => {
+                    if !single_string_sink_runs_shell(language, sink, haystack, call_start, region)
+                    {
+                        continue;
+                    }
+                    script.to_string()
+                }
+                _ if matches!(
+                    language,
+                    ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+                ) && JS_SHELL_TRUE.is_match(region)
+                    || language == ScriptLanguage::Python && PY_SHELL_TRUE.is_match(region) =>
+                {
+                    operands.join(" ")
+                }
+                _ => operands
+                    .iter()
+                    .map(|operand| quote_exec_operand(operand))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            out.push(ReconstructedCommand {
+                command,
+                start: call_start,
+                end: m.end(),
+            });
+        }
     }
     if language == ScriptLanguage::Perl {
         // Backticks and `qx` hand their text to the shell as well. A payload the
@@ -4094,6 +4112,112 @@ impl PythonSinkText {
             .find(|span| span.contains(&at))
             .map(|span| span.end)
     }
+}
+
+/// Most bindings of one name read per sink call (#602).
+const MAX_PYTHON_ARGV_BINDINGS: usize = 16;
+
+/// A Python sink call whose whole argv is a bare name: its first positional
+/// argument, or `args=NAME`, followed by `,` or `)`.
+static PY_ARGV_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*(?:args\s*=\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*[,)]",
+    )
+    .expect("python argv name regex compiles")
+});
+
+/// A statement that assigns a list or tuple literal to a name, annotated or
+/// not: `NAME = [`, `NAME: list[str] = (`. It ends at the opening bracket.
+static PY_LITERAL_BINDING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|;)[ \t]*(?P<name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*(?::[^=\n;]*)?=[ \t]*[\[(]")
+        .expect("python literal binding regex compiles")
+});
+
+/// The text of a Python sink call whose whole argv is a bare name, once for
+/// each list or tuple literal the body assigns to that name, written in the
+/// name's place (#602).
+///
+/// `args = ['rm', '-rf', '/home/user']` then `subprocess.run(args)` runs the
+/// same argv as the call with the list inline, which every layer judges; read
+/// through the name it reached none of them. Every literal assignment counts,
+/// in any scope and whatever comes between, so a later rebinding or another
+/// function's variable of the same name can only add a reading. A name bound
+/// to anything else (a call, `sys.argv`, a comprehension) is not resolved and
+/// keeps its earlier posture, and an assignment inside a string literal is
+/// text.
+fn python_bound_argv_calls(
+    language: ScriptLanguage,
+    code: &str,
+    call: &str,
+    text: Option<&PythonSinkText>,
+) -> Vec<String> {
+    if language != ScriptLanguage::Python {
+        return Vec::new();
+    }
+    let Some(name) = PY_ARGV_NAME
+        .captures(call)
+        .and_then(|caps| caps.name("name"))
+        .filter(|name| !matches!(name.as_str(), "True" | "False" | "None"))
+    else {
+        return Vec::new();
+    };
+    let mut calls = Vec::new();
+    for caps in PY_LITERAL_BINDING.captures_iter(code) {
+        if calls.len() >= MAX_PYTHON_ARGV_BINDINGS {
+            break;
+        }
+        if caps.name("name").map(|bound| bound.as_str()) != Some(name.as_str()) {
+            continue;
+        }
+        let Some(open) = caps.get(0).map(|found| found.end() - 1) else {
+            continue;
+        };
+        if text.is_some_and(|text| text.strings.iter().any(|span| span.contains(&open))) {
+            continue;
+        }
+        let Some(end) = python_bracket_end(code.as_bytes(), open) else {
+            continue;
+        };
+        calls.push(format!(
+            "{}{}{}",
+            &call[..name.start()],
+            &code[open..end],
+            &call[name.end()..]
+        ));
+    }
+    calls
+}
+
+/// One past the bracket that closes the one opening at `open` in Python
+/// source, with string literals skipped, or `None` when it does not close.
+fn python_bracket_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' | b'"' => {
+                let fields = python_string_has_fields(bytes, i);
+                i = python_string_end(bytes, i, fields)?.1;
+            }
+            b'#' => {
+                i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |at| i + at);
+            }
+            b'\\' => i += 2,
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Byte ranges of a Python body.
@@ -12664,6 +12788,45 @@ def cleanup():
                     .len(),
                 1
             );
+        }
+
+        /// #602: a bare-name argv is read through each list or tuple literal
+        /// the body assigns to that name, and through nothing else.
+        #[test]
+        fn bare_name_argv_reads_each_literal_binding_602() {
+            let code = "a = ['git', 'status']\nb: tuple = (\n    'x',  # )\n    ')',\n)\n\
+                        if c:\n    a = ['ls', f'{d[\"]\"]}']\ns = \"\"\"\na = ['rm']\n\"\"\"\n\
+                        a == ['eq']\na += ['add']\ne = sys.argv[1:]; a = ('k',)\n";
+            let text = PythonSinkText::read(code);
+            let bound = |call: &str| {
+                python_bound_argv_calls(ScriptLanguage::Python, code, call, text.as_ref())
+            };
+            assert_eq!(
+                bound("run(a)"),
+                [
+                    "run(['git', 'status'])",
+                    "run(['ls', f'{d[\"]\"]}'])",
+                    "run(('k',))",
+                ]
+            );
+            assert_eq!(
+                bound("run(args=b, check=True)"),
+                ["run(args=(\n    'x',  # )\n    ')',\n), check=True)"]
+            );
+            for call in [
+                "run(True)",
+                "run(a.b)",
+                "run(a[0])",
+                "run(['x'])",
+                "run(e)",
+                "run(s)",
+            ] {
+                assert!(bound(call).is_empty(), "{call:?}: {:?}", bound(call));
+            }
+            assert!(python_bound_argv_calls(ScriptLanguage::Ruby, code, "run(a)", None).is_empty());
+            assert_eq!(python_bracket_end(b"[1, (2, ']'), 3] tail", 0), Some(16));
+            assert_eq!(python_bracket_end(b"[1, 2", 0), None);
+            assert_eq!(python_bracket_end(b"[1, ']", 0), None);
         }
     }
 

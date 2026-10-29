@@ -42374,6 +42374,64 @@ mod tests {
         }
     }
 
+    /// #602 end to end: a Python sink argv passed by a name bound to a literal
+    /// list or tuple is judged as that literal written inline. A name bound to
+    /// anything else, or only in a string or comment, keeps its old posture.
+    #[test]
+    fn python_argv_bound_to_a_name_is_judged_602() {
+        let body = |code: &str| format!("python3 - <<'PY'\n{code}\nPY");
+        let packs = ["core.git", "core.filesystem", "system.disk"];
+        for command in [
+            body("import subprocess\nargs = ['rm','-rf','/home/user']\nsubprocess.run(args)"),
+            body("import subprocess\nargs = ('git','reset','--hard')\nsubprocess.run(args)"),
+            body("import subprocess\nx = ['a']\nargs = ['git','add',*x]\nsubprocess.run(args)"),
+            body("import subprocess\nargs = ['rm','-rf','/home/user']\nsubprocess.run(args=args)"),
+            body(
+                "import subprocess\nargs = ['rm','-rf','/home/user']\n\
+                 subprocess.check_call(args)\nsubprocess.Popen(args)",
+            ),
+            "python3 -c 'import subprocess; a = [\"git\",\"reset\",\"--hard\"]; subprocess.run(a)'"
+                .to_string(),
+            body(
+                "import subprocess\ncmd: list[str] = [\n    'git',\n    'reset',\n    \
+                 '--hard',  # discard\n]\nsubprocess.run(cmd, check=True)",
+            ),
+            body(
+                "import subprocess\ncmd = ['dd', 'if=/dev/zero', 'of=/dev/sda']\nsubprocess.run(cmd)",
+            ),
+            body(
+                "import subprocess\ncmd = ['git', 'status']\nif x:\n    \
+                 cmd = ['git', 'clean', '-fdx']\nsubprocess.run(cmd)",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(&command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "{command:?} must be denied: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            body("import subprocess\ncmd = ['git', 'status']\nsubprocess.run(cmd)"),
+            body("import subprocess, sys\nargs = sys.argv[1:]\nsubprocess.run(args)"),
+            body(
+                "import subprocess\ns = \"args = ['rm','-rf','/home/user']\"\n\
+                 args = ['git','status']\nsubprocess.run(args)",
+            ),
+            body(
+                "import subprocess\n# args = ['rm','-rf','/home/user']\n\
+                 args = ['git','status']\nsubprocess.run(args)",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(&command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "{command:?} must be allowed: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
     #[test]
     fn here_string_receiver_analysis_preserves_bash_rule_allowlists_issue_555() {
         let enabled_packs = ["core.git".to_string(), "core.filesystem".to_string()]
