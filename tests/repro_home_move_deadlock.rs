@@ -219,6 +219,43 @@ fn prose_remediations_are_executable_for_a_home_path() {
     }
 }
 
+/// GitHub #605: both explanations recommended `mv <path> ~/.Trash/` as if any
+/// source qualified, but the Trash carve-out admits only home, temp and
+/// relative sources. The prose must say so, and the moves it rules out must
+/// stay denied: a Trash move is not a way out for a tree outside home.
+#[test]
+fn prose_scopes_the_trash_move_to_the_sources_it_admits() {
+    let registry = PackRegistry::new();
+    let pack = registry
+        .get("core.filesystem")
+        .expect("core.filesystem pack resolves");
+    for (command, rule) in [
+        ("rm -rf /etc/vendor", "rm-rf-root-home"),
+        (
+            "mv /Applications/Probe.app ~/.Trash/",
+            "mv-sensitive-source-root-home",
+        ),
+    ] {
+        let hit = pack
+            .check(command)
+            .unwrap_or_else(|| panic!("expected DENY for {command:?}"));
+        assert_eq!(hit.name, Some(rule), "{command:?}");
+        let prose = hit.explanation.expect("explanation");
+        assert!(
+            prose.contains("not for any other absolute path"),
+            "{rule} must scope its Trash advice: {prose}"
+        );
+    }
+    for command in [
+        "mv /Applications/Probe.app ~/.Trash/",
+        r#"mv "/Library/Application Support/Vendor" ~/.Trash/"#,
+        "mv /usr/local/vendor ~/.Trash/",
+        "mv /opt/vendor ~/.local/share/Trash/",
+    ] {
+        assert_denied(command);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GitHub #422: the same rename written with a relative source
 // ---------------------------------------------------------------------------

@@ -5250,7 +5250,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              dcg auto-allows recursive deletion only for literal temp paths:\n  \
              rm -rf /tmp/<subdir>/scratch\n\n\
              For any other directory, preview first, then either delete interactively \
-             or move the tree aside (dcg allows all three forms):\n  \
+             or move the tree aside. dcg allows all three forms, the Trash move only \
+             for a source under a home directory, under a temp directory, or a relative \
+             path, not for any other absolute path (`mv /opt/<x> ~/.Trash/` stays \
+             denied by `mv-sensitive-source-root-home`):\n  \
              find /path/to/directory -type f | head -20\n  \
              rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
              mv /path/to/directory ~/.Trash/            # macOS soft-delete, recoverable\n  \
@@ -5849,7 +5852,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Rename or move within one home subtree — allowed, quoted or not:\n  \
                `mv ~/Documents/<a> ~/Documents/<b>` (both sides at least two components \
                below the home root, no dotfile tree, no `..`).\n\
-             - Soft-delete into the platform Trash (recoverable, and allowed):\n  \
+             - Soft-delete into the platform Trash (recoverable; allowed for a source \
+               under a home directory, under a temp directory, or a relative path, not \
+               for any other absolute path):\n  \
                `mv <path> ~/.Trash/` on macOS, `mv <path> ~/.local/share/Trash/` on Linux.\n\
              - Soft-delete via in-place rename: `mv <file> <file>.deleted-YYYYMMDD`.\n\
              - Copy first and verify, then delete the copy's source only with explicit \
