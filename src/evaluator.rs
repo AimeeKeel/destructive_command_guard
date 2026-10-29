@@ -364,6 +364,18 @@ thread_local! {
     static ALLOW_ONCE_REQUEST_CWD: std::cell::RefCell<AllowOnceRequestCwd> = const {
         std::cell::RefCell::new(AllowOnceRequestCwd::Unspecified)
     };
+    /// An ordinary exact grant cannot hide an explicit block on a later
+    /// nested command. Policy inspection must read past whole-command grants,
+    /// including the grant whose eligibility it is checking, without spending
+    /// any of them. Recursive evaluation stays on this thread.
+    static ALLOW_ONCE_POLICY_REPLAY: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    /// A finding-only rescan can discard its verdict, so it must never spend
+    /// a stateful grant. Permanent exemptions still govern its findings.
+    static ALLOW_ONCE_SUPPRESSED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 #[derive(Clone, Default)]
@@ -497,11 +509,51 @@ impl Drop for SafePatternScope {
     }
 }
 
+struct AllowOncePolicyScope {
+    previous: bool,
+}
+
+impl AllowOncePolicyScope {
+    fn enter() -> Self {
+        Self {
+            previous: ALLOW_ONCE_POLICY_REPLAY.with(|slot| slot.replace(true)),
+        }
+    }
+}
+
+impl Drop for AllowOncePolicyScope {
+    fn drop(&mut self) {
+        ALLOW_ONCE_POLICY_REPLAY.with(|slot| slot.set(self.previous));
+    }
+}
+
+struct AllowOnceSuppressionScope {
+    previous: bool,
+}
+
+impl AllowOnceSuppressionScope {
+    fn enter() -> Self {
+        Self {
+            previous: ALLOW_ONCE_SUPPRESSED.with(|slot| slot.replace(true)),
+        }
+    }
+}
+
+impl Drop for AllowOnceSuppressionScope {
+    fn drop(&mut self) {
+        ALLOW_ONCE_SUPPRESSED.with(|slot| slot.set(self.previous));
+    }
+}
+
 /// A whole-command grant authorizes the original outer request. Detection
 /// replays may change case, remove syntax, or extract executable children;
 /// none of those derived strings is a new request the operator authorized.
-/// An explicitly approved outer envelope is checked before its children run.
+/// Policy inspection deliberately acquires none: an ordinary grant must not
+/// bypass an explicit block merely because another finding appears first.
 fn original_command_grant<T>(command: &str, grant: impl FnOnce(&str) -> Option<T>) -> Option<T> {
+    if ALLOW_ONCE_POLICY_REPLAY.with(std::cell::Cell::get) {
+        return None;
+    }
     let source = SAFE_PATTERN_SOURCE.with(|slot| slot.borrow().clone());
     match source {
         Some(source) if source.parent.is_none() => grant(&source.command),
@@ -5975,7 +6027,8 @@ fn windows_launcher_envelopes(
 /// allowlist grant for that rule first (mirrors the
 /// `ExecutableTextSink::Unverified` handling). Returns `None` when the rule
 /// is allowlisted — the caller falls back to ordinary evaluation — recording
-/// the hit for audit output.
+/// the hit for audit output. Policy inspection cannot treat a waived refusal
+/// as proof that the unread source contains no explicit block.
 fn launcher_unverified_denial(
     rule: &str,
     reason: &str,
@@ -5985,6 +6038,12 @@ fn launcher_unverified_denial(
 ) -> Option<EvaluationResult> {
     let (pack_id, pattern_name) = split_ast_rule_id(rule);
     if let Some(hit) = allowlists.match_rule_at_path(&pack_id, &pattern_name, project_path) {
+        if ALLOW_ONCE_POLICY_REPLAY.with(std::cell::Cell::get) {
+            return Some(EvaluationResult {
+                decision: EvaluationDecision::Indeterminate,
+                ..EvaluationResult::allowed()
+            });
+        }
         if first_allowlist_hit.is_none() {
             *first_allowlist_hit = Some((
                 PatternMatch {
@@ -6689,6 +6748,149 @@ fn parse_obfuscated_posix_inline_launcher_segment(
     }
 }
 
+/// Locate only a source operand whose option grammar is modeled here. Python
+/// stops option parsing at its source; other interpreters can replace or add
+/// programs through later flags, so their proof requires the minimal argv.
+fn non_shell_inline_source_word<'a>(
+    words: &[&'a str],
+    language: crate::heredoc::ScriptLanguage,
+) -> Option<&'a str> {
+    use crate::heredoc::ScriptLanguage;
+
+    if language == ScriptLanguage::Python {
+        return python_inline_source_word(words);
+    }
+    let [_, raw_flag, source] = words else {
+        return None;
+    };
+    let flag = crate::normalize::decode_posix_literal_word(raw_flag)?;
+    matches!(
+        (language, flag.as_ref()),
+        (ScriptLanguage::Ruby, "-e")
+            | (ScriptLanguage::Perl, "-e" | "-E")
+            | (
+                ScriptLanguage::JavaScript,
+                "-e" | "--eval" | "-p" | "--print"
+            )
+            | (ScriptLanguage::Php, "-r")
+    )
+    .then_some(*source)
+}
+
+/// Prove that Tier 2 extracted this launcher's actual, fully literal source.
+/// A successful extraction elsewhere in the command (including a decoy in
+/// script argv or inside its source) does not prove ownership of this payload.
+fn posix_inline_source_is_fully_extracted(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+) -> bool {
+    if !context.heredoc_settings.enabled || deadline_exceeded(context.deadline) {
+        return false;
+    }
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    if tokens.len() > MAX_STATIC_SHELL_SOURCE_TERMS
+        || tokens
+            .iter()
+            .any(|token| token.kind != NormalizeTokenKind::Word)
+    {
+        return false;
+    }
+    let Some(words) = tokens
+        .iter()
+        .map(|token| token.text(command))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Some(exec_index) = words
+        .iter()
+        .position(|word| !posix_word_is_assignment_prefix(word))
+    else {
+        return false;
+    };
+    let words = &words[exec_index..];
+    let Some(executable) = crate::normalize::decode_posix_literal_word(words[0]) else {
+        return false;
+    };
+    let name = executable
+        .rsplit('/')
+        .next()
+        .unwrap_or(&executable)
+        .to_ascii_lowercase();
+    if !non_shell_inline_interpreter_name(&name) {
+        return false;
+    }
+    let language = crate::heredoc::ScriptLanguage::from_command(&name);
+    let Some(raw_source) = non_shell_inline_source_word(words, language) else {
+        return false;
+    };
+    let Some(source) = crate::normalize::decode_posix_literal_word(raw_source) else {
+        return false;
+    };
+    let Some(source_start) = (raw_source.as_ptr() as usize).checked_sub(command.as_ptr() as usize)
+    else {
+        return false;
+    };
+    let Some(source_end) = source_start.checked_add(raw_source.len()) else {
+        return false;
+    };
+    let source_range = source_start..source_end;
+    if command.get(source_range.clone()) != Some(raw_source) {
+        return false;
+    }
+    let mut limits = context.heredoc_settings.limits;
+    if let Some(deadline) = context.deadline {
+        let Some(remaining) = deadline.remaining() else {
+            return false;
+        };
+        limits.timeout_ms = limits
+            .timeout_ms
+            .min(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
+    }
+    let ExtractionResult::Extracted(contents) = extract_content(command, &limits) else {
+        return false;
+    };
+    !deadline_exceeded(context.deadline)
+        && contents.iter().any(|content| {
+            content.language == language
+                && content.word_range.as_ref() == Some(&source_range)
+                && content.content == source.as_ref()
+                && tokens[exec_index]
+                    .byte_range
+                    .contains(&content.byte_range.start)
+                && content.heredoc_type.is_none()
+                && content
+                    .execution_target()
+                    .is_some_and(|target| target.eq_ignore_ascii_case(&name))
+                && !heredoc_content_is_exempt(command, content, context)
+        })
+}
+
+/// Unlike a general unverified launcher, a literal non-shell program can be
+/// inspected in its own language. Prove and inspect the same view immediately:
+/// later trigger or sanitization gates must not decide whether it is read.
+fn inspect_unverified_posix_inline_policy(
+    segment: &str,
+    context: HeredocEvaluationContext<'_>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let stripped = strip_wrapper_prefixes(segment);
+    let view = stripped.normalized.as_ref();
+    if stripped.wrapper_limit_reached || !posix_inline_source_is_fully_extracted(view, context) {
+        return Some(EvaluationResult {
+            decision: EvaluationDecision::Indeterminate,
+            ..EvaluationResult::allowed()
+        });
+    }
+    let mut result = evaluate_heredoc(view, context, first_allowlist_hit)?;
+    if let Some(info) = result.pattern_info.as_mut() {
+        // These offsets belong to a stripped segment, not the outer request.
+        info.matched_span = None;
+        info.matched_text_preview = None;
+    }
+    Some(result)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_obfuscated_posix_inline_launchers(
     command: &str,
@@ -6731,6 +6933,35 @@ fn evaluate_obfuscated_posix_inline_launchers(
                             &(segment_start..segment_start + segment.len()),
                         )
                     {
+                        continue;
+                    }
+                    let (pack_id, pattern_name) =
+                        split_ast_rule_id(POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE);
+                    if ALLOW_ONCE_POLICY_REPLAY.with(std::cell::Cell::get)
+                        && allowlists
+                            .match_rule_at_path(&pack_id, &pattern_name, project_path)
+                            .is_some()
+                    {
+                        if let Some(result) = inspect_unverified_posix_inline_policy(
+                            segment,
+                            HeredocEvaluationContext {
+                                allowlists,
+                                heredoc_settings,
+                                project_path,
+                                deadline,
+                                enabled_keywords,
+                                ordered_packs,
+                                keyword_index,
+                                compiled_overrides,
+                                allow_once_audit,
+                                shell_dialect: ShellDialect::Posix,
+                                nested_command_depth,
+                                inherited_automated_stdin,
+                            },
+                            first_allowlist_hit,
+                        ) {
+                            return Some(result);
+                        }
                         continue;
                     }
                     if let Some(denial) = launcher_unverified_denial(
@@ -12888,6 +13119,12 @@ fn evaluate_executable_text_sinks(
                 if let Some(hit) =
                     allowlists.match_rule_at_path(&pack_id, &pattern_name, project_path)
                 {
+                    if ALLOW_ONCE_POLICY_REPLAY.with(std::cell::Cell::get) {
+                        return Some(EvaluationResult {
+                            decision: EvaluationDecision::Indeterminate,
+                            ..EvaluationResult::allowed()
+                        });
+                    }
                     if first_allowlist_hit.is_none() {
                         *first_allowlist_hit = Some((
                             PatternMatch {
@@ -12919,6 +13156,12 @@ fn evaluate_executable_text_sinks(
                 if let Some(hit) =
                     allowlists.match_rule_at_path(&pack_id, &pattern_name, project_path)
                 {
+                    if ALLOW_ONCE_POLICY_REPLAY.with(std::cell::Cell::get) {
+                        return Some(EvaluationResult {
+                            decision: EvaluationDecision::Indeterminate,
+                            ..EvaluationResult::allowed()
+                        });
+                    }
                     if first_allowlist_hit.is_none() {
                         *first_allowlist_hit = Some((
                             PatternMatch {
@@ -14129,6 +14372,9 @@ fn allow_once_match(
     project_path: Option<&Path>,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
+    if ALLOW_ONCE_SUPPRESSED.with(std::cell::Cell::get) {
+        return None;
+    }
     // A policy replay is a different detection view of the same request.
     // Resolve its identity before consulting the store: matching the derived
     // text would both authorize another command and consume its one-use grant.
@@ -14148,6 +14394,9 @@ fn allow_once_match_force_config(
     project_path: Option<&Path>,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
+    if ALLOW_ONCE_SUPPRESSED.with(std::cell::Cell::get) {
+        return None;
+    }
     original_command_grant(command, |original| {
         let cwd = allow_once_request_cwd(project_path)?;
         let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
@@ -14176,13 +14425,151 @@ pub(crate) fn allow_once_request_cwd(project_path: Option<&Path>) -> Option<Path
     (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
+const MAX_ALLOW_ONCE_POLICY_REPLAYS: usize = 32;
+
+/// Inspect explicit blocks without letting an earlier pack/launcher finding
+/// or whole-command grant hide a later child. Only the rules already found
+/// are waived, in memory, and every replay reads the same original bytes.
+///
+/// `Some` is a complete allow or an explicit config denial. Incomplete work,
+/// an unwaivable finding, no progress, or the bound returns `None`; the caller
+/// retains its existing denial and spends no grant.
+fn inspect_allow_once_policy(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+    max_replays: usize,
+) -> Option<EvaluationResult> {
+    let _policy_scope = AllowOncePolicyScope::enter();
+    let mut settings = context.heredoc_settings.clone();
+    settings.content_allowlist = None;
+    let mut allowlists = LayeredAllowlist::default();
+    let mut waived_rules: Vec<(String, String)> = Vec::new();
+    for _ in 0..max_replays {
+        if deadline_exceeded(context.deadline) {
+            return None;
+        }
+        let result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            command,
+            context.enabled_keywords,
+            context.ordered_packs,
+            context.keyword_index,
+            context.compiled_overrides,
+            &allowlists,
+            &settings,
+            None,
+            context.project_path,
+            context.deadline,
+            context.shell_dialect,
+            context.nested_command_depth,
+            context.inherited_automated_stdin,
+        );
+        if result.is_denied()
+            && result
+                .pattern_info
+                .as_ref()
+                .is_some_and(|info| info.source == MatchSource::ConfigOverride)
+        {
+            return Some(result);
+        }
+        if deadline_exceeded(context.deadline)
+            || nested_evaluation_incomplete(&result)
+            || result.regex_evaluation_incomplete
+        {
+            return None;
+        }
+        // A warn/log finding can also stop nested evaluation before its
+        // siblings. Read past it just as a denial; only a result without an
+        // unwaived finding establishes that every visited source is clear.
+        if result.is_allowed()
+            && (result.effective_mode.is_none() || result.allowlist_override.is_some())
+        {
+            return Some(result);
+        }
+        let info = result.pattern_info.as_ref()?;
+        let (pack_id, pattern_name) = (info.pack_id.as_deref()?, info.pattern_name.as_deref()?);
+        if pack_id.is_empty()
+            || pattern_name.is_empty()
+            || waived_rules
+                .iter()
+                .any(|(pack, pattern)| pack == pack_id && pattern == pattern_name)
+        {
+            return None;
+        }
+        waived_rules.push((pack_id.to_string(), pattern_name.to_string()));
+        allowlists = allowlists.with_rule_grants(
+            &[(pack_id, pattern_name)],
+            "inspect explicit policy before exact authorization",
+            "allow-once-policy-inspection",
+        );
+    }
+    None
+}
+
+/// Authorize an exact request only after explicit policy has precedence over
+/// every earlier named finding. Preview is advisory: the final atomic store
+/// match rechecks exact bytes, cwd, expiry, and the required force permission.
+fn allow_once_result(
+    command: &str,
+    context: HeredocEvaluationContext<'_>,
+) -> Option<EvaluationResult> {
+    if ALLOW_ONCE_SUPPRESSED.with(std::cell::Cell::get)
+        || context.nested_command_depth != 0
+        || context.compiled_overrides.configuration_error.is_some()
+    {
+        return None;
+    }
+    if context.compiled_overrides.block.is_empty() {
+        return allow_once_match(command, context.project_path, context.allow_once_audit)
+            .map(|_| EvaluationResult::allowed_by_allow_once());
+    }
+    original_command_grant(command, |original| {
+        let cwd = allow_once_request_cwd(context.project_path)?;
+        let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
+        let (active, _) = store.preview_active(Utc::now()).ok()?;
+        let mut matching = active
+            .iter()
+            .filter(|entry| entry.command_raw == original && entry.matches_scope(&cwd))
+            .peekable();
+        matching.peek()?;
+        if matching.any(|entry| entry.force_allow_config) {
+            return store
+                .match_command_force_config(original, &cwd, Utc::now(), context.allow_once_audit)
+                .ok()
+                .flatten()
+                .map(|_| EvaluationResult::allowed_by_allow_once());
+        }
+        let policy = inspect_allow_once_policy(original, context, MAX_ALLOW_ONCE_POLICY_REPLAYS)?;
+        if policy.is_denied() {
+            // A new forced entry may have been granted while inspection ran;
+            // only the atomic force-only lookup may override this block.
+            return Some(
+                store
+                    .match_command_force_config(
+                        original,
+                        &cwd,
+                        Utc::now(),
+                        context.allow_once_audit,
+                    )
+                    .ok()
+                    .flatten()
+                    .map_or(policy, |_| EvaluationResult::allowed_by_allow_once()),
+            );
+        }
+        store
+            .match_command(original, &cwd, Utc::now(), context.allow_once_audit)
+            .ok()
+            .flatten()
+            .map(|_| EvaluationResult::allowed_by_allow_once())
+    })
+}
+
 /// Return whether evaluation may recurse into an executable payload before the
 /// ordinary full-command allowlist phase.
 ///
-/// Keep this predicate deliberately broad. It is only a performance guard for
-/// the allow-once store lookup; a false positive costs one bounded lookup,
-/// whereas a false negative would make an explicitly authorized outer command
-/// impossible to run because its nested payload is denied first.
+/// Keep this predicate deliberately broad. It schedules the early allow-once
+/// lookup, while the original outer request can also redeem after an actual
+/// denial. Unpredicted nested syntax must not become an authorization boundary,
+/// and unrelated commands that pass quick rejection still avoid store I/O.
 fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
     if check_triggers(command) == TriggerResult::Triggered
         || command.contains("$(")
@@ -14198,9 +14585,9 @@ fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
         return true;
     }
 
-    // A quoted or escaped interpreter path such as `'/usr/bin/python3' -c …`
-    // matches no trigger, yet the launcher verifier refuses or recurses into
-    // it before the deferred lookup (issue #599).
+    // Interpreter spellings beyond the trigger grammar, such as an internally
+    // quoted executable, can still reach a launcher refusal or recursive
+    // inspection before the deferred lookup (issue #599).
     if crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix)
         .into_iter()
         .any(|segment| {
@@ -14793,7 +15180,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         return EvaluationResult::denied_by_config(reason.to_string());
     }
 
-    let _safe_pattern_scope = SafePatternScope::enter(command, shell_dialect, nested_command_depth);
+    let safe_pattern_scope = SafePatternScope::enter(command, shell_dialect, nested_command_depth);
     let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
     let mut result = evaluate_command_in_dialect_union(
         command,
@@ -14875,6 +15262,44 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
             };
         }
         result.regex_evaluation_incomplete = true;
+    }
+    // The early lookup predicate is a performance guard, not an authorization
+    // boundary. A nested inspection it did not predict must not strand an
+    // exact grant for the original request. Recover only at the real outer
+    // entry, after detection views finish; same-depth internal replays and
+    // extracted children must never spend a grant for their derived text.
+    // Explicit configuration denials still require a forced grant, and an
+    // incomplete evaluation without a known denial remains fail-closed.
+    if nested_command_depth == 0
+        && safe_pattern_scope.previous.is_none()
+        && result.decision == EvaluationDecision::Deny
+        && let Some(info) = result.pattern_info.as_ref()
+    {
+        let authorization = if info.source == MatchSource::ConfigOverride {
+            allow_once_match_force_config(command, project_path, allow_once_audit)
+                .map(|_| EvaluationResult::allowed_by_allow_once())
+        } else {
+            allow_once_result(
+                command,
+                HeredocEvaluationContext {
+                    allowlists,
+                    heredoc_settings,
+                    project_path,
+                    deadline,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allow_once_audit,
+                    shell_dialect,
+                    nested_command_depth,
+                    inherited_automated_stdin,
+                },
+            )
+        };
+        if let Some(authorization) = authorization {
+            return authorization;
+        }
     }
     result
 }
@@ -15130,9 +15555,25 @@ fn evaluate_command_in_single_dialect_view(
         && (may_evaluate_nested_payload_before_allowlists(command)
             || !posix_executable_model.invocations.is_empty());
     if checked_allow_once_before_nested
-        && allow_once_match(allow_once_command, project_path, allow_once_audit).is_some()
+        && let Some(authorization) = allow_once_result(
+            allow_once_command,
+            HeredocEvaluationContext {
+                allowlists,
+                heredoc_settings,
+                project_path,
+                deadline,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allow_once_audit,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            },
+        )
     {
-        return EvaluationResult::allowed_by_allow_once();
+        return authorization;
     }
     if command_allowlisted_as_written(command, allowlists, project_path) {
         return EvaluationResult::allowed();
@@ -15792,9 +16233,25 @@ fn evaluate_command_in_single_dialect_view(
     // every unrelated hook invocation.
     if nested_command_depth == 0
         && !checked_allow_once_before_nested
-        && allow_once_match(allow_once_command, project_path, allow_once_audit).is_some()
+        && let Some(authorization) = allow_once_result(
+            allow_once_command,
+            HeredocEvaluationContext {
+                allowlists,
+                heredoc_settings,
+                project_path,
+                deadline,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allow_once_audit,
+                shell_dialect,
+                nested_command_depth,
+                inherited_automated_stdin,
+            },
+        )
     {
-        return EvaluationResult::allowed_by_allow_once();
+        return authorization;
     }
 
     // The careful-company Windows preset treats `hfdt` as a trusted first-party
@@ -33416,18 +33873,11 @@ where
         return EvaluationResult::allowed();
     }
 
-    // Step 1: Check allow-once overrides (may be superseded by config blocklist).
-    let allow_once = allow_once_match(command, None, None);
-
-    // Step 2: Check precompiled block overrides before allow overrides. Deny
-    // wins on overlapping config overrides unless allow-once was granted with
-    // force_allow_config.
+    // Check policy before consuming a single-use grant. An ordinary grant
+    // must remain available when an explicit block still denies the request.
     if let Some(reason) = compiled_overrides.check_block(command) {
-        if allow_once
-            .as_ref()
-            .is_some_and(|entry| entry.force_allow_config)
-        {
-            return EvaluationResult::allowed();
+        if allow_once_match_force_config(command, None, None).is_some() {
+            return EvaluationResult::allowed_by_allow_once();
         }
         return EvaluationResult::denied_by_config(reason.to_string());
     }
@@ -33436,22 +33886,38 @@ where
         return EvaluationResult::allowed();
     }
 
-    if allow_once.is_some() {
-        return EvaluationResult::allowed();
-    }
-
-    // Step 2.5: Pre-calculate ordered packs for heredoc recursion (and later use)
+    // Use the same policy-aware grant check as the modern evaluator, including
+    // blocks in reconstructed executable children.
     let enabled_packs: HashSet<String> = config.enabled_pack_ids();
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+    let heredoc_settings = config.heredoc_settings();
+    let project_path = resolve_project_path(&heredoc_settings, None);
+    let project_path = project_path.as_deref();
+    if let Some(authorization) = allow_once_result(
+        command,
+        HeredocEvaluationContext {
+            allowlists,
+            heredoc_settings: &heredoc_settings,
+            project_path,
+            deadline: None,
+            enabled_keywords,
+            ordered_packs: &ordered_packs,
+            keyword_index: keyword_index.as_ref(),
+            compiled_overrides,
+            allow_once_audit: None,
+            shell_dialect: ShellDialect::Unknown,
+            nested_command_depth: 0,
+            inherited_automated_stdin: false,
+        },
+    ) {
+        return authorization;
+    }
 
     // Step 3: Heredoc / inline-script detection (Tier 1/2/3, bounded fallback).
     // See `evaluate_command` for detailed rationale.
-    let heredoc_settings = config.heredoc_settings();
     let mut precomputed_sanitized = None;
     let mut heredoc_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
-    let project_path = resolve_project_path(&heredoc_settings, None);
-    let project_path = project_path.as_deref();
     if heredoc_settings.enabled && check_triggers(command) == TriggerResult::Triggered {
         let sanitized = sanitize_for_pattern_matching(command);
         let sanitized_str = sanitized.as_ref();
@@ -33807,6 +34273,24 @@ fn evaluate_heredoc(
         Ok(extraction) => extraction,
         Err(decided) => return Some(*decided),
     };
+
+    // A fallback can prove a destructive finding in unread source, but
+    // waiving that finding cannot prove that an explicit block is absent.
+    // Ordinary authorization must retain its denial and grant if policy
+    // inspection cannot read every source. Keep normal fallback behavior.
+    if ALLOW_ONCE_POLICY_REPLAY.with(std::cell::Cell::get)
+        && matches!(
+            &extraction,
+            ExtractionResult::Skipped(_)
+                | ExtractionResult::Partial { .. }
+                | ExtractionResult::Failed(_)
+        )
+    {
+        return Some(EvaluationResult {
+            decision: EvaluationDecision::Indeterminate,
+            ..EvaluationResult::allowed()
+        });
+    }
 
     let (contents, fallback_needed) = match extraction {
         ExtractionResult::Extracted(contents) => (contents, false),
@@ -34257,7 +34741,11 @@ fn evaluate_heredoc(
                             content.execution_target(),
                             line_number,
                         );
-                        info.source = MatchSource::HeredocAst; // Mark as heredoc source
+                        // Keep explicit policy provenance through the carrier:
+                        // policy modes and allow-once --force depend on it.
+                        if info.source != MatchSource::ConfigOverride {
+                            info.source = MatchSource::HeredocAst;
+                        }
                         if let Some(span) = info.matched_span {
                             if let Some(mapped_inner) =
                                 map_heredoc_span(command, &content, evaluated_start, evaluated_end)
@@ -34303,6 +34791,12 @@ fn evaluate_heredoc(
         {
             Ok(matches) => matches,
             Err(err) => {
+                if ALLOW_ONCE_POLICY_REPLAY.with(std::cell::Cell::get) {
+                    return Some(EvaluationResult {
+                        decision: EvaluationDecision::Indeterminate,
+                        ..EvaluationResult::allowed()
+                    });
+                }
                 if let Some(blocked) =
                     check_fallback_patterns(&content.content, context, first_allowlist_hit)
                 {
@@ -34788,7 +35282,9 @@ fn reconstructed_interpreter_commands_verdict(
                         .count()
                         + 1,
                 );
-                info.source = MatchSource::HeredocAst;
+                if info.source != MatchSource::ConfigOverride {
+                    info.source = MatchSource::HeredocAst;
+                }
                 info.matched_span =
                     map_heredoc_span(command, content, reconstructed.start, reconstructed.end);
                 info.matched_text_preview = info
@@ -35234,23 +35730,28 @@ fn check_command_fallback_patterns(
     let denial = check_fallback_patterns(command, context, first_allowlist_hit)?;
     let mut without_tier = context.heredoc_settings.clone();
     without_tier.enabled = false;
-    // Only the packs' own verdict is asked for: no allow-once grant is
-    // matched or spent here.
-    let packs = evaluate_command_with_pack_order_deadline_at_path_inner(
-        command,
-        context.enabled_keywords,
-        context.ordered_packs,
-        context.keyword_index,
-        context.compiled_overrides,
-        context.allowlists,
-        &without_tier,
-        None,
-        context.project_path,
-        context.deadline,
-        context.shell_dialect,
-        context.nested_command_depth,
-        context.inherited_automated_stdin,
-    );
+    // Only the packs' own verdict is asked for. This disabled-tier rescan
+    // discards an Allow, so none of its early, deferred, or forced lookups
+    // may spend a single-use grant. An absent audit config cannot ensure that.
+    // Permanent allowlists and overrides retain their existing semantics.
+    let packs = {
+        let _allow_once_scope = AllowOnceSuppressionScope::enter();
+        evaluate_command_with_pack_order_deadline_at_path_inner(
+            command,
+            context.enabled_keywords,
+            context.ordered_packs,
+            context.keyword_index,
+            context.compiled_overrides,
+            context.allowlists,
+            &without_tier,
+            None,
+            context.project_path,
+            context.deadline,
+            context.shell_dialect,
+            context.nested_command_depth,
+            context.inherited_automated_stdin,
+        )
+    };
     Some(if packs.decision == EvaluationDecision::Deny {
         packs
     } else {
@@ -43402,6 +43903,457 @@ mod tests {
         );
     }
 
+    #[test]
+    fn embedded_config_blocks_keep_their_source_and_deny_policy() {
+        for mode in [
+            crate::config::PolicyMode::Warn,
+            crate::config::PolicyMode::Log,
+        ] {
+            let mut config = default_config();
+            config.heredoc.timeout_ms = Some(5_000);
+            config.policy.default_mode = Some(mode);
+            config.overrides.block.push(crate::config::BlockOverride {
+                pattern: "^git status$".to_string(),
+                reason: "explicit embedded command block".to_string(),
+            });
+            for command in [
+                "bash -c 'git status'",
+                r#"python3 -c 'import os; os.system("git status")'"#,
+                r#"python3 -c 'import subprocess; subprocess.run(["git", "status"])'"#,
+            ] {
+                let detailed = evaluate_detailed(command, &config);
+                assert!(detailed.result.is_denied(), "{command}: {detailed:?}");
+                assert_eq!(
+                    detailed.result.effective_mode,
+                    Some(crate::packs::DecisionMode::Deny),
+                    "an embedded explicit block must not inherit {mode:?}: {command}"
+                );
+                assert_eq!(
+                    detailed
+                        .result
+                        .pattern_info
+                        .as_ref()
+                        .map(|info| info.source),
+                    Some(MatchSource::ConfigOverride),
+                    "the policy provenance must survive its carrier: {command}"
+                );
+                assert!(
+                    detailed.result.reason().is_some_and(|reason| {
+                        reason.contains("explicit embedded command block")
+                    }),
+                    "{command}: {detailed:?}"
+                );
+            }
+        }
+    }
+
+    fn inspect_allow_once_policy_for_test(
+        command: &str,
+        config: &Config,
+        allowlists: &LayeredAllowlist,
+        max_replays: usize,
+        deadline: Option<&Deadline>,
+        nested_command_depth: usize,
+    ) -> Option<EvaluationResult> {
+        let packs = config.enabled_pack_ids();
+        let ordered_packs = REGISTRY.expand_enabled_ordered(&packs);
+        let enabled_keywords = REGISTRY.collect_enabled_keywords(&packs);
+        let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled_overrides = config.overrides.compile();
+        let mut heredoc_settings = config.heredoc_settings();
+        heredoc_settings.limits.timeout_ms = 5_000;
+        inspect_allow_once_policy(
+            command,
+            HeredocEvaluationContext {
+                allowlists,
+                heredoc_settings: &heredoc_settings,
+                project_path: None,
+                deadline,
+                enabled_keywords: &enabled_keywords,
+                ordered_packs: &ordered_packs,
+                keyword_index: keyword_index.as_ref(),
+                compiled_overrides: &compiled_overrides,
+                allow_once_audit: None,
+                shell_dialect: ShellDialect::Posix,
+                nested_command_depth,
+                inherited_automated_stdin: false,
+            },
+            max_replays,
+        )
+    }
+
+    #[test]
+    fn allow_once_policy_replay_reaches_blocks_after_denials_and_warnings() {
+        let mut config = default_config();
+        config.overrides.block.push(crate::config::BlockOverride {
+            pattern: "^git status$".to_string(),
+            reason: "explicit later child block".to_string(),
+        });
+        let allowlists = default_allowlists();
+        for (command, first_mode) in [
+            (
+                r#"alias a="'/usr/bin/python3' -c 'print(1)'" b='git status'; a; b"#,
+                crate::packs::DecisionMode::Deny,
+            ),
+            (
+                "alias a='git stash drop' b='git status'; a; b",
+                crate::packs::DecisionMode::Warn,
+            ),
+            (
+                r#"bash -c "alias a='git reset --hard' b='git status'; a; b""#,
+                crate::packs::DecisionMode::Deny,
+            ),
+        ] {
+            let initial = {
+                let _scope = AllowOncePolicyScope::enter();
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix)
+            };
+            assert_eq!(initial.effective_mode, Some(first_mode), "{command}");
+            assert!(
+                inspect_allow_once_policy_for_test(command, &config, &allowlists, 1, None, 0)
+                    .is_none(),
+                "one finding cannot establish that later policy is clear: {command}"
+            );
+            let result = inspect_allow_once_policy_for_test(
+                command,
+                &config,
+                &allowlists,
+                MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                None,
+                0,
+            )
+            .expect("bounded replay reaches the later explicit policy");
+            assert!(result.is_denied(), "{command}: {result:?}");
+            assert_eq!(
+                result.pattern_info.as_ref().map(|info| info.source),
+                Some(MatchSource::ConfigOverride),
+                "{command}: {result:?}"
+            );
+            assert!(
+                result
+                    .reason()
+                    .is_some_and(|reason| reason.contains("explicit later child block")),
+                "the policy reason survives embedded-source context: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_once_policy_replay_requires_complete_bounded_progress() {
+        let mut config = default_config();
+        config.overrides.block.push(crate::config::BlockOverride {
+            pattern: "^unrelated-policy-command$".to_string(),
+            reason: "unrelated block".to_string(),
+        });
+        let allowlists = default_allowlists();
+        let command = r#"alias a="'/usr/bin/python3' -c 'print(1)'"; a"#;
+        for bound in [0, 1] {
+            assert!(
+                inspect_allow_once_policy_for_test(command, &config, &allowlists, bound, None, 0)
+                    .is_none(),
+                "an exhausted replay bound must not authorize"
+            );
+        }
+        let result = inspect_allow_once_policy_for_test(
+            command,
+            &config,
+            &allowlists,
+            MAX_ALLOW_ONCE_POLICY_REPLAYS,
+            None,
+            0,
+        )
+        .expect("an unrelated block does not prohibit a completed exact authorization");
+        assert!(result.is_allowed(), "{result:?}");
+        let deadline = Deadline::new(std::time::Duration::ZERO);
+        assert!(
+            inspect_allow_once_policy_for_test(
+                command,
+                &config,
+                &allowlists,
+                MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                Some(&deadline),
+                0,
+            )
+            .is_none(),
+            "an expired deadline cannot establish policy clearance"
+        );
+        assert!(
+            inspect_allow_once_policy_for_test(
+                command,
+                &config,
+                &allowlists,
+                MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                None,
+                MAX_EMBEDDED_SHELL_DEPTH + 1,
+            )
+            .is_none(),
+            "an unnamed nesting refusal cannot be waived to manufacture progress"
+        );
+    }
+
+    #[test]
+    fn allow_once_policy_replay_does_not_clear_unread_embedded_source() {
+        let mut config = default_config();
+        config.overrides.block.push(crate::config::BlockOverride {
+            pattern: "^git status$".to_string(),
+            reason: "block in the unread shell source".to_string(),
+        });
+        let allowlists = default_allowlists();
+        for (command, partial) in [
+            ("bash -c 'rm -rf /; git status'", false),
+            ("bash -c 'true'; bash -c 'rm -rf /; git status'", true),
+        ] {
+            config.heredoc.max_body_bytes = None;
+            config.heredoc.max_heredocs = None;
+            let complete = inspect_allow_once_policy_for_test(
+                command,
+                &config,
+                &allowlists,
+                MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                None,
+                0,
+            )
+            .expect("the full shell source exposes the explicit nested block");
+            assert!(complete.is_denied(), "{command}: {complete:?}");
+            assert_eq!(
+                complete.pattern_info.as_ref().map(|info| info.source),
+                Some(MatchSource::ConfigOverride),
+                "{command}: {complete:?}"
+            );
+
+            if partial {
+                config.heredoc.max_heredocs = Some(1);
+            } else {
+                config.heredoc.max_body_bytes = Some(8);
+            }
+            let mut settings = config.heredoc_settings();
+            settings.limits.timeout_ms = 5_000;
+            let extracted = extract_content(command, &settings.limits);
+            assert!(
+                if partial {
+                    matches!(
+                        &extracted,
+                        ExtractionResult::Partial { extracted, skipped }
+                            if extracted.len() == 1
+                                && extracted[0].content == "true"
+                                && skipped.iter().any(|reason| matches!(
+                                    reason,
+                                    SkipReason::ExceededHeredocLimit { limit: 1 }
+                                ))
+                    )
+                } else {
+                    matches!(&extracted, ExtractionResult::Skipped(_))
+                },
+                "fixture must actually leave source unread: {command}: {extracted:?}"
+            );
+            assert!(
+                inspect_allow_once_policy_for_test(
+                    command,
+                    &config,
+                    &allowlists,
+                    MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                    None,
+                    0,
+                )
+                .is_none(),
+                "waiving fallback findings must not certify unread policy: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_once_policy_replay_requires_this_launchers_literal_source() {
+        let mut config = default_config();
+        config.overrides.block.push(crate::config::BlockOverride {
+            pattern: "^git diff$".to_string(),
+            reason: "unrelated explicit block".to_string(),
+        });
+        let allowlists = default_allowlists();
+        for command in [
+            r"'/usr/bin/python3' -c 'print(1)'",
+            r#""/usr/bin/python3" -I -c 'print(1)'"#,
+            r"'/usr/bin/node' -e 'console.log(1)'",
+            r"'/usr/bin/ruby' -e 'puts 1'",
+            r"'/usr/bin/perl' -e 'print 1;'",
+        ] {
+            let result = inspect_allow_once_policy_for_test(
+                command,
+                &config,
+                &allowlists,
+                MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                None,
+                0,
+            )
+            .expect("a complete owned literal source can establish policy clearance");
+            assert!(result.is_allowed(), "{command}: {result:?}");
+        }
+
+        // Tier 2 really does extract this trailing decoy, but Python treats
+        // it as script argv. The internally quoted executable's own source
+        // remains unread, so any-extracted-content is insufficient evidence.
+        let decoy = r#"/usr/bin/py"thon3" -c 'import subprocess; subprocess.run(["git", "status"])' python3 -c 'print(1)'"#;
+        let mut limits = config.heredoc_settings().limits;
+        limits.timeout_ms = 5_000;
+        let ExtractionResult::Extracted(contents) = extract_content(decoy, &limits) else {
+            panic!("the fixture must contain a complete, unrelated source extraction");
+        };
+        assert!(contents.iter().any(|content| content.content == "print(1)"));
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.content.contains("git"))
+        );
+
+        for command in [
+            decoy,
+            r#"/usr/bin/py"thon3" -c 'print(1)'"#,
+            r#"/usr/bin/py"thon3" -c "print(\"python3 -c 'print(1)'\")""#,
+            r"'/usr/bin/python3' -m module -c 'print(1)'",
+            r#"'/usr/bin/python3' -c "$SCRIPT""#,
+            r"'/usr/bin/node' -e 'console.log(1)' -e 'console.log(2)'",
+            r"'/usr/bin/ruby' -e 'puts 1' -e 'puts 2'",
+            r"'/usr/bin/ruby' -E 'puts 1'",
+            r"'/usr/bin/lua' -e 'print(1)'",
+        ] {
+            assert!(
+                inspect_allow_once_policy_for_test(
+                    command,
+                    &config,
+                    &allowlists,
+                    MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                    None,
+                    0,
+                )
+                .is_none(),
+                "an unread or unowned source cannot establish policy clearance: {command}"
+            );
+        }
+
+        for (enabled, languages) in [
+            (Some(false), None),
+            (Some(true), Some(vec!["bash".to_string()])),
+        ] {
+            config.heredoc.enabled = enabled;
+            config.heredoc.languages = languages;
+            assert!(
+                inspect_allow_once_policy_for_test(
+                    r"'/usr/bin/python3' -c 'print(1)'",
+                    &config,
+                    &allowlists,
+                    MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                    None,
+                    0,
+                )
+                .is_none(),
+                "disabled language inspection cannot prove that policy is clear"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_once_policy_replay_cannot_waive_unverified_execution_sources() {
+        let mut config = default_config();
+        config.overrides.block.push(crate::config::BlockOverride {
+            pattern: "^git status$".to_string(),
+            reason: "source must be read to rule out this child".to_string(),
+        });
+        assert!(
+            collect_executable_text_sinks(r#"eval "$SCRIPT""#, ShellDialect::Posix)
+                .iter()
+                .any(|sink| matches!(sink, ExecutableTextSink::Unverified { .. }))
+        );
+        assert!(
+            collect_executable_text_sinks("opaque-producer | sh", ShellDialect::Posix)
+                .iter()
+                .any(|sink| matches!(sink, ExecutableTextSink::UnverifiedSource { .. }))
+        );
+        for (command, rule) in [
+            (
+                "powershell -EncodedCommand %%%",
+                "heredoc.shell:launcher-unverified",
+            ),
+            (r#"eval "$SCRIPT""#, "heredoc.posix:eval-dynamic"),
+            ("opaque-producer | sh", "heredoc.posix:pipeline-consumer"),
+        ] {
+            let allowlists = project_allowlists_for_rule(rule, "permanent rule exemption");
+            let ordinary = evaluate_with_pack_ids_and_allowlists_at_path(
+                command,
+                &["core.filesystem"],
+                &allowlists,
+                None,
+            );
+            assert!(
+                ordinary.is_allowed(),
+                "ordinary rule exemptions retain their behavior: {command}: {ordinary:?}"
+            );
+            assert!(
+                inspect_allow_once_policy_for_test(
+                    command,
+                    &config,
+                    &allowlists,
+                    MAX_ALLOW_ONCE_POLICY_REPLAYS,
+                    None,
+                    0,
+                )
+                .is_none(),
+                "waiving an actual incomplete-source finding is not a policy proof: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_once_policy_replay_suppresses_grants_and_restores_their_scope() {
+        let command = "bash -c 'git status'";
+        let mut config = default_config();
+        config
+            .overrides
+            .allow
+            .push(crate::config::AllowOverride::Simple(".*".to_string()));
+        config.overrides.block.push(crate::config::BlockOverride {
+            pattern: "^git status$".to_string(),
+            reason: "policy behind exemptions".to_string(),
+        });
+        config.heredoc.allowlist = Some(crate::config::HeredocAllowlistConfig {
+            patterns: vec![crate::config::AllowedHeredocPattern {
+                language: None,
+                pattern: "git status".to_string(),
+                reason: "content exemption must not settle policy inspection".to_string(),
+            }],
+            ..Default::default()
+        });
+        let allowlists = project_allowlists_for_command_selector(
+            AllowSelector::ExactCommand(command.to_string()),
+            false,
+        );
+        let compiled = config.overrides.compile();
+        assert!(command_allowed_by_override_as_written(command, &compiled));
+        let result = inspect_allow_once_policy_for_test(
+            command,
+            &config,
+            &allowlists,
+            MAX_ALLOW_ONCE_POLICY_REPLAYS,
+            None,
+            0,
+        )
+        .expect("whole-command exemptions cannot hide an explicit nested block");
+        assert!(result.is_denied(), "{result:?}");
+        assert_eq!(
+            result.pattern_info.as_ref().map(|info| info.source),
+            Some(MatchSource::ConfigOverride)
+        );
+        assert!(command_allowed_by_override_as_written(command, &compiled));
+        {
+            let _outer = AllowOncePolicyScope::enter();
+            assert!(original_command_grant(command, |_| Some(())).is_none());
+            {
+                let _inner = AllowOncePolicyScope::enter();
+                assert!(original_command_grant(command, |_| Some(())).is_none());
+            }
+            assert!(original_command_grant(command, |_| Some(())).is_none());
+        }
+        assert_eq!(original_command_grant(command, |_| Some(())), Some(()));
+    }
+
     // =========================================================================
     // Match Span Tests (git_safety_guard-99e.2.4)
     // =========================================================================
@@ -51264,19 +52216,45 @@ mod tests {
         ));
         let redaction = crate::logging::RedactionConfig::default();
 
-        // Exercise the deferred lookup, pre-recursion lookup, and forced
-        // config-override lookup. All three must use the same request scope.
-        for (command, force) in [
-            ("git reset --hard HEAD", false),
-            ("sh -c 'git reset --hard HEAD'", false),
-            ("sh -c 'cd \"$DEST\" && git reset --hard HEAD'", false),
-            ("git reset --hard HEAD", true),
+        const QUOTED: &str = r"'/usr/bin/python3' -c 'print(1)'";
+        const QUOTED_ALIAS: &str = r#"alias a="'/usr/bin/python3' -c 'print(1)'"; a"#;
+        const LATE_QUOTED_ALIAS: &str = r#"alias a='/usr/bin/py"thon3" -c "print(1)"'; a"#;
+        assert!(
+            !may_evaluate_nested_payload_before_allowlists(LATE_QUOTED_ALIAS),
+            "this carrier must exercise recovery after nested inspection"
+        );
+
+        // Deferred, pre-recursion, late-recovery, and forced lookups all use
+        // the same request scope. An unrelated block additionally exercises
+        // the advisory preview, policy inspection, and atomic grant match.
+        for (command, force, inspect_policy) in [
+            ("git reset --hard HEAD", false, false),
+            ("sh -c 'git reset --hard HEAD'", false, false),
+            (
+                "sh -c 'cd \"$DEST\" && git reset --hard HEAD'",
+                false,
+                false,
+            ),
+            ("git reset --hard HEAD", true, false),
+            (QUOTED, false, false),
+            (QUOTED_ALIAS, false, false),
+            (QUOTED, false, true),
+            (QUOTED_ALIAS, false, true),
+            (QUOTED, true, false),
+            (QUOTED_ALIAS, true, false),
+            (LATE_QUOTED_ALIAS, false, false),
         ] {
             let mut config = default_config();
+            config.heredoc.timeout_ms = Some(5_000);
             if force {
                 config.overrides.block.push(crate::config::BlockOverride {
                     pattern: format!("^{}$", regex::escape(command)),
                     reason: "request-directory forced-grant control".to_string(),
+                });
+            } else if inspect_policy {
+                config.overrides.block.push(crate::config::BlockOverride {
+                    pattern: "^git status$".to_string(),
+                    reason: "unrelated policy still requires a request-scoped grant".to_string(),
                 });
             }
             let enabled = config.enabled_pack_ids();
@@ -51496,6 +52474,30 @@ mod tests {
             assert!(!active[0].is_consumed());
 
             if explicit_block && !force_allow_config {
+                let no_safe: [crate::packs::SafePattern; 0] = [];
+                let destructive = [crate::destructive_pattern!(
+                    "policy-rm",
+                    r"\brm\b",
+                    "decision-only policy control"
+                )];
+                let legacy = evaluate_command_with_legacy(
+                    approved,
+                    &config,
+                    &["rm"],
+                    &config.overrides.compile(),
+                    &default_allowlists(),
+                    &no_safe,
+                    &destructive,
+                );
+                assert!(legacy.is_denied(), "legacy policy: {legacy:?}");
+                assert_eq!(
+                    store
+                        .preview_active(Utc::now())
+                        .expect("inspect legacy policy refusal")
+                        .0,
+                    std::slice::from_ref(&entry),
+                    "legacy policy must refuse before spending an ordinary grant"
+                );
                 assert!(evaluate_detailed(approved, &config).result.is_denied());
                 assert_eq!(
                     store
@@ -51572,15 +52574,16 @@ mod tests {
             return;
         }
 
-        // Issue #599: a quoted interpreter path matches no heredoc trigger, so
-        // the launcher verifier refused these before the deferred grant lookup
-        // and a reviewed exact grant could never be redeemed.
+        // Issue #599: a quoted interpreter path previously missed the heredoc
+        // trigger, and a launcher refusal could strand an exact authorization
+        // before the deferred grant lookup.
         let cwd = std::env::current_dir().expect("fixture working directory");
         let cwd_text = cwd.to_string_lossy();
         let store = AllowOnceStore::new(PathBuf::from(
             std::env::var_os(ENV_ALLOW_ONCE_PATH).expect("isolated allow-once store"),
         ));
-        let config = default_config();
+        let mut config = default_config();
+        config.heredoc.timeout_ms = Some(5_000);
         let redaction = crate::logging::RedactionConfig::default();
         let active_grants = || store.preview_active(Utc::now()).expect("inspect grants").0;
 
@@ -51650,6 +52653,153 @@ mod tests {
                 "{command}: the grant remains single-use"
             );
         }
+
+        // The bounded fallback rechecks a detection view at the same numeric
+        // depth. Neither its view's grant nor the enclosing request's grant
+        // may be spent before the caller discards an internal allow. Keep a
+        // direct launcher here: an alias would deliberately withdraw the
+        // diagnostic mask because it can rebind the dcg command (#584).
+        let original =
+            r"dcg test 'git reset --hard'; '/usr/bin/python3' -c 'print(1)'; git reset --hard";
+        let derived = mask_dcg_self_inspection_segments(original, ShellDialect::Posix);
+        assert_ne!(derived.as_ref(), original, "diagnostic must be masked");
+        assert!(may_evaluate_nested_payload_before_allowlists(original));
+        assert!(may_evaluate_nested_payload_before_allowlists(&derived));
+        let refused = evaluate_detailed(&derived, &config);
+        assert_eq!(
+            refused
+                .result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("inline-launcher-unverified"),
+            "the replay must stop before the deferred grant lookup: {refused:?}"
+        );
+        let now = Utc::now();
+        let pending = PendingExceptionRecord::new(
+            now,
+            &cwd_text,
+            &derived,
+            "reviewed independent detection-view spelling",
+            &redaction,
+            true,
+            None,
+        );
+        let entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            &cwd_text,
+            true,
+            false,
+            &redaction,
+        );
+        store
+            .add_entry(&entry, now)
+            .expect("seed replay-view grant");
+        let original_pending = PendingExceptionRecord::new(
+            now,
+            &cwd_text,
+            original,
+            "reviewed original request",
+            &redaction,
+            true,
+            None,
+        );
+        let original_entry = AllowOnceEntry::from_pending(
+            &original_pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            &cwd_text,
+            true,
+            false,
+            &redaction,
+        );
+        store
+            .add_entry(&original_entry, now)
+            .expect("seed original-request grant");
+        let mut forced_entry = original_entry.clone();
+        forced_entry.force_allow_config = true;
+        store
+            .add_entry(&forced_entry, now)
+            .expect("seed forced original-request grant");
+        let mut forced_config = default_config();
+        forced_config
+            .overrides
+            .block
+            .push(crate::config::BlockOverride {
+                pattern: format!("^{}$", regex::escape(original)),
+                reason: "explicit fallback policy".to_string(),
+            });
+        let forced_compiled = forced_config.overrides.compile();
+        let packs = config.enabled_pack_ids();
+        let ordered_packs = REGISTRY.expand_enabled_ordered(&packs);
+        let keywords = REGISTRY.collect_enabled_keywords(&packs);
+        let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
+        let settings = config.heredoc_settings();
+        {
+            let _outer = SafePatternScope::enter(original, ShellDialect::Posix, 0);
+            let context = HeredocEvaluationContext {
+                allowlists: &allowlists,
+                heredoc_settings: &settings,
+                project_path: None,
+                deadline: None,
+                enabled_keywords: &keywords,
+                ordered_packs: &ordered_packs,
+                keyword_index: keyword_index.as_ref(),
+                compiled_overrides: &compiled,
+                allow_once_audit: None,
+                shell_dialect: ShellDialect::Posix,
+                nested_command_depth: 0,
+                inherited_automated_stdin: false,
+            };
+            for view in [derived.as_ref(), original] {
+                let replay = check_command_fallback_patterns(view, context, &mut None)
+                    .expect("the trailing reset must trigger the bounded fallback");
+                assert!(replay.is_denied(), "internal replay: {replay:?}");
+                assert_eq!(
+                    active_grants(),
+                    [entry.clone(), original_entry.clone(), forced_entry.clone()],
+                    "an internal same-depth replay must not consume any grant: {view}"
+                );
+            }
+            let forced_replay = check_command_fallback_patterns(
+                original,
+                HeredocEvaluationContext {
+                    compiled_overrides: &forced_compiled,
+                    ..context
+                },
+                &mut None,
+            )
+            .expect("explicit block in a finding-only replay");
+            assert!(forced_replay.is_denied());
+            assert_eq!(
+                forced_replay.pattern_info.as_ref().map(|info| info.source),
+                Some(MatchSource::ConfigOverride)
+            );
+            assert_eq!(
+                active_grants(),
+                [entry.clone(), original_entry.clone(), forced_entry],
+                "the direct force-only helper must also remain non-consuming"
+            );
+        }
+        let forced = evaluate_detailed(original, &forced_config);
+        assert_eq!(forced.result.bypass_method, Some(BypassMethod::AllowOnce));
+        assert_eq!(active_grants(), [entry.clone(), original_entry]);
+        let explicit = evaluate_detailed(original, &config);
+        assert_eq!(explicit.result.bypass_method, Some(BypassMethod::AllowOnce));
+        assert_eq!(active_grants(), std::slice::from_ref(&entry));
+        assert!(evaluate_detailed(original, &config).result.is_denied());
+        assert_eq!(active_grants(), [entry]);
+        let explicit = evaluate_detailed(&derived, &config);
+        assert_eq!(explicit.result.bypass_method, Some(BypassMethod::AllowOnce));
+        assert!(
+            active_grants().is_empty(),
+            "independent exact request consumes"
+        );
+        assert!(evaluate_detailed(&derived, &config).result.is_denied());
         println!("{CHILD_COMPLETION}");
     }
 

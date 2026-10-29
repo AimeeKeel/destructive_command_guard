@@ -83,6 +83,9 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
     // - Windows .exe extensions (python.exe, python3.11.exe, etc.)
     // - Attached quotes (python -c"...", bash -c'...')
+    // - A closing quote on the executable path ('/usr/bin/python3' -c ...).
+    //   Tier 2 already accepts it; without this, an argv-form Python sink
+    //   with no incidental trigger can skip language-aware inspection (#599).
     //
     // Tier 1 MUST have zero false negatives for Tier 2 extraction.
     //
@@ -92,18 +95,18 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     // superset invariant.  False positives are acceptable for Tier 1.
     r"<<<",
     // Python inline execution (matches python, python3, python3.11, python.exe, python3.11.exe, etc.)
-    r#"\bpython[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ce][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bpython[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ce][A-Za-z]*(?:\s|['"]|$)"#,
     // Ruby inline execution (matches ruby, ruby3, ruby3.0, ruby.exe, etc.)
-    r#"\bruby[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
-    r#"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bruby[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\birb[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Perl inline execution (matches perl, perl5, perl5.36, perl.exe, etc.)
-    r#"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bperl[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
     // Node.js inline execution (matches node, node18, nodejs, node.exe, etc.)
-    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // Bun and Deno inline execution (issue #397). Bun runs `-e`/`-p` exactly as
     // Node does, so the identical payload must reach the identical rules; before
     // this, swapping `node` for `bun` was a one-word bypass of a live deny.
-    r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\b(?:bun|deno)[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // Bun's `exec` subcommand hands its argument to a shell, so it is an inline
     // shell payload under a subcommand rather than a flag (issue #397).
     // The optional quote matches `subcommand_inline_payload`, which dequotes the
@@ -134,15 +137,15 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 31] = [
     r"\$\.system\s*\(",
     r"\.doShellScript\s*\(",
     // PHP inline execution
-    r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bphp[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
-    r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\blua[0-9.]*(?:\.exe)?\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+['\x22]?-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.).
     // dash/ksh/mksh are ordinary POSIX shells: without them `dash -c "git
     // reset --hard"` was never unwrapped, and command-position rules such as
     // core.git never saw the payload. An option or its value may be quoted
     // (`bash -o 'errexit' -c`, `bash '-e' -c`); the argv is the same.
-    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b["']?(?:\s+['\x22]?(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?['\x22]?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*|['\x22][A-Za-z_][A-Za-z0-9_]*['\x22]))?)*\s+['\x22]?-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
     // PowerShell inline execution (powershell -Command '...', pwsh -c "...",
     // and Windows full-path forms like
     //   "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '...'
@@ -2612,6 +2615,99 @@ static INLINE_SHELL_ARGUMENT_AFTER_C: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"{prefix}\s+(\S)")).expect("shell argument locator compiles")
 });
 
+/// The first source operand owned by a literal POSIX shell invocation.
+///
+/// A regex locator can mistake an inner `-c` for the launcher's flag: its
+/// optional option operands may swallow `sh -c` and a quoted interpreter
+/// path inside the shell's source (#599). Follow complete argv words instead,
+/// stopping at the first operand after the shell's own `-c`. Value-taking
+/// options still own their next word, and options after `-c` remain options.
+/// Unknown option syntax and launchers inside enclosing words retain the
+/// existing extraction path; this only replaces a provably owned source.
+fn posix_shell_inline_source_start(
+    command: &str,
+    launcher_start: usize,
+    launcher_name: &str,
+) -> Option<usize> {
+    let name = launcher_name.strip_suffix(".exe").unwrap_or(launcher_name);
+    if !matches!(name, "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh") {
+        return None;
+    }
+    let launcher = shell_word_around(command, launcher_start)?;
+    let executable = crate::normalize::decode_posix_literal_word(command.get(launcher.clone())?)?;
+    if executable.rsplit('/').next() != Some(launcher_name) {
+        return None;
+    }
+
+    let bytes = command.as_bytes();
+    let mut cursor = launcher.end;
+    let mut has_code_flag = false;
+    let mut option_value = false;
+    let mut options_ended = false;
+    // Keep the ownership check bounded even on a command of only options.
+    for _ in 0..64 {
+        while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+        let start = cursor;
+        cursor = crate::normalize::consume_posix_word_token(bytes, start, bytes.len());
+        if cursor <= start {
+            return None;
+        }
+        if options_ended {
+            return Some(start);
+        }
+        let Some(word) = crate::normalize::decode_posix_literal_word(&command[start..cursor])
+        else {
+            return (has_code_flag && !option_value).then_some(start);
+        };
+        if option_value {
+            option_value = false;
+            continue;
+        }
+        if matches!(word.as_ref(), "--" | "-") {
+            if !has_code_flag {
+                return None;
+            }
+            options_ended = true;
+            continue;
+        }
+        if word.starts_with("--") {
+            match word.as_ref() {
+                "--rcfile" | "--init-file" => option_value = true,
+                "--norc" | "--noprofile" | "--login" | "--posix" | "--restricted" | "--verbose" => {
+                }
+                _ => return None,
+            }
+        } else if word.starts_with(['-', '+']) {
+            let flags = &word[1..];
+            // Only known flag arities can prove where the source starts.
+            // Other shells/versions have value-taking short options such as
+            // ksh -R or mksh -T; leave those on the existing extraction path.
+            const NO_VALUE_FLAGS: &[u8] = b"abCefhiklmnprstuvx";
+            if flags.is_empty()
+                || !flags.bytes().all(|byte| {
+                    NO_VALUE_FLAGS.contains(&byte) || matches!(byte, b'c' | b'o' | b'O')
+                })
+                || (name == "zsh" && flags.contains('b'))
+                || (word.starts_with('+') && flags.contains('c'))
+            {
+                return None;
+            }
+            // -o/-O take the next argv word, including a word spelled -c.
+            // Do not infer semantics for an option name glued into a cluster.
+            if flags[..flags.len() - 1].contains(['o', 'O']) {
+                return None;
+            }
+            has_code_flag |= word.starts_with('-') && flags.contains('c');
+            option_value = flags.ends_with(['o', 'O']);
+        } else {
+            return has_code_flag.then_some(start);
+        }
+    }
+    None
+}
+
 /// Extract inline scripts from -c/-e flags.
 fn extract_inline_scripts(
     command: &str,
@@ -2723,6 +2819,17 @@ fn extract_inline_scripts(
                 continue;
             };
             let captured = content_match.start()..content_match.end();
+            let shell_source_start = (!is_powershell)
+                .then(|| {
+                    cap.get(1).and_then(|name| {
+                        posix_shell_inline_source_start(
+                            redirect_view.as_deref().unwrap_or(command),
+                            name.start(),
+                            cmd_name,
+                        )
+                    })
+                })
+                .flatten();
             let program = if is_powershell {
                 InlineProgram {
                     content: Cow::Borrowed(content),
@@ -2730,6 +2837,8 @@ fn extract_inline_scripts(
                     word_range: captured,
                     resolved: false, // native dialect remains on its existing path
                 }
+            } else if let Some(start) = shell_source_start {
+                inline_program_at(command, start, start..start + 1, skip_reasons)
             } else if raw_argument {
                 inline_program_at(command, captured.start, captured, skip_reasons)
             } else {
@@ -2738,6 +2847,7 @@ fn extract_inline_scripts(
             // The shell consumes these as options after -c, not as code.
             // The dedicated options-after-c locator recovers the operand.
             if raw_argument
+                && shell_source_start.is_none()
                 && ScriptLanguage::from_command(cmd_name) == ScriptLanguage::Bash
                 && program.content.starts_with(['-', '+'])
             {
@@ -23361,6 +23471,189 @@ EOF";
             assert!(
                 !contents.iter().any(|c| c.content == not_payload),
                 "{command:?}: {contents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_interpreter_triggers_reach_complete_source_extraction_issue_599() {
+        let limits = ExtractionLimits {
+            timeout_ms: 5_000,
+            ..ExtractionLimits::default()
+        };
+        // These are classification inputs only. In particular, the Python
+        // argv sink has no `system(` or other incidental trigger to rescue
+        // an interpreter trigger that fails at the executable's closing quote.
+        let python = r#"import subprocess; subprocess.run(["git", "reset", "--hard"]); subprocess.run(["git", "status"])"#;
+        for (name, flag, source, language) in [
+            ("python3", "-c", python, ScriptLanguage::Python),
+            ("python3.11.exe", "-c", python, ScriptLanguage::Python),
+            ("ruby3.0", "-e", "puts 1", ScriptLanguage::Ruby),
+            ("irb3.0", "-e", "puts 1", ScriptLanguage::Ruby),
+            ("perl5.36", "-e", "print 1", ScriptLanguage::Perl),
+            (
+                "nodejs20",
+                "-e",
+                "console.log(1)",
+                ScriptLanguage::JavaScript,
+            ),
+            ("bun1.2", "-e", "console.log(1)", ScriptLanguage::TypeScript),
+            ("php8.3", "-r", "echo 1;", ScriptLanguage::Php),
+            // Lua is extracted with the existing unknown-language fallback.
+            ("lua5.4", "-e", "print(1)", ScriptLanguage::Unknown),
+            ("sh", "-c", "git status", ScriptLanguage::Bash),
+            ("bash", "-c", "git status", ScriptLanguage::Bash),
+            ("dash", "-c", "git status", ScriptLanguage::Bash),
+            ("zsh", "-c", "git status", ScriptLanguage::Bash),
+            ("fish", "-c", "git status", ScriptLanguage::Bash),
+            ("ksh93", "-c", "git status", ScriptLanguage::Bash),
+            ("mksh", "-c", "git status", ScriptLanguage::Bash),
+        ] {
+            let path = format!("/usr/bin/{name}");
+            for executable in [path.clone(), format!("'{path}'"), format!("\"{path}\"")] {
+                let command = format!("{executable} {flag} '{source}'");
+                assert_eq!(
+                    check_triggers(&command),
+                    TriggerResult::Triggered,
+                    "Tier 1 must reach the extraction Tier 2 supports: {command}"
+                );
+                let contents = match extract_content(&command, &limits) {
+                    ExtractionResult::Extracted(contents) => contents,
+                    other => panic!("{command:?}: {other:?}"),
+                };
+                assert_eq!(contents.len(), 1, "{command:?}: {contents:?}");
+                assert_eq!(contents[0].language, language, "{command:?}");
+                assert_eq!(contents[0].content, source, "{command:?}");
+                assert_eq!(
+                    contents[0]
+                        .word_range
+                        .as_ref()
+                        .and_then(|range| command.get(range.clone())),
+                    Some(format!("'{source}'").as_str()),
+                    "the complete source operand must be inspected: {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_shell_sources_keep_their_own_inline_flag_issue_599() {
+        let limits = ExtractionLimits {
+            timeout_ms: 5_000,
+            ..ExtractionLimits::default()
+        };
+        // These are extraction inputs only. No interpreter or shell runs.
+        for (inner, python_source) in [
+            ("'/usr/bin/python3' -c 'print(1)'", "print(1)"),
+            (
+                "'/usr/bin/python3' -c 'import pathlib; pathlib.Path(\"important.txt\").unlink()'",
+                "import pathlib; pathlib.Path(\"important.txt\").unlink()",
+            ),
+            (
+                "python3 -c 'import pathlib; pathlib.Path(\"other.txt\").unlink()'",
+                "import pathlib; pathlib.Path(\"other.txt\").unlink()",
+            ),
+        ] {
+            let quoted = format!("'{}'", inner.replace('\'', "'\"'\"'"));
+            for (prefix, suffix) in [
+                ("sh -c", ""),
+                ("bash --norc -lc", ""),
+                ("bash --rcfile /tmp/dcg599.rc -c", ""),
+                ("bash --rcfile '-c' -c", ""),
+                ("bash -o errexit -c", ""),
+                ("bash -c -o 'errexit'", ""),
+                ("sh -c --", ""),
+                ("sh 2>/dev/null -c", ""),
+                ("sh -c", " ignored -c 'git reset --hard'"),
+            ] {
+                let command = format!("{prefix} {quoted}{suffix}");
+                assert_eq!(check_triggers(&command), TriggerResult::Triggered);
+                let contents = match extract_content(&command, &limits) {
+                    ExtractionResult::Extracted(contents) => contents,
+                    other => panic!("{command:?}: {other:?}"),
+                };
+                let word_start = prefix.len() + 1;
+                let word_range = word_start..word_start + quoted.len();
+                // The raw view can extract an inner Python program before
+                // the redirect-blanked view finds the outer shell. That
+                // additive read is valid; the shell must still own exactly
+                // one complete source, rather than an inner -c operand.
+                let outer: Vec<_> = contents
+                    .iter()
+                    .filter(|content| content.byte_range.start < word_start)
+                    .collect();
+                assert_eq!(outer.len(), 1, "{command:?}: {contents:?}");
+                let source = outer[0];
+                assert_eq!(source.language, ScriptLanguage::Bash, "{command:?}");
+                assert_eq!(source.content, inner, "{command:?}");
+                assert_eq!(source.word_range.as_ref(), Some(&word_range), "{command:?}");
+                assert_eq!(
+                    source.execution_target(),
+                    prefix.split_whitespace().next(),
+                    "{command:?}"
+                );
+                assert_eq!(
+                    source
+                        .word_range
+                        .as_ref()
+                        .and_then(|range| command.get(range.clone())),
+                    Some(quoted.as_str()),
+                    "the complete outer argv word owns this source: {command:?}"
+                );
+                for child in contents
+                    .iter()
+                    .filter(|content| content.byte_range.start >= word_start)
+                {
+                    assert_eq!(child.language, ScriptLanguage::Python, "{command:?}");
+                    assert_eq!(child.content, python_source, "{command:?}");
+                    assert!(child.byte_range.end <= word_range.end, "{command:?}");
+                    assert!(
+                        child.word_range.as_ref().is_some_and(|range| {
+                            range.start > word_range.start && range.end < word_range.end
+                        }),
+                        "only the contained Python source may be an additive extraction: {command:?}"
+                    );
+                }
+            }
+        }
+        // Selecting the first generic regex flag would break Python -E or
+        // Perl -p. Their distinct option/source grammars remain unchanged.
+        for (command, language, source) in [
+            (
+                "python3 -E -c 'print(1)'",
+                ScriptLanguage::Python,
+                "print(1)",
+            ),
+            ("perl -pi -e 'print 1'", ScriptLanguage::Perl, "print 1"),
+            (
+                "node --require /tmp/setup.js -e 'console.log(1)'",
+                ScriptLanguage::JavaScript,
+                "console.log(1)",
+            ),
+        ] {
+            let contents = match extract_content(command, &limits) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{command:?}: {other:?}"),
+            };
+            assert_eq!(contents.len(), 1, "{command:?}: {contents:?}");
+            assert_eq!(contents[0].language, language, "{command:?}");
+            assert_eq!(contents[0].content, source, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn inline_shell_source_ownership_leaves_unmodeled_options_to_existing_extraction() {
+        for (command, shell) in [
+            ("ksh -c -R /tmp/dcg599.crossref 'git reset --hard'", "ksh"),
+            ("mksh -c -T /dev/ttyCn 'git reset --hard'", "mksh"),
+            ("bash -c -Z 'git reset --hard'", "bash"),
+            ("zsh -b -c 'git reset --hard'", "zsh"),
+            ("bash -c +c 'git reset --hard'", "bash"),
+        ] {
+            assert_eq!(
+                posix_shell_inline_source_start(command, 0, shell),
+                None,
+                "unmodeled option semantics cannot prove source ownership: {command}"
             );
         }
     }

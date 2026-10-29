@@ -1460,6 +1460,17 @@ mod allow_once_management_tests {
 
 mod allow_once_flow_tests {
     use super::*;
+    use destructive_command_guard::pending_exceptions::{
+        AllowOnceEntry, AllowOnceScopeKind, PendingExceptionRecord,
+    };
+
+    const INLINE_POLICY_REASON: &str = "issue 599 explicit policy";
+    const INLINE_SENTINEL: &str = "decision-only sentinel\n";
+    const QUOTED_PRINT: &str = "'/usr/bin/python3' -c 'print(1)'";
+    const QUOTED_UNLINK: &str =
+        "'/usr/bin/python3' -c 'import pathlib; pathlib.Path(\"important.txt\").unlink()'";
+    const UNQUOTED_UNLINK: &str =
+        "python3 -c 'import pathlib; pathlib.Path(\"important.txt\").unlink()'";
 
     /// Dedicated test environment with control over all file paths.
     struct FlowTestEnv {
@@ -1468,17 +1479,25 @@ mod allow_once_flow_tests {
         xdg_config_dir: std::path::PathBuf,
         pending_path: std::path::PathBuf,
         allow_once_path: std::path::PathBuf,
+        config_path: Option<std::path::PathBuf>,
     }
 
     impl FlowTestEnv {
         fn new() -> Self {
+            Self::with_repository(true)
+        }
+
+        fn with_repository(repository: bool) -> Self {
             let temp = tempfile::tempdir().expect("tempdir");
             let home_dir = temp.path().join("home");
             let xdg_config_dir = temp.path().join("xdg_config");
             std::fs::create_dir_all(&home_dir).expect("HOME dir");
             std::fs::create_dir_all(&xdg_config_dir).expect("XDG_CONFIG_HOME dir");
-            // Create a .git directory so it's recognized as a repo
-            std::fs::create_dir_all(temp.path().join(".git")).expect(".git dir");
+            // Preserve the existing tests' project scope. The inline tests
+            // deliberately use a plain directory to exercise exact cwd scope.
+            if repository {
+                std::fs::create_dir_all(temp.path().join(".git")).expect(".git dir");
+            }
 
             let pending_path = temp.path().join("pending_exceptions.jsonl");
             let allow_once_path = temp.path().join("allow_once.jsonl");
@@ -1489,7 +1508,219 @@ mod allow_once_flow_tests {
                 xdg_config_dir,
                 pending_path,
                 allow_once_path,
+                config_path: None,
             }
+        }
+
+        fn with_inline_policy() -> Self {
+            let mut env = Self::with_repository(false);
+            for directory in ["tmp", "xdg_cache", "xdg_state", "xdg_data", "other_cwd"] {
+                std::fs::create_dir_all(env.temp.path().join(directory))
+                    .expect("isolated inline test directory");
+            }
+            for filename in ["important.txt", "other.txt"] {
+                std::fs::write(env.temp.path().join(filename), INLINE_SENTINEL)
+                    .expect("decision-only payload sentinel");
+            }
+            env.config_path = Some(env.temp.path().join("inline-policy.toml"));
+            env.write_inline_policy(None);
+            env
+        }
+
+        fn write_inline_policy(&self, blocked_command: Option<&str>) {
+            let block = blocked_command.map_or_else(String::new, |command| {
+                format!(
+                    "[overrides]\nblock = [{{ pattern = {:?}, reason = {:?} }}]\n",
+                    format!("^{}$", regex::escape(command)),
+                    INLINE_POLICY_REASON,
+                )
+            });
+            std::fs::write(
+                self.config_path.as_ref().expect("inline policy path"),
+                format!(
+                    "[general]\ncheck_updates = false\nself_heal_hook = false\n\
+                     [packs]\nenabled = [\"core.git\", \"core.filesystem\"]\n\
+                     [history]\nenabled = false\n\
+                     [heredoc]\nenabled = true\ntimeout_ms = 5000\n\
+                     fallback_on_parse_error = false\n{block}"
+                ),
+            )
+            .expect("write isolated inline policy");
+        }
+
+        fn inline_command(&self, cwd: &std::path::Path) -> Command {
+            let scratch = self.temp.path().join("tmp");
+            let mut command = Command::new(dcg_binary());
+            command
+                .env_clear()
+                .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
+                .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
+                .env("XDG_CACHE_HOME", self.temp.path().join("xdg_cache"))
+                .env("XDG_STATE_HOME", self.temp.path().join("xdg_state"))
+                .env("XDG_DATA_HOME", self.temp.path().join("xdg_data"))
+                .env("TMPDIR", &scratch)
+                .env("TEMP", &scratch)
+                .env("TMP", &scratch)
+                .env(
+                    "DCG_CONFIG",
+                    self.config_path.as_ref().expect("inline policy path"),
+                )
+                .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+                .env("DCG_PENDING_EXCEPTIONS_PATH", &self.pending_path)
+                .env("DCG_ALLOW_ONCE_PATH", &self.allow_once_path)
+                .env("DCG_NO_SELF_HEAL", "1")
+                .env("DCG_SELF_HEAL_HOOK", "0")
+                .env("DCG_NO_UPDATE_CHECK", "1")
+                .env("DCG_HOOK_TIMEOUT_MS", "5000")
+                .env("DCG_DIALECT", "posix")
+                .env("NO_COLOR", "1")
+                .env("TERM", "dumb")
+                .current_dir(cwd)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        }
+
+        /// The candidate is JSON data for DCG. No candidate shell or Python
+        /// interpreter is launched by these tests.
+        fn run_inline_hook(
+            &self,
+            tool: &str,
+            candidate: &str,
+            cwd: &std::path::Path,
+        ) -> HookRunOutput {
+            let payload = serde_json::json!({
+                "tool_name": tool,
+                "tool_input": { "command": candidate },
+            });
+            let mut child = self
+                .inline_command(cwd)
+                .arg("hook")
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("spawn inline decision-only hook");
+            serde_json::to_writer(child.stdin.take().expect("hook stdin"), &payload)
+                .expect("write inert candidate JSON");
+            let output = child.wait_with_output().expect("wait for inline hook");
+            self.assert_payload_untouched();
+            HookRunOutput {
+                command: candidate.to_string(),
+                output,
+            }
+        }
+
+        fn run_inline_cli(&self, args: &[&str]) -> std::process::Output {
+            let output = self
+                .inline_command(self.temp.path())
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .expect("run native inline authorization CLI");
+            self.assert_payload_untouched();
+            output
+        }
+
+        fn assert_payload_untouched(&self) {
+            for filename in ["important.txt", "other.txt"] {
+                assert_eq!(
+                    std::fs::read_to_string(self.temp.path().join(filename))
+                        .expect("candidate payload must not execute"),
+                    INLINE_SENTINEL,
+                );
+            }
+        }
+
+        fn read_grants(&self) -> Vec<AllowOnceEntry> {
+            let contents = match std::fs::read_to_string(&self.allow_once_path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+                Err(error) => panic!("read persisted native grants: {error}"),
+            };
+            contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str(line).expect("typed native grant"))
+                .collect()
+        }
+
+        fn redeem_inline_denial(
+            &self,
+            denial: &serde_json::Value,
+            command: &str,
+            force: bool,
+        ) -> AllowOnceEntry {
+            let code = denial["allowOnceCode"]
+                .as_str()
+                .expect("native denial code");
+            let hash = denial["allowOnceFullHash"]
+                .as_str()
+                .expect("native denial full hash");
+            let pending: PendingExceptionRecord = std::fs::read_to_string(&self.pending_path)
+                .expect("native pending store")
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<PendingExceptionRecord>(line).expect("pending JSON")
+                })
+                .find(|entry| entry.full_hash == hash)
+                .expect("native denial persisted its matching pending record");
+            assert_eq!(pending.short_code, code);
+            assert_eq!(pending.command_raw, command);
+            assert_eq!(std::path::Path::new(&pending.cwd), self.temp.path());
+            assert_eq!(pending.source.as_deref() == Some("ConfigOverride"), force);
+
+            let mut args = vec![
+                "allow-once",
+                code,
+                "--yes",
+                "--single-use",
+                "--json",
+                "--show-raw",
+                "--hash",
+                hash,
+            ];
+            if force {
+                args.push("--force");
+            }
+            let output = self.run_inline_cli(&args);
+            assert!(
+                output.status.success(),
+                "native redemption failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let json: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("native redemption JSON");
+            assert_eq!(json["status"], "ok");
+            assert_eq!(json["command"], command);
+            assert_eq!(json["single_use"], true);
+            assert_eq!(json["dry_run"], false);
+            assert_eq!(json["force"], force);
+            assert_eq!(json["scope_kind"], "cwd");
+            let entry = self
+                .read_grants()
+                .into_iter()
+                .rev()
+                .find(|entry| entry.source_full_hash == hash && entry.force_allow_config == force)
+                .expect("native CLI persisted the exact requested grant");
+            assert_eq!(entry.command_raw, command);
+            assert_eq!(entry.source_short_code, code);
+            assert_eq!(entry.scope_kind, AllowOnceScopeKind::Cwd);
+            assert_eq!(std::path::Path::new(&entry.scope_path), self.temp.path());
+            assert!(entry.single_use);
+            assert!(entry.consumed_at.is_none());
+            entry
+        }
+
+        fn grant_inline_request(&self, tool: &str, command: &str) -> AllowOnceEntry {
+            assert!(self.read_grants().is_empty(), "fresh native grant fixture");
+            let denied = self.run_inline_hook(tool, command, self.temp.path());
+            let denial = assert_inline_denial(tool, &denied);
+            let entry = self.redeem_inline_denial(&denial, command, false);
+            assert_eq!(self.read_grants(), std::slice::from_ref(&entry));
+            // Only read persisted bytes after redemption: diagnostics also
+            // evaluate commands and must not consume the grant under test.
+            entry
         }
 
         /// Run dcg in hook mode with JSON input.
@@ -1661,6 +1892,544 @@ mod allow_once_flow_tests {
             stdout,
             result.stderr_str()
         );
+    }
+
+    fn assert_inline_denial(tool: &str, result: &HookRunOutput) -> serde_json::Value {
+        assert!(
+            result.output.status.success(),
+            "{tool}: hook failure for {}\n{}\n{}",
+            result.command,
+            result.stdout_str(),
+            result.stderr_str(),
+        );
+        let json: serde_json::Value = serde_json::from_str(result.stdout_str().trim())
+            .unwrap_or_else(|error| panic!("{tool}: expected denial JSON: {error}: {result:?}"));
+        if tool == "terminal" {
+            assert_eq!(json["decision"], "block", "{}: {json}", result.command);
+            assert_eq!(json["action"], "block", "{}: {json}", result.command);
+            json
+        } else {
+            let body = &json["hookSpecificOutput"];
+            assert_eq!(
+                body["permissionDecision"], "deny",
+                "{}: {json}",
+                result.command
+            );
+            body.clone()
+        }
+    }
+
+    fn assert_inline_policy_denial(tool: &str, result: &HookRunOutput) -> serde_json::Value {
+        let denial = assert_inline_denial(tool, result);
+        assert!(
+            result.stdout_str().contains(INLINE_POLICY_REASON),
+            "{tool}: explicit policy must remain the reason: {}",
+            result.stdout_str(),
+        );
+        denial
+    }
+
+    fn inline_policy_order_commands() -> Vec<String> {
+        let mut commands = Vec::new();
+        for source in [
+            r#"alias a="'/usr/bin/python3' -c 'print(1)'" b='git status'; a; b"#,
+            r#"alias b='git status' a="'/usr/bin/python3' -c 'print(1)'"; b; a"#,
+        ] {
+            // A harmless backslash in a comment triggers the early lookup;
+            // the same alias bodies without it exercise late authorization.
+            for suffix in ["", " # \\"] {
+                commands.push(format!("{source}{suffix}"));
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn inline_interpreter_native_grants_match_original_bytes_and_cwd_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in [
+                QUOTED_PRINT,
+                "\"/usr/bin/python3\" -c 'print(1)'",
+                QUOTED_UNLINK,
+                UNQUOTED_UNLINK,
+                "/usr/bin/python3 -c 'import pathlib; pathlib.Path(\"important.txt\").unlink()'",
+                "python3 -c 'import pathlib; mask = 1 & 1; pathlib.Path(\"important.txt\").unlink()'",
+            ] {
+                let env = FlowTestEnv::with_inline_policy();
+                let grant = env.grant_inline_request(tool, command);
+                let changed_payload = command
+                    .replace("print(1)", "print(2)")
+                    .replace("important.txt", "other.txt");
+                assert_ne!(changed_payload, command);
+                for altered in [format!("{command} "), changed_payload] {
+                    assert_inline_denial(
+                        tool,
+                        &env.run_inline_hook(tool, &altered, env.temp.path()),
+                    );
+                    assert_eq!(
+                        env.read_grants(),
+                        std::slice::from_ref(&grant),
+                        "{tool}: {altered}"
+                    );
+                }
+                assert_inline_denial(
+                    tool,
+                    &env.run_inline_hook(tool, command, &env.temp.path().join("other_cwd")),
+                );
+                assert_eq!(env.read_grants(), std::slice::from_ref(&grant));
+                assert_is_allowed(&env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(
+                    env.read_grants().is_empty(),
+                    "exact native grant is consumed"
+                );
+                assert_inline_denial(tool, &env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(
+                    env.read_grants().is_empty(),
+                    "single-use grant cannot be reused"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expired_inline_interpreter_grants_never_authorize_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in [
+                QUOTED_PRINT,
+                UNQUOTED_UNLINK,
+                r#"alias x="'/usr/bin/python3' -c 'print(1)'"; x"#,
+            ] {
+                let env = FlowTestEnv::with_inline_policy();
+                let mut expired = env.grant_inline_request(tool, command);
+                // Move a real native grant's complete, valid lifetime into
+                // the past. This tests expiry rather than malformed lifetime
+                // rejection, without sleeps or clock races.
+                expired.created_at = "2000-01-01T00:00:00Z".to_string();
+                expired.expires_at = "2000-01-01T01:00:00Z".to_string();
+                std::fs::write(
+                    &env.allow_once_path,
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&expired).expect("expired grant JSON")
+                    ),
+                )
+                .expect("expire native fixture grant");
+                for _ in 0..2 {
+                    assert_inline_denial(
+                        tool,
+                        &env.run_inline_hook(tool, command, env.temp.path()),
+                    );
+                    for remaining in env.read_grants() {
+                        assert_eq!(
+                            remaining, expired,
+                            "an expired grant may be pruned, never spent"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_inline_policy_denials_preserve_unforced_grants_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in [QUOTED_PRINT, UNQUOTED_UNLINK] {
+                let env = FlowTestEnv::with_inline_policy();
+                let grant = env.grant_inline_request(tool, command);
+                env.write_inline_policy(Some(command));
+                for _ in 0..2 {
+                    assert_inline_policy_denial(
+                        tool,
+                        &env.run_inline_hook(tool, command, env.temp.path()),
+                    );
+                    assert_eq!(env.read_grants(), std::slice::from_ref(&grant));
+                }
+                env.write_inline_policy(None);
+                assert_is_allowed(&env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+                assert_inline_denial(tool, &env.run_inline_hook(tool, command, env.temp.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn nested_inline_requests_cannot_borrow_an_inner_grant_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for inner in [QUOTED_UNLINK, UNQUOTED_UNLINK] {
+                let env = FlowTestEnv::with_inline_policy();
+                let quoted = format!("'{}'", inner.replace('\'', "'\"'\"'"));
+                let nested = [
+                    format!("sh -c {quoted}"),
+                    format!("eval {quoted}"),
+                    format!("printf '%s' \"$({inner})\""),
+                    format!("{inner}; git reset --hard"),
+                ];
+                // Pin destructive detection independently of grant handling.
+                for command in &nested {
+                    assert_inline_denial(
+                        tool,
+                        &env.run_inline_hook(tool, command, env.temp.path()),
+                    );
+                    assert!(env.read_grants().is_empty());
+                }
+                let grant = env.grant_inline_request(tool, inner);
+                for command in &nested {
+                    assert_inline_denial(
+                        tool,
+                        &env.run_inline_hook(tool, command, env.temp.path()),
+                    );
+                    assert_eq!(
+                        env.read_grants(),
+                        std::slice::from_ref(&grant),
+                        "nested request: {command}",
+                    );
+                }
+                assert_is_allowed(&env.run_inline_hook(tool, inner, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+                assert_inline_denial(tool, &env.run_inline_hook(tool, inner, env.temp.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn outer_quoted_interpreter_grants_survive_nested_inspection_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in [
+                r#"alias x="'/usr/bin/python3' -c 'print(1)'"; x"#,
+                r#"trap "'/usr/bin/python3' -c 'print(1)'" EXIT"#,
+                r#"PROMPT_COMMAND="'/usr/bin/python3' -c 'print(1)'""#,
+                "'/usr/bin/python3'${IFS}-c${IFS}'print(1)'",
+            ] {
+                let env = FlowTestEnv::with_inline_policy();
+                let grant = env.grant_inline_request(tool, command);
+                let altered = format!("{command} ");
+                assert_inline_denial(tool, &env.run_inline_hook(tool, &altered, env.temp.path()));
+                assert_eq!(
+                    env.read_grants(),
+                    std::slice::from_ref(&grant),
+                    "changed outer bytes: {altered}",
+                );
+                assert_is_allowed(&env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+                assert_inline_denial(tool, &env.run_inline_hook(tool, command, env.temp.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn nested_policy_denials_preserve_outer_inline_grants_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in [
+                r#"alias x="'/usr/bin/python3' -c 'print(1)'"; x"#,
+                r#"trap "'/usr/bin/python3' -c 'print(1)'" EXIT"#,
+            ] {
+                let env = FlowTestEnv::with_inline_policy();
+                let grant = env.grant_inline_request(tool, command);
+                env.write_inline_policy(Some(QUOTED_PRINT));
+                assert_inline_policy_denial(
+                    tool,
+                    &env.run_inline_hook(tool, command, env.temp.path()),
+                );
+                assert_eq!(env.read_grants(), std::slice::from_ref(&grant));
+                env.write_inline_policy(None);
+                assert_is_allowed(&env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+                assert_inline_denial(tool, &env.run_inline_hook(tool, command, env.temp.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn nested_policy_order_preserves_ordinary_inline_grants_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in inline_policy_order_commands() {
+                let env = FlowTestEnv::with_inline_policy();
+                let grant = env.grant_inline_request(tool, &command);
+                env.write_inline_policy(Some("git status"));
+                assert_inline_policy_denial(
+                    tool,
+                    &env.run_inline_hook(tool, &command, env.temp.path()),
+                );
+                assert_eq!(env.read_grants(), std::slice::from_ref(&grant));
+                // Keep a configured block so successful authorization must
+                // finish policy inspection rather than take the no-block path.
+                env.write_inline_policy(Some("git diff"));
+                assert_is_allowed(&env.run_inline_hook(tool, &command, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+                assert_inline_denial(tool, &env.run_inline_hook(tool, &command, env.temp.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_quoted_python_sources_preserve_nested_policy_issue_599() {
+        // Neither argv list contains a contiguous shell command or another
+        // incidental heredoc trigger. Policy inspection must enter the
+        // interpreter's source to find the later explicitly blocked command.
+        let source = r#"import subprocess; subprocess.run(["git", "reset", "--hard"]); subprocess.run(["git", "status"])"#;
+        for tool in ["terminal", "Bash"] {
+            for interpreter in [
+                "'/usr/bin/python3'",
+                "\"/usr/bin/python3\"",
+                "/usr/bin/python3",
+            ] {
+                let child = format!("{interpreter} -c '{source}'");
+                let alias = format!("alias p='{}'; p", child.replace('\'', "'\"'\"'"));
+                for command in [child, alias] {
+                    let env = FlowTestEnv::with_inline_policy();
+                    let grant = env.grant_inline_request(tool, &command);
+                    env.write_inline_policy(Some("git status"));
+                    assert_inline_policy_denial(
+                        tool,
+                        &env.run_inline_hook(tool, &command, env.temp.path()),
+                    );
+                    assert_eq!(
+                        env.read_grants(),
+                        std::slice::from_ref(&grant),
+                        "{tool}: a block inside the interpreter must retain the exact grant: {command}",
+                    );
+
+                    // A completed inspection with unrelated policy can still
+                    // honor the retained native grant, but only once.
+                    env.write_inline_policy(Some("git diff"));
+                    assert_is_allowed(&env.run_inline_hook(tool, &command, env.temp.path()));
+                    assert!(env.read_grants().is_empty());
+                    assert_inline_denial(
+                        tool,
+                        &env.run_inline_hook(tool, &command, env.temp.path()),
+                    );
+                    assert!(env.read_grants().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unread_python_sources_cannot_clear_policy_with_a_decoy_issue_599() {
+        let payload = r#"import subprocess; subprocess.run(["git", "reset", "--hard"]); subprocess.run(["git", "status"])"#;
+        for tool in ["terminal", "Bash"] {
+            // Internal name quoting is still an unresolved source. A known
+            // harmless body elsewhere cannot prove this body's policy clear.
+            let opaque = format!(r#"/usr/bin/py"thon3" -c '{payload}'"#);
+            let decoy_before = format!("python3 -c 'print(1)'; {opaque}");
+            let decoy_after = format!("{opaque}; python3 -c 'print(1)'");
+            for source in [opaque, decoy_before, decoy_after] {
+                let alias = format!("alias p='{}'; p", source.replace('\'', "'\"'\"'"));
+                for command in [source, alias] {
+                    let env = FlowTestEnv::with_inline_policy();
+                    let grant = env.grant_inline_request(tool, &command);
+                    for blocked_child in ["git status", "git diff"] {
+                        env.write_inline_policy(Some(blocked_child));
+                        assert_inline_denial(
+                            tool,
+                            &env.run_inline_hook(tool, &command, env.temp.path()),
+                        );
+                        assert_eq!(
+                            env.read_grants(),
+                            std::slice::from_ref(&grant),
+                            "{tool}: unread source cannot clear {blocked_child:?}: {command}",
+                        );
+                    }
+
+                    // Without a policy block to inspect, the exact reviewed
+                    // outer request remains eligible for one authorization.
+                    env.write_inline_policy(None);
+                    assert_is_allowed(&env.run_inline_hook(tool, &command, env.temp.path()));
+                    assert!(env.read_grants().is_empty());
+                    assert_inline_denial(
+                        tool,
+                        &env.run_inline_hook(tool, &command, env.temp.path()),
+                    );
+                    assert!(env.read_grants().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forced_nested_policy_grants_skip_retained_ordinary_grants_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in inline_policy_order_commands() {
+                let env = FlowTestEnv::with_inline_policy();
+                let ordinary = env.grant_inline_request(tool, &command);
+                env.write_inline_policy(Some("git status"));
+                let denied = env.run_inline_hook(tool, &command, env.temp.path());
+                let denial = assert_inline_policy_denial(tool, &denied);
+                assert_eq!(env.read_grants(), std::slice::from_ref(&ordinary));
+                let code = denial["allowOnceCode"]
+                    .as_str()
+                    .expect("policy denial code");
+                let refused = env.run_inline_cli(&["allow-once", code, "--yes", "--json"]);
+                assert!(
+                    !refused.status.success(),
+                    "explicit policy requires native --force"
+                );
+                assert!(String::from_utf8_lossy(&refused.stderr).contains("--force"));
+                assert_eq!(env.read_grants(), std::slice::from_ref(&ordinary));
+                let forced = env.redeem_inline_denial(&denial, &command, true);
+                let both = vec![ordinary.clone(), forced];
+                assert_eq!(env.read_grants(), both);
+
+                let altered = format!("{command} ");
+                assert_inline_denial(tool, &env.run_inline_hook(tool, &altered, env.temp.path()));
+                assert_eq!(env.read_grants(), both);
+                // Neither grant applies in another cwd. An earlier detector
+                // may own the denial; both stored grants must stay untouched.
+                assert_inline_denial(
+                    tool,
+                    &env.run_inline_hook(tool, &command, &env.temp.path().join("other_cwd")),
+                );
+                assert_eq!(env.read_grants(), both);
+                assert_is_allowed(&env.run_inline_hook(tool, &command, env.temp.path()));
+                assert_eq!(
+                    env.read_grants(),
+                    std::slice::from_ref(&ordinary),
+                    "only the later forced grant may override the nested policy",
+                );
+                assert_inline_policy_denial(
+                    tool,
+                    &env.run_inline_hook(tool, &command, env.temp.path()),
+                );
+                assert_eq!(env.read_grants(), std::slice::from_ref(&ordinary));
+                env.write_inline_policy(None);
+                assert_is_allowed(&env.run_inline_hook(tool, &command, env.temp.path()));
+                assert!(
+                    env.read_grants().is_empty(),
+                    "ordinary grant remains usable once"
+                );
+                assert_inline_denial(tool, &env.run_inline_hook(tool, &command, env.temp.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_nested_policy_inspection_preserves_inline_grants_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in [
+                "bash -c 'rm -rf /; git status'",
+                "bash -c 'true'; bash -c 'rm -rf /; git status'",
+            ] {
+                let env = FlowTestEnv::with_inline_policy();
+                let grant = env.grant_inline_request(tool, command);
+                env.write_inline_policy(Some("git status"));
+                let config_path = env.config_path.as_ref().expect("inline policy path");
+                let mut policy: toml::Value = toml::from_str(
+                    &std::fs::read_to_string(config_path).expect("read inline policy"),
+                )
+                .expect("parse inline policy");
+                let heredoc = policy["heredoc"].as_table_mut().expect("heredoc settings");
+                // The first source is skipped; the second retains the small
+                // `true` body but leaves its destructive sibling unread.
+                heredoc.insert("max_body_bytes".to_string(), toml::Value::Integer(8));
+                // Strict extraction failure already denies. Enable the
+                // fallback so waiving its finding cannot hide unread policy.
+                heredoc.insert(
+                    "fallback_on_parse_error".to_string(),
+                    toml::Value::Boolean(true),
+                );
+                std::fs::write(
+                    config_path,
+                    toml::to_string(&policy).expect("serialize limited policy"),
+                )
+                .expect("write limited policy");
+                assert_inline_denial(tool, &env.run_inline_hook(tool, command, env.temp.path()));
+                assert_eq!(
+                    env.read_grants(),
+                    std::slice::from_ref(&grant),
+                    "{tool}: incomplete policy inspection must preserve the grant: {command}",
+                );
+                // Restore only the size limit. With the full body readable,
+                // the explicit child policy must be the reason for denial.
+                assert_eq!(
+                    policy["heredoc"]
+                        .as_table_mut()
+                        .expect("heredoc settings")
+                        .remove("max_body_bytes"),
+                    Some(toml::Value::Integer(8)),
+                );
+                std::fs::write(
+                    config_path,
+                    toml::to_string(&policy).expect("serialize complete policy"),
+                )
+                .expect("restore complete policy inspection");
+                assert_inline_policy_denial(
+                    tool,
+                    &env.run_inline_hook(tool, command, env.temp.path()),
+                );
+                assert_eq!(env.read_grants(), std::slice::from_ref(&grant));
+                // An unrelated block still requires policy replay, which
+                // can now finish and spend the retained grant exactly once.
+                env.write_inline_policy(Some("git diff"));
+                assert_is_allowed(&env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+                assert_inline_denial(tool, &env.run_inline_hook(tool, command, env.temp.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn nested_inline_policy_denials_require_explicit_force_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            for command in [
+                QUOTED_PRINT,
+                r#"alias x="'/usr/bin/python3' -c 'print(1)'"; x"#,
+                r#"trap "'/usr/bin/python3' -c 'print(1)'" EXIT"#,
+            ] {
+                let env = FlowTestEnv::with_inline_policy();
+                env.write_inline_policy(Some(QUOTED_PRINT));
+                let denied = env.run_inline_hook(tool, command, env.temp.path());
+                let denial = assert_inline_policy_denial(tool, &denied);
+                let code = denial["allowOnceCode"]
+                    .as_str()
+                    .expect("native policy code");
+                let refused = env.run_inline_cli(&["allow-once", code, "--yes", "--json"]);
+                assert!(!refused.status.success());
+                assert!(String::from_utf8_lossy(&refused.stderr).contains("--force"));
+                assert!(env.read_grants().is_empty());
+                let forced = env.redeem_inline_denial(&denial, command, true);
+                assert_inline_denial(
+                    tool,
+                    &env.run_inline_hook(tool, &format!("{command} "), env.temp.path()),
+                );
+                assert_eq!(env.read_grants(), std::slice::from_ref(&forced));
+                assert_inline_policy_denial(
+                    tool,
+                    &env.run_inline_hook(tool, command, &env.temp.path().join("other_cwd")),
+                );
+                assert_eq!(env.read_grants(), std::slice::from_ref(&forced));
+                assert_is_allowed(&env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+                assert_inline_policy_denial(
+                    tool,
+                    &env.run_inline_hook(tool, command, env.temp.path()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_authorization_keeps_safe_and_destructive_controls_issue_599() {
+        for tool in ["terminal", "Bash"] {
+            let env = FlowTestEnv::with_inline_policy();
+            for command in [
+                "python3 -c 'print(1)'",
+                "/usr/bin/python3 -c 'print(1)'",
+                "python3 -c 'print(1 & 1)'",
+                "git status",
+            ] {
+                assert_is_allowed(&env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+            }
+            for command in [
+                "git reset --hard",
+                QUOTED_PRINT,
+                QUOTED_UNLINK,
+                UNQUOTED_UNLINK,
+            ] {
+                assert_inline_denial(tool, &env.run_inline_hook(tool, command, env.temp.path()));
+                assert!(env.read_grants().is_empty());
+            }
+        }
     }
 
     #[test]

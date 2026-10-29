@@ -836,7 +836,7 @@ impl AllowOnceStore {
         Ok(Some(selected))
     }
 
-    /// Match a command against allow-once entries, but only grant if `force_allow_config` is set.
+    /// Match a command against the first scoped allow-once entry with `force_allow_config` set.
     ///
     /// This prevents single-use entries from being consumed when a config blocklist would still
     /// deny the command (unless explicitly forced).
@@ -864,17 +864,13 @@ impl AllowOnceStore {
             rewrite_allow_once_records(&mut file, &active)?;
         }
 
-        let idx = active
-            .iter()
-            .position(|entry| entry.command_raw == command && entry.matches_scope(cwd));
+        let idx = active.iter().position(|entry| {
+            entry.command_raw == command && entry.matches_scope(cwd) && entry.force_allow_config
+        });
 
         let Some(idx) = idx else {
             return Ok(None);
         };
-
-        if !active[idx].force_allow_config {
-            return Ok(None);
-        }
 
         let mut selected = active[idx].clone();
         if active[idx].single_use {
@@ -1969,6 +1965,84 @@ mod tests {
 
         let second = store.match_command("git status", cwd, now, None).unwrap();
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn test_forced_allow_once_skips_ordinary_and_mismatched_entries_issue_599() {
+        let dir = TempDir::new().expect("tempdir");
+        let cwd_dir = TempDir::new().expect("cwd tempdir");
+        let other_dir = TempDir::new().expect("other cwd tempdir");
+        let cwd = cwd_dir.path();
+        let scope = cwd.to_str().unwrap();
+        let store = AllowOnceStore::new(dir.path().join("allow_once.jsonl"));
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let command = "'/usr/bin/python3' -c 'print(1)'";
+        let redaction = redaction_config();
+        let pending =
+            PendingExceptionRecord::new(now, scope, command, "blocked", &redaction, true, None);
+        let ordinary = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            scope,
+            true,
+            false,
+            &redaction,
+        );
+        let mut forced = ordinary.clone();
+        forced.force_allow_config = true;
+        let mut wrong_command = forced.clone();
+        wrong_command.command_raw.push(' ');
+        let mut wrong_cwd = forced.clone();
+        wrong_cwd.scope_path = other_dir.path().to_str().unwrap().to_string();
+        let preserved = [ordinary.clone(), wrong_command, wrong_cwd];
+        for entry in &preserved {
+            store.add_entry(entry, now).unwrap();
+        }
+
+        assert!(
+            store
+                .match_command_force_config(command, cwd, now, None)
+                .unwrap()
+                .is_none(),
+            "ordinary, altered-command, and other-cwd entries cannot override policy"
+        );
+        assert_eq!(store.load_active(now).unwrap().0, preserved);
+
+        // A later explicit forced authorization must not be hidden by the
+        // retained ordinary entry for the same command and cwd.
+        store.add_entry(&forced, now).unwrap();
+        let selected = store
+            .match_command_force_config(command, cwd, now, None)
+            .unwrap()
+            .expect("later matching forced entry");
+        forced.consumed_at = Some(format_timestamp(now));
+        assert_eq!(selected, forced);
+        assert_eq!(store.load_active(now).unwrap().0, preserved);
+        assert!(
+            store
+                .match_command_force_config(command, cwd, now, None)
+                .unwrap()
+                .is_none(),
+            "a forced single-use entry cannot be reused"
+        );
+        assert_eq!(store.load_active(now).unwrap().0, preserved);
+
+        // Removing the policy later still leaves the ordinary authorization
+        // usable once; the failed policy attempts never consumed it.
+        let selected = store.match_command(command, cwd, now, None).unwrap();
+        let mut consumed_ordinary = ordinary;
+        consumed_ordinary.consumed_at = Some(format_timestamp(now));
+        assert_eq!(selected, Some(consumed_ordinary));
+        assert_eq!(store.load_active(now).unwrap().0, preserved[1..]);
+        assert!(
+            store
+                .match_command(command, cwd, now, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

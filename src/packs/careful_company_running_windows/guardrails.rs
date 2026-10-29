@@ -348,8 +348,44 @@ fn authorization_store_write_span_with_paths_in_source(
     stores: &AuthorizationStorePaths,
     source_context: Option<(&str, usize)>,
 ) -> Option<Range<usize>> {
+    if let Some(span) =
+        authorization_store_write_span_in_range(command, stores, source_context, None)
+    {
+        return Some(span);
+    }
+
+    // Masking a harmless sed script erases an argv position, not the write
+    // performed by -i. Recover roles only when the original interval has the
+    // same visible bytes. Parse its full owner so quoted examples and stored
+    // source never become standalone commands merely because of a slice.
+    let (source, start) = source_context?;
+    let end = start.checked_add(command.len())?;
+    let original = source.get(start..end)?;
+    if original == command
+        || !original
+            .bytes()
+            .zip(command.bytes())
+            .all(|(raw, masked)| raw == masked || masked.is_ascii_whitespace())
+    {
+        return None;
+    }
+    authorization_store_write_span_in_range(source, stores, None, Some(start..end))
+        .map(|span| span.start - start..span.end - start)
+}
+
+fn authorization_store_write_span_in_range(
+    command: &str,
+    stores: &AuthorizationStorePaths,
+    source_context: Option<(&str, usize)>,
+    visible_range: Option<Range<usize>>,
+) -> Option<Range<usize>> {
     let ast = crate::heredoc::try_parse_shell_ast(command).ok()?;
     let (source, source_base) = source_context.unwrap_or((command, 0));
+    let visible = |span: &Range<usize>| {
+        visible_range
+            .as_ref()
+            .is_none_or(|range| range.start <= span.start && span.end <= range.end)
+    };
     let mut pending = vec![ast.root()];
     while let Some(node) = pending.pop() {
         match node.kind().as_ref() {
@@ -363,13 +399,34 @@ fn authorization_store_write_span_with_paths_in_source(
                     .filter(|owner| {
                         matches!(owner.kind().as_ref(), "command" | "redirected_statement")
                     })
-                    .map_or(node.range().start, |owner| owner.range().start);
+                    .map_or_else(
+                        || node.range().start,
+                        |owner| {
+                            // Bash can attach the redirect to the whole `a && b`
+                            // list, although only its final statement opens it.
+                            // Keep preceding directory changes, but do not enter
+                            // a compound/subshell body: its redirect opens first.
+                            let mut statement = owner.field("body").unwrap_or(owner);
+                            while statement.kind() == "list" {
+                                let Some(last) = statement
+                                    .children()
+                                    .filter(|part| part.is_named() && part.kind() != "comment")
+                                    .last()
+                                else {
+                                    break;
+                                };
+                                statement = last;
+                            }
+                            statement.range().start
+                        },
+                    );
                 if node.children().any(|part| {
                     matches!(
                         part.kind().as_ref(),
                         ">" | ">>" | ">|" | "&>" | "&>>" | ">&" | "<>"
                     )
                 }) && let Some(target) = node.field("destination")
+                    && visible(&(node.range().start..target.range().end))
                     && stores
                         .at_source_prefix(source.get(..source_base.checked_add(statement_start)?)?)
                         .matches_word(target.text().as_ref())
@@ -381,7 +438,7 @@ fn authorization_store_write_span_with_paths_in_source(
                 let statement_start = node
                     .parent()
                     .filter(|owner| owner.kind() == "redirected_statement")
-                    .map_or(node.range().start, |owner| owner.range().start);
+                    .map_or_else(|| node.range().start, |owner| owner.range().start);
                 let mut words = Vec::new();
                 for child in node.children().filter(ast_grep_core::Node::is_named) {
                     if !matches!(
@@ -415,7 +472,23 @@ fn authorization_store_write_span_with_paths_in_source(
                 }
                 let scoped_stores = stores
                     .at_source_prefix(source.get(..source_base.checked_add(statement_start)?)?);
-                if let Some(span) = authorization_writer_span(&words, &scoped_stores) {
+                if let Some(span) = authorization_writer_span(&words, &scoped_stores)
+                    && visible(&span)
+                {
+                    return Some(span);
+                }
+                // A mapped interval can start after an existing normalizer's
+                // wrapper/path prefix. Reuse only an exact suffix of this
+                // AST-owned command, retaining its complete argument list.
+                if visible_range.is_some()
+                    && let Some(span) = authorization_normalized_writer_span(
+                        node.text().as_ref(),
+                        node.range().start,
+                        &words,
+                        &scoped_stores,
+                    )
+                    && visible(&span)
+                {
                     return Some(span);
                 }
             }
@@ -424,6 +497,25 @@ fn authorization_store_write_span_with_paths_in_source(
         pending.extend(node.children());
     }
     None
+}
+
+fn authorization_normalized_writer_span(
+    command: &str,
+    command_offset: usize,
+    words: &[(String, Range<usize>)],
+    stores: &AuthorizationStorePaths,
+) -> Option<Range<usize>> {
+    let normalized = crate::normalize::normalize_command_in_dialect(command, ShellDialect::Posix);
+    let prefix = command.strip_suffix(normalized.as_ref())?;
+    let start = command_offset.checked_add(prefix.len())?;
+    let index = words
+        .iter()
+        .position(|(_, span)| span.start <= start && start < span.end)?;
+    let mut arguments = words[index..].to_vec();
+    let (program, span) = arguments.first_mut()?;
+    *program = program.get(start.checked_sub(span.start)?..)?.to_string();
+    span.start = start;
+    authorization_writer_span(&arguments, stores)
 }
 
 struct AuthorizationStorePaths {
@@ -668,7 +760,7 @@ fn authorization_writer_span(
                         || option.starts_with("--expression=")
                         || option.starts_with("--file=") =>
                 {
-                    sed_script = true
+                    sed_script = true;
                 }
                 ("sed", option)
                     if option == "--in-place"
@@ -683,7 +775,7 @@ fn authorization_writer_span(
                                 .any(|ch| ch == 'i')
                         }) =>
                 {
-                    in_place = true
+                    in_place = true;
                 }
                 _ => {}
             }
@@ -1347,6 +1439,167 @@ mod tests {
     }
 
     #[test]
+    fn authorization_store_writer_argv_survives_data_masking() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let stores = AuthorizationStorePaths {
+            paths: vec![fixture.path().join("grants.data")],
+            cwd: Some(fixture.path().to_path_buf()),
+        };
+        for (command, masked) in [
+            ("sed -i 's/true/false/' grants.data", true),
+            ("sed -i \"s/true/false/\" grants.data", true),
+            ("sed -i s/true/false/ grants.data", true),
+            ("sed -i -e 's/true/false/' grants.data", true),
+            ("sed -i.bak 's/true/false/' grants.data", true),
+            ("sed -i '' 's/true/false/' grants.data", false),
+        ] {
+            let source = format!("true; {command}");
+            let offset = source.find("sed").expect("writer offset");
+            let sanitized = crate::context::sanitize_for_pattern_matching(&source);
+            let matching = &sanitized[offset..];
+            assert_eq!(
+                matching != command,
+                masked,
+                "fixture distinguishes masked argv from the unmasked BSD control"
+            );
+            assert_eq!(
+                authorization_store_write_span_with_paths_in_source(
+                    matching,
+                    &stores,
+                    Some((&source, offset)),
+                ),
+                Some(0..command.len()),
+                "masked script must keep its argv role: {source}; view: {matching:?}"
+            );
+        }
+        for (source, stripped_prefix) in [
+            ("sudo sed -i 's/true/false/' grants.data", true),
+            ("env sed -i 's/true/false/' grants.data", true),
+            ("command sed -i 's/true/false/' grants.data", true),
+            ("/usr/bin/sed -i 's/true/false/' grants.data", false),
+            ("sudo /usr/bin/sed -i 's/true/false/' grants.data", true),
+        ] {
+            let normalized =
+                crate::normalize::normalize_command_in_dialect(source, ShellDialect::Posix);
+            let offset = source
+                .strip_suffix(normalized.as_ref())
+                .expect("normalization retains an exact source suffix")
+                .len();
+            assert_eq!(
+                offset > 0,
+                stripped_prefix,
+                "known wrappers are stripped; the sed executable path stays intact"
+            );
+            let sanitized = crate::context::sanitize_for_pattern_matching(&normalized);
+            assert_eq!(
+                authorization_store_write_span_with_paths_in_source(
+                    &sanitized,
+                    &stores,
+                    Some((source, offset)),
+                ),
+                Some(0..normalized.len()),
+                "owned writer survives a proven normalized prefix: {source}"
+            );
+        }
+        for source in [
+            "sed -n 's/true/false/' grants.data",
+            "sed -i 's/true/false/' ordinary.txt",
+            "sed -i 's/true/false/' grants.data --help",
+            r#"printf '%s' "sed -i 's/true/false/' grants.data""#,
+            "# sed -i 's/true/false/' grants.data",
+            "cat <<'EOF'\nsed -i 's/true/false/' grants.data\nEOF",
+            "edit_later() { sed -i 's/true/false/' grants.data; }",
+        ] {
+            let sanitized = crate::context::sanitize_for_pattern_matching(source);
+            assert!(
+                authorization_store_write_span_with_paths_in_source(
+                    &sanitized,
+                    &stores,
+                    Some((source, 0)),
+                )
+                .is_none(),
+                "data, reads and unrelated writes remain unrelated: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_store_masked_sources_keep_ownership_and_segment_bounds() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let stores = AuthorizationStorePaths {
+            paths: vec![fixture.path().join("grants.data")],
+            cwd: Some(fixture.path().to_path_buf()),
+        };
+        for (middle, expected) in [
+            ("sed -i 's/true/false/' grants.data", true),
+            ("sed -i 's/true/false/' ordinary.txt", false),
+        ] {
+            let source =
+                format!("printf before > grants.data; {middle}; printf after > grants.data");
+            let offset = source.find("sed").expect("middle writer");
+            let sanitized = crate::context::sanitize_for_pattern_matching(&source);
+            let matching = &sanitized[offset..offset + middle.len()];
+            assert_eq!(
+                authorization_store_write_span_with_paths_in_source(
+                    matching,
+                    &stores,
+                    Some((&source, offset)),
+                ),
+                expected.then_some(0..middle.len()),
+                "neither borrow nor stop at a write outside the segment: {source}"
+            );
+        }
+        let source = r#"printf '%s' "sed -i 's/true/false/' grants.data""#;
+        let offset = source.find("sed").expect("quoted example");
+        let end = source.len() - 1;
+        let sanitized = crate::context::sanitize_for_pattern_matching(source);
+        assert!(
+            authorization_store_write_span_with_paths_in_source(
+                &sanitized[offset..end],
+                &stores,
+                Some((source, offset)),
+            )
+            .is_none(),
+            "a source interval inside quoted data is not executable source"
+        );
+
+        let source = "sed -i 's/true/false/' grants.data --help";
+        let end = source.find(" --help").expect("trailing help option");
+        let sanitized = crate::context::sanitize_for_pattern_matching(source);
+        assert!(
+            authorization_store_write_span_with_paths_in_source(
+                &sanitized[..end],
+                &stores,
+                Some((source, 0)),
+            )
+            .is_none(),
+            "the owning command's complete argv keeps its help semantics"
+        );
+
+        let source = "sed -i 's/true/false/' grants.data";
+        let sanitized = crate::context::sanitize_for_pattern_matching(source);
+        let changed = sanitized.replacen("sed", "cat", 1);
+        assert!(
+            authorization_store_write_span_with_paths_in_source(
+                &changed,
+                &stores,
+                Some((source, 0)),
+            )
+            .is_none(),
+            "changed visible bytes cannot borrow original argv"
+        );
+        assert!(
+            authorization_store_write_span_with_paths_in_source(
+                &sanitized,
+                &stores,
+                Some((source, usize::MAX)),
+            )
+            .is_none(),
+            "invalid source offsets cannot borrow original argv"
+        );
+    }
+
+    #[test]
     fn authorization_store_relative_writes_follow_leading_cd_only() {
         let fixture = tempfile::tempdir().expect("fixture");
         let store_dir = fixture.path().join("store");
@@ -1363,6 +1616,20 @@ mod tests {
                 store_dir.display()
             ),
             format!("cd '{}' && tee -a grants.data", store_dir.display()),
+            format!(
+                "cd '{}' && true && printf forged > grants.data",
+                store_dir.display()
+            ),
+            format!(
+                "cd '{}' && cd '{}' > grants.data",
+                store_dir.display(),
+                other_dir.display()
+            ),
+            format!(
+                "cd '{}' && {{ cd '{}'; printf ordinary; }} > grants.data",
+                store_dir.display(),
+                other_dir.display()
+            ),
         ] {
             assert!(
                 authorization_store_write_span_with_paths(&command, &stores).is_some(),
@@ -1389,6 +1656,10 @@ mod tests {
                 store_dir.display()
             ),
             "cd \"$UNKNOWN\"; printf ordinary > grants.data".to_string(),
+            format!(
+                "cd '{}' && printf ordinary > grants.data",
+                fixture.path().join("missing").display()
+            ),
         ] {
             assert!(
                 authorization_store_write_span_with_paths(&command, &stores).is_none(),
@@ -1444,6 +1715,15 @@ mod tests {
             )
             .is_none(),
             "segment must not borrow the request's old cwd after cd"
+        );
+        let command = format!(
+            "cd '{}' && cd '{}' > grants.data",
+            other_dir.display(),
+            store_dir.display()
+        );
+        assert!(
+            authorization_store_write_span_with_paths(&command, &in_store).is_none(),
+            "the final cd opens its redirect before entering the store directory"
         );
     }
 
