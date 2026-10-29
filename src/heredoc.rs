@@ -2279,6 +2279,7 @@ fn extract_content_with_scan_view(
     // Extract heredocs (<<, <<-, <<~)
     extract_heredocs(
         command,
+        scan_view,
         limits,
         start_time,
         timeout,
@@ -7814,6 +7815,7 @@ fn literal_herestring_receiver_language(
 /// Extract heredocs (<<, <<-, <<~).
 fn extract_heredocs(
     command: &str,
+    scan_view: &str,
     limits: &ExtractionLimits,
     start_time: Instant,
     timeout: Duration,
@@ -7863,6 +7865,28 @@ fn extract_heredocs(
                 })
                 .iter()
                 .any(|body| body.contains(&full_match.start()))
+        {
+            continue;
+        }
+        // Nor is a heredoc written inside a body that only becomes data
+        // (#604): `cat > f <<'SH'` holding `python3 - <<'PY' … PY` saves a
+        // script, and its Python was judged as a program that runs now. The
+        // scan view blanks exactly those bodies, so the operator reads as a
+        // blank there. A body the command then runs keeps its text in the
+        // view (`cat > f <<'SH' … bash f`), as does every body when the view
+        // is the raw text; a body piped to a shell is judged again as
+        // commands by the evaluator's pipeline collector, where its heredocs
+        // are extracted. An outer body that a proven interpreter later runs
+        // with script arguments keeps its heredocs as well.
+        if scan_view.len() == command.len()
+            && scan_view.as_bytes().get(full_match.start()) == Some(&b' ')
+            && !extracted.iter().any(|outer| {
+                outer.additional_execution_target.is_some()
+                    && outer
+                        .content_range
+                        .as_ref()
+                        .is_some_and(|body| body.contains(&full_match.start()))
+            })
         {
             continue;
         }
@@ -18443,6 +18467,45 @@ mod tests {
                 contents[0].content,
                 "print <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA"
             );
+        }
+
+        /// #604: a heredoc inside a body that is only written to a file is
+        /// text in that file. A body the command then runs keeps it, and the
+        /// raw view the structural scans pass keeps every body's heredocs.
+        #[test]
+        fn heredocs_inside_data_bodies_are_not_extracted_604() {
+            let nested = "python3 - <<'PY'\nimport shutil\nshutil.rmtree('/x')\nPY";
+            let delimiters = |command: &str, scan_view: &str| -> Vec<String> {
+                match extract_content_with_scan_view(
+                    command,
+                    scan_view,
+                    &ExtractionLimits {
+                        timeout_ms: 5_000,
+                        ..ExtractionLimits::default()
+                    },
+                ) {
+                    ExtractionResult::Extracted(contents) => contents
+                        .into_iter()
+                        .filter_map(|content| content.delimiter)
+                        .collect(),
+                    other => panic!("{command:?}: {other:?}"),
+                }
+            };
+            for command in [
+                format!("cat > f <<'SH'\n{nested}\nSH"),
+                format!("tee f >/dev/null <<'SH'\n{nested}\nSH"),
+            ] {
+                let masked = mask_non_expanding_data_heredocs(&command);
+                assert_eq!(delimiters(&command, &masked), ["SH"], "{command:?}");
+                assert_eq!(delimiters(&command, &command), ["SH", "PY"], "{command:?}");
+            }
+            for command in [
+                format!("cat > f <<'SH'\n{nested}\nSH\nbash f"),
+                format!("bash <<'SH'\n{nested}\nSH"),
+            ] {
+                let masked = mask_non_expanding_data_heredocs(&command);
+                assert_eq!(delimiters(&command, &masked), ["SH", "PY"], "{command:?}");
+            }
         }
 
         #[test]

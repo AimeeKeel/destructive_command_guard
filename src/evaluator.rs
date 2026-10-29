@@ -16891,6 +16891,15 @@ fn posix_alias_definition_bodies(command: &str) -> Vec<String> {
 ///   [`crate::heredoc::brace_expanded_command`].
 fn posix_deferred_command_views(command: &str) -> Vec<String> {
     const MAX_VIEWS: usize = 16;
+    // A quoted heredoc body that only becomes data is not commands the shell
+    // runs later (#604): `cat > f <<'SH'` holding `X=$(pwd)` and then
+    // `trap x EXIT` made a view of an unclosed heredoc that failed to parse.
+    // Read the view the eval collector reads. A body written to a file the
+    // command then runs keeps its text in this view (`cat > f <<'SH' … bash
+    // f`). A body piped to a shell is blanked here (`cat <<'SH' | bash`), and
+    // `collect_data_heredoc_output_sinks` judges it as source on its own.
+    let masked = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let command = masked.as_ref();
     let bytes = command.as_bytes();
     let trap = command.match_indices("trap").any(|(at, _)| {
         (at == 0
@@ -42232,6 +42241,63 @@ mod tests {
             assert!(
                 result.is_allowed(),
                 "safe nested Python: {safe:?}: {result:?}"
+            );
+        }
+    }
+
+    /// #604: a quoted body that is only written to a file holds no command
+    /// the shell runs later (`trap`, `PROMPT_COMMAND`) and no program that
+    /// runs now (a nested heredoc). Each body a shell runs is still judged:
+    /// piped to a shell, run as a file, run with script arguments, or sourced.
+    #[test]
+    fn data_heredoc_bodies_hold_no_deferred_or_nested_programs_604() {
+        let rmtree = "python3 - <<'PY'\nimport shutil\nshutil.rmtree('/home/example/project')\nPY";
+        for command in [
+            "cat > f <<'SH'\nX=$(pwd)\ntrap x EXIT\nSH".to_string(),
+            "tee f >/dev/null <<'SH'\nX=$(pwd)\ntrap x EXIT\nSH".to_string(),
+            "cat > f <<'SH'\ntrap x EXIT\nX=$(pwd)\nSH".to_string(),
+            "cat > f <<SH\nX=$(pwd)\ntrap x EXIT\nSH".to_string(),
+            "cat > f <<'SH'\ntrap 'rm -rf ~' EXIT\nSH".to_string(),
+            "cat > f <<'SH'\nPROMPT_COMMAND='rm -rf ~'\nSH".to_string(),
+            "cat > f <<'SH'\npython3 - <<'PY'\nimport subprocess\n\
+             subprocess.Popen(['/bin/bash', 'x', *arguments])\nPY\nSH"
+                .to_string(),
+            format!("cat > f <<'SH'\n{rmtree}\nSH"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?} must be allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "X=$(pwd)\ntrap 'rm -rf ~' EXIT".to_string(),
+            "cat <<'SH' | bash\ntrap 'rm -rf ~' EXIT\nSH".to_string(),
+            "cat > f <<'SH'\ntrap 'rm -rf ~' EXIT\nSH\nbash f".to_string(),
+            "cat > f.sh <<'SH'\ntrap 'rm -rf ~' EXIT\nSH\nbash f.sh x".to_string(),
+            "cat > f <<'SH'\ntrap 'rm -rf ~' EXIT\nSH\n. ./f".to_string(),
+            "cat >> ~/.bashrc <<'SH'\ntrap 'rm -rf ~' EXIT\nSH".to_string(),
+            "cat <<'SH' | bash\ngit reset --hard\nSH".to_string(),
+            "cat > f <<'SH'\ngit reset --hard\nSH\nbash f".to_string(),
+            format!("cat <<'SH' | bash\n{rmtree}\nSH"),
+            format!("cat > f <<'SH'\n{rmtree}\nSH\nbash f"),
+            format!("cat > f.sh <<'SH'\n{rmtree}\nSH\nbash f.sh x"),
+            format!("cat > f <<'SH'\n{rmtree}\nSH\n. ./f"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
             );
         }
     }
