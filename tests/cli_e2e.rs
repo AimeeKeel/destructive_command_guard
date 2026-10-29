@@ -1296,11 +1296,10 @@ mod allow_once_management_tests {
         }
     }
 
-    fn fixed_timestamp() -> DateTime<Utc> {
-        // Use a far-future timestamp so tests don't become time-sensitive as real time advances.
-        DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
+    fn active_timestamp() -> DateTime<Utc> {
+        // The child validates both ends of the grant's lifetime against its
+        // real clock. Future-dated fixtures are intentionally invalid (#610).
+        Utc::now()
     }
 
     const fn redaction_config() -> RedactionConfig {
@@ -1314,7 +1313,7 @@ mod allow_once_management_tests {
     #[test]
     fn allow_once_list_redacts_by_default_and_show_raw_reveals() {
         let env = AllowOnceEnv::new();
-        let now = fixed_timestamp();
+        let now = active_timestamp();
         let redaction = redaction_config();
 
         let command_raw = r#"echo "0123456789""#;
@@ -1364,7 +1363,7 @@ mod allow_once_management_tests {
     #[test]
     fn allow_once_revoke_removes_pending_and_active() {
         let env = AllowOnceEnv::new();
-        let now = fixed_timestamp();
+        let now = active_timestamp();
         let redaction = redaction_config();
 
         let command_raw = r#"echo "abcdefghijklmnopqrstuvwxyz""#;
@@ -1411,7 +1410,7 @@ mod allow_once_management_tests {
     #[test]
     fn allow_once_clear_all_wipes_stores() {
         let env = AllowOnceEnv::new();
-        let now = fixed_timestamp();
+        let now = active_timestamp();
         let redaction = redaction_config();
 
         let command_raw = r#"echo "abcdefghijklmnopqrstuvwxyz""#;
@@ -7748,11 +7747,8 @@ mod hook_mode_tests {
         }
     }
 
-    fn fixed_timestamp() -> DateTime<Utc> {
-        // Use a far-future timestamp so tests don't become time-sensitive as real time advances.
-        DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
+    fn active_timestamp() -> DateTime<Utc> {
+        Utc::now()
     }
 
     const fn redaction_config() -> RedactionConfig {
@@ -7765,18 +7761,9 @@ mod hook_mode_tests {
 
     /// The cwd spelling dcg will actually observe at runtime.
     ///
-    /// dcg resolves its working directory with `std::env::current_dir()` on
-    /// every path that touches allow-once — recording a block
-    /// (`src/main.rs`), matching an entry (`src/evaluator.rs`), and redeeming
-    /// a code (`src/cli.rs`). `current_dir()` returns the *symlink-resolved*
-    /// path, so on macOS a `/var/folders/...` tempdir is seen as
-    /// `/private/var/folders/...`. `AllowOnceEntry::matches_scope` compares
-    /// paths for exact equality, so an entry written with the raw tempdir path
-    /// could never match, and these tests failed on macOS while passing on
-    /// Linux (where `/var` is not a symlink).
-    ///
-    /// This is a test-fidelity fix, not a product fix: all three production
-    /// paths derive the cwd the same way, so they agree with each other.
+    /// These fixtures omit a hook-reported cwd, so the process cwd is the
+    /// available scope. Use its canonical spelling across macOS tempdir
+    /// aliases and Windows verbatim paths, as the authorization store does.
     fn observed_cwd(path: &std::path::Path) -> std::path::PathBuf {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         // `canonicalize` yields a `\\?\`-prefixed verbatim path on Windows,
@@ -7793,7 +7780,7 @@ mod hook_mode_tests {
         command: &str,
         force_allow_config: bool,
     ) {
-        let now = fixed_timestamp();
+        let now = active_timestamp();
         let redaction = redaction_config();
         let cwd_str = observed_cwd(cwd).to_string_lossy().into_owned();
 

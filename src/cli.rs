@@ -33,8 +33,7 @@ use crate::packs::{
     load_external_packs,
 };
 use crate::pending_exceptions::{
-    AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
-    PendingExceptionStore,
+    AllowOnceEntry, AllowOnceStore, PendingExceptionRecord, PendingExceptionStore,
 };
 use crate::perf::Deadline;
 use crate::suggest::{
@@ -21091,17 +21090,9 @@ fn handle_allow_once_command(
         .into());
     }
 
-    let selected_cwd = if selected.cwd == "<unknown>" || selected.cwd.is_empty() {
-        cwd
-    } else {
-        std::path::PathBuf::from(&selected.cwd)
-    };
-    let repo_root =
-        crate::config::find_repo_root(&selected_cwd, crate::config::REPO_ROOT_SEARCH_MAX_HOPS);
-    let (scope_kind, scope_path) = repo_root.map_or_else(
-        || (AllowOnceScopeKind::Cwd, selected_cwd.clone()),
-        |root| (AllowOnceScopeKind::Project, root),
-    );
+    let selected_cwd = std::path::Path::new(&selected.cwd);
+    let (scope_kind, scope_path) = crate::pending_exceptions::resolve_allow_once_scope(selected_cwd)
+    .ok_or("Cannot resolve a safe scope for the blocked command's directory; re-run the blocked command from an existing directory to obtain a new code.")?;
     let scope_path_str = scope_path.to_string_lossy().to_string();
 
     let entry = AllowOnceEntry::from_pending(
@@ -21175,7 +21166,7 @@ fn handle_allow_once_command(
         }
     }
 
-    let allow_once_path = AllowOnceStore::default_path(Some(&selected_cwd));
+    let allow_once_path = AllowOnceStore::default_path(Some(selected_cwd));
     let allow_once_store = AllowOnceStore::new(allow_once_path.clone());
     let _maintenance = allow_once_store.add_entry(&entry, now)?;
 
@@ -21271,13 +21262,15 @@ fn handle_allow_once_list(
     if !pending_maintenance.is_empty() || !allow_once_maintenance.is_empty() {
         println!();
         println!(
-            "Maintenance: pending(pruned_expired={}, pruned_consumed={}, parse_errors={}), allow_once(pruned_expired={}, pruned_consumed={}, parse_errors={})",
+            "Maintenance: pending(pruned_expired={}, pruned_consumed={}, parse_errors={}, read_errors={}), allow_once(pruned_expired={}, pruned_consumed={}, parse_errors={}, read_errors={})",
             pending_maintenance.pruned_expired,
             pending_maintenance.pruned_consumed,
             pending_maintenance.parse_errors,
+            pending_maintenance.read_errors,
             allow_once_maintenance.pruned_expired,
             allow_once_maintenance.pruned_consumed,
-            allow_once_maintenance.parse_errors
+            allow_once_maintenance.parse_errors,
+            allow_once_maintenance.read_errors
         );
     }
 
