@@ -42302,6 +42302,78 @@ mod tests {
         }
     }
 
+    /// #601 end to end: Python call text in a comment, or in a string the body
+    /// cannot run, is not a call. Strings handed to dynamic execution, real
+    /// calls, and destructive literals are judged as before.
+    #[test]
+    fn python_call_text_in_strings_and_comments_is_not_a_call_601() {
+        let body = |code: &str| format!("python3 - <<'PY'\n{code}\nPY");
+        for command in [
+            body("s = \"subprocess.run(['git','status'\""),
+            body("# subprocess.run(['git','x'\nprint(1)"),
+            body("s = 'subprocess.run([\"git\",\"add\",*x])'"),
+            body("s = \"subprocess.Popen(['git','status'\""),
+            body("s = \"subprocess.check_output(['git','status'\""),
+            body("s = \"run(['git','status'\""),
+            body(
+                "import sys\nt = open(sys.argv[1]).read()\n\
+                 t = t.replace(\"subprocess.run(['git', 'status'\", \"run_git('status'\")",
+            ),
+            "python3 -c 'print(1)  # subprocess.run([\"git\",\"x\"'".to_string(),
+            body("s = '''subprocess.run(['git','mv',f'{old}','b'])'''"),
+            body("s = '''subprocess.Popen(['git','mv',old,'b'])'''"),
+            body(
+                "s = '''subprocess.run(\n    [\n        \"git\",\n        \"mv\",\n        \
+                 f\"{old}{suffix}\",\n    ],\n)'''",
+            ),
+            body("# subprocess.run(['git','mv',old,'b'])"),
+            body("s = '''subprocess.check_output(['git',args])'''"),
+            body("# subprocess.run(['git',args])"),
+            body("print(1)  # subprocess.run(['rm','-rf','/home/user'])"),
+            body("import subprocess\ncmd = ['git', 'status']\nsubprocess.run(cmd)"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?} must be allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        let rm = "import subprocess; subprocess.run(['rm','-rf','/home/user'])";
+        for command in [
+            body("import subprocess\nx = ['a']\nsubprocess.run(['git', 'add', *x])"),
+            body(&format!("exec(\"{rm}\")")),
+            body(&format!("s = \"{rm}\"\nexec(s)")),
+            body(&format!(
+                "code = compile(\"{rm}\", 'x', 'exec')\nexec(code)"
+            )),
+            body(&format!(
+                "import subprocess, sys\nsubprocess.run([sys.executable, '-c', \"{rm}\"])"
+            )),
+            body(&format!(
+                "import subprocess, sys\ns = \"{rm}\"\nsubprocess.run([sys.executable, '-c', s])"
+            )),
+            body("s = \"subprocess.run(['rm','-rf','/home/user'])\"\nprint(s)"),
+            body("import subprocess\nold = 'a'\nsubprocess.run(['git','mv',old,'b'])"),
+            body("import subprocess\nargs = 'status'\nsubprocess.check_output(['git',args])"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
     #[test]
     fn here_string_receiver_analysis_preserves_bash_rule_allowlists_issue_555() {
         let enabled_packs = ["core.git".to_string(), "core.filesystem".to_string()]

@@ -565,11 +565,23 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         _ => return out,
     };
 
-    for caps in sink_regex.captures_iter(code) {
+    // A Python comment never runs, and call text in a string literal is not a
+    // call unless something can run the string (#601): see `PythonSinkText`.
+    let python_text = (language == ScriptLanguage::Python)
+        .then(|| PythonSinkText::read(code))
+        .flatten();
+    let haystack = python_text
+        .as_ref()
+        .map_or(code, |text| text.comments_masked.as_str());
+
+    for caps in sink_regex.captures_iter(haystack) {
         let Some(m) = caps.get(0) else { continue };
         let Some((call_start, sink)) = exec_sink_call(&caps) else {
             continue;
         };
+        let inert_string_end = python_text
+            .as_ref()
+            .and_then(|text| text.inert_string_end(call_start));
 
         // Scan the sink call's full argument region — not just its first string
         // literal — so a destructive payload nested inside a list/tuple literal
@@ -577,8 +589,17 @@ pub fn scan_executing_sink_matches(code: &str, language: ScriptLanguage) -> Vec<
         // first literal (`"sh"`) is inert (#136). The region spans from the
         // opening paren of this match to the balanced close paren (bounded to the
         // remainder of the source), descending into bracketed list elements.
-        let arg_region = exec_sink_arg_region(code, call_start);
-        let Some(hit) = detect_destructive_in_args(arg_region, language) else {
+        // Call text inside an inert string ends where the string does.
+        let arg_region = exec_sink_arg_region(
+            inert_string_end.map_or(haystack, |end| &haystack[..end]),
+            call_start,
+        );
+        let hit = if inert_string_end.is_some() {
+            detect_destructive_in_literal_args(arg_region, language)
+        } else {
+            detect_destructive_in_args(arg_region, language)
+        };
+        let Some(hit) = hit else {
             continue;
         };
 
@@ -747,8 +768,15 @@ pub fn exec_sink_reconstructed_commands(
     // Perl comments can hold a `system(...)` that never runs; mask them so a
     // commented call is not reconstructed and over-blocked. Masking preserves
     // length, so the sink spans still line up with `code`.
+    // Python's are masked the same way, and call text in a string nothing can
+    // run is not a call (#601).
+    let python_text = (language == ScriptLanguage::Python)
+        .then(|| PythonSinkText::read(code))
+        .flatten();
     let masked = if language == ScriptLanguage::Perl {
         mask_perl_comments(code)
+    } else if let Some(text) = python_text.as_ref() {
+        std::borrow::Cow::Borrowed(text.comments_masked.as_str())
     } else {
         std::borrow::Cow::Borrowed(code)
     };
@@ -771,7 +799,13 @@ pub fn exec_sink_reconstructed_commands(
         let Some((call_start, sink)) = exec_sink_call(&caps) else {
             continue;
         };
-        let region = exec_sink_arg_region(haystack, call_start);
+        let inert_string_end = python_text
+            .as_ref()
+            .and_then(|text| text.inert_string_end(call_start));
+        let region = exec_sink_arg_region(
+            inert_string_end.map_or(haystack, |end| &haystack[..end]),
+            call_start,
+        );
         // A call the rm/git backstop owns (any `detect_destructive_in_args`
         // hit) is left to it, so an allowlisted `rm`/`git` is not re-denied
         // here under a pack rule id.
@@ -803,6 +837,17 @@ pub fn exec_sink_reconstructed_commands(
             exec_argv_operands(region, language)
         };
         if argv.unverified {
+            continue;
+        }
+        // In a string nothing runs, a name is text, not a value decided at run
+        // time, so it raises no dynamic-path or alias question (#601). A fully
+        // literal command is still judged, as any destructive literal is.
+        if inert_string_end.is_some()
+            && argv
+                .values
+                .iter()
+                .any(|value| value.contains(RUNTIME_VALUE))
+        {
             continue;
         }
         let operands = argv.values;
@@ -3979,6 +4024,212 @@ fn mask_perl_comments(code: &str) -> std::borrow::Cow<'_, str> {
     String::from_utf8(out).map_or(std::borrow::Cow::Borrowed(code), std::borrow::Cow::Owned)
 }
 
+/// A Python body as the exec-sink scans read it (#601).
+///
+/// A sink name inside a comment is never a call, so comments are blanked, as
+/// Perl's are. A sink name inside a string literal becomes a call only when
+/// something runs the string, and `strings_may_run` says whether the body
+/// could: outside every string and comment it has a sink call, or a name that
+/// executes, imports or looks up code at run time. When it cannot, call text
+/// in a string is judged by its literal content alone. Destructive argv still
+/// blocks there, as any destructive literal does, but the questions only a
+/// real call raises (how many arguments a spread supplies, which value a name
+/// holds at run time) are not asked of text.
+///
+/// The edit scripts that quote another script's `subprocess.run([…` line in
+/// a search or replacement string were denied for those questions.
+struct PythonSinkText {
+    /// The body with every comment blanked; offsets match the body.
+    comments_masked: String,
+    /// The contents of each plain string literal (not an f- or t-string,
+    /// whose fields are code), quotes excluded.
+    strings: PythonSpans,
+    strings_may_run: bool,
+}
+
+/// Names through which a Python body can run, import or look up code that a
+/// string spells: dynamic execution, reflection, and the process and
+/// interpreter modules whose calls the sink regex does not name.
+static PY_STRING_RUNNER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:exec\w*|eval|compile|__import__|import_module|getattr|importlib|runpy|globals|locals|vars|__builtins__|builtins|__dict__|codeop|InteractiveInterpreter|InteractiveConsole|runsource|runcode|interact|pickle|marshal|ctypes|subprocess|pty|asyncio|multiprocessing|pexpect|commands|popen\w*|system|spawn\w*|posix_spawn\w*|startfile)\b|\b(?:import|from)\s+code\b",
+    )
+    .expect("python string runner regex compiles")
+});
+
+impl PythonSinkText {
+    /// `None` when a string literal does not close, so nothing is masked.
+    fn read(code: &str) -> Option<Self> {
+        let (comments, strings) = python_comment_and_string_spans(code)?;
+        let mut masked = code.as_bytes().to_vec();
+        for span in &comments {
+            masked[span.clone()].fill(b' ');
+        }
+        let comments_masked = String::from_utf8(masked.clone()).ok()?;
+        for span in &strings {
+            for byte in &mut masked[span.clone()] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+        }
+        let code_only = String::from_utf8(masked).ok()?;
+        let strings_may_run =
+            PY_EXEC_SINK_LITERAL.is_match(&code_only) || PY_STRING_RUNNER.is_match(&code_only);
+        Some(Self {
+            comments_masked,
+            strings,
+            strings_may_run,
+        })
+    }
+
+    /// Where the plain string literal holding `at` ends, when nothing in the
+    /// body can run a string.
+    fn inert_string_end(&self, at: usize) -> Option<usize> {
+        if self.strings_may_run {
+            return None;
+        }
+        self.strings
+            .iter()
+            .find(|span| span.contains(&at))
+            .map(|span| span.end)
+    }
+}
+
+/// Byte ranges of a Python body.
+type PythonSpans = Vec<std::ops::Range<usize>>;
+
+/// The comments and the plain string literals' contents in a Python body, or
+/// `None` when a literal does not close (the body would not run at all, and
+/// the reading cannot be trusted).
+fn python_comment_and_string_spans(code: &str) -> Option<(PythonSpans, PythonSpans)> {
+    let bytes = code.as_bytes();
+    let mut comments = Vec::new();
+    let mut strings = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                let end = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |at| i + at);
+                comments.push(i..end);
+                i = end;
+            }
+            b'\'' | b'"' => {
+                let fields = python_string_has_fields(bytes, i);
+                let (content, end) = python_string_end(bytes, i, fields)?;
+                if !fields {
+                    strings.push(content);
+                }
+                i = end;
+            }
+            // A line continuation, or a stray backslash the parser rejects.
+            b'\\' => i += 2,
+            _ => i += 1,
+        }
+    }
+    Some((comments, strings))
+}
+
+/// Whether the string literal whose quote is at `quote` is an f- or t-string:
+/// its prefix (the letters directly before the quote) names one.
+fn python_string_has_fields(bytes: &[u8], quote: usize) -> bool {
+    let prefix_start = bytes[..quote]
+        .iter()
+        .rposition(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+        .map_or(0, |at| at + 1);
+    let prefix = &bytes[prefix_start..quote];
+    prefix.len() <= 2
+        && prefix
+            .iter()
+            .any(|byte| matches!(byte.to_ascii_lowercase(), b'f' | b't'))
+        && prefix
+            .iter()
+            .all(|byte| matches!(byte.to_ascii_lowercase(), b'f' | b't' | b'r'))
+}
+
+/// The contents of the string literal opening at `open` and the offset one
+/// past its closing quote, or `None` when it does not close. A replacement
+/// field of an f- or t-string is code: a quote inside it opens a nested
+/// literal rather than ending this one (PEP 701).
+fn python_string_end(
+    bytes: &[u8],
+    open: usize,
+    fields: bool,
+) -> Option<(std::ops::Range<usize>, usize)> {
+    let quote = bytes[open];
+    let triple = bytes.get(open + 1) == Some(&quote) && bytes.get(open + 2) == Some(&quote);
+    let start = open + if triple { 3 } else { 1 };
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\n' if !triple => return None,
+            b'{' if fields => {
+                if bytes.get(i + 1) == Some(&b'{') {
+                    i += 2;
+                } else {
+                    i = python_replacement_field_end(bytes, i + 1)?;
+                }
+            }
+            byte if byte == quote => {
+                if !triple {
+                    return Some((start..i, i + 1));
+                }
+                if bytes.get(i + 1) == Some(&quote) && bytes.get(i + 2) == Some(&quote) {
+                    return Some((start..i, i + 3));
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// One past the `}` that closes the replacement field whose code starts at
+/// `start`. After a top-level `:` or `!` the field is a format spec, where a
+/// quote is a fill character and only nested fields matter.
+fn python_replacement_field_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut spec = false;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b'(' | b'[' if !spec => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' if !spec => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+            }
+            b':' | b'!' if !spec && depth == 0 => {
+                spec = true;
+                i += 1;
+            }
+            b'\'' | b'"' if !spec => {
+                let fields = python_string_has_fields(bytes, i);
+                i = python_string_end(bytes, i, fields)?.1;
+            }
+            // A comment inside a field: not worth reading.
+            b'#' if !spec => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 fn string_literal_from_caps<'t>(caps: &regex::Captures<'t>) -> Option<&'t str> {
     caps.name("dq")
         .or_else(|| caps.name("sq"))
@@ -4095,6 +4346,24 @@ fn detect_destructive_in_args(
     call_text: &str,
     language: ScriptLanguage,
 ) -> Option<ShellPayloadHit> {
+    detect_destructive_in_args_counting(call_text, language, true)
+}
+
+/// [`detect_destructive_in_args`] for call text inside a string literal that
+/// nothing can run (#601): its literals are judged, but an argument list that
+/// cannot be counted is not a finding, because no call exists to count.
+fn detect_destructive_in_literal_args(
+    call_text: &str,
+    language: ScriptLanguage,
+) -> Option<ShellPayloadHit> {
+    detect_destructive_in_args_counting(call_text, language, false)
+}
+
+fn detect_destructive_in_args_counting(
+    call_text: &str,
+    language: ScriptLanguage,
+    count_arguments: bool,
+) -> Option<ShellPayloadHit> {
     // Operands, not literals. A token split across a concatenation operator is
     // one operand the call really builds, and reading its halves separately hid
     // it from both views below in every language at once (#474).
@@ -4145,9 +4414,10 @@ fn detect_destructive_in_args(
         // targets. Never grant a fixed-argv proof to that shape. A wholly
         // opaque command retains the existing warn-only posture; this finding
         // applies when the executable itself is visible.
-        if literals
-            .first()
-            .is_some_and(|program| !program.is_empty() && !program.contains(RUNTIME_VALUE))
+        if count_arguments
+            && literals
+                .first()
+                .is_some_and(|program| !program.is_empty() && !program.contains(RUNTIME_VALUE))
         {
             found = more_severe(
                 found,
@@ -12272,6 +12542,128 @@ def cleanup():
             ] {
                 assert!(commands(code, language).is_empty(), "{code:?}");
             }
+        }
+    }
+
+    /// #601: call text in a Python comment, or in a string literal nothing can
+    /// run, is not a call.
+    mod python_sink_text_in_strings_and_comments {
+        use super::*;
+
+        fn blocking_rules(code: &str) -> Vec<String> {
+            scan_executing_sink_matches(code, ScriptLanguage::Python)
+                .into_iter()
+                .filter(|m| m.severity.blocks_by_default())
+                .map(|m| m.rule_id)
+                .collect()
+        }
+
+        fn commands(code: &str) -> Vec<String> {
+            exec_sink_reconstructed_commands(code, ScriptLanguage::Python)
+                .into_iter()
+                .map(|c| c.command)
+                .collect()
+        }
+
+        #[test]
+        fn lexer_finds_comments_and_plain_string_contents() {
+            let code = "a = 'x#y'  # c1\nb = \"it\\\"s\"\nc = '''q\n'r' \"s\"'''\n\
+                        d = f\"{e['k']!r:>{w}} {{z}}\"\ng = r'a\\'b' # c2";
+            let (comments, strings) = python_comment_and_string_spans(code).expect("closes");
+            let text = |spans: &[std::ops::Range<usize>]| -> Vec<String> {
+                spans
+                    .iter()
+                    .map(|span| code[span.clone()].to_string())
+                    .collect()
+            };
+            assert_eq!(text(&comments), ["# c1", "# c2"]);
+            // The f-string is code; its nested `'k'` is skipped with it.
+            assert_eq!(text(&strings), ["x#y", "it\\\"s", "q\n'r' \"s\"", "a\\'b"]);
+            for unclosed in [
+                "s = 'abc\nprint(1)",
+                "s = '''abc",
+                "s = f\"{x\"",
+                "s = \"a\\",
+            ] {
+                assert!(
+                    python_comment_and_string_spans(unclosed).is_none(),
+                    "{unclosed:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn call_text_in_comments_and_inert_strings_raises_no_call_questions() {
+            for code in [
+                "s = \"subprocess.run(['git','status'\"",
+                "# subprocess.run(['git','x'\nprint(1)",
+                "s = 'subprocess.run([\"git\",\"add\",*x])'",
+                "s = \"subprocess.Popen(['git','status'\"",
+                "s = \"subprocess.check_output(['git','status'\"",
+                "s = \"run(['git','status'\"",
+                "import sys\nt = open(sys.argv[1]).read()\n\
+                 t = t.replace(\"subprocess.run(['git', 'status'\", \"run_git('status'\")\n\
+                 open(sys.argv[1], 'w').write(t)",
+                "print(1)  # subprocess.run([\"git\",\"x\"",
+                "name = 'a'\nprint(f\"patched {name!r:>10} {{x}}\")\n\
+                 s = \"subprocess.run(['git','status'\"",
+            ] {
+                assert_eq!(blocking_rules(code), Vec::<String>::new(), "{code:?}");
+            }
+            for code in [
+                "s = '''subprocess.run(['git','mv',f'{old}','b'])'''",
+                "s = '''subprocess.Popen(['git','mv',old,'b'])'''",
+                "s = '''subprocess.run(\n    [\n        \"git\",\n        \"mv\",\n        \
+                 f\"{old}{suffix}\",\n    ],\n)'''",
+                "# subprocess.run(['git','mv',old,'b'])",
+                "s = '''subprocess.check_output(['git',args])'''",
+                "# subprocess.run(['git',args])",
+            ] {
+                assert_eq!(commands(code), Vec::<String>::new(), "{code:?}");
+            }
+        }
+
+        #[test]
+        fn strings_a_body_can_run_and_real_calls_keep_every_question() {
+            // A string handed to dynamic execution, or a body with a real sink
+            // or a runner name anywhere outside its strings, is read as before.
+            for code in [
+                "x = ['a']\nsubprocess.run(['git', 'add', *x])",
+                "s = \"subprocess.run(['git','add',*x])\"\nexec(s)",
+                "s = \"subprocess.run(['git','add',*x])\"\neval(compile(s, 'f', 'exec'))",
+                "import subprocess\ns = \"subprocess.run(['git','add',*x])\"",
+                "from os import system\ns = \"subprocess.run(['git','add',*x])\"",
+                "s = \"subprocess.run(['git','add',*x])\"\ngetattr(m, 'f')(s)",
+                // Lexer edge cases must not hide the real call.
+                "s = 'it\\'s'\nsubprocess.run(['git', *x])",
+                "s = r'a\\'b'\nsubprocess.run(['git', *x])",
+                "s = '''it's \"x\" '''\nsubprocess.run(['git', *x])",
+                "s = f\"{d[\"k\"]}\"\nsubprocess.run(['git', *x])",
+            ] {
+                assert!(
+                    blocking_rules(code)
+                        .iter()
+                        .any(|rule| rule.ends_with("argv_unverified")),
+                    "{code:?}: {:?}",
+                    blocking_rules(code)
+                );
+            }
+            // Destructive argv in a string still blocks, as any destructive
+            // literal in a body does.
+            assert_eq!(
+                blocking_rules("s = \"subprocess.run(['rm','-rf','/home/user'])\"\nprint(s)"),
+                ["heredoc.python.exec_sink.rm_rf_catastrophic"]
+            );
+            let dd = commands("s = \"subprocess.run(['dd','if=/dev/zero','of=/dev/sda'])\"");
+            assert!(
+                matches!(dd.as_slice(), [command] if command.starts_with("dd ")),
+                "{dd:?}"
+            );
+            assert_eq!(
+                commands("import subprocess\nold = 'a'\nsubprocess.run(['git','mv',old,'b'])")
+                    .len(),
+                1
+            );
         }
     }
 
