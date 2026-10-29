@@ -79,6 +79,13 @@ default. Before #378 the default was reusable.
 
 All allow-once exceptions expire after **24 hours** from creation. This cannot be changed.
 
+DCG checks this limit when reading stored grants and pending codes, as well as
+when creating them. Records with an unsupported schema, malformed timestamps,
+future creation time, non-positive lifetime, or lifetime longer than 24 hours
+are rejected. A grant is expired at its expiration timestamp. Invalid records
+are skipped without disabling valid neighboring grants and are removed during
+store maintenance.
+
 ### Directory Scope
 
 Exceptions are scoped based on whether the command was blocked inside a git repository:
@@ -87,6 +94,14 @@ Exceptions are scoped based on whether the command was blocked inside a git repo
 - **cwd scope** (outside git repos): If blocked outside a git repository, the exception only applies in the exact directory where the command was blocked.
 
 The scope is automatically determined—you cannot override it. This ensures exceptions are appropriately scoped: broad enough to be useful within a project, but not so broad that they leak across unrelated directories.
+
+Scope checks use the requested command's working directory, including a
+directory supplied by the agent hook. Paths are resolved before comparison so
+`..` components and symlinks cannot escape a scope. A project scope must name
+an existing repository root, cannot cover a filesystem root, and does not
+extend into a nested repository, submodule, or separate worktree. A missing,
+relative, or unknown directory cannot authorize a grant or be replaced with
+the directory where someone redeems the code.
 
 ### Exact Command Match
 
@@ -279,19 +294,33 @@ These can be overridden with environment variables:
 - `DCG_PENDING_EXCEPTIONS_PATH`
 - `DCG_ALLOW_ONCE_PATH`
 
+With `careful_company_running_windows.guardrails` enabled, the
+`dcg-policy-self-weakening` rule also checks shell writes to the authorization
+stores, including redirects and common filesystem-writing commands. Reads and
+writes to unrelated files remain available.
+
+These files are local authorization state, not an independent security boundary
+against a process that can modify them. Record validation enforces the lifetime
+and scope limits; it does not authenticate who approved a grant. The optional
+short-code secret below does not sign stored grants, and a shell hook cannot
+intercept writes made through a separate file-editing tool.
+
 ---
 
 ## Optional HMAC Hardening
 
 Set `DCG_ALLOW_ONCE_SECRET` to harden short-code generation with HMAC-SHA256.
-This prevents attackers (or tooling) from forging valid short codes without the secret.
+Newly generated codes then depend on the secret as well as the request metadata.
+This does not authenticate records loaded from either authorization store.
 
 Trade-offs:
-- **Security**: stronger, tamper-resistant short codes.
-- **Recoverability**: if the secret changes or is lost, previously issued codes will no longer resolve.
-  Re-run the blocked command to generate a new code under the new secret.
+- **Generation**: a party without the secret cannot recompute newly issued codes
+  from the command, directory, and timestamp alone.
+- **Rotation**: changing the secret changes future codes. Already stored pending
+  codes and approved grants retain their own expiration and scope limits; secret
+  rotation does not revoke them. Use `revoke` or `clear` to remove them.
 
-Keep the secret stable within the environment where you expect to resolve codes.
+Keep the secret stable when you need consistent code generation across hooks.
 
 ---
 

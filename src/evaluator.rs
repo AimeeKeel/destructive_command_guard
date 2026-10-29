@@ -358,6 +358,49 @@ thread_local! {
     static AUTHORIZATION_REPLAY_SOURCE: std::cell::RefCell<Option<Rc<str>>> = const {
         std::cell::RefCell::new(None)
     };
+    /// A hook knows whether its request's working directory is unresolved.
+    /// Keep that distinct from library callers that supplied no directory and
+    /// may still use the process cwd.
+    static ALLOW_ONCE_REQUEST_CWD: std::cell::RefCell<AllowOnceRequestCwd> = const {
+        std::cell::RefCell::new(AllowOnceRequestCwd::Unspecified)
+    };
+}
+
+#[derive(Clone, Default)]
+enum AllowOnceRequestCwd {
+    #[default]
+    Unspecified,
+    Known(Rc<Path>),
+    Unknown,
+}
+
+/// Bind allow-once authorization to one request's known starting directory.
+///
+/// Hook adapters install this around evaluation and policy replays. `None`
+/// explicitly means the request directory is unknown, so no scoped grant can
+/// apply. Without an installed context, an explicit evaluator path is used,
+/// with the process cwd as a fallback only for callers that supply no path.
+/// The `Rc` makes this guard thread-bound, like the synchronous evaluation it
+/// scopes, and dropping it restores the previous request context.
+#[must_use]
+pub struct AllowOnceCwdScope {
+    previous: AllowOnceRequestCwd,
+}
+
+impl AllowOnceCwdScope {
+    pub fn install(cwd: Option<&Path>) -> Self {
+        let request_cwd = cwd.map_or(AllowOnceRequestCwd::Unknown, |path| {
+            AllowOnceRequestCwd::Known(Rc::from(path))
+        });
+        let previous = ALLOW_ONCE_REQUEST_CWD.with(|slot| slot.replace(request_cwd));
+        Self { previous }
+    }
+}
+
+impl Drop for AllowOnceCwdScope {
+    fn drop(&mut self) {
+        ALLOW_ONCE_REQUEST_CWD.with(|slot| *slot.borrow_mut() = std::mem::take(&mut self.previous));
+    }
 }
 
 struct SafePatternSource {
@@ -14083,13 +14126,14 @@ fn resolve_project_path(
 
 fn allow_once_match(
     command: &str,
+    project_path: Option<&Path>,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
     // A policy replay is a different detection view of the same request.
     // Resolve its identity before consulting the store: matching the derived
     // text would both authorize another command and consume its one-use grant.
     original_command_grant(command, |original| {
-        let cwd = std::env::current_dir().ok()?;
+        let cwd = allow_once_request_cwd(project_path)?;
         let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
         store
             .match_command(original, &cwd, Utc::now(), allow_once_audit)
@@ -14101,16 +14145,35 @@ fn allow_once_match(
 #[allow(dead_code)]
 fn allow_once_match_force_config(
     command: &str,
+    project_path: Option<&Path>,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
     original_command_grant(command, |original| {
-        let cwd = std::env::current_dir().ok()?;
+        let cwd = allow_once_request_cwd(project_path)?;
         let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
         store
             .match_command_force_config(original, &cwd, Utc::now(), allow_once_audit)
             .ok()
             .flatten()
     })
+}
+
+/// Resolve the authoritative request's starting directory. `None` represents
+/// an explicitly unknown/invalid directory, unless no request or explicit
+/// path was supplied and the process cwd is also unavailable.
+pub(crate) fn allow_once_request_cwd(project_path: Option<&Path>) -> Option<PathBuf> {
+    let request_cwd = ALLOW_ONCE_REQUEST_CWD.with(|slot| slot.borrow().clone());
+    let cwd = match request_cwd {
+        AllowOnceRequestCwd::Known(cwd) => cwd.as_ref().to_path_buf(),
+        // An explicitly unresolved request must never borrow the hook
+        // process's directory, even when another evaluation view has a path.
+        AllowOnceRequestCwd::Unknown => return None,
+        AllowOnceRequestCwd::Unspecified => match project_path {
+            Some(cwd) => cwd.to_path_buf(),
+            None => std::env::current_dir().ok()?,
+        },
+    };
+    (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
 /// Return whether evaluation may recurse into an executable payload before the
@@ -14962,7 +15025,8 @@ fn evaluate_command_in_single_dialect_view(
     // may intentionally bypass an explicit config block.
     if let Some(reason) = compiled_overrides.check_block(command) {
         if nested_command_depth == 0
-            && allow_once_match_force_config(allow_once_command, allow_once_audit).is_some()
+            && allow_once_match_force_config(allow_once_command, project_path, allow_once_audit)
+                .is_some()
         {
             return EvaluationResult::allowed_by_allow_once();
         }
@@ -15066,7 +15130,7 @@ fn evaluate_command_in_single_dialect_view(
         && (may_evaluate_nested_payload_before_allowlists(command)
             || !posix_executable_model.invocations.is_empty());
     if checked_allow_once_before_nested
-        && allow_once_match(allow_once_command, allow_once_audit).is_some()
+        && allow_once_match(allow_once_command, project_path, allow_once_audit).is_some()
     {
         return EvaluationResult::allowed_by_allow_once();
     }
@@ -15728,7 +15792,7 @@ fn evaluate_command_in_single_dialect_view(
     // every unrelated hook invocation.
     if nested_command_depth == 0
         && !checked_allow_once_before_nested
-        && allow_once_match(allow_once_command, allow_once_audit).is_some()
+        && allow_once_match(allow_once_command, project_path, allow_once_audit).is_some()
     {
         return EvaluationResult::allowed_by_allow_once();
     }
@@ -31741,10 +31805,11 @@ fn find_actionable_command_pattern_span(
     if pack_id == "careful_company_running_windows.guardrails"
         && let Some(rule @ ("dcg-bypass-or-uninstall" | "dcg-policy-self-weakening")) = pattern_name
         && let Some(range) =
-            crate::packs::careful_company_running_windows::guardrails::dcg_control_action_span(
+            crate::packs::careful_company_running_windows::guardrails::dcg_control_action_span_in_source(
                 command,
                 shell_dialect,
                 rule,
+                source_context,
             )
     {
         let span = MatchSpan {
@@ -33352,7 +33417,7 @@ where
     }
 
     // Step 1: Check allow-once overrides (may be superseded by config blocklist).
-    let allow_once = allow_once_match(command, None);
+    let allow_once = allow_once_match(command, None, None);
 
     // Step 2: Check precompiled block overrides before allow overrides. Deny
     // wins on overlapping config overrides unless allow-once was granted with
@@ -51145,6 +51210,176 @@ mod tests {
                 .result
                 .is_allowed()
         );
+    }
+
+    #[test]
+    fn allow_once_authorization_uses_request_directory_issue_610() {
+        use crate::pending_exceptions::{
+            AllowOnceEntry, AllowOnceScopeKind, ENV_ALLOW_ONCE_PATH, PendingExceptionRecord,
+        };
+
+        const CHILD_MARKER: &str = "DCG_TEST_ALLOW_ONCE_REQUEST_CWD_CHILD";
+        const CHILD_COMPLETION: &str = "dcg-allow-once-request-cwd-child-complete";
+
+        // Environment and cwd are process-global, so run this matrix in a
+        // child rather than mutating them alongside parallel test readers.
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let fixtures = tempfile::tempdir().expect("allow-once fixture directory");
+            let process_cwd = fixtures.path().join("hook-process");
+            std::fs::create_dir(&process_cwd).unwrap();
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args([
+                "--exact",
+                "evaluator::tests::allow_once_authorization_uses_request_directory_issue_610",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(
+                ENV_ALLOW_ONCE_PATH,
+                fixtures.path().join("allow_once.jsonl"),
+            )
+            .current_dir(&process_cwd)
+            .output()
+            .expect("run isolated request-directory test");
+            assert!(
+                output.status.success(),
+                "isolated request-directory test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETION));
+            return;
+        }
+
+        let process_cwd = std::env::current_dir().unwrap();
+        let request_cwd = process_cwd.parent().unwrap().join("request");
+        std::fs::create_dir(&request_cwd).unwrap();
+        let missing_cwd = request_cwd.join("missing");
+        let file_cwd = request_cwd.join("file");
+        std::fs::write(&file_cwd, "not a directory").unwrap();
+        let store = AllowOnceStore::new(PathBuf::from(
+            std::env::var_os(ENV_ALLOW_ONCE_PATH).unwrap(),
+        ));
+        let redaction = crate::logging::RedactionConfig::default();
+
+        // Exercise the deferred lookup, pre-recursion lookup, and forced
+        // config-override lookup. All three must use the same request scope.
+        for (command, force) in [
+            ("git reset --hard HEAD", false),
+            ("sh -c 'git reset --hard HEAD'", false),
+            ("sh -c 'cd \"$DEST\" && git reset --hard HEAD'", false),
+            ("git reset --hard HEAD", true),
+        ] {
+            let mut config = default_config();
+            if force {
+                config.overrides.block.push(crate::config::BlockOverride {
+                    pattern: format!("^{}$", regex::escape(command)),
+                    reason: "request-directory forced-grant control".to_string(),
+                });
+            }
+            let enabled = config.enabled_pack_ids();
+            let keywords = REGISTRY.collect_enabled_keywords(&enabled);
+            let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+            let index = REGISTRY.build_enabled_keyword_index(&ordered);
+            let overrides = config.overrides.compile();
+            let allowlists = default_allowlists();
+            let settings = config.heredoc_settings();
+            let evaluate = |cwd: Option<&Path>| {
+                evaluate_command_with_pack_order_at_path_in_dialect(
+                    command,
+                    &keywords,
+                    &ordered,
+                    index.as_ref(),
+                    &overrides,
+                    &allowlists,
+                    &settings,
+                    cwd,
+                    ShellDialect::Posix,
+                )
+            };
+            let grant = |cwd: &Path| {
+                let now = Utc::now();
+                let cwd = cwd.to_string_lossy();
+                let pending = PendingExceptionRecord::new(
+                    now,
+                    &cwd,
+                    command,
+                    "reviewed request-directory control",
+                    &redaction,
+                    true,
+                    None,
+                );
+                let entry = AllowOnceEntry::from_pending(
+                    &pending,
+                    now,
+                    AllowOnceScopeKind::Cwd,
+                    &cwd,
+                    true,
+                    force,
+                    &redaction,
+                );
+                store.add_entry(&entry, now).expect("seed one-use grant");
+            };
+            let active = || store.preview_active(Utc::now()).unwrap().0;
+
+            grant(&process_cwd);
+            for cwd in [
+                request_cwd.as_path(),
+                Path::new("."),
+                missing_cwd.as_path(),
+                file_cwd.as_path(),
+            ] {
+                let result = evaluate(Some(cwd));
+                assert!(result.is_denied(), "{command}: {cwd:?}: {result:?}");
+                assert_eq!(active().len(), 1, "wrong scope must not consume a grant");
+            }
+
+            {
+                let _request = AllowOnceCwdScope::install(Some(&request_cwd));
+                assert!(evaluate(Some(&process_cwd)).is_denied());
+                {
+                    let _unknown = AllowOnceCwdScope::install(None);
+                    assert!(evaluate(Some(&process_cwd)).is_denied());
+                    assert!(evaluate(None).is_denied());
+                }
+                // Dropping a nested context restores the outer request, not
+                // the hook process's directory.
+                assert!(evaluate(None).is_denied());
+                assert_eq!(active().len(), 1);
+            }
+            // A library call with no explicit/request cwd may use getcwd;
+            // the previous request's unknown/different scope must not leak.
+            let fallback = evaluate(None);
+            assert!(fallback.is_allowed(), "{command}: {fallback:?}");
+            assert!(active().is_empty());
+
+            grant(&request_cwd);
+            let allowed = evaluate(Some(&request_cwd));
+            assert!(allowed.is_allowed(), "{command}: {allowed:?}");
+            assert!(matches!(
+                allowed.bypass_method,
+                Some(BypassMethod::AllowOnce)
+            ));
+            assert!(active().is_empty());
+            assert!(
+                evaluate(Some(&request_cwd)).is_denied(),
+                "single-use remains single-use"
+            );
+
+            grant(&request_cwd);
+            {
+                let _request = AllowOnceCwdScope::install(Some(&request_cwd));
+                let allowed = evaluate(None);
+                assert!(
+                    allowed.is_allowed(),
+                    "base-scoped envelope: {command}: {allowed:?}"
+                );
+                assert!(active().is_empty());
+            }
+        }
+        println!("{CHILD_COMPLETION}");
     }
 
     #[test]

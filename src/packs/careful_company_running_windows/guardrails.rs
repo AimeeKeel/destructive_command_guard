@@ -18,6 +18,7 @@
 //!     business data.
 //!   - **dcg and the agent's own configuration**: `DCG_BYPASS`, `dcg uninstall`,
 //!     allowlist grants (`dcg allowlist add`, `dcg allow-once`), the runtime
+//!     authorization stores (`allow_once.jsonl`, `pending_exceptions.jsonl`),
 //!     config overrides (`DCG_DISABLE`, `DCG_PACKS`, `DCG_CONFIG`,
 //!     `DCG_POLICY_DEFAULT_MODE=warn|log`, `DCG_POLICY_OBSERVE_UNTIL`,
 //!     `DCG_HEREDOC_ENABLED=false`), and edits to the agent hook files
@@ -54,6 +55,8 @@ use crate::normalize::{
 use crate::packs::careful_company_running_windows::shared_safe_patterns;
 use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
+use std::ops::Range;
+use std::path::{Component, Path, PathBuf};
 
 // Match the global options declared by `cli::Cli`, including between an
 // `allowlist` command and its subcommand. Only --agent consumes a value: a
@@ -85,6 +88,17 @@ pub(crate) fn dcg_control_action_span(
     dialect: ShellDialect,
     expected_rule: &str,
 ) -> Option<std::ops::Range<usize>> {
+    dcg_control_action_span_in_source(command, dialect, expected_rule, None)
+}
+
+/// Preserve the enclosing request when a pack evaluates one command segment.
+/// Relative write destinations depend on directory changes before that segment.
+pub(crate) fn dcg_control_action_span_in_source(
+    command: &str,
+    dialect: ShellDialect,
+    expected_rule: &str,
+    source_context: Option<(&str, usize)>,
+) -> Option<std::ops::Range<usize>> {
     if !matches!(
         expected_rule,
         "dcg-bypass-or-uninstall" | "dcg-policy-self-weakening"
@@ -96,6 +110,12 @@ pub(crate) fn dcg_control_action_span(
     } else {
         dialect
     };
+    if expected_rule == "dcg-policy-self-weakening"
+        && let Some(span) =
+            authorization_store_write_span_from_source(command, dialect, source_context)
+    {
+        return Some(span);
+    }
     let tokens = tokenize_for_shell_dialect(command, dialect);
     let mut start = 0;
     let mut depth = 0usize;
@@ -292,6 +312,450 @@ fn dcg_segment_action_span(
     None
 }
 
+/// Add destructive evidence only for a write to a DCG authorization store.
+/// The Bash tree owns redirections and argv boundaries: quoted examples,
+/// comments, heredoc data, read-only inputs and backup-copy sources are not
+/// writes. This is deliberately not a general shell or filesystem sandbox.
+pub(crate) fn authorization_store_write_span(
+    command: &str,
+    dialect: ShellDialect,
+) -> Option<Range<usize>> {
+    authorization_store_write_span_from_source(command, dialect, None)
+}
+
+fn authorization_store_write_span_from_source(
+    command: &str,
+    dialect: ShellDialect,
+    source_context: Option<(&str, usize)>,
+) -> Option<Range<usize>> {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return None;
+    }
+    let stores = AuthorizationStorePaths::current();
+    authorization_store_write_span_with_paths_in_source(command, &stores, source_context)
+}
+
+#[cfg(test)]
+fn authorization_store_write_span_with_paths(
+    command: &str,
+    stores: &AuthorizationStorePaths,
+) -> Option<Range<usize>> {
+    authorization_store_write_span_with_paths_in_source(command, stores, None)
+}
+
+fn authorization_store_write_span_with_paths_in_source(
+    command: &str,
+    stores: &AuthorizationStorePaths,
+    source_context: Option<(&str, usize)>,
+) -> Option<Range<usize>> {
+    let ast = crate::heredoc::try_parse_shell_ast(command).ok()?;
+    let (source, source_base) = source_context.unwrap_or((command, 0));
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        match node.kind().as_ref() {
+            // Stored source is handled by the evaluator when it is executed.
+            "heredoc_body" | "comment" | "function_definition" => continue,
+            "file_redirect" => {
+                // Redirections open before the simple command runs: a `cd`
+                // with a redirect still writes in its previous directory.
+                let statement_start = node
+                    .parent()
+                    .filter(|owner| {
+                        matches!(owner.kind().as_ref(), "command" | "redirected_statement")
+                    })
+                    .map_or(node.range().start, |owner| owner.range().start);
+                if node.children().any(|part| {
+                    matches!(
+                        part.kind().as_ref(),
+                        ">" | ">>" | ">|" | "&>" | "&>>" | ">&" | "<>"
+                    )
+                }) && let Some(target) = node.field("destination")
+                    && stores
+                        .at_source_prefix(source.get(..source_base.checked_add(statement_start)?)?)
+                        .matches_word(target.text().as_ref())
+                {
+                    return Some(node.range().start..target.range().end);
+                }
+            }
+            "command" => {
+                let statement_start = node
+                    .parent()
+                    .filter(|owner| owner.kind() == "redirected_statement")
+                    .map_or(node.range().start, |owner| owner.range().start);
+                let mut words = Vec::new();
+                for child in node.children().filter(ast_grep_core::Node::is_named) {
+                    if !matches!(
+                        child.kind().as_ref(),
+                        "variable_assignment" | "file_redirect" | "comment"
+                    ) {
+                        words.push((child.text().to_string(), child.range()));
+                    }
+                }
+                // Bash attaches argv after a redirection to its destination
+                // field. The first destination is the file; later children
+                // still belong to this simple command's argv.
+                if let Some(owner) = node.parent()
+                    && owner.kind() == "redirected_statement"
+                    && owner
+                        .field("body")
+                        .is_some_and(|body| body.node_id() == node.node_id())
+                {
+                    for redirect in owner
+                        .children()
+                        .filter(|part| part.kind() == "file_redirect")
+                    {
+                        words.extend(
+                            redirect
+                                .children()
+                                .filter(|part| part.is_named() && part.kind() != "file_descriptor")
+                                .skip(1)
+                                .map(|part| (part.text().to_string(), part.range())),
+                        );
+                    }
+                }
+                let scoped_stores = stores
+                    .at_source_prefix(source.get(..source_base.checked_add(statement_start)?)?);
+                if let Some(span) = authorization_writer_span(&words, &scoped_stores) {
+                    return Some(span);
+                }
+            }
+            _ => {}
+        }
+        pending.extend(node.children());
+    }
+    None
+}
+
+struct AuthorizationStorePaths {
+    paths: Vec<PathBuf>,
+    cwd: Option<PathBuf>,
+}
+
+impl AuthorizationStorePaths {
+    fn current() -> Self {
+        let cwd = crate::evaluator::allow_once_request_cwd(None);
+        let mut paths = vec![
+            crate::pending_exceptions::AllowOnceStore::default_path(cwd.as_deref()),
+            crate::pending_exceptions::PendingExceptionStore::default_path(cwd.as_deref()),
+        ];
+        // Protect both supported default locations even before a file exists:
+        // creating the legacy store can make it take precedence on next use.
+        for base in [
+            crate::config::home_dir().map(|home| home.join(".config")),
+            crate::config::user_config_dir(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for name in ["allow_once.jsonl", "pending_exceptions.jsonl"] {
+                paths.push(base.join("dcg").join(name));
+            }
+        }
+        Self { paths, cwd }
+    }
+
+    fn at_source_prefix(&self, prefix: &str) -> Self {
+        Self {
+            paths: self.paths.clone(),
+            cwd: self.cwd.as_deref().and_then(|base| {
+                crate::rebase_recovery::resolve_effective_cwd(base, prefix, ShellDialect::Posix)
+            }),
+        }
+    }
+
+    fn matches_word(&self, raw: &str) -> bool {
+        // These names specifically designate the authorization stores. Do not
+        // inspect arbitrary shell variables or execute any expansion.
+        if matches!(
+            raw.trim_matches('"'),
+            "$DCG_ALLOW_ONCE_PATH"
+                | "${DCG_ALLOW_ONCE_PATH}"
+                | "$DCG_PENDING_EXCEPTIONS_PATH"
+                | "${DCG_PENDING_EXCEPTIONS_PATH}"
+        ) {
+            return true;
+        }
+        decode_authorization_path(raw).is_some_and(|path| self.matches_path(&path))
+    }
+
+    fn matches_path(&self, path: &Path) -> bool {
+        let Some(path) = authorization_absolute_path(path, self.cwd.as_deref()) else {
+            return false;
+        };
+        self.paths.iter().any(|store| {
+            authorization_absolute_path(store, self.cwd.as_deref())
+                .is_some_and(|store| path == store)
+        })
+    }
+
+    fn copy_destination(&self, destination: &str, sources: &[&(String, Range<usize>)]) -> bool {
+        if self.matches_word(destination) {
+            return true;
+        }
+        let Some(directory) = decode_authorization_path(destination) else {
+            return false;
+        };
+        sources.iter().any(|(raw, _)| {
+            decode_authorization_path(raw)
+                .and_then(|path| path.file_name().map(|name| directory.join(name)))
+                .is_some_and(|path| self.matches_path(&path))
+        })
+    }
+}
+
+fn authorization_absolute_path(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd?.join(path)
+    };
+    // Resolve symlinks before folding `..`: `link/../file` follows link's
+    // physical parent. New stores still have an existing parent to resolve.
+    if let Ok(resolved) = path.canonicalize() {
+        return Some(resolved);
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(resolved) = parent.canonicalize()
+    {
+        return Some(resolved.join(name));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+/// Decode only literal path syntax and the conventional directory variables.
+/// A quoted tilde or a single-quoted variable is a literal filename, not an
+/// expansion; it therefore cannot turn unrelated fixture files into stores.
+fn decode_authorization_path(raw: &str) -> Option<PathBuf> {
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        return Some(
+            crate::config::home_dir()?
+                .join(crate::normalize::decode_posix_literal_word(suffix)?.as_ref()),
+        );
+    }
+    let double_quoted = raw.starts_with('"');
+    let word = raw.strip_prefix('"').unwrap_or(raw);
+    for name in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        "USERPROFILE",
+        "DCG_ALLOW_ONCE_PATH",
+        "DCG_PENDING_EXCEPTIONS_PATH",
+    ] {
+        for prefix in [format!("${name}"), format!("${{{name}}}")] {
+            let Some(suffix) = word.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !suffix.is_empty() && !suffix.starts_with(['/', '"']) {
+                continue;
+            }
+            let base = if name == "HOME" {
+                crate::config::home_dir()?
+            } else {
+                PathBuf::from(std::env::var_os(name)?)
+            };
+            // Replace only the proven leading variable with a literal marker,
+            // then let the existing decoder own quote concatenation. Both
+            // "$HOME/dir" and "$HOME"/dir denote the same single shell word.
+            let replacement = format!(
+                "{}DCG_PATH_PREFIX{suffix}",
+                if double_quoted { "\"" } else { "" }
+            );
+            let decoded = crate::normalize::decode_posix_literal_word(&replacement)?;
+            let suffix = decoded.strip_prefix("DCG_PATH_PREFIX")?;
+            if !suffix.is_empty() && !suffix.starts_with('/') {
+                return None;
+            }
+            return Some(base.join(suffix.trim_start_matches('/')));
+        }
+    }
+    crate::normalize::decode_posix_literal_word(raw).map(|path| PathBuf::from(path.as_ref()))
+}
+
+fn authorization_writer_span(
+    words: &[(String, Range<usize>)],
+    stores: &AuthorizationStorePaths,
+) -> Option<Range<usize>> {
+    let (program, program_span) = words.first()?;
+    let program = crate::normalize::decode_posix_literal_word(program)?;
+    let name = program.rsplit('/').next()?;
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    let args = &words[1..];
+    if !matches!(
+        name,
+        "cp" | "mv" | "install" | "tee" | "truncate" | "sed" | "dd" | "rm" | "touch"
+    ) {
+        return None;
+    }
+    let mut operands = Vec::new();
+    let mut options = true;
+    let mut skip_value = false;
+    let mut target_directory = None;
+    let mut directory_value = false;
+    let mut in_place = false;
+    let mut sed_script = false;
+    let mut dd_destination = None;
+    for arg @ (raw, span) in args {
+        if std::mem::take(&mut directory_value) {
+            target_directory = Some((arg, 0));
+            continue;
+        }
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        let value = crate::normalize::decode_posix_literal_word(raw);
+        let value = value.as_deref().unwrap_or(raw);
+        if options && value == "--" {
+            options = false;
+            continue;
+        }
+        if options && matches!(value, "--help" | "--version") {
+            return None;
+        }
+        if name == "dd" {
+            if let Some(target) = raw.strip_prefix("of=")
+                && stores.matches_word(target)
+            {
+                dd_destination = Some(program_span.start..span.end);
+            }
+            if value
+                .strip_prefix("of=")
+                .is_some_and(|target| stores.matches_path(Path::new(target)))
+            {
+                dd_destination = Some(program_span.start..span.end);
+            }
+            continue;
+        }
+        if options && value.starts_with('-') && value != "-" {
+            match (name, value) {
+                ("cp" | "mv" | "install", "-t" | "--target-directory") => directory_value = true,
+                ("cp" | "mv" | "install", option) if option.starts_with("--target-directory=") => {
+                    target_directory = Some((arg, raw.find('=')? + 1));
+                }
+                ("cp" | "mv" | "install", option)
+                    if short_target_directory_offset(option).is_some() =>
+                {
+                    let offset = short_target_directory_offset(raw)?;
+                    if offset == raw.len() {
+                        directory_value = true;
+                    } else {
+                        target_directory = Some((arg, offset));
+                    }
+                }
+                (
+                    "cp" | "mv" | "install",
+                    "-S" | "--suffix" | "-m" | "--mode" | "-o" | "--owner" | "-g" | "--group",
+                )
+                | ("truncate", "-s" | "--size" | "-r" | "--reference")
+                | ("touch", "-r" | "--reference" | "-d" | "--date" | "-t") => skip_value = true,
+                ("sed", "-e" | "--expression" | "-f" | "--file") => {
+                    sed_script = true;
+                    skip_value = true;
+                }
+                ("sed", option)
+                    if option.starts_with("-e")
+                        || option.starts_with("-f")
+                        || option.starts_with("--expression=")
+                        || option.starts_with("--file=") =>
+                {
+                    sed_script = true
+                }
+                ("sed", option)
+                    if option == "--in-place"
+                        || option.starts_with("--in-place=")
+                        || option.starts_with("-i")
+                        || option.strip_prefix('-').is_some_and(|flags| {
+                            flags
+                                .chars()
+                                .take_while(|ch| {
+                                    matches!(ch, 'n' | 'E' | 'r' | 's' | 'u' | 'z' | 'i')
+                                })
+                                .any(|ch| ch == 'i')
+                        }) =>
+                {
+                    in_place = true
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if name == "sed" && !sed_script {
+            // BSD's `sed -i '' script file` has an empty backup suffix.
+            if in_place && value.is_empty() {
+                continue;
+            }
+            sed_script = true;
+            continue;
+        }
+        operands.push(arg);
+    }
+    if name == "sed" && !in_place {
+        return None;
+    }
+    if name == "dd" {
+        return dd_destination;
+    }
+    if matches!(name, "cp" | "install" | "mv") {
+        if name == "mv"
+            && let Some((_, span)) = operands.iter().find(|(raw, _)| stores.matches_word(raw))
+        {
+            return Some(program_span.start..span.end);
+        }
+        let (target, offset, sources) = if let Some((target, offset)) = target_directory {
+            (target, offset, operands.as_slice())
+        } else {
+            let (target, sources) = operands.split_last()?;
+            if sources.is_empty() {
+                return None;
+            }
+            (*target, 0, sources)
+        };
+        let target_path = target.0.get(offset..)?;
+        if offset != 0 && target_path.starts_with('~') {
+            // `-t~/dir` and `--target-directory=~/dir` are not shell tilde
+            // expansions. The separate argv form `-t ~/dir` is.
+            return None;
+        }
+        return stores
+            .copy_destination(target_path, sources)
+            .then_some(program_span.start..target.1.end);
+    }
+    operands.into_iter().find_map(|(raw, span)| {
+        stores
+            .matches_word(raw)
+            .then_some(program_span.start..span.end)
+    })
+}
+
+/// `t` consumes the rest of a short-option word (or the next argv word).
+/// Stop at an earlier option with an argument, so its value is not reparsed
+/// as more flags (`install -m644t` is a mode, not a target directory).
+fn short_target_directory_offset(option: &str) -> Option<usize> {
+    let flags = option.strip_prefix('-')?;
+    if flags.starts_with('-') {
+        return None;
+    }
+    for (offset, flag) in flags.char_indices() {
+        match flag {
+            't' => return Some(offset + 2),
+            'S' | 'm' | 'o' | 'g' => return None,
+            'a'..='z' | 'A'..='Z' => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
 const CONTROL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "Ask the operator to make the change",
@@ -383,6 +847,20 @@ pub const KEYWORDS: &[&str] = &[
     "DCG_BYPASS",
     "dcg",
     "DCG",
+    // Configured stores can have arbitrary filenames, so writes must reach
+    // the structural destination check even without a `dcg` path component.
+    ">",
+    "cp",
+    "mv",
+    "install",
+    "tee",
+    "truncate",
+    "sed",
+    "dd",
+    "rm",
+    "touch",
+    "allow_once.jsonl",
+    "pending_exceptions.jsonl",
     "uninstall.ps1",
     // The hook-tamper rule matches ANY `.json` under an agent config directory
     // (`settings.local.json`, `mcp.json`, …), so the directory names are the
@@ -590,10 +1068,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 dcg_global_options!(),
                 r"(?:add|add-command|import)|allow-once|allow)\b|\bDCG_(?:DISABLE|PACKS|CONFIG)\b\s*[=:]|\bsetx?\s+DCG_(?:DISABLE|PACKS|CONFIG)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_(?:DISABLE|PACKS|CONFIG)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_(?:DISABLE|PACKS|CONFIG)[\x22']\s*,|\bDCG_POLICY_DEFAULT_MODE\b\s*[=:]\s*[\x22']?(?:log|warn)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_POLICY_DEFAULT_MODE\b[^|&;\r\n]*[\x22']?(?:log|warn)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_POLICY_DEFAULT_MODE[\x22']\s*,\s*[\x22'](?:log|warn)\b|\bDCG_POLICY_OBSERVE_UNTIL\b\s*[=:]\s*\S|\bset-item\b[^|&;\r\n]*\benv:DCG_POLICY_OBSERVE_UNTIL\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_POLICY_OBSERVE_UNTIL[\x22']\s*,|\bDCG_HEREDOC_ENABLED\b\s*[=:]\s*[\x22']?(?:false|0|off|no)\b|\bset-item\b[^|&;\r\n]*\benv:DCG_HEREDOC_ENABLED\b[^|&;\r\n]*[\x22']?(?:false|0|off|no)\b|\bsetenvironmentvariable\s*\(\s*[\x22']DCG_HEREDOC_ENABLED[\x22']\s*,\s*[\x22']?(?:false|0|off|no)\b"
             )),
-            reason: "Granting an allowlist exception or overriding pack/policy config lets the agent clear its own path.",
+            reason: "Granting an exception, writing an authorization store, or overriding policy config lets the agent clear its own path.",
             severity: crate::packs::Severity::Critical,
             explanation: Some(
-                "`dcg allowlist add` and `dcg allow-once` grant permission for a rule or command, and the \
+                "`dcg allowlist add` and `dcg allow-once` grant permission for a rule or command. \
+             Shell writes to `allow_once.jsonl` or `pending_exceptions.jsonl` can forge the same \
+             authorization; redirections and filesystem writers are checked against the stores' \
+             default and configured locations. Read-only inspection and backup copies remain \
+             available. The \
              runtime environment overrides weaken enforcement wholesale: `DCG_PACKS` *replaces* the \
              enabled list (so it silently drops this preset), `DCG_DISABLE` removes packs, \
              `DCG_CONFIG` swaps the config file, `DCG_POLICY_DEFAULT_MODE=warn|log` and \
@@ -735,6 +1217,270 @@ mod tests {
         assert_patterns_compile(&pack);
         assert_all_patterns_have_reasons(&pack);
         assert_unique_pattern_names(&pack);
+    }
+
+    #[test]
+    fn authorization_store_writes_block_with_existing_policy_rule() {
+        let pack = create_pack();
+        for command in [
+            "printf '%s\\n' '{\"single_use\":false}' >> ~/.config/dcg/allow_once.jsonl",
+            "echo forged>~/.config/dcg/allow_once.jsonl",
+            "> ~/.config/dcg/allow_once.jsonl",
+            "cat 3<> ~/.config/dcg/pending_exceptions.jsonl",
+            "cat >| \"$HOME/.config/dcg/allow_once.jsonl\" <<'EOF'\nforged\nEOF",
+            "printf forged >> \"$HOME\"/.config/dcg/allow_once.jsonl",
+            "tee \"${HOME}\"/.config/dcg/pending_exceptions.jsonl",
+            "printf x | tee -a ~/.config/dcg/allow_once.jsonl",
+            "tee -- ~/.config/dcg/pending_exceptions.jsonl < payload.jsonl",
+            "cp payload.jsonl ~/.config/dcg/allow_once.jsonl",
+            "cp -t ~/.config/dcg /tmp/allow_once.jsonl",
+            "cp -ft ~/.config/dcg /tmp/allow_once.jsonl",
+            "cp --target-directory=\"$HOME/.config/dcg\" /tmp/allow_once.jsonl",
+            "cp -t\"$HOME/.config/dcg\" /tmp/pending_exceptions.jsonl",
+            "cp /tmp/allow_once.jsonl ~/.config/dcg/",
+            "cp payload.jsonl > /tmp/copy.log ~/.config/dcg/allow_once.jsonl",
+            "mv payload.jsonl ~/.config/dcg/allow_once.jsonl",
+            "mv ~/.config/dcg/allow_once.jsonl /tmp/moved.jsonl",
+            "install -m 600 payload.jsonl ~/.config/dcg/allow_once.jsonl",
+            "install -t ~/.config/dcg /tmp/pending_exceptions.jsonl",
+            "sed -i 's/true/false/' ~/.config/dcg/allow_once.jsonl",
+            "sed -i.bak -e 's/true/false/' ~/.config/dcg/allow_once.jsonl",
+            "sed -ni 'p' ~/.config/dcg/pending_exceptions.jsonl",
+            "sed --in-place --expression 's/a/b/' ~/.config/dcg/allow_once.jsonl",
+            "sed -i '' 's/a/b/' ~/.config/dcg/allow_once.jsonl",
+            "truncate -s 0 ~/.config/dcg/allow_once.jsonl",
+            "truncate --size=0 ~/.config/dcg/pending_exceptions.jsonl",
+            "dd if=payload.jsonl of=\"$HOME/.config/dcg/allow_once.jsonl\"",
+            "rm ~/.config/dcg/pending_exceptions.jsonl",
+            "touch ~/.config/dcg/allow_once.jsonl",
+            "printf forged >> \"$DCG_ALLOW_ONCE_PATH\"",
+            "tee -a \"${DCG_PENDING_EXCEPTIONS_PATH}\"",
+            "echo ready; printf x >> ~/.config/dcg/allow_once.jsonl",
+            "(printf x >> ~/.config/dcg/allow_once.jsonl)",
+        ] {
+            assert_blocks_reachably(&pack, command, "dcg-policy-self-weakening");
+            let span =
+                dcg_control_action_span(command, ShellDialect::Posix, "dcg-policy-self-weakening")
+                    .unwrap_or_else(|| panic!("missing evaluator proof: {command}"));
+            assert!(command.get(span).is_some(), "source span: {command}");
+        }
+    }
+
+    #[test]
+    fn authorization_store_reads_backups_and_unrelated_writes_remain_allowed() {
+        let pack = create_pack();
+        for command in [
+            "cat ~/.config/dcg/allow_once.jsonl",
+            "cat < ~/.config/dcg/pending_exceptions.jsonl > /tmp/backup.jsonl",
+            "cp ~/.config/dcg/allow_once.jsonl /tmp/backup.jsonl",
+            "cp ~/.config/dcg/allow_once.jsonl ~/.config/dcg/allow_once.jsonl.bak",
+            "cp -t /tmp ~/.config/dcg/allow_once.jsonl",
+            "install -m 600 ~/.config/dcg/allow_once.jsonl /tmp/backup.jsonl",
+            "dd if=~/.config/dcg/allow_once.jsonl of=/tmp/backup.jsonl",
+            "sed -n 'p' ~/.config/dcg/allow_once.jsonl",
+            "sed -i -f ~/.config/dcg/allow_once.jsonl ordinary.txt",
+            "sed -i 's|~/.config/dcg/allow_once.jsonl|backup|' ordinary.txt",
+            "truncate --reference ~/.config/dcg/allow_once.jsonl ordinary.txt",
+            "touch -r ~/.config/dcg/allow_once.jsonl ordinary.txt",
+            "touch --reference ~/.config/dcg/allow_once.jsonl ordinary.txt",
+            "cp -ft /tmp ~/.config/dcg/allow_once.jsonl",
+            "printf x >> ./fixtures/allow_once.jsonl",
+            "tee ./fixtures/pending_exceptions.jsonl",
+            "printf x > ~/.config/dcg/allow_once.jsonl.backup",
+            "printf x > ~/.config/dcg/not_allow_once.jsonl",
+            "printf '%s\\n' 'x >> ~/.config/dcg/allow_once.jsonl'",
+            "echo 'cp payload.jsonl ~/.config/dcg/allow_once.jsonl'",
+            "# printf x > ~/.config/dcg/allow_once.jsonl",
+            "cat <<'EOF'\ncp payload ~/.config/dcg/allow_once.jsonl\nEOF",
+            "printf '%s' '~/.config/dcg/allow_once.jsonl' > ordinary.txt",
+            "tee '$DCG_ALLOW_ONCE_PATH'",
+            "tee '~/.config/dcg/allow_once.jsonl'",
+            "tee --help ~/.config/dcg/allow_once.jsonl",
+            "cp --version payload.jsonl ~/.config/dcg/allow_once.jsonl",
+            "cp /tmp/allow_once.jsonl --target-directory=\"$HOME/.config/dcg\" --help",
+            "cp --target-directory=~/.config/dcg /tmp/allow_once.jsonl",
+            "cp -t~/.config/dcg /tmp/allow_once.jsonl",
+        ] {
+            assert_allows(&pack, command);
+            assert!(
+                authorization_store_write_span(command, ShellDialect::Posix).is_none(),
+                "unrelated operation: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_store_custom_paths_and_relative_destinations_are_checked() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        std::fs::create_dir(fixture.path().join("subdir")).expect("path component");
+        let stores = AuthorizationStorePaths {
+            paths: vec![
+                fixture.path().join("grants.data"),
+                fixture.path().join("requests.data"),
+            ],
+            cwd: Some(fixture.path().to_path_buf()),
+        };
+        for command in [
+            "printf forged > grants.data",
+            "tee -a ./requests.data",
+            "cp payload grants.data",
+            "sed -i 's/a/b/' requests.data",
+            "truncate -s 0 subdir/../grants.data",
+            "dd if=payload 'of=grants.data'",
+        ] {
+            assert!(
+                authorization_store_write_span_with_paths(command, &stores).is_some(),
+                "selected store: {command}"
+            );
+        }
+        for command in [
+            "printf forged > allow_once.jsonl",
+            "cp grants.data backup.data",
+            "tee grants.data.bak",
+            "cat < requests.data",
+        ] {
+            assert!(
+                authorization_store_write_span_with_paths(command, &stores).is_none(),
+                "unrelated file: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_store_relative_writes_follow_leading_cd_only() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let store_dir = fixture.path().join("store");
+        let other_dir = fixture.path().join("other");
+        std::fs::create_dir(&store_dir).expect("store directory");
+        std::fs::create_dir(&other_dir).expect("other directory");
+        let stores = AuthorizationStorePaths {
+            paths: vec![store_dir.join("grants.data")],
+            cwd: Some(other_dir.clone()),
+        };
+        for command in [
+            format!(
+                "cd '{}' && printf forged > grants.data",
+                store_dir.display()
+            ),
+            format!("cd '{}' && tee -a grants.data", store_dir.display()),
+        ] {
+            assert!(
+                authorization_store_write_span_with_paths(&command, &stores).is_some(),
+                "leading cd: {command}"
+            );
+            let offset = command.find(" && ").expect("separator") + 4;
+            assert!(
+                authorization_store_write_span_with_paths_in_source(
+                    &command[offset..],
+                    &stores,
+                    Some((&command, offset)),
+                )
+                .is_some(),
+                "segment retains the original directory change: {command}"
+            );
+        }
+        for command in [
+            format!(
+                "printf ordinary > grants.data; cd '{}'",
+                store_dir.display()
+            ),
+            format!(
+                "(cd '{}'); printf ordinary > grants.data",
+                store_dir.display()
+            ),
+            "cd \"$UNKNOWN\"; printf ordinary > grants.data".to_string(),
+        ] {
+            assert!(
+                authorization_store_write_span_with_paths(&command, &stores).is_none(),
+                "unrelated or unknown cwd: {command}"
+            );
+        }
+        let in_store = AuthorizationStorePaths {
+            paths: stores.paths.clone(),
+            cwd: Some(store_dir.clone()),
+        };
+        let command = format!("cd '{}' > grants.data", store_dir.display());
+        assert!(
+            authorization_store_write_span_with_paths(&command, &stores).is_none(),
+            "cd opens its redirect in the old unrelated directory"
+        );
+        let command = format!("cd '{}' > grants.data", other_dir.display());
+        assert!(
+            authorization_store_write_span_with_paths(&command, &in_store).is_some(),
+            "cd opens its redirect before leaving the protected directory"
+        );
+        for command in [
+            "printf '%s' '{\"reason\":\"cd\"}' > grants.data",
+            "printf '%s' 'cd /somewhere' >> grants.data",
+        ] {
+            assert!(
+                authorization_store_write_span_with_paths(command, &in_store).is_some(),
+                "data mentioning cd does not hide the write: {command}"
+            );
+            assert!(
+                authorization_store_write_span_with_paths(command, &stores).is_none(),
+                "ordinary write with cd as data remains unrelated: {command}"
+            );
+        }
+        let command = format!("printf forged > grants.data; cd '{}'", other_dir.display());
+        assert!(
+            authorization_store_write_span_with_paths(&command, &in_store).is_some(),
+            "a later cd must not hide an earlier write"
+        );
+        let command = format!(
+            "cd '{}' && printf ordinary > grants.data",
+            other_dir.display()
+        );
+        assert!(
+            authorization_store_write_span_with_paths(&command, &in_store).is_none(),
+            "leaving the store directory makes the relative file unrelated"
+        );
+        let offset = command.find(" && ").expect("separator") + 4;
+        assert!(
+            authorization_store_write_span_with_paths_in_source(
+                &command[offset..],
+                &in_store,
+                Some((&command, offset)),
+            )
+            .is_none(),
+            "segment must not borrow the request's old cwd after cd"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn authorization_store_paths_resolve_symlinks_before_parent_components() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let physical = fixture.path().join("physical");
+        std::fs::create_dir_all(physical.join("child")).expect("physical directories");
+        let alias = fixture.path().join("alias");
+        std::os::unix::fs::symlink(physical.join("child"), &alias).expect("alias");
+        let stores = AuthorizationStorePaths {
+            paths: vec![physical.join("grants.data")],
+            cwd: Some(fixture.path().to_path_buf()),
+        };
+        assert!(
+            stores.matches_path(&alias.join("../grants.data")),
+            "follow the symlink before .. even before the store is created"
+        );
+        let inverse = AuthorizationStorePaths {
+            paths: vec![fixture.path().join("grants.data")],
+            cwd: Some(fixture.path().to_path_buf()),
+        };
+        assert!(
+            !inverse.matches_path(&alias.join("../grants.data")),
+            "lexical parent is not the file the shell writes"
+        );
+        let directory_alias = fixture.path().join("store-link");
+        std::os::unix::fs::symlink(&physical, &directory_alias).expect("directory alias");
+        let linked_store = AuthorizationStorePaths {
+            paths: vec![directory_alias.join("new.data")],
+            cwd: Some(fixture.path().to_path_buf()),
+        };
+        assert!(
+            linked_store.matches_path(&physical.join("new.data")),
+            "a missing store's existing parent identifies its physical destination"
+        );
     }
 
     #[test]

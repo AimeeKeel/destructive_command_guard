@@ -27,7 +27,7 @@ use destructive_command_guard::config::{CompiledOverrides, Config, HeredocSettin
 #[cfg(test)]
 use destructive_command_guard::evaluator::evaluate_command_with_pack_order_deadline_at_path;
 use destructive_command_guard::evaluator::{
-    EvaluationDecision, EvaluationResult,
+    AllowOnceCwdScope, EvaluationDecision, EvaluationResult,
     evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
@@ -1126,6 +1126,7 @@ fn load_effective_allowlists_for_agent(config: &Config, agent: &Agent) -> Layere
 /// response later — after every batch entry has been resolved.
 struct ResolvedDenyFamily {
     command: String,
+    allow_once_cwd: Option<PathBuf>,
     result: destructive_command_guard::evaluator::EvaluationResult,
     mode: DecisionMode,
     eval_duration: Duration,
@@ -1217,10 +1218,10 @@ struct HookEvalContext<'a> {
     /// Working directory reported by the harness in the hook payload (`cwd`),
     /// when present. This is where the command will run, which can differ
     /// from the hook process's own cwd; rebase-recovery resolution prefers
-    /// it (#331). Allow-once and history keep using `cwd_path`, the path the
-    /// matching CLI commands resolve from.
+    /// it (#331). Allow-once uses its validated form in `scope_base`; history
+    /// retains the hook process's `cwd_path`.
     hook_cwd: Option<&'a Path>,
-    /// Base directory for matching directory-scoped (`paths = [...]`)
+    /// Base directory for allow-once grants and directory-scoped (`paths = [...]`)
     /// allowlist entries: the directory the harness says the command runs in,
     /// before any `cd` on the command line itself is applied (#387). `None`
     /// means dcg could not determine it, which makes every path-scoped grant
@@ -1449,6 +1450,13 @@ fn resolve_hook_command(
             shell_dialect,
         )
     });
+    // An exact-command grant approves the whole request envelope from its
+    // reported starting directory. Its command bytes already include any cd
+    // or nested shell; unlike rule-level path allowlists above, it must not
+    // switch to a derived inner-command directory or become unusable when a
+    // nested cd cannot be resolved. An unknown request directory still fails
+    // closed. Keep this identity installed through policy replays.
+    let _allow_once_cwd = AllowOnceCwdScope::install(ctx.scope_base);
 
     // Use the shared evaluator for hook mode parity with `dcg test`.
     let eval_start = Instant::now();
@@ -1628,6 +1636,7 @@ fn resolve_hook_command(
         // carries pattern info for its deny. Keep the conservative answer.
         return ResolvedCommandOutcome::DenyFamily(Box::new(ResolvedDenyFamily {
             command: command.to_string(),
+            allow_once_cwd: ctx.scope_base.map(Path::to_path_buf),
             result,
             mode: DecisionMode::Deny,
             eval_duration,
@@ -1666,6 +1675,7 @@ fn resolve_hook_command(
 
     ResolvedCommandOutcome::DenyFamily(Box::new(ResolvedDenyFamily {
         command: command.to_string(),
+        allow_once_cwd: ctx.scope_base.map(Path::to_path_buf),
         result,
         mode,
         eval_duration,
@@ -1723,6 +1733,7 @@ fn publish_decisive_response(
 
     let ResolvedDenyFamily {
         command,
+        allow_once_cwd,
         result,
         mode,
         eval_duration,
@@ -1757,8 +1768,6 @@ fn publish_decisive_response(
 
     match mode {
         DecisionMode::Deny | DecisionMode::Ask => {
-            let store_path = PendingExceptionStore::default_path(ctx.cwd_path);
-            let store = PendingExceptionStore::new(store_path);
             let reason = match (pack, pattern) {
                 (Some(pack_id), Some(pattern_name)) => {
                     format!("{pack_id}:{pattern_name} - {}", info.reason)
@@ -1774,7 +1783,10 @@ fn publish_decisive_response(
             // emitted WITHOUT a code — the block always stands.
             let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
             let remaining = ctx.deadline.remaining().unwrap_or(Duration::ZERO);
-            if !remaining.is_zero() {
+            if let Some(allow_once_cwd) = allow_once_cwd.as_deref().filter(|_| !remaining.is_zero())
+            {
+                let store_path = PendingExceptionStore::default_path(Some(allow_once_cwd));
+                let store = PendingExceptionStore::new(store_path);
                 let budget = PersistBudget {
                     lock_wait: remaining.min(ALLOW_ONCE_LOCK_WAIT),
                     allow_maintenance: remaining > ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
@@ -1788,7 +1800,7 @@ fn publish_decisive_response(
                 };
                 match store.record_block_bounded(
                     &command,
-                    ctx.working_dir,
+                    allow_once_cwd.to_string_lossy().as_ref(),
                     &reason,
                     &ctx.config.logging.redaction,
                     false,

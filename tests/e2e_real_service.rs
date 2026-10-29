@@ -105,6 +105,10 @@ impl RealServiceEnv {
     fn cwd_path(&self) -> &Path {
         self.cwd.path()
     }
+
+    fn allow_once_path(&self) -> PathBuf {
+        self.home.path().join(".config/dcg/allow_once.jsonl")
+    }
 }
 
 struct DcgRun {
@@ -240,13 +244,35 @@ fn run_hook(
     command: &str,
     extra_env: &[(&str, &str)],
 ) -> DcgRun {
-    let payload = protocol.payload(command, env.cwd_path());
-    run_dcg(log, env, &[], Some(&payload), extra_env)
+    run_hook_at(log, env, env.cwd_path(), protocol, command, extra_env)
+}
+
+fn run_hook_at(
+    log: &TestLog,
+    env: &RealServiceEnv,
+    cwd: &Path,
+    protocol: Protocol,
+    command: &str,
+    extra_env: &[(&str, &str)],
+) -> DcgRun {
+    let payload = protocol.payload(command, cwd);
+    run_dcg_at(log, env, cwd, &[], Some(&payload), extra_env)
 }
 
 fn run_dcg(
     log: &TestLog,
     env: &RealServiceEnv,
+    args: &[&str],
+    stdin: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> DcgRun {
+    run_dcg_at(log, env, env.cwd_path(), args, stdin, extra_env)
+}
+
+fn run_dcg_at(
+    log: &TestLog,
+    env: &RealServiceEnv,
+    cwd: &Path,
     args: &[&str],
     stdin: Option<&str>,
     extra_env: &[(&str, &str)],
@@ -260,7 +286,7 @@ fn run_dcg(
         test = %log.name,
         binary = %binary.display(),
         args = ?args,
-        cwd = %env.cwd_path().display(),
+        cwd = %cwd.display(),
         home = %env.home_path().display(),
         stdin_bytes = stdin.map_or(0, str::len)
     );
@@ -268,7 +294,7 @@ fn run_dcg(
     let started = Instant::now();
     let mut cmd = Command::new(&binary);
     cmd.args(args)
-        .current_dir(env.cwd_path())
+        .current_dir(cwd)
         .env_clear()
         .env("PATH", system_path)
         .env("HOME", env.home_path())
@@ -277,7 +303,13 @@ fn run_dcg(
         .env("TEMP", &env.tmp_dir)
         .env("TMP", &env.tmp_dir)
         .env("XDG_CONFIG_HOME", env.home_path().join(".config"))
+        .env("DCG_ALLOW_ONCE_PATH", env.allow_once_path())
+        .env(
+            "DCG_PENDING_EXCEPTIONS_PATH",
+            env.home_path().join(".config/dcg/pending_exceptions.jsonl"),
+        )
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_SELF_HEAL_HOOK", "0")
         .env("NO_COLOR", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -547,6 +579,62 @@ fn expected_ask_shape() -> Value {
     })
 }
 
+fn assert_reset_denied(run: &DcgRun, case: &str) {
+    assert_eq!(run.exit_code, 0, "{case}: hook should exit normally");
+    let output = run.stdout_json();
+    assert_eq!(
+        output["hookSpecificOutput"]["permissionDecision"], "deny",
+        "{case}: an invalid or out-of-scope grant must not authorize the command"
+    );
+    assert_eq!(
+        output["hookSpecificOutput"]["ruleId"], "core.git:reset-hard",
+        "{case}: the normal destructive-command policy should remain effective"
+    );
+}
+
+fn grant_allow_once(log: &TestLog, env: &RealServiceEnv, cwd: &Path, reusable: bool) -> Value {
+    let denied = run_hook_at(log, env, cwd, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+    assert_reset_denied(&denied, "before approval");
+    let output = denied.stdout_json();
+    let code = output["hookSpecificOutput"]["allowOnceCode"]
+        .as_str()
+        .expect("denied command should issue a pending code");
+    let mut args = vec!["allow-once", code, "--yes"];
+    if reusable {
+        args.push("--reusable");
+    }
+    let approved = run_dcg_at(log, env, cwd, &args, None, &[]);
+    assert_eq!(
+        approved.exit_code, 0,
+        "real pending-code redemption failed: {}\n{}",
+        approved.stdout, approved.stderr
+    );
+
+    let stored = fs::read_to_string(env.allow_once_path()).expect("read the approved grant");
+    serde_json::from_str(stored.lines().last().expect("approved grant line"))
+        .expect("parse the approved grant")
+}
+
+fn write_allow_once_entry(env: &RealServiceEnv, entry: &Value) {
+    let mut line = serde_json::to_string(entry).expect("serialize test grant");
+    line.push('\n');
+    fs::write(env.allow_once_path(), line).expect("write isolated test grant");
+}
+
+fn init_test_repo(path: &Path) {
+    fs::create_dir_all(path).expect("create test repository directory");
+    let output = Command::new("git")
+        .args(["-c", "init.templateDir=", "init", "--quiet"])
+        .arg(path)
+        .output()
+        .expect("initialize test git repository");
+    assert!(
+        output.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn safe_bash_allows_silently_for_claude_and_codex() {
     with_test_log("safe_bash_allows_silently_for_claude_and_codex", |log| {
@@ -805,6 +893,436 @@ fn allow_once_short_code_round_trip_redeems_real_pending_exception() {
             let retry = run_hook(log, &env, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
             assert_eq!(retry.exit_code, 0, "allow-once retry should exit 0");
             assert_empty(log, "allow-once retry stdout", &retry.stdout);
+
+            let consumed = run_hook(log, &env, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+            assert_reset_denied(&consumed, "default grant is consumed on first use");
+        },
+    );
+}
+
+#[test]
+fn allow_once_rejects_forged_lifetime_and_scope_records() {
+    with_test_log(
+        "allow_once_rejects_forged_lifetime_and_scope_records",
+        |log| {
+            let env = RealServiceEnv::new("forged-grants");
+            let approved = grant_allow_once(log, &env, env.cwd_path(), true);
+            let now = chrono::Utc::now();
+            let future = (now + chrono::Duration::hours(1)).to_rfc3339();
+            let later = (now + chrono::Duration::hours(2)).to_rfc3339();
+            let expired_created = (now - chrono::Duration::hours(25)).to_rfc3339();
+            let expired = (now - chrono::Duration::hours(1)).to_rfc3339();
+            let root = env.cwd_path().ancestors().last().expect("filesystem root");
+
+            for (case, changes) in [
+                (
+                    "expiry in 2099",
+                    json!({ "expires_at": "2099-01-01T00:00:00Z" }),
+                ),
+                (
+                    "future creation within a 24-hour window",
+                    json!({ "created_at": future, "expires_at": later }),
+                ),
+                (
+                    "expired reusable grant",
+                    json!({ "created_at": expired_created, "expires_at": expired }),
+                ),
+                (
+                    "nonpositive lifetime",
+                    json!({ "expires_at": approved["created_at"] }),
+                ),
+                ("malformed creation", json!({ "created_at": "not-a-time" })),
+                ("malformed expiry", json!({ "expires_at": "not-a-time" })),
+                ("unsupported schema", json!({ "schema_version": 99 })),
+                ("empty scope", json!({ "scope_path": "" })),
+                ("relative scope", json!({ "scope_path": "." })),
+                (
+                    "project scope at filesystem root",
+                    json!({ "scope_kind": "project", "scope_path": root }),
+                ),
+                (
+                    "project scope outside a repository",
+                    json!({ "scope_kind": "project", "scope_path": env.cwd_path() }),
+                ),
+            ] {
+                let mut forged = approved.clone();
+                forged
+                    .as_object_mut()
+                    .expect("grant object")
+                    .extend(changes.as_object().expect("changed fields").clone());
+                write_allow_once_entry(&env, &forged);
+                let result = run_hook(log, &env, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+                assert_reset_denied(&result, case);
+            }
+
+            // Invalid neighbors must not discard an independently valid approval.
+            let mut forged = approved.clone();
+            forged["expires_at"] = json!("2099-01-01T00:00:00Z");
+            fs::write(
+                env.allow_once_path(),
+                format!("not json\n{forged}\n{approved}\n"),
+            )
+            .expect("write malformed, forged and valid grants together");
+            for _ in 0..2 {
+                let result = run_hook(log, &env, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+                assert_eq!(result.exit_code, 0);
+                assert_empty(
+                    log,
+                    "valid reusable grant survives invalid records",
+                    &result.stdout,
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn allow_once_reusable_grants_respect_project_and_exact_command_boundaries() {
+    with_test_log(
+        "allow_once_reusable_grants_respect_project_and_exact_command_boundaries",
+        |log| {
+            let env = RealServiceEnv::new("project-grants");
+            let project = env.cwd_path().join("project");
+            let child = project.join("src");
+            let sibling = env.cwd_path().join("project-other");
+            let nested = project.join("nested-repo");
+            init_test_repo(&project);
+            fs::create_dir_all(&child).expect("create project child");
+            fs::create_dir_all(&sibling).expect("create sibling with common path prefix");
+            init_test_repo(&nested);
+
+            let approved = grant_allow_once(log, &env, &child, true);
+            assert_eq!(approved["scope_kind"], "project");
+            assert_eq!(approved["single_use"], false);
+            for cwd in [&project, &child, &project] {
+                let result =
+                    run_hook_at(log, &env, cwd, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+                assert_eq!(result.exit_code, 0);
+                assert_empty(log, "approved project root/descendant", &result.stdout);
+            }
+
+            let changed_command = run_hook_at(
+                log,
+                &env,
+                &project,
+                Protocol::Claude,
+                "git reset --hard HEAD~2",
+                &[],
+            );
+            assert_reset_denied(&changed_command, "different command text");
+            for cwd in [sibling.as_path(), nested.as_path(), env.cwd_path()] {
+                let result =
+                    run_hook_at(log, &env, cwd, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+                assert_reset_denied(&result, "different project or outside the repository");
+            }
+
+            #[cfg(unix)]
+            {
+                let escape = project.join("outside-link");
+                std::os::unix::fs::symlink(&sibling, &escape)
+                    .expect("create symlink outside project");
+                let result = run_hook_at(
+                    log,
+                    &env,
+                    &escape,
+                    Protocol::Claude,
+                    DESTRUCTIVE_COMMAND,
+                    &[],
+                );
+                assert_reset_denied(&result, "symlink exits project scope");
+            }
+
+            let retry = run_hook_at(
+                log,
+                &env,
+                &child,
+                Protocol::Claude,
+                DESTRUCTIVE_COMMAND,
+                &[],
+            );
+            assert_eq!(retry.exit_code, 0);
+            assert_empty(
+                log,
+                "out-of-scope attempts do not consume valid reusable grant",
+                &retry.stdout,
+            );
+        },
+    );
+}
+
+#[test]
+fn allow_once_cwd_grants_do_not_cover_descendants() {
+    with_test_log("allow_once_cwd_grants_do_not_cover_descendants", |log| {
+        let env = RealServiceEnv::new("cwd-grants");
+        let child = env.cwd_path().join("child");
+        fs::create_dir_all(&child).expect("create non-project child directory");
+        let approved = grant_allow_once(log, &env, env.cwd_path(), false);
+        assert_eq!(approved["scope_kind"], "cwd");
+        assert_eq!(approved["single_use"], true);
+
+        let outside = run_hook_at(
+            log,
+            &env,
+            &child,
+            Protocol::Claude,
+            DESTRUCTIVE_COMMAND,
+            &[],
+        );
+        assert_reset_denied(&outside, "cwd grants are exact, not recursive");
+        let permitted = run_hook(log, &env, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+        assert_eq!(permitted.exit_code, 0);
+        assert_empty(
+            log,
+            "nonmatching cwd does not consume single-use approval",
+            &permitted.stdout,
+        );
+        let consumed = run_hook(log, &env, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+        assert_reset_denied(&consumed, "valid single-use grant is consumed");
+    });
+}
+
+#[test]
+fn allow_once_uses_request_cwd_instead_of_hook_process_cwd() {
+    with_test_log(
+        "allow_once_uses_request_cwd_instead_of_hook_process_cwd",
+        |log| {
+            let env = RealServiceEnv::new("request-cwd-grants");
+            let request_cwd = env.cwd_path().join("request");
+            fs::create_dir_all(&request_cwd).expect("create requested working directory");
+            let process_grant = grant_allow_once(log, &env, env.cwd_path(), true);
+
+            let request = Protocol::Claude.payload(DESTRUCTIVE_COMMAND, &request_cwd);
+            let outside = run_dcg(log, &env, &[], Some(&request), &[]);
+            assert_reset_denied(&outside, "process cwd grant must not cover request cwd");
+
+            for invalid_cwd in [PathBuf::from("relative"), env.cwd_path().join("missing")] {
+                let invalid = Protocol::Claude.payload(DESTRUCTIVE_COMMAND, &invalid_cwd);
+                let result = run_dcg(log, &env, &[], Some(&invalid), &[]);
+                assert_reset_denied(
+                    &result,
+                    "invalid request cwd cannot fall back to process cwd",
+                );
+            }
+
+            // Redeem the code minted by the hook launched from a different cwd.
+            // Both the pending record and the eventual grant must retain request scope.
+            let output = outside.stdout_json();
+            let code = output["hookSpecificOutput"]["allowOnceCode"]
+                .as_str()
+                .expect("out-of-scope denial should issue a code for request cwd");
+            let approval = run_dcg(
+                log,
+                &env,
+                &["allow-once", code, "--yes", "--reusable"],
+                None,
+                &[],
+            );
+            assert_eq!(approval.exit_code, 0, "{}", approval.stderr);
+            let allowed = run_dcg(log, &env, &[], Some(&request), &[]);
+            assert_eq!(allowed.exit_code, 0);
+            assert_empty(
+                log,
+                "request cwd grant is honored from another process cwd",
+                &allowed.stdout,
+            );
+
+            // Leave only the request grant, then try the reverse mismatch.
+            let entries = fs::read_to_string(env.allow_once_path()).expect("read granted entries");
+            let request_grant = entries
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("grant JSON"))
+                .find(|entry| entry["source_full_hash"] != process_grant["source_full_hash"])
+                .expect("request grant was recorded separately");
+            write_allow_once_entry(&env, &request_grant);
+            let process_request = Protocol::Claude.payload(DESTRUCTIVE_COMMAND, env.cwd_path());
+            let denied = run_dcg_at(log, &env, &request_cwd, &[], Some(&process_request), &[]);
+            assert_reset_denied(
+                &denied,
+                "request grant cannot cover caller working directory",
+            );
+        },
+    );
+}
+
+#[test]
+fn allow_once_can_approve_exact_nested_cd_command_from_request_scope() {
+    with_test_log(
+        "allow_once_can_approve_exact_nested_cd_command_from_request_scope",
+        |log| {
+            let env = RealServiceEnv::new("nested-cd-grant");
+            let command = r#"sh -c 'cd "$DEST" && git reset --hard HEAD~1'"#;
+            let denied = run_hook(log, &env, Protocol::Claude, command, &[]);
+            assert_eq!(denied.exit_code, 0);
+            let output = denied.stdout_json();
+            assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+            let code = output["hookSpecificOutput"]["allowOnceCode"]
+                .as_str()
+                .expect("blocked exact envelope should remain approvable");
+            let approval = run_dcg(
+                log,
+                &env,
+                &["allow-once", code, "--yes", "--reusable"],
+                None,
+                &[],
+            );
+            assert_eq!(approval.exit_code, 0, "{}", approval.stderr);
+            let allowed = run_hook(log, &env, Protocol::Claude, command, &[]);
+            assert_eq!(allowed.exit_code, 0);
+            assert_empty(log, "exact approved nested-cd command", &allowed.stdout);
+
+            let unrelated = env.cwd_path().join("other-base");
+            fs::create_dir_all(&unrelated).expect("create unrelated command base");
+            let outside = run_hook_at(log, &env, &unrelated, Protocol::Claude, command, &[]);
+            assert_eq!(outside.exit_code, 0);
+            assert_eq!(
+                outside.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+                "deny",
+                "exact command grants remain bound to their approved request directory"
+            );
+        },
+    );
+}
+
+#[test]
+fn allow_once_redemption_rejects_unresolvable_pending_directories() {
+    with_test_log(
+        "allow_once_redemption_rejects_unresolvable_pending_directories",
+        |log| {
+            let env = RealServiceEnv::new("invalid-pending-cwd");
+            let denied = run_hook(log, &env, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
+            assert_reset_denied(&denied, "initial pending-code issuance");
+            let output = denied.stdout_json();
+            let code = output["hookSpecificOutput"]["allowOnceCode"]
+                .as_str()
+                .expect("real denial must issue a pending code");
+            let pending_path = env.home_path().join(".config/dcg/pending_exceptions.jsonl");
+            let original: Value = serde_json::from_str(
+                fs::read_to_string(&pending_path)
+                    .expect("read issued pending record")
+                    .trim(),
+            )
+            .expect("pending record JSON");
+
+            for cwd in [
+                json!("<unknown>"),
+                json!(""),
+                json!("relative-directory"),
+                json!(env.cwd_path().join("missing-directory")),
+            ] {
+                let mut malformed = original.clone();
+                malformed["cwd"] = cwd.clone();
+                fs::write(&pending_path, format!("{malformed}\n"))
+                    .expect("write isolated malformed pending scope");
+                let redemption = run_dcg(log, &env, &["allow-once", code, "--yes"], None, &[]);
+                assert_ne!(
+                    redemption.exit_code, 0,
+                    "invalid pending cwd {cwd} must not be rebound to approval cwd"
+                );
+                assert_contains(
+                    log,
+                    "invalid pending scope error",
+                    &redemption.stderr,
+                    "scope",
+                );
+                if env.allow_once_path().exists() {
+                    let grants = fs::read_to_string(env.allow_once_path()).expect("read grants");
+                    assert_empty(log, "invalid pending scope cannot mint a grant", &grants);
+                }
+            }
+
+            fs::write(&pending_path, format!("{original}\n"))
+                .expect("restore the valid issued pending record");
+            let valid = run_dcg(log, &env, &["allow-once", code, "--yes"], None, &[]);
+            assert_eq!(
+                valid.exit_code, 0,
+                "valid original pending record: {}",
+                valid.stderr
+            );
+        },
+    );
+}
+
+#[test]
+fn guardrails_block_authorization_store_writes_without_blocking_reads() {
+    with_test_log(
+        "guardrails_block_authorization_store_writes_without_blocking_reads",
+        |log| {
+            let env = RealServiceEnv::new("authorization-store-writes");
+            env.write_config(
+                "[packs]\nenabled = [\"careful_company_running_windows.guardrails\"]\n",
+            );
+
+            // These strings are submitted only to the hook; no shell executes them.
+            for command in [
+                "printf '%s\\n' '{}' >> ~/.config/dcg/allow_once.jsonl",
+                "printf '%s\\n' '{}' | tee -a ~/.config/dcg/pending_exceptions.jsonl",
+                "cp /tmp/forged.jsonl ~/.config/dcg/allow_once.jsonl",
+                "sed -i 's/true/false/' ~/.config/dcg/allow_once.jsonl",
+            ] {
+                let result = run_hook(log, &env, Protocol::Claude, command, &[]);
+                assert_eq!(result.exit_code, 0);
+                let output = result.stdout_json();
+                assert_eq!(
+                    output["hookSpecificOutput"]["permissionDecision"], "deny",
+                    "authorization-store mutation must be denied: {command}"
+                );
+                assert_eq!(
+                    output["hookSpecificOutput"]["packId"],
+                    "careful_company_running_windows.guardrails",
+                    "write must reach the guardrails pack: {command}"
+                );
+                assert_eq!(
+                    output["hookSpecificOutput"]["ruleId"],
+                    "careful_company_running_windows.guardrails:dcg-policy-self-weakening"
+                );
+            }
+
+            for command in [
+                "cat ~/.config/dcg/allow_once.jsonl",
+                "cp ~/.config/dcg/allow_once.jsonl /tmp/grant-backup.jsonl",
+                "printf '%s\\n' '{}' >> /tmp/application.jsonl",
+                "printf '%s\\n' '~/.config/dcg/allow_once.jsonl' > /tmp/notes.txt",
+                "echo 'x > ~/.config/dcg/allow_once.jsonl'",
+                "printf '%s\\n' '{}' > ~/.config/dcg/allow_once.jsonl.bak",
+            ] {
+                let result = run_hook(log, &env, Protocol::Claude, command, &[]);
+                assert_eq!(result.exit_code, 0);
+                assert_empty(log, command, &result.stdout);
+            }
+        },
+    );
+}
+
+#[test]
+fn guardrails_resolve_relative_store_writes_from_request_cwd() {
+    with_test_log(
+        "guardrails_resolve_relative_store_writes_from_request_cwd",
+        |log| {
+            let env = RealServiceEnv::new("store-write-request-cwd");
+            env.write_config(
+                "[packs]\nenabled = [\"careful_company_running_windows.guardrails\"]\n",
+            );
+            let store_dir = env.home_path().join(".config/dcg");
+            let command = "printf forged > allow_once.jsonl";
+            let request = Protocol::Claude.payload(command, &store_dir);
+            let blocked = run_dcg(log, &env, &[], Some(&request), &[]);
+            assert_eq!(blocked.exit_code, 0);
+            let output = blocked.stdout_json();
+            assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert_eq!(
+                output["hookSpecificOutput"]["ruleId"],
+                "careful_company_running_windows.guardrails:dcg-policy-self-weakening",
+                "a relative destination in request cwd must resolve to the selected store"
+            );
+
+            let unrelated_request = Protocol::Claude.payload(command, env.cwd_path());
+            let unrelated = run_dcg_at(log, &env, &store_dir, &[], Some(&unrelated_request), &[]);
+            assert_eq!(unrelated.exit_code, 0);
+            assert_empty(
+                log,
+                "same basename in an unrelated request directory",
+                &unrelated.stdout,
+            );
         },
     );
 }

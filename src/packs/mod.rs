@@ -709,6 +709,13 @@ impl Pack {
     #[must_use]
     pub(crate) fn semantic_safe_decision(&self, cmd: &str) -> Option<bool> {
         match self.id.as_str() {
+            "careful_company_running_windows.guardrails" => {
+                crate::packs::careful_company_running_windows::guardrails::authorization_store_write_span(
+                    cmd,
+                    crate::normalize::ShellDialect::Unknown,
+                )
+                .map(|_| false)
+            }
             "core.filesystem" => {
                 // This proof owns unlink's exemptions, including rejected
                 // literal-path boundaries that a legacy temp regex may match.
@@ -823,6 +830,15 @@ impl Pack {
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
+        if self.id == "careful_company_running_windows.guardrails"
+            && crate::packs::careful_company_running_windows::guardrails::authorization_store_write_span(
+                cmd,
+                crate::normalize::ShellDialect::Unknown,
+            )
+            .is_some()
+        {
+            return self.destructive_match_by_name("dcg-policy-self-weakening", cmd);
+        }
         if self.id == "system.permissions" {
             match crate::packs::system::permissions::posix_permission_decision(
                 cmd,
@@ -1061,6 +1077,12 @@ impl Pack {
     /// pattern in another (`docker system prune`).
     #[must_use]
     pub fn check(&self, cmd: &str) -> Option<DestructiveMatch> {
+        // Authorization-store paths depend on leading directory changes.
+        // Keep the full source for this pack's structural write proof; its
+        // safe regexes already exclude shell separators and redirections.
+        if self.id == "careful_company_running_windows.guardrails" {
+            return self.check_single(cmd);
+        }
         let segments = crate::packs::split_command_segments(cmd);
         if segments.len() > 1 {
             if self.id == "careful_company_running_windows.upload"
