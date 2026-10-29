@@ -350,7 +350,10 @@ pub struct DestructivePattern {
     /// this list. A dynamic argv0 (one containing a shell expansion) never
     /// matches.
     ///
-    /// Names must be written lowercase without a path or extension.
+    /// Names must be written lowercase without a path or extension. In a
+    /// built-in pack, a name ending in `*` covers every program that starts
+    /// with the rest of it and is longer: `mkfs.*` matches `mkfs.ext4` but not
+    /// `mkfs`. External packs reject `*` when they load.
     pub executables: Option<&'static [&'static str]>,
 }
 

@@ -372,10 +372,38 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // agent can run directly: `mke2fs` (ext2/3/4), `mkdosfs`, `mkntfs`,
         // `mkexfatfs`, and macOS `newfs_*`. `mke2fs /dev/sdb1` reached this
         // pack through `/dev/` and matched no rule, so it was allowed.
+        //
+        // These three rules are scoped to the program that runs (#600): a
+        // formatter's name anywhere on the line made `which mkfs.vfat
+        // mkfs.ext4`, `man mkswap wipefs` and `ls /sbin/mkfs.ext4 x` formats.
+        // The scope follows wrappers and launchers (`sudo`, `find -exec`,
+        // `xargs`, ...), so every spelling that runs the tool is still
+        // judged. It also names the programs that run a command line on
+        // another host or in a container (`ssh host mkfs.ext4 …`, `docker
+        // exec c wipefs …`) and `toybox`, which the unscoped rules covered.
         destructive_pattern!(
             "mkfs",
             r"(?:mkfs(?:\.[a-z0-9]+)?|mke2fs|mkdosfs|mkntfs|mkexfatfs|newfs(?:_[a-z0-9]+)?)\s+",
-            "mkfs formats a partition/device and ERASES all existing data."
+            "mkfs formats a partition/device and ERASES all existing data.",
+            executables = [
+                "mkfs",
+                "mkfs.*",
+                "mke2fs",
+                "mkdosfs",
+                "mkntfs",
+                "mkexfatfs",
+                "newfs",
+                "newfs_*",
+                "ssh",
+                "toybox",
+                "docker",
+                "podman",
+                "nerdctl",
+                "kubectl",
+                "oc",
+                "lxc",
+                "incus"
+            ]
         ),
         // mkswap (format as swap area). Same blast radius as mkfs: overwrites
         // any existing data on the target device. Shipped as its own rule
@@ -383,13 +411,21 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "mkswap",
             r"mkswap\s+",
-            "mkswap formats a partition as a swap area, ERASING any existing data."
+            "mkswap formats a partition as a swap area, ERASING any existing data.",
+            executables = [
+                "mkswap", "ssh", "toybox", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc",
+                "incus"
+            ]
         ),
         // wipefs
         destructive_pattern!(
             "wipefs",
             r"wipefs\s+",
-            "wipefs removes filesystem signatures. Use with extreme caution."
+            "wipefs removes filesystem signatures. Use with extreme caution.",
+            executables = [
+                "wipefs", "ssh", "toybox", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc",
+                "incus"
+            ]
         ),
         // mount with potentially dangerous options
         destructive_pattern!(
@@ -1506,12 +1542,49 @@ mod tests {
         // requires `mkswap\s+` so a hyphenated/embedded mention does not match.
         assert_no_match(&pack, "cat mkswap-readme.md");
         assert_no_match(&pack, "ls /usr/share/doc/mkswap");
-        // Note: `echo mkswap is dangerous` matches at the raw-pack level
-        // because the regex sees `mkswap ` (the space is the second token
-        // separator). The evaluator's echo/printf args-data sanitize layer
-        // masks that text before pack evaluation, so the full pipeline still
-        // allows the command — exercised in
-        // scripts/e2e_destructive_equivalents.sh::scenario_system_disk_default.
+        // The rule is scoped to the mkswap program (#600), so the pack itself
+        // no longer reads `mkswap ` in echoed text as the command.
+        assert_no_match(&pack, "echo mkswap is dangerous");
+    }
+
+    /// #600: the formatter rules matched a tool's name anywhere on the line,
+    /// so a lookup naming two tools, a manual page or a directory listing was
+    /// refused as a format. They now judge the program that runs, through the
+    /// wrappers and launchers that run it.
+    #[test]
+    fn formatter_rules_judge_the_program_that_runs_issue_600() {
+        let pack = create_pack();
+        for command in [
+            "which mkfs.vfat mkfs.ext4",
+            "type mkfs.ext4 mkswap",
+            "whereis wipefs mkfs.ext4",
+            "man mkswap wipefs",
+            "ls /sbin/mkfs.vfat /sbin/mkfs.ext4",
+            "cat mkfs.ext4 notes.txt",
+            "tool --no-mkfs /tmp/x",
+        ] {
+            assert_no_match(&pack, command);
+        }
+        for (command, rule) in [
+            ("mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("sudo mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("/sbin/mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("mkfs -t ext4 /dev/sdb1", "mkfs"),
+            ("mke2fs /dev/sdb1", "mkfs"),
+            ("newfs_hfs /dev/disk2s1", "mkfs"),
+            ("find /dev -name 'sd?' -exec mkfs.ext4 {} \\;", "mkfs"),
+            ("ssh host mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("docker run --privileged alpine mkfs.ext4 /dev/sdb1", "mkfs"),
+            ("busybox mkfs.ext2 /dev/sdb1", "mkfs"),
+            ("mkswap /dev/sdb2", "mkswap"),
+            ("toybox mkswap /dev/sdb2", "mkswap"),
+            ("timeout 60 mkswap /dev/sdb2", "mkswap"),
+            ("wipefs -a /dev/sdb", "wipefs"),
+            ("printf '/dev/sdb\\n' | xargs wipefs -a", "wipefs"),
+            ("kubectl exec pod -- wipefs -a /dev/sdb", "wipefs"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
     }
 
     #[test]

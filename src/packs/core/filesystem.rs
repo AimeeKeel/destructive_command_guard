@@ -5528,6 +5528,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // established rule IDs and sensitive-path attribution, with executable
         // scoping on the legacy raw-text fallback. Single argument only —
         // multi-arg unlink isn't standard.
+        //
+        // The scope also names the programs that run a command line on
+        // another host or in a container (`ssh host unlink …`, `docker exec
+        // c unlink …`, `kubectl exec pod -- unlink …`) and `toybox`, which
+        // runs an applet as `busybox` does. The unscoped rules denied those,
+        // and scoping to argv0 (#550) had let them through.
         destructive_pattern!(
             "unlink-root-home",
             r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
@@ -5545,7 +5551,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - `cp <file> <file>.bak && unlink <file>` to keep an explicit backup.\n\
              - `unlink /tmp/<subdir>/scratch` is allowed (temp dirs).",
             UNLINK_SUGGESTIONS,
-            executables = ["unlink"]
+            executables = [
+                "unlink", "ssh", "toybox", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc",
+                "incus"
+            ]
         ),
         // ----- `unlink <file>` (High: any other target) -----
         //
@@ -5565,7 +5574,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - For temp scratch: `unlink /tmp/<subdir>/scratch` is allowed.\n\
              - Use `mv <file> /tmp/quarantine-<file>` if you want a delayed delete.",
             UNLINK_SUGGESTIONS,
-            executables = ["unlink"]
+            executables = [
+                "unlink", "ssh", "toybox", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc",
+                "incus"
+            ]
         ),
         // ----- destructive `truncate -s/--size` (Critical: root/home/system) -----
         //

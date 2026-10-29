@@ -31974,10 +31974,20 @@ fn segment_invokes_executable_in_dialect(
     executables: &[&str],
     dialect: ShellDialect,
 ) -> bool {
+    // A trailing `*` declares a family of programs: `mkfs.*` covers
+    // `mkfs.ext4`, `mkfs.vfat`, ... but not a bare `mkfs`.
     let declared = |name: &str| {
         executables
             .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+            .any(|candidate| match candidate.strip_suffix('*') {
+                Some(prefix) => {
+                    name.len() > prefix.len()
+                        && name
+                            .get(..prefix.len())
+                            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                }
+                None => candidate.eq_ignore_ascii_case(name),
+            })
     };
     match segment_executable_in_dialect(segment, dialect) {
         SegmentExecutable::Name(argv0) => {
@@ -37433,6 +37443,16 @@ mod tests {
             "strace -f unlink /etc/passwd",
             "chroot /srv/root unlink /etc/passwd",
             "sudo unlink /etc/sudoers",
+            // Remote and container command lines run their operand; the
+            // argv0-scoped rule allowed these until they were modeled.
+            "ssh host unlink /etc/passwd",
+            "ssh -p 2222 host unlink /etc/passwd",
+            "toybox unlink /etc/passwd",
+            "docker run alpine unlink /etc/passwd",
+            "docker exec c unlink /etc/passwd",
+            "podman run alpine unlink /etc/passwd",
+            "kubectl exec pod -- unlink /etc/passwd",
+            "lxc exec c -- unlink /etc/passwd",
             "mv /home/user/repo /tmp/r",
             "'mv' /home/user/repo /tmp/r",
             // Words the shell still reads as `mv`.
@@ -37447,6 +37467,57 @@ mod tests {
                 &["core.filesystem"],
                 ShellDialect::Posix,
             );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #600 end to end: a formatter's name in a lookup, a manual page or a
+    /// listing is not a format, while every spelling that runs the formatter
+    /// stays denied.
+    #[test]
+    fn formatter_rules_judge_the_program_that_runs_600() {
+        for command in [
+            "which mkfs.vfat mkfs.ext4",
+            "type mkfs.ext4 mkswap",
+            "whereis wipefs mkfs.ext4",
+            "man mkswap wipefs",
+            "ls /sbin/mkfs.vfat /sbin/mkfs.ext4",
+            "command -v mkfs.ext4 mkswap wipefs",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["system.disk"], ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "mkfs.ext4 /dev/sdb1",
+            "sudo mkfs.ext4 /dev/sdb1",
+            "\\mkfs.ext4 /dev/sdb1",
+            "mkfs.ext4\"\" /dev/sdb1",
+            "'mkfs.ext4' /dev/sdb1",
+            "'wipefs' -a /dev/sdb",
+            "exec mkfs.ext4 /dev/sdb1",
+            "bash -c 'mkfs.ext4 /dev/sdb1'",
+            "ssh host mkfs.ext4 /dev/sdb1",
+            "ssh host 'mkfs.ext4 /dev/sdb1'",
+            "systemd-run mkfs.ext4 /dev/sdb1",
+            "nsenter -t 1 -m mkfs.ext4 /dev/sdb1",
+            "docker exec c mkfs.ext4 /dev/sdb1",
+            "find /dev -name 'sd?' -exec mkfs.ext4 {} \\;",
+            "sudo mkswap /dev/sdb2",
+            "toybox mkswap /dev/sdb2",
+            "sudo wipefs -a /dev/sdb",
+            "lsblk | xargs wipefs -a",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["system.disk"], ShellDialect::Posix);
             assert!(
                 result.is_denied(),
                 "{command:?} must stay denied: {:?}",
@@ -48788,6 +48859,25 @@ mod tests {
         ));
         assert!(!segment_invokes_executable("grep -R foo /etc", &["chmod"]));
         assert!(!segment_invokes_executable("$X -R 755 /etc", &["chmod"]));
+
+        // A trailing `*` declares a program family (#600): the prefix and at
+        // least one more character, read case-insensitively.
+        for (segment, expected) in [
+            ("mkfs.ext4 /dev/sdb1", true),
+            ("MKFS.VFAT /dev/sdb1", true),
+            ("/sbin/mkfs.btrfs /dev/sdb1", true),
+            ("sudo mkfs.xfs -f /dev/sdb1", true),
+            ("xargs mkfs.ext4", true),
+            ("mkfs /dev/sdb1", false),
+            ("mkfsx /dev/sdb1", false),
+            ("which mkfs.ext4", false),
+        ] {
+            assert_eq!(
+                segment_invokes_executable(segment, &["mkfs.*"]),
+                expected,
+                "{segment:?}"
+            );
+        }
 
         for (segment, expected) in [
             ("@C:\\Tools\\MYTOOL.EXE danger", Some("mytool")),
